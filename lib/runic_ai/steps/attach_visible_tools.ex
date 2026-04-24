@@ -7,6 +7,7 @@ defmodule RunicAI.Steps.AttachVisibleTools do
 
   alias RunicAI.Agent.TurnRequest
   alias RunicAI.Tool.Selection
+  alias RunicAI.Tool.RequirementPolicy
 
   def new(opts \\ []) do
     name = Keyword.get(opts, :name, :attach_visible_tools)
@@ -25,12 +26,14 @@ defmodule RunicAI.Steps.AttachVisibleTools do
   def attach(%TurnRequest{} = turn_request, %Selection{} = selection, opts \\ []) do
     with {:ok, turn_request} <- TurnRequest.validate(turn_request),
          {:ok, selection} <- Selection.validate(selection),
+         {:ok, tool_choice} <- resolve_tool_choice(turn_request, selection, opts),
          {:ok, req_tools} <- Selection.to_req_llm_tools(selection) do
       llm_opts =
         turn_request.llm_opts
         |> Keyword.delete(:tools)
+        |> Keyword.delete(:tool_choice)
         |> maybe_put_tools(req_tools)
-        |> maybe_put_override(:tool_choice, Keyword.get(opts, :tool_choice))
+        |> maybe_put_override(:tool_choice, tool_choice)
 
       TurnRequest.new(turn_request.state,
         input_message: turn_request.input_message,
@@ -57,4 +60,25 @@ defmodule RunicAI.Steps.AttachVisibleTools do
 
   defp maybe_put_override(llm_opts, _key, nil), do: llm_opts
   defp maybe_put_override(llm_opts, key, value), do: Keyword.put(llm_opts, key, value)
+
+  defp resolve_tool_choice(%TurnRequest{} = turn_request, %Selection{} = selection, opts) do
+    cond do
+      Keyword.has_key?(opts, :tool_choice) and Keyword.has_key?(opts, :tool_requirement) ->
+        {:error,
+         RunicAI.Error.validation(
+           "attach_visible_tools accepts either :tool_choice or :tool_requirement, not both",
+           source: __MODULE__
+         )}
+
+      Keyword.has_key?(opts, :tool_requirement) ->
+        RequirementPolicy.resolve_tool_choice(
+          Keyword.get(opts, :tool_requirement),
+          turn_request,
+          selection
+        )
+
+      true ->
+        {:ok, Keyword.get(opts, :tool_choice)}
+    end
+  end
 end

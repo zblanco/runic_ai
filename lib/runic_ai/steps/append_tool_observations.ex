@@ -10,6 +10,7 @@ defmodule RunicAI.Steps.AppendToolObservations do
   alias RunicAI.Tool.ExecutionPlan
   alias RunicAI.Tool.ExecutionPolicy
   alias RunicAI.Tool.Observation
+  alias RunicAI.Tool.RequirementPolicy
 
   def new(opts \\ []) do
     name = Keyword.get(opts, :name, :append_tool_observations)
@@ -85,7 +86,12 @@ defmodule RunicAI.Steps.AppendToolObservations do
         Map.get(usage, :tool_retries, 0) + Enum.count(results, &(&1.status == :retry))
       )
 
-    %State{state | metadata: Map.put(metadata, :usage, usage)}
+    metadata =
+      metadata
+      |> Map.put(:usage, usage)
+      |> RequirementPolicy.mark_post_tool_turn()
+
+    %State{state | metadata: metadata}
   end
 
   defp maybe_apply_failure_policy(state, results, %ExecutionPolicy{} = policy) do

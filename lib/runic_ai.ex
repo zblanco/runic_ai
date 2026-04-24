@@ -15,7 +15,8 @@ defmodule RunicAI do
   assistant turns.
 
   Phase 2 extends that kernel with typed tool-calling contracts under
-  `RunicAI.Tool.*` and the reference
+  `RunicAI.Tool.*`, including semantic recipe-level
+  `RunicAI.Tool.RequirementPolicy`, and the reference
   `RunicAI.Recipes.ConversationalToolAgent` workflow for model -> tool ->
   model loops.
 
@@ -46,6 +47,43 @@ defmodule RunicAI do
   delegation, scoped inheritance, parallel child execution, deterministic join
   policies, and jury-style evaluation as typed Runic dataflow rather than
   bespoke orchestration.
+
+  Phase 6 adds a workflow-owned integrated runtime layer under
+  `RunicAI.Integrated.*`. `RunicAI.Integrated.RuntimeState` is the
+  authoritative multi-agent reducer state, keyed by `agent_id`, with
+  per-lane `RunicAI.Integrated.SessionState`, typed
+  `RunicAI.Integrated.Signal` input envelopes, `RunicAI.Integrated.PendingWork`
+  pause metadata, and `RunicAI.Integrated.Emission` output envelopes. The
+  reference `RunicAI.Recipes.IntegratedAgentKernel`,
+  `RunicAI.Recipes.IntegratedChatAgent`, and
+  `RunicAI.Recipes.IntegratedToolAgent` workflows show how to keep one or many
+  agent lanes inside a Runic workflow using `Runic.accumulator` plus
+  `state_of/1`-driven routing while still reusing the earlier turn, tool,
+  budget, review, and wait contracts.
+
+  Phase 7 adds an operability layer under `RunicAI.Trace.*`,
+  `RunicAI.Harness.*`, `RunicAI.Testing.*`, and `RunicAI.Evaluation.*`.
+  `RunicAI.Trace.Event`, `RunicAI.Trace.CapturePolicy`, and
+  `RunicAI.Trace.Trajectory` provide a typed semantic trace and replay artifact
+  across both recipe families. `RunicAI.Harness.TurnProcessor` and
+  `RunicAI.Harness.Integrated` provide process-agnostic in-memory drivers for
+  external-state and workflow-owned recipes. `RunicAI.Testing.*` adds scripted
+  doubles plus replay helpers derived from captured trajectories, and
+  `RunicAI.Recipes.EvaluationHarness` turns fixture cases into
+  accumulator-backed running metrics and evaluation reports without forcing one
+  OTP runtime model into the core library.
+
+  Phase 8 adds a production-facing runtime layer under `RunicAI.Runtime.*`.
+  `RunicAI.Runtime.SessionSpec`, `RunicAI.Runtime.Handle`, and the generic
+  `RunicAI.Runtime.SessionServer` let applications supervise and address
+  long-lived harness sessions while preserving `RunicAI.Harness.Session` as the
+  canonical snapshot. Runtime backends provide in-memory execution plus
+  `Runic.Runner`-backed execution for both external-state and integrated recipe
+  families, scheduler adapters deliver explicit `RunicAI.Wait` wakes, and
+  `RunicAI.Tool.ExecutionAdapter`, `RunicAI.Candidate.*`,
+  `RunicAI.Context.HorizonPolicy`, and `RunicAI.Optimization.*` add the
+  extension points for real execution environments, candidate routing, and
+  observational optimization.
 
   ## LLM Access
 

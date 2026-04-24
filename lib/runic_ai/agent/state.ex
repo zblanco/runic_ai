@@ -8,6 +8,7 @@ defmodule RunicAI.Agent.State do
   alias RunicAI.Context.State, as: ContextState
   alias RunicAI.Error
   alias RunicAI.Message
+  alias RunicAI.Tool.RequirementPolicy
 
   @valid_statuses [:running, :completed, :halted]
 
@@ -210,7 +211,11 @@ defmodule RunicAI.Agent.State do
            apply_conversation_turn(state.conversation, turn_request, turn_result) do
       next_status = next_status(state, turn_result)
       pending_action = next_pending_action(turn_result)
-      metadata = update_usage_metadata(state.metadata, turn_result)
+
+      metadata =
+        state.metadata
+        |> update_usage_metadata(turn_result)
+        |> update_tool_requirement_metadata(turn_result)
 
       {:ok,
        %__MODULE__{
@@ -332,6 +337,13 @@ defmodule RunicAI.Agent.State do
     |> Map.put(:usage, usage)
     |> Map.put(:timing, timing)
   end
+
+  defp update_tool_requirement_metadata(metadata, %TurnResult{kind: :tool_requests})
+       when is_map(metadata),
+       do: metadata
+
+  defp update_tool_requirement_metadata(metadata, %TurnResult{}) when is_map(metadata),
+    do: RequirementPolicy.clear_post_tool_turn(metadata)
 
   defp validate_metadata(metadata) when is_map(metadata), do: :ok
 

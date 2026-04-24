@@ -87,6 +87,44 @@ defmodule RunicAI.Recipes.ConversationalToolAgentTest do
            ]
   end
 
+  test "tool_requirement :required only forces tool choice before the first tool batch" do
+    weather_tool = weather_tool()
+
+    client = fn _model, %Prompt{messages: messages}, opts ->
+      case Enum.find(messages, &(&1.role == :tool)) do
+        nil ->
+          assert opts[:tool_choice] == :required
+
+          {:ok,
+           RunicAI.LLM.TestClient.tool_response(
+             [
+               RunicAI.LLM.TestClient.tool_call("get_weather", %{location: "Paris"}, id: "call_1")
+             ],
+             "Let me check."
+           )}
+
+        tool_message ->
+          assert tool_message.content =~ "\"sunny\""
+          assert opts[:tool_choice] == :auto
+          {:ok, RunicAI.LLM.TestClient.result("Paris is sunny.")}
+      end
+    end
+
+    workflow =
+      ConversationalToolAgent.react_until_resolution(
+        [
+          model: "test:model",
+          registry: [weather_tool],
+          client: client,
+          tool_requirement: :required
+        ],
+        %{user: "What's the weather in Paris?"}
+      )
+
+    assert ConversationalToolAgent.latest_reply_text(workflow) == "Paris is sunny."
+    assert ConversationalToolAgent.latest_turn_result(workflow).kind == :reply
+  end
+
   defp weather_tool do
     Definition.new!(
       name: "get_weather",

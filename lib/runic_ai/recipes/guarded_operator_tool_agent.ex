@@ -36,12 +36,15 @@ defmodule RunicAI.Recipes.GuardedOperatorToolAgent do
   alias RunicAI.Tool.CallResult
   alias RunicAI.Tool.ExecutionPlan
   alias RunicAI.Tool.Observation
+  alias RunicAI.Tool.RequirementPolicy
   alias RunicAI.Tool.Registry
   alias RunicAI.Tool.Selection
   alias RunicAI.Wait
 
   @spec new(keyword()) :: Workflow.t()
   def new(opts \\ []) do
+    tool_requirement = RequirementPolicy.from_recipe_opts!(opts)
+
     request_step =
       AssembleTurnRequest.new(
         name: :assemble_turn_request,
@@ -78,7 +81,7 @@ defmodule RunicAI.Recipes.GuardedOperatorToolAgent do
     attach_tools_step =
       AttachVisibleTools.new(
         name: :attach_visible_tools,
-        tool_choice: Keyword.get(opts, :tool_choice)
+        tool_requirement: tool_requirement
       )
 
     prompt_step = AssembleTurnPrompt.new(name: :assemble_turn_prompt)

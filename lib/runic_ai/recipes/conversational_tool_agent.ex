@@ -28,10 +28,13 @@ defmodule RunicAI.Recipes.ConversationalToolAgent do
   alias RunicAI.Tool.CallResult
   alias RunicAI.Tool.ExecutionPlan
   alias RunicAI.Tool.Observation
+  alias RunicAI.Tool.RequirementPolicy
   alias RunicAI.Tool.Selection
 
   @spec new(keyword()) :: Workflow.t()
   def new(opts \\ []) do
+    tool_requirement = RequirementPolicy.from_recipe_opts!(opts)
+
     request_step =
       AssembleTurnRequest.new(
         name: :assemble_turn_request,
@@ -60,7 +63,7 @@ defmodule RunicAI.Recipes.ConversationalToolAgent do
     attach_tools_step =
       AttachVisibleTools.new(
         name: :attach_visible_tools,
-        tool_choice: Keyword.get(opts, :tool_choice)
+        tool_requirement: tool_requirement
       )
 
     prompt_step = AssembleTurnPrompt.new(name: :assemble_turn_prompt)
@@ -132,18 +135,20 @@ defmodule RunicAI.Recipes.ConversationalToolAgent do
 
   @spec latest_state(Workflow.t()) :: State.t() | nil
   def latest_state(%Workflow{} = workflow) do
-    workflow
-    |> Workflow.raw_productions()
-    |> Enum.filter(&match?(%State{}, &1))
-    |> List.last()
+    latest_from_components(workflow, [:append_tool_observations, :update_agent_state], State) ||
+      workflow
+      |> Workflow.raw_productions()
+      |> Enum.filter(&match?(%State{}, &1))
+      |> List.last()
   end
 
   @spec latest_turn_result(Workflow.t()) :: TurnResult.t() | nil
   def latest_turn_result(%Workflow{} = workflow) do
-    workflow
-    |> Workflow.raw_productions()
-    |> Enum.filter(&match?(%TurnResult{}, &1))
-    |> List.last()
+    latest_from_components(workflow, [:interpret_tool_requests, :interpret_turn], TurnResult) ||
+      workflow
+      |> Workflow.raw_productions()
+      |> Enum.filter(&match?(%TurnResult{}, &1))
+      |> List.last()
   end
 
   @spec latest_continue_decision(Workflow.t()) :: ContinueDecision.t() | nil
@@ -233,6 +238,15 @@ defmodule RunicAI.Recipes.ConversationalToolAgent do
     |> Workflow.raw_productions()
     |> Enum.filter(&match?(%{__struct__: ^module}, &1))
     |> List.last()
+  end
+
+  defp latest_from_components(%Workflow{} = workflow, component_names, module) do
+    Enum.find_value(component_names, fn component_name ->
+      workflow
+      |> Workflow.raw_productions(component_name)
+      |> Enum.reverse()
+      |> Enum.find(&match?(%{__struct__: ^module}, &1))
+    end)
   end
 
   defp recipe_llm_opts(opts) do

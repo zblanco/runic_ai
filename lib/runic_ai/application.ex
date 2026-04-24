@@ -8,8 +8,9 @@ defmodule RunicAI.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: RunicAI.Worker.start_link(arg)
-      # {RunicAI.Worker, arg}
+      {RunicAI.Runtime.Registry, []},
+      {RunicAI.Runtime.SessionSupervisor, []},
+      {Runic.Runner, name: RunicAI.Runtime.Runner}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

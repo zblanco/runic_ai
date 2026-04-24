@@ -18,11 +18,15 @@ the components provided.
   under `RunicAI.Agent.*`, plus the Phase 2 tool lane contracts under
   `RunicAI.Tool.*`, the Phase 4 context-engineering contracts under
   `RunicAI.Context.*`, `RunicAI.Memory.*`, and `RunicAI.Retrieval.*`, and the
-  Phase 5 decomposition contracts under `RunicAI.Decomposition.*`.
+  Phase 5 decomposition contracts under `RunicAI.Decomposition.*`, plus the
+  Phase 6 workflow-owned runtime contracts under `RunicAI.Integrated.*`.
 - **LLM-agnostic** — LLM access goes through a thin `RunicAI.LLM` behaviour backed by ReqLLM.
   Clients are injected per call as plain modules or functions.
 - **No process assumptions** — Components are pure data structures evaluated lazily.
   Bring your own GenServer, GenStage, or bare Task.
+- **Operability-first** — Phase 7 adds typed traces, in-memory harness drivers,
+  deterministic scripted doubles, replay helpers, and accumulator-backed
+  evaluation workflows without collapsing the library into one runtime topology.
 
 ## Installation
 
@@ -92,6 +96,8 @@ end
 - `RunicAI.Tool.Definition` — canonical tool definition and executor boundary
 - `RunicAI.Tool.Registry` — validated available-tool registry
 - `RunicAI.Tool.Selection` — per-turn visible tool set
+- `RunicAI.Tool.RequirementPolicy` — semantic recipe-level tool-use policy,
+  such as optional vs required-before-answer
 - `RunicAI.Tool.CallRequest` — normalized one-shot tool invocation request
 - `RunicAI.Tool.ExecutionPolicy` — explicit execution and failure policy
 - `RunicAI.Tool.ExecutionPlan` — deterministic batch execution plan
@@ -137,6 +143,21 @@ end
 - `RunicAI.Decomposition.Result` / `RunicAI.Decomposition.JoinPolicy` /
   `RunicAI.Decomposition.Evaluation` — normalized child outcomes, deterministic
   joins, and judge/jury assessment data
+- `RunicAI.Integrated.AgentRef` / `RunicAI.Integrated.SessionState` —
+  workflow-owned identity and per-lane live agent state
+- `RunicAI.Integrated.Signal` / `RunicAI.Integrated.Emission` — typed inbound
+  runtime events and identity-carrying outbound values
+- `RunicAI.Integrated.PendingWork` / `RunicAI.Integrated.RuntimeState` —
+  durable pause metadata and the authoritative accumulator state for one or
+  many integrated agent lanes
+- `RunicAI.Trace.Event` / `RunicAI.Trace.CapturePolicy` /
+  `RunicAI.Trace.Trajectory` — semantic trace events, redaction-aware payload
+  capture, and replayable execution artifacts
+- `RunicAI.Harness.Policy` / `RunicAI.Harness.Session` — process-agnostic
+  operational policy and serializable session state for harness-driven runs
+- `RunicAI.Evaluation.Case` / `RunicAI.Evaluation.Expectation` /
+  `RunicAI.Evaluation.Result` / `RunicAI.Evaluation.Run` — typed evaluation
+  fixtures, scoring predicates, case results, and aggregate run artifacts
 
 ## Conversational Kernel
 
@@ -464,3 +485,151 @@ bundle = SummaryBackedChatAgent.latest_bundle(workflow)
 Retrieval stays intentionally light in the core library. RunicAI owns the
 contracts, normalization, and recipe wiring, while storage, search, embeddings,
 and indexing stay behind user-supplied adapters.
+
+## Integrated Stateful Recipes
+
+Phase 6 adds a workflow-owned state track on top of the earlier external-state
+recipes.
+
+The key difference is where the live loop state sits:
+
+- `RunicAI.Recipes.ChatAgentKernel`,
+  `RunicAI.Recipes.ConversationalToolAgent`, and
+  `RunicAI.Recipes.GuardedOperatorToolAgent` keep `RunicAI.Agent.State`
+  persistence-agnostic so a caller can store it and decide when to re-enter.
+- `RunicAI.Recipes.IntegratedChatAgent` and
+  `RunicAI.Recipes.IntegratedToolAgent` keep that state inside the workflow
+  itself under an authoritative `RunicAI.Integrated.RuntimeState`,
+  maintained by a `Runic.accumulator`, with routing decisions driven by
+  `state_of/1`.
+
+The integrated path is:
+
+```text
+Integrated.Signal
+  -> Integrated.RuntimeState accumulator
+  -> state_of(:integrated_runtime) routing rule
+  -> Integrated.SessionState for one agent_id
+  -> existing turn/tool/control contracts
+  -> updated Integrated.SessionState
+  -> Integrated.Emission | more Integrated.Signal | quiescence
+```
+
+This lets one or many agent lanes share a workflow while still reusing the
+Phase 1-5 contracts for turns, tool plans, budgets, waits, reviews, and
+resume signals.
+
+Phase 6 ships three reference recipes:
+
+- `RunicAI.Recipes.IntegratedAgentKernel` — generic workflow-owned runtime
+  kernel for typed integrated signals and emissions
+- `RunicAI.Recipes.IntegratedChatAgent` — stateful chat recipe that keeps
+  conversation state inside the workflow across repeated signals
+- `RunicAI.Recipes.IntegratedToolAgent` — stateful tool recipe with scoped
+  review, wait, wake, and resume handling inside the same workflow runtime
+
+Example:
+
+```elixir
+alias Runic.Workflow
+alias RunicAI.Recipes.IntegratedChatAgent
+
+workflow =
+  IntegratedChatAgent.new(
+    default_agent_id: "chat",
+    model: "openai:gpt-4.1-mini",
+    system: "You are concise"
+  )
+  |> Workflow.react_until_satisfied(%{
+    user: "My favorite color is vermilion. Reply only with noted."
+  })
+
+workflow =
+  Workflow.react_until_satisfied(
+    workflow,
+    %{user: "What color did I say was my favorite? Reply with one word."}
+  )
+
+reply = IntegratedChatAgent.latest_reply_text(workflow, "chat")
+session = IntegratedChatAgent.session(workflow, "chat")
+```
+
+`RunicAI.Recipes.IntegratedToolAgent` extends the same runtime with tool loops,
+budget checks, guard pauses, typed review requests, typed waits, and wake or
+resume signals, all scoped back to the correct `agent_id`.
+
+## Observability, Testing, And Evaluation
+
+Phase 7 adds a process-agnostic operability layer over both recipe families.
+
+- `RunicAI.Trace.Event` gives a stable semantic event vocabulary for turns,
+  tool plans, tool calls, tool results, reviews, waits, emissions, and final
+  workflow quiescence
+- `RunicAI.Trace.CapturePolicy` and `RunicAI.Trace.Trajectory` let callers
+  choose summary, full, or replay-grade payload capture without changing the
+  recipes themselves
+- `RunicAI.Harness.TurnProcessor` and `RunicAI.Harness.Integrated` provide
+  in-memory drivers that can submit inputs, drain until quiescence, preserve
+  snapshots, and attach sinks without committing to a GenServer or
+  `Runic.Runner` runtime yet
+- `RunicAI.Testing.ScriptedLLM`, `RunicAI.Testing.ScriptedToolExecutor`,
+  `RunicAI.Testing.ScriptedRetrieval`, and `RunicAI.Testing.Replay` turn
+  trajectories into deterministic doubles for regression work
+- `RunicAI.Recipes.EvaluationHarness` runs `RunicAI.Evaluation.Case` fixtures
+  through either recipe track and keeps running metrics under `Runic.accumulator`
+
+Harness example:
+
+```elixir
+alias RunicAI.Harness.Policy
+alias RunicAI.Harness.TurnProcessor
+alias RunicAI.Recipes.GuardedOperatorToolAgent
+alias RunicAI.Trace.Sinks.InMemory
+
+policy =
+  Policy.new!(
+    capture_policy: [mode: :summary],
+    sinks: [InMemory]
+  )
+
+session =
+  TurnProcessor.new_session(GuardedOperatorToolAgent,
+    recipe_opts: [
+      model: "openai:gpt-4.1-mini",
+      registry: [weather_tool],
+      client: weather_client
+    ],
+    policy: policy
+  )
+  |> TurnProcessor.submit(%{user: "What's the weather in Paris?"})
+  |> TurnProcessor.drain(policy)
+
+trajectory = session.trajectory
+latest = List.last(session.outputs)
+```
+
+Evaluation example:
+
+```elixir
+alias RunicAI.Evaluation.Case
+alias RunicAI.Harness.Policy
+alias RunicAI.Recipes.ChatAgentKernel
+alias RunicAI.Recipes.EvaluationHarness
+
+run =
+  EvaluationHarness.run(
+    [
+      Case.new!(
+        id: "hello-case",
+        input: %{user: "say hello"},
+        expected: [{:contains_text, "hello"}]
+      )
+    ],
+    recipe: ChatAgentKernel,
+    recipe_opts: [model: "openai:gpt-4.1-mini", client: client],
+    policy: Policy.new!(capture_policy: [mode: :summary])
+  )
+
+run.aggregate
+run.results
+```
