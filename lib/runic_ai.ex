@@ -85,6 +85,13 @@ defmodule RunicAI do
   extension points for real execution environments, candidate routing, and
   observational optimization.
 
+  Phase 9 begins an RLM execution layer under `RunicAI.RLM.*`. It externalizes
+  long-context sources into typed environments, slices, and materialized
+  artifacts; adds policy, plan, cost, episode, continuation, and plan-patch
+  contracts; and includes the first `RunicAI.Recipes.RLMSummarizer` workflow
+  that proves split -> materialize -> map leaves -> reduce as ordinary Runic
+  dataflow.
+
   ## LLM Access
 
   Use `RunicAI.LLM` for all LLM interactions. Its canonical path composes
