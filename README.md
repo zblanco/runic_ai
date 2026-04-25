@@ -1,36 +1,54 @@
 # RunicAI
 
-A toolbox of AI components built on top of [Runic](https://hex.pm/packages/runic) workflows
-and [ReqLLM](https://hex.pm/packages/req_llm).
+RunicAI is a workflow-native toolbox for building AI and agent systems in
+Elixir.
 
-RunicAI provides reusable building blocks for constructing AI agent loops, LLM workflow steps,
-error-handling control flow, scheduling policies, fallback patterns, and more — all composed
-as Runic workflow graphs. Users build their own AI workflows and agents by assembling
-the components provided.
+It provides typed contracts, Runic components, reference recipes, testing
+helpers, tracing, evaluation harnesses, and runtime adapters on top of
+[Runic](https://hex.pm/packages/runic) workflows and
+[ReqLLM](https://hex.pm/packages/req_llm).
 
-## Key Ideas
+The short version: RunicAI helps you build agents as explicit workflow graphs
+instead of hidden loops. Prompts, messages, model results, tool calls, context
+state, guard decisions, waits, reviews, traces, and evaluations are all ordinary
+values that can be inspected, tested, replayed, persisted, and recomposed.
 
-- **Runic-native** — Every component is a standard Runic `Step`, `Rule`, `StateMachine`, etc.,
-  composable into `Runic.Workflow` graphs with full DAG-based dataflow evaluation.
-- **Contract-owned** — RunicAI owns the values that move through workflows:
-  `RunicAI.Message`, `RunicAI.Prompt`, `RunicAI.Conversation.State`,
-  `RunicAI.LLM.Request`, `RunicAI.LLM.Result`, and the Phase 1 kernel contracts
-  under `RunicAI.Agent.*`, plus the Phase 2 tool lane contracts under
-  `RunicAI.Tool.*`, the Phase 4 context-engineering contracts under
-  `RunicAI.Context.*`, `RunicAI.Memory.*`, and `RunicAI.Retrieval.*`, and the
-  Phase 5 decomposition contracts under `RunicAI.Decomposition.*`, plus the
-  Phase 6 workflow-owned runtime contracts under `RunicAI.Integrated.*`.
-- **LLM-agnostic** — LLM access goes through a thin `RunicAI.LLM` behaviour backed by ReqLLM.
-  Clients are injected per call as plain modules or functions.
-- **No process assumptions** — Components are pure data structures evaluated lazily.
-  Bring your own GenServer, GenStage, or bare Task.
-- **Operability-first** — Phase 7 adds typed traces, in-memory harness drivers,
-  deterministic scripted doubles, replay helpers, and accumulator-backed
-  evaluation workflows without collapsing the library into one runtime topology.
+```mermaid
+flowchart LR
+  input[User input] --> request[TurnRequest]
+  request --> prompt[Prompt]
+  prompt --> model[LLM Result]
+  model --> turn[TurnResult]
+  turn --> state[Agent State]
+  state --> decision[Continue Decision]
+```
+
+## Why RunicAI
+
+Most agent code starts as a loop around a model call. That works for the first
+demo, then becomes harder to reason about as soon as you add tools, context
+windows, reviews, timeouts, retries, memory, evaluation, and production
+runtime concerns.
+
+RunicAI keeps those concerns visible:
+
+- **Workflow-native composition** - Components are ordinary Runic steps, rules,
+  reducers, accumulators, and workflows.
+- **Typed contracts** - The values moving through the graph have names and
+  validation: `RunicAI.Agent.TurnRequest`, `RunicAI.Tool.ExecutionPlan`,
+  `RunicAI.Context.Bundle`, `RunicAI.Trace.Event`, and so on.
+- **Provider-neutral LLM access** - `RunicAI.LLM` delegates to ReqLLM by
+  default, while every call can inject a plain module or function client.
+- **Process-agnostic core** - Workflows describe state transitions. Your
+  application chooses whether to run them in a request, a job, a GenServer, a
+  supervised runtime session, or a `Runic.Runner`.
+- **Operable by design** - Tracing, replay, scripted doubles, harnesses,
+  evaluation cases, runtime sessions, schedulers, and adapters are part of the
+  library surface.
 
 ## Installation
 
-Add `runic_ai` to your list of dependencies in `mix.exs`:
+Add `runic_ai` to your dependencies:
 
 ```elixir
 def deps do
@@ -40,596 +58,244 @@ def deps do
 end
 ```
 
-## Quick Example
+Then run:
+
+```bash
+mix deps.get
+```
+
+## Quick Start
+
+Every model call can receive a fake client. That makes examples and tests
+deterministic and keeps your first run free of API keys.
+
+```elixir
+client = fn _model, _prompt, _opts ->
+  result =
+    RunicAI.LLM.Result.new!(
+      RunicAI.Message.new!(:assistant, "hello from a fake model"),
+      finish_reason: :stop
+    )
+
+  {:ok, result}
+end
+
+{:ok, result} =
+  RunicAI.LLM.generate_text(
+    "test:model",
+    "Say hello",
+    client: client
+  )
+
+RunicAI.LLM.Result.text(result)
+#=> "hello from a fake model"
+```
+
+The same injection style works inside recipes:
 
 ```elixir
 require Runic
-alias Runic.Workflow
-alias RunicAI.LLM.Request
-alias RunicAI.LLM.Result
 
-# A step that calls an LLM through the normalized request/result contracts
-llm_step =
-  Runic.step(
-    fn prompt_text ->
-      request = Request.new!("anthropic:claude-haiku-4-5", prompt_text)
-      {:ok, result} = RunicAI.LLM.generate_text(request)
-      Result.text(result)
-    end,
-    name: :ask_llm
-  )
-
-workflow = Runic.workflow(name: :simple_llm, steps: [llm_step])
-workflow = Workflow.react_until_satisfied(workflow, "Explain recursion briefly.")
-
-Workflow.raw_productions(workflow)
-```
-
-## Testing
-
-LLM calls are injectable out of the box with plain modules or functions:
-
-```elixir
-test "generates text" do
-  client = fn _model, _prompt, _opts ->
-    {:ok, RunicAI.LLM.TestClient.result("mocked response")}
-  end
-
-  assert {:ok, result} =
-           RunicAI.LLM.generate_text("anthropic:claude-haiku-4-5", "hello", client: client)
-
-  assert RunicAI.LLM.Result.text(result) == "mocked response"
-end
-```
-
-## Core Contracts
-
-- `RunicAI.Message` — canonical workflow message
-- `RunicAI.Prompt` — provider-neutral prompt bundle
-- `RunicAI.Conversation.State` — reducer state for conversation flows
-- `RunicAI.LLM.Request` — normalized text-generation request
-- `RunicAI.LLM.Result` — normalized text-generation result
-- `RunicAI.Agent.State` — durable conversational agent state
-- `RunicAI.Agent.TurnRequest` — one conversational turn input
-- `RunicAI.Agent.TurnResult` — one interpreted conversational turn output
-- `RunicAI.Agent.ContinueDecision` — explicit loop-control decision
-- `RunicAI.Tool.Definition` — canonical tool definition and executor boundary
-- `RunicAI.Tool.Registry` — validated available-tool registry
-- `RunicAI.Tool.Selection` — per-turn visible tool set
-- `RunicAI.Tool.RequirementPolicy` — semantic recipe-level tool-use policy,
-  such as optional vs required-before-answer
-- `RunicAI.Tool.CallRequest` — normalized one-shot tool invocation request
-- `RunicAI.Tool.ExecutionPolicy` — explicit execution and failure policy
-- `RunicAI.Tool.ExecutionPlan` — deterministic batch execution plan
-- `RunicAI.Tool.BatchResult` — workflow-stable wrapper for tool call batches
-- `RunicAI.Tool.CallResult` — normalized tool invocation outcome
-- `RunicAI.Tool.Observation` — model-ready tool observation message
-- `RunicAI.Control.BudgetPolicy` — declarative turn, model, tool, time, cost,
-  and recursion limits
-- `RunicAI.Control.GuardRequest` — typed guard input at named workflow
-  boundaries
-- `RunicAI.Control.GuardDecision` — allow, deny, review, wait, or rewrite
-  outcome
-- `RunicAI.ReviewRequest` / `RunicAI.ReviewDecision` — typed operator approval
-  round-trips
-- `RunicAI.Wait` / `RunicAI.ResumeSignal` — typed deferred-progress and resume
-  contracts
-- `RunicAI.Context.Ref` — stable context graph reference with provenance labels
-- `RunicAI.Context.Node` — typed graph node for messages, summaries, memory,
-  retrieval, and handoff artifacts
-- `RunicAI.Context.Graph` — wrapped multigraph substrate for context lineage
-- `RunicAI.Context.State` — durable derived context state carried with agent
-  state
-- `RunicAI.Context.Focus` — explicit current goal, entities, constraints, and
-  salience hints
-- `RunicAI.Context.Bundle` — assembled active window just before prompt
-  projection
-- `RunicAI.Context.WindowPolicy` / `RunicAI.Context.CompactionPolicy` —
-  explicit window and compaction policy data
-- `RunicAI.Context.PressureSnapshot` / `RunicAI.Context.PressureDecision` —
-  typed context-window pressure evaluation
-- `RunicAI.Context.HandoffRequest` / `RunicAI.Context.HandoffArtifact` —
-  typed thread-handoff input and output
-- `RunicAI.Memory.Entry` / `RunicAI.Memory.Query` / `RunicAI.Memory.ReadResult`
-  / `RunicAI.Memory.Store` — provenance-first memory contracts and adapter seam
-- `RunicAI.Retrieval.Query` / `RunicAI.Retrieval.Document` /
-  `RunicAI.Retrieval.Result` / `RunicAI.Retrieval.Provider` —
-  backend-neutral retrieval contracts and adapter seam
-- `RunicAI.Decomposition.Role` / `RunicAI.Decomposition.Registry` — reusable
-  delegate profiles and validated role catalogs
-- `RunicAI.Decomposition.InheritancePolicy` / `RunicAI.Decomposition.Task` /
-  `RunicAI.Decomposition.TaskPlan` / `RunicAI.Decomposition.Assignment` —
-  typed child planning and materialized assignment contracts
-- `RunicAI.Decomposition.Result` / `RunicAI.Decomposition.JoinPolicy` /
-  `RunicAI.Decomposition.Evaluation` — normalized child outcomes, deterministic
-  joins, and judge/jury assessment data
-- `RunicAI.Integrated.AgentRef` / `RunicAI.Integrated.SessionState` —
-  workflow-owned identity and per-lane live agent state
-- `RunicAI.Integrated.Signal` / `RunicAI.Integrated.Emission` — typed inbound
-  runtime events and identity-carrying outbound values
-- `RunicAI.Integrated.PendingWork` / `RunicAI.Integrated.RuntimeState` —
-  durable pause metadata and the authoritative accumulator state for one or
-  many integrated agent lanes
-- `RunicAI.Trace.Event` / `RunicAI.Trace.CapturePolicy` /
-  `RunicAI.Trace.Trajectory` — semantic trace events, redaction-aware payload
-  capture, and replayable execution artifacts
-- `RunicAI.Harness.Policy` / `RunicAI.Harness.Session` — process-agnostic
-  operational policy and serializable session state for harness-driven runs
-- `RunicAI.Evaluation.Case` / `RunicAI.Evaluation.Expectation` /
-  `RunicAI.Evaluation.Result` / `RunicAI.Evaluation.Run` — typed evaluation
-  fixtures, scoring predicates, case results, and aggregate run artifacts
-
-## Conversational Kernel
-
-Phase 1 adds a reference conversational kernel workflow in
-`RunicAI.Recipes.ChatAgentKernel`.
-
-The kernel path is:
-
-```text
-Agent.State + input
-  -> TurnRequest
-  -> Prompt
-  -> LLM.Result
-  -> TurnResult
-  -> Agent.State
-  -> ContinueDecision
-```
-
-Example:
-
-```elixir
 alias Runic.Workflow
 alias RunicAI.Recipes.ChatAgentKernel
+
+client = fn _model, _prompt, _opts ->
+  result =
+    RunicAI.LLM.Result.new!(
+      RunicAI.Message.new!(:assistant, "hello from the guide"),
+      finish_reason: :stop,
+      usage: %{input_tokens: 3, output_tokens: 4, total_tokens: 7}
+    )
+
+  {:ok, result}
+end
 
 workflow =
   ChatAgentKernel.new(
-    model: "openai:gpt-4.1-mini",
-    system: "You are concise"
+    model: "test:model",
+    system: "You are concise.",
+    client: client
   )
+  |> Workflow.react_until_satisfied(%{user: "Say hello."})
 
-workflow =
-  Workflow.react_until_satisfied(workflow, %{
-    user: "Reply with exactly hello."
-  })
-
-state = ChatAgentKernel.latest_state(workflow)
-reply = ChatAgentKernel.latest_reply_text(workflow)
-decision = ChatAgentKernel.latest_continue_decision(workflow)
+ChatAgentKernel.latest_reply_text(workflow)
+#=> "hello from the guide"
 ```
 
-## Tool-Calling Kernel
+For real provider calls, omit `:client` and pass a ReqLLM model string such as
+`"anthropic:claude-haiku-4-5"` or `"openai:gpt-4.1-mini"`, with provider
+credentials configured as ReqLLM expects.
 
-Phase 2 adds a reference conversational tool agent workflow in
-`RunicAI.Recipes.ConversationalToolAgent`.
+## What To Use First
 
-The tool path is:
+Start with the smallest recipe that matches your application.
 
-```text
-Agent.State + input
-  -> TurnRequest
-  -> Tool.Selection
-  -> Prompt + visible tools
-  -> LLM.Result
-  -> TurnResult
-  -> Tool.ExecutionPlan
-  -> Tool.BatchResult
-  -> Tool.Observation[]
-  -> Agent.State
-  -> ContinueDecision
+| Goal | Start with |
+| --- | --- |
+| One conversational turn or a simple chat loop | `RunicAI.Recipes.ChatAgentKernel` |
+| A model that can call tools | `RunicAI.Recipes.ConversationalToolAgent` |
+| Tool use with budgets, guards, waits, and review | `RunicAI.Recipes.GuardedOperatorToolAgent` |
+| Long conversations with summaries, memory, retrieval, and handoff | `RunicAI.Recipes.SummaryBackedChatAgent` or `RunicAI.Recipes.MemoryAwareToolAgent` |
+| Delegating work to roles or subagents | `RunicAI.Recipes.PlannerExecutorWorkflow`, `RunicAI.Recipes.ParallelResearchSynthesizer`, or `RunicAI.Recipes.ReviewerEditorJury` |
+| Workflow-owned state across many turns or agent lanes | `RunicAI.Recipes.IntegratedChatAgent` or `RunicAI.Recipes.IntegratedToolAgent` |
+| Regression tests and behavior scoring | `RunicAI.Recipes.EvaluationHarness` |
+| Long-context split/map/reduce work | `RunicAI.Recipes.RLMSummarizer` |
+| Supervised operation, scheduling, and durable execution | `RunicAI.Runtime.*` |
+
+## Core Ideas
+
+### Workflows Are The Composition Layer
+
+RunicAI does not ask you to adopt one agent process model. It gives you
+components that compose into Runic workflow graphs.
+
+```mermaid
+flowchart TD
+  step[Runic step] --> transform[Transform typed values]
+  rule[Runic rule] --> route[Route decisions]
+  reduce[Runic reducer] --> aggregate[Aggregate results]
+  acc[Runic accumulator] --> state[Own workflow state]
+  recipe[RunicAI recipe] --> graph[Reusable workflow graph]
 ```
 
-Example:
+### Contracts Carry Meaning
 
-```elixir
-alias RunicAI.Recipes.ConversationalToolAgent
-alias RunicAI.Tool.Definition
+RunicAI's public structs are the system vocabulary. A tool call is not just a
+map; it is a `RunicAI.Tool.CallRequest`. A pause for human approval is not just
+a magic atom; it is a `RunicAI.ReviewRequest`. A context window is not hidden
+prompt slicing; it is a `RunicAI.Context.Bundle` with provenance.
 
-weather_tool =
-  Definition.new!(
-    name: "get_weather",
-    description: "Get the weather for a city",
-    parameter_schema: [location: [type: :string, required: true]],
-    executor: fn %{location: location} ->
-      {:ok, %{location: location, forecast: "sunny"}}
-    end
-  )
+That contract approach gives you useful extension points:
 
-workflow =
-  ConversationalToolAgent.react_until_resolution(
-    [
-      model: "openai:gpt-4.1-mini",
-      system: "Call tools before answering when the request depends on them.",
-      registry: [weather_tool],
-      llm_opts: [temperature: 0.0]
-    ],
-    %{user: "What's the weather in Paris?"}
-  )
+- custom LLM clients through `RunicAI.LLM`
+- custom tools through `RunicAI.Tool.Definition` and execution adapters
+- custom memory and retrieval through `RunicAI.Memory.Store` and
+  `RunicAI.Retrieval.Provider`
+- custom tracing through `RunicAI.Trace.Sink`
+- custom runtime topology through `RunicAI.Harness.*`, `RunicAI.Runtime.*`, or
+  your own process layer
 
-reply = ConversationalToolAgent.latest_reply_text(workflow)
-tool_results = ConversationalToolAgent.latest_tool_results(workflow)
+### State Can Be Caller-Owned Or Workflow-Owned
+
+External-state recipes return the latest `RunicAI.Agent.State`; your
+application persists it and decides when to re-enter the workflow.
+
+Integrated recipes keep live session state inside the workflow as
+`RunicAI.Integrated.RuntimeState`, which is useful for long-lived sessions,
+queued signals, multiple agent lanes, waits, and scoped resumes.
+
+```mermaid
+flowchart LR
+  subgraph External State
+    req1[Input] --> wf1[Recipe workflow]
+    wf1 --> app_state[Application stores Agent.State]
+    app_state --> req2[Next input]
+  end
+
+  subgraph Workflow Owned State
+    sig1[Signal] --> wf2[Integrated workflow]
+    wf2 --> runtime[Integrated.RuntimeState]
+    runtime --> sig2[Next signal]
+  end
 ```
 
-## Decomposition Workflows
+## Documentation
 
-Phase 5 adds typed delegation and fan-out/fan-in recipes on top of the earlier
-single-thread kernels.
+The docs are organized around how users build with the library:
 
-The decomposition path is:
+- **Start Here** - Getting started and the mental model.
+- **Core Concepts** - Workflows, contracts, context engineering, controls, and
+  state models.
+- **Recipes** - Practical guides for each canonical workflow.
+- **Extending RunicAI** - Components, tools, telemetry, authorization,
+  persistence, runtime integration, and causal logging.
+- **Reference** - Component catalog, testing strategy, and the release
+  checklist. Option details live with the modules and recipe guides that accept
+  them.
+- **Livebooks** - Interactive walkthroughs with deterministic fake clients.
 
-```text
-TaskPlan
-  -> Assignment[]
-  -> child execution
-  -> Result[]
-  -> JoinPolicy
-  -> reduced Result
+Useful entry points:
+
+- [Getting Started](guides/getting-started.md)
+- [Mental Model](guides/mental-model.md)
+- [Workflows As Composition](guides/workflows-as-composition.md)
+- [Contracts](guides/contracts.md)
+- [Context Engineering](guides/context-engineering.md)
+- [Controls And Limits](guides/controls-and-limits.md)
+- [Stateless Versus Stateful Agents](guides/stateless-vs-stateful-agents.md)
+- [Component Catalog](guides/reference/component-catalog.md)
+
+## Testing And Evaluation
+
+RunicAI is designed so tests can stay deterministic.
+
+- Inject fake LLM clients with `client: fn model, prompt, opts -> ... end`.
+- Use `RunicAI.Testing.ScriptedLLM` for ordered model responses.
+- Use `RunicAI.Testing.ScriptedToolExecutor` for deterministic tools.
+- Capture `RunicAI.Trace.Trajectory` values and replay them with
+  `RunicAI.Testing.Replay`.
+- Run scenario fixtures through `RunicAI.Recipes.EvaluationHarness`.
+
+```mermaid
+sequenceDiagram
+  participant Test
+  participant Harness
+  participant Workflow
+  participant FakeLLM
+  participant Trace
+
+  Test->>Harness: submit input
+  Harness->>Workflow: react until quiescent
+  Workflow->>FakeLLM: generate_text
+  FakeLLM-->>Workflow: deterministic Result
+  Workflow->>Trace: emit events
+  Harness-->>Test: session snapshot
 ```
 
-Example:
+## Runtime And Production Use
 
-```elixir
-alias RunicAI.Decomposition.Role
-alias RunicAI.Decomposition.Task
-alias RunicAI.Decomposition.TaskPlan
-alias RunicAI.Recipes.PlannerExecutorWorkflow
+The core components do not assume one process topology. For production use,
+`RunicAI.Runtime.*` provides supervised session servers, handles, backends,
+schedulers, and `Runic.Runner` integration while preserving the same harness
+session and trace artifacts used in tests.
 
-worker_role =
-  Role.new!(
-    name: "worker",
-    kind: :workflow,
-    description: "Produce one keyed payload",
-    builder: fn assignment ->
-      payload = assignment.input.input
-      %{payload[:key] => payload[:value]}
-    end
-  )
+Use the runtime layer when you need:
 
-task_plan =
-  TaskPlan.new!(
-    [
-      Task.new!(id: "alpha", goal: "Produce alpha", role: "worker", input: %{key: :alpha, value: 1}),
-      Task.new!(id: "beta", goal: "Produce beta", role: "worker", input: %{key: :beta, value: 2})
-    ],
-    join_policy: [mode: :merge]
-  )
+- long-lived addressable sessions
+- waits and scheduler wakeups
+- supervised operation
+- runner-backed execution
+- runtime tool adapters
+- candidate routing or optimization hooks
 
-workflow =
-  PlannerExecutorWorkflow.react_until_resolution(
-    [registry: [worker_role]],
-    %{task_plan: task_plan}
-  )
+## Safety Notes
 
-result = PlannerExecutorWorkflow.latest_result(workflow)
+Tools can execute real capabilities. Treat tool definitions, command adapters,
+external workers, trace payload capture, and review bypasses as security
+boundaries in your application. Use guard points, authorization checks, review
+requests, capture policies, and redaction before exposing tools to untrusted
+inputs.
+
+See [SECURITY.md](SECURITY.md) for release-oriented security guidance.
+
+## Development
+
+Common commands:
+
+```bash
+mix deps.get
+mix compile
+mix format
+mix test
+mix docs
 ```
 
-The Phase 5 reference recipes are:
-
-- `RunicAI.Recipes.PlannerExecutorWorkflow`
-- `RunicAI.Recipes.ParallelResearchSynthesizer`
-- `RunicAI.Recipes.ReviewerEditorJury`
-
-Two useful Phase 5 details:
-
-- `RunicAI.Decomposition.JoinPolicy` `:merge` mode supports
-  `merge_conflicts: :error | :first_wins | :last_wins | :nest_by_task`
-  so overlapping child outputs are explicit rather than silently order-dependent.
-- `RunicAI.Recipes.ParallelResearchSynthesizer` returns namespaced
-  `findings_by_task` and `findings_by_topic` in its deterministic output, and
-  can optionally run a `:synthesizer_role` child for a final synthesis pass
-  while keeping the deterministic reduction as a fallback.
-
-## Controlled Tool Agent
-
-Phase 3 adds the guarded reference recipe in
-`RunicAI.Recipes.GuardedOperatorToolAgent`.
-
-This recipe wraps the Phase 2 tool lane with:
-
-- budget evaluation
-- guard points before tool execution and before answer emission
-- typed review and wait outputs
-- retry and fallback wrappers around LLM and tool boundaries
-
-The controlled path is:
-
-```text
-Agent.State + input
-  -> TurnRequest
-  -> Tool.Selection
-  -> Prompt + visible tools
-  -> LLM.Result
-  -> TurnResult
-  -> BudgetDecision / GuardDecision
-  -> ReviewRequest | Wait | Tool.ExecutionPlan | Agent.State
-  -> Tool.BatchResult
-  -> Agent.State
-  -> ContinueDecision
-```
-
-Example:
-
-```elixir
-alias RunicAI.Recipes.GuardedOperatorToolAgent
-alias RunicAI.Tool.Definition
-
-transfer_tool =
-  Definition.new!(
-    name: "initiate_transfer",
-    description: "Initiate a bank transfer",
-    parameter_schema: [
-      account_id: [type: :string, required: true],
-      amount_cents: [type: :integer, required: true]
-    ],
-    executor: fn args -> {:ok, %{accepted: true, args: args}} end
-  )
-
-workflow =
-  GuardedOperatorToolAgent.new(
-    model: "openai:gpt-4.1-mini",
-    registry: [transfer_tool],
-    budget_policy: [max_tool_calls: 1, on_exhaustion: :review],
-    pre_tool_guard: fn request ->
-      requested_tools = Enum.map(request.execution_plan.calls, & &1.tool_name)
-
-      if "initiate_transfer" in requested_tools do
-        :review
-      else
-        :allow
-      end
-    end
-  )
-  |> Runic.Workflow.react_until_satisfied(%{user: "Transfer $25 to acct_123."})
-
-pending_review = GuardedOperatorToolAgent.latest_review_request(workflow)
-state = GuardedOperatorToolAgent.latest_state(workflow)
-```
-
-### External-State Pause And Resume
-
-The guarded recipe is intentionally persistence-agnostic.
-
-When a turn pauses, persist the returned `Agent.State` and inspect
-`state.pending_action`:
-
-- `RunicAI.ReviewRequest` means the caller should collect a
-  `RunicAI.ReviewDecision`
-- `RunicAI.Wait` means the caller should collect a `RunicAI.ResumeSignal`
-
-Phase 3 ships the normalization steps that let your runtime handle that
-re-entry explicitly:
-
-```elixir
-alias RunicAI.Steps.ApplyReviewDecision
-alias RunicAI.Steps.NormalizeResumeSignal
-
-approved_subject =
-  ApplyReviewDecision.apply_decision!(review_request, review_decision)
-
-resume_payload =
-  NormalizeResumeSignal.normalize!(wait, resume_signal)
-```
-
-The guarded recipe helper also accepts those typed values directly on the next
-turn:
-
-```elixir
-resumed_workflow =
-  GuardedOperatorToolAgent.react_until_resolution(
-    [model: "openai:gpt-4.1-mini", registry: [transfer_tool]],
-    %{
-      state: state,
-      review_decision: %{resume_key: pending_review.resume_key, status: :approved}
-    }
-  )
-```
-
-That keeps the workflow contracts typed and serializable without requiring a
-live in-memory pause process.
-
-## Context Engineering Layer
-
-Phase 4 adds an explicit context layer on top of transcript history instead of
-stretching one ever-growing prompt window forever.
-
-The intended shape is:
-
-```text
-Conversation.State
-  -> Context.State
-  -> Focus
-  -> Memory recall / Retrieval input
-  -> PressureDecision
-  -> Compaction
-  -> Context.Bundle
-  -> Prompt
-```
-
-The core design rule is that transcript history remains source-of-truth state,
-while active context is a derived graph with stable refs back to original
-messages, tool observations, summaries, memory entries, and handoff artifacts.
-
-Phase 4 ships three reference recipes:
-
-- `RunicAI.Recipes.SummaryBackedChatAgent` — chat workflow with focus
-  inference, pressure evaluation, summary compaction, memory recall, and
-  retrieval-aware bundle assembly
-- `RunicAI.Recipes.MemoryAwareToolAgent` — tool-calling workflow extended with
-  the same context-engineering path plus post-turn and post-tool memory writes
-- `RunicAI.Recipes.HandoffContextBuilder` — focused handoff artifact builder
-  for starting a new thread from an existing `RunicAI.Agent.State`
-
-Example:
-
-```elixir
-alias Runic.Workflow
-alias RunicAI.Recipes.SummaryBackedChatAgent
-
-workflow =
-  SummaryBackedChatAgent.new(
-    model: "openai:gpt-4.1-mini",
-    system: "You keep track of long-running work carefully.",
-    window_policy: [soft_pressure_tokens: 1_200, hard_pressure_tokens: 1_800],
-    summarizer: fn _prompt, _opts ->
-      {:ok, RunicAI.LLM.TestClient.result("Summary: the user is debugging the payment flow.")}
-    end
-  )
-  |> Workflow.react_until_satisfied(%{user: "We fixed auth yesterday. Focus on payment retries now."})
-
-reply = SummaryBackedChatAgent.latest_reply_text(workflow)
-focus = SummaryBackedChatAgent.latest_focus(workflow)
-pressure = SummaryBackedChatAgent.latest_pressure_decision(workflow)
-bundle = SummaryBackedChatAgent.latest_bundle(workflow)
-```
-
-Retrieval stays intentionally light in the core library. RunicAI owns the
-contracts, normalization, and recipe wiring, while storage, search, embeddings,
-and indexing stay behind user-supplied adapters.
-
-## Integrated Stateful Recipes
-
-Phase 6 adds a workflow-owned state track on top of the earlier external-state
-recipes.
-
-The key difference is where the live loop state sits:
-
-- `RunicAI.Recipes.ChatAgentKernel`,
-  `RunicAI.Recipes.ConversationalToolAgent`, and
-  `RunicAI.Recipes.GuardedOperatorToolAgent` keep `RunicAI.Agent.State`
-  persistence-agnostic so a caller can store it and decide when to re-enter.
-- `RunicAI.Recipes.IntegratedChatAgent` and
-  `RunicAI.Recipes.IntegratedToolAgent` keep that state inside the workflow
-  itself under an authoritative `RunicAI.Integrated.RuntimeState`,
-  maintained by a `Runic.accumulator`, with routing decisions driven by
-  `state_of/1`.
-
-The integrated path is:
-
-```text
-Integrated.Signal
-  -> Integrated.RuntimeState accumulator
-  -> state_of(:integrated_runtime) routing rule
-  -> Integrated.SessionState for one agent_id
-  -> existing turn/tool/control contracts
-  -> updated Integrated.SessionState
-  -> Integrated.Emission | more Integrated.Signal | quiescence
-```
-
-This lets one or many agent lanes share a workflow while still reusing the
-Phase 1-5 contracts for turns, tool plans, budgets, waits, reviews, and
-resume signals.
-
-Phase 6 ships three reference recipes:
-
-- `RunicAI.Recipes.IntegratedAgentKernel` — generic workflow-owned runtime
-  kernel for typed integrated signals and emissions
-- `RunicAI.Recipes.IntegratedChatAgent` — stateful chat recipe that keeps
-  conversation state inside the workflow across repeated signals
-- `RunicAI.Recipes.IntegratedToolAgent` — stateful tool recipe with scoped
-  review, wait, wake, and resume handling inside the same workflow runtime
-
-Example:
-
-```elixir
-alias Runic.Workflow
-alias RunicAI.Recipes.IntegratedChatAgent
-
-workflow =
-  IntegratedChatAgent.new(
-    default_agent_id: "chat",
-    model: "openai:gpt-4.1-mini",
-    system: "You are concise"
-  )
-  |> Workflow.react_until_satisfied(%{
-    user: "My favorite color is vermilion. Reply only with noted."
-  })
-
-workflow =
-  Workflow.react_until_satisfied(
-    workflow,
-    %{user: "What color did I say was my favorite? Reply with one word."}
-  )
-
-reply = IntegratedChatAgent.latest_reply_text(workflow, "chat")
-session = IntegratedChatAgent.session(workflow, "chat")
-```
-
-`RunicAI.Recipes.IntegratedToolAgent` extends the same runtime with tool loops,
-budget checks, guard pauses, typed review requests, typed waits, and wake or
-resume signals, all scoped back to the correct `agent_id`.
-
-## Observability, Testing, And Evaluation
-
-Phase 7 adds a process-agnostic operability layer over both recipe families.
-
-- `RunicAI.Trace.Event` gives a stable semantic event vocabulary for turns,
-  tool plans, tool calls, tool results, reviews, waits, emissions, and final
-  workflow quiescence
-- `RunicAI.Trace.CapturePolicy` and `RunicAI.Trace.Trajectory` let callers
-  choose summary, full, or replay-grade payload capture without changing the
-  recipes themselves
-- `RunicAI.Harness.TurnProcessor` and `RunicAI.Harness.Integrated` provide
-  in-memory drivers that can submit inputs, drain until quiescence, preserve
-  snapshots, and attach sinks without committing to a GenServer or
-  `Runic.Runner` runtime yet
-- `RunicAI.Testing.ScriptedLLM`, `RunicAI.Testing.ScriptedToolExecutor`,
-  `RunicAI.Testing.ScriptedRetrieval`, and `RunicAI.Testing.Replay` turn
-  trajectories into deterministic doubles for regression work
-- `RunicAI.Recipes.EvaluationHarness` runs `RunicAI.Evaluation.Case` fixtures
-  through either recipe track and keeps running metrics under `Runic.accumulator`
-
-Harness example:
-
-```elixir
-alias RunicAI.Harness.Policy
-alias RunicAI.Harness.TurnProcessor
-alias RunicAI.Recipes.GuardedOperatorToolAgent
-alias RunicAI.Trace.Sinks.InMemory
-
-policy =
-  Policy.new!(
-    capture_policy: [mode: :summary],
-    sinks: [InMemory]
-  )
-
-session =
-  TurnProcessor.new_session(GuardedOperatorToolAgent,
-    recipe_opts: [
-      model: "openai:gpt-4.1-mini",
-      registry: [weather_tool],
-      client: weather_client
-    ],
-    policy: policy
-  )
-  |> TurnProcessor.submit(%{user: "What's the weather in Paris?"})
-  |> TurnProcessor.drain(policy)
-
-trajectory = session.trajectory
-latest = List.last(session.outputs)
-```
-
-Evaluation example:
-
-```elixir
-alias RunicAI.Evaluation.Case
-alias RunicAI.Harness.Policy
-alias RunicAI.Recipes.ChatAgentKernel
-alias RunicAI.Recipes.EvaluationHarness
-
-run =
-  EvaluationHarness.run(
-    [
-      Case.new!(
-        id: "hello-case",
-        input: %{user: "say hello"},
-        expected: [{:contains_text, "hello"}]
-      )
-    ],
-    recipe: ChatAgentKernel,
-    recipe_opts: [model: "openai:gpt-4.1-mini", client: client],
-    policy: Policy.new!(capture_policy: [mode: :summary])
-  )
-
-run.aggregate
-run.results
-```
+The documentation build uses ExDoc guides, Livebooks, grouped module docs, and
+Mermaid diagrams for workflow visualizations.
+
+## Status
+
+RunicAI is pre-1.0. Public contracts and recipes are intended to be useful and
+stable enough for real application trials, but the library should still be
+treated as an early release candidate until production use has exercised the
+APIs.

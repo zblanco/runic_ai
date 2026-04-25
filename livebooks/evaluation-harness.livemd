@@ -1,0 +1,27 @@
+# RunicAI Evaluation Harness
+
+```elixir
+Mix.install([
+  {:runic_ai, path: ".."}
+])
+```
+
+Use evaluation cases to turn expected behavior into repeatable checks.
+
+```elixir
+alias RunicAI.Evaluation.Case
+
+Case.new!(
+  id: "hello-case",
+  input: %{user: "say hello"},
+  expected: [{:contains_text, "hello"}]
+)
+```
+
+```mermaid
+flowchart LR
+  cases[Evaluation cases] --> harness[Evaluation harness]
+  harness --> recipe[Recipe run]
+  recipe --> results[Case results]
+  results --> aggregate[Aggregate metrics]
+```

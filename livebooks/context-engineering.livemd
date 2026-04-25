@@ -1,0 +1,34 @@
+# RunicAI Context Engineering
+
+```elixir
+Mix.install([
+  {:runic_ai, path: ".."}
+])
+```
+
+Context engineering keeps transcript truth separate from derived working
+context.
+
+```mermaid
+flowchart LR
+  transcript[Conversation transcript] --> graph[Context graph]
+  graph --> focus[Focus]
+  focus --> memory[Memory recall]
+  focus --> retrieval[Retrieval]
+  memory --> bundle[Context bundle]
+  retrieval --> bundle
+  graph --> pressure[Window pressure]
+  pressure --> compaction[Compaction]
+  compaction --> bundle
+  bundle --> prompt[Prompt]
+```
+
+```elixir
+alias RunicAI.Context.Focus
+
+Focus.new!(
+  goal: "Resolve the user's deployment issue",
+  entities: ["release", "assets", "database"],
+  constraints: ["Keep the response concise"]
+)
+```

@@ -1,5 +1,13 @@
 defmodule RunicAI.Decomposition.Callable do
-  @moduledoc false
+  @moduledoc """
+  Shared callable shape for decomposition roles and join policies.
+
+  A callable is either a unary function, an `{module, function}` pair, or an
+  `{module, function, extra_args}` tuple. Decomposition components use this
+  helper to validate and invoke user-supplied planners, role builders,
+  synthesizers, evaluators, and reducers without prescribing one process or
+  runtime boundary.
+  """
 
   alias RunicAI.Error
 

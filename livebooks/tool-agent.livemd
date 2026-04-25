@@ -1,0 +1,35 @@
+# RunicAI Tool Agent
+
+```elixir
+Mix.install([
+  {:runic_ai, path: ".."}
+])
+```
+
+This notebook sketches the tool-agent contracts with deterministic data. Use
+the recipe guide for the full workflow.
+
+```elixir
+alias RunicAI.Tool.Definition
+
+weather_tool =
+  Definition.new!(
+    name: "get_weather",
+    description: "Get the weather for a city.",
+    parameter_schema: [location: [type: :string, required: true]],
+    executor: fn %{location: location} ->
+      {:ok, %{location: location, forecast: "sunny"}}
+    end
+  )
+
+weather_tool.name
+```
+
+```mermaid
+flowchart LR
+  model[LLM result] --> requests[Tool call requests]
+  requests --> plan[Execution plan]
+  plan --> tools[Tool executors]
+  tools --> observations[Tool observations]
+  observations --> prompt[Next prompt]
+```

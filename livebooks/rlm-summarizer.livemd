@@ -1,0 +1,22 @@
+# RunicAI RLM Summarizer
+
+```elixir
+Mix.install([
+  {:runic_ai, path: ".."}
+])
+```
+
+RLM-style workflows keep large sources outside one expanding prompt and run
+bounded model work over slices.
+
+```mermaid
+flowchart LR
+  source[External source] --> split[Split]
+  split --> materialize[Materialize slices]
+  materialize --> map[Map leaves]
+  map --> reduce[Reduce summaries]
+  reduce --> artifact[Materialized artifact]
+```
+
+Use `RunicAI.Recipes.RLMSummarizer` when a direct prompt would be too large or
+too opaque to inspect.

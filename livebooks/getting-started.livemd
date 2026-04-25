@@ -1,0 +1,53 @@
+# RunicAI Getting Started
+
+```elixir
+Mix.install([
+  {:runic_ai, path: ".."}
+])
+```
+
+## A Deterministic Model Client
+
+```elixir
+fake_client = fn _model, _prompt, _opts ->
+  result =
+    RunicAI.LLM.Result.new!(
+      RunicAI.Message.new!(:assistant, "hello from Livebook"),
+      finish_reason: :stop
+    )
+
+  {:ok, result}
+end
+```
+
+## Generate Text
+
+```elixir
+{:ok, result} =
+  RunicAI.LLM.generate_text(
+    "test:model",
+    "Say hello",
+    client: fake_client
+  )
+
+RunicAI.LLM.Result.text(result)
+```
+
+## Run The Chat Recipe
+
+```elixir
+require Runic
+
+alias Runic.Workflow
+alias RunicAI.Recipes.ChatAgentKernel
+
+workflow =
+  ChatAgentKernel.new(
+    model: "test:model",
+    system: "You are concise.",
+    client: fake_client
+  )
+  |> Workflow.react_until_satisfied(%{user: "Say hello."})
+
+ChatAgentKernel.latest_reply_text(workflow)
+```
