@@ -1,0 +1,125 @@
+# Subagent Decomposition
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+Decomposition is useful when one model turn is the wrong shape for the work.
+RunicAI models delegation as data:
+
+* parent input
+* `TaskPlan`
+* child `Task`s
+* materialized `Assignment`s
+* child `Result`s
+* a `JoinPolicy`
+
+This is not only "multiple personalities." It is a typed fan-out/fan-in layer
+that can run deterministic functions, child workflows, tool agents, judges, or
+bounded LLM leaves.
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Define LLM-Backed Roles
+
+```elixir
+alias RunicAI.Decomposition.{Registry, Result, Role}
+
+researcher =
+  Role.new!(
+    name: "researcher",
+    kind: :llm,
+    description: "Produces a focused research note for one topic.",
+    builder: fn assignment ->
+      topic = assignment.input[:topic] || assignment.task.metadata[:topic]
+      query = assignment.input[:query] || "RunicAI"
+
+      prompt = """
+      Write a compact research note.
+
+      Query: #{query}
+      Topic: #{topic}
+
+      Return three bullets and one risk or caveat.
+      """
+
+      {:ok, response} = RunicAI.LLM.generate_text(model, prompt, llm_opts)
+
+      Result.completed!(assignment.task.id, RunicAI.LLM.Result.text(response),
+        metadata: assignment.task.metadata
+      )
+    end
+  )
+
+registry = Registry.new!([researcher])
+```
+
+## Run Parallel Research
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+alias RunicAI.Recipes.ParallelResearchSynthesizer
+
+research_workflow =
+  ParallelResearchSynthesizer.new(
+    registry: registry,
+    researcher_role: "researcher"
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(research_workflow)
+```
+
+```elixir
+research_run =
+  ParallelResearchSynthesizer.react_until_resolution(
+    [
+      registry: registry,
+      researcher_role: "researcher"
+    ],
+    %{
+      query: "How should a RunicAI user choose a recipe?",
+      topics: ["chat kernel", "tool agent", "context-aware agent"]
+    }
+  )
+
+ParallelResearchSynthesizer.latest_output(research_run).summary
+```
+
+```elixir
+Kino.Layout.tabs(
+  "Task plan": Kino.Tree.new(ParallelResearchSynthesizer.latest_task_plan(research_run)),
+  Assignments: Kino.Tree.new(ParallelResearchSynthesizer.latest_assignments(research_run)),
+  "Child results": Kino.Tree.new(ParallelResearchSynthesizer.latest_child_results(research_run)),
+  Output: Kino.Tree.new(ParallelResearchSynthesizer.latest_output(research_run))
+)
+```
+
+## Reviewer / Editor / Jury Shape
+
+`ReviewerEditorJury` is the same substrate used differently: generate candidate
+outputs, ask judge roles to evaluate them, and either select a winner or request
+human review when confidence is too low or tied.
+
+```elixir
+alias RunicAI.Recipes.ReviewerEditorJury
+
+jury_workflow = ReviewerEditorJury.new(registry: registry, judge_roles: [])
+RunicAI.Livebook.WorkflowViz.tabs(jury_workflow)
+```

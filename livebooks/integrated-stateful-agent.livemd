@@ -1,0 +1,105 @@
+# Integrated Stateful Agents
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+External-state recipes return `Agent.State` and ask the caller to pass it into
+the next turn. Integrated recipes keep agent lanes inside workflow-owned
+`RunicAI.Integrated.RuntimeState`.
+
+Use integrated state when you need:
+
+* long-lived addressable agent lanes
+* queued signals
+* multiple agents in one workflow
+* waits and review resumes indexed by resume key
+* runtime sessions that can be supervised and persisted
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Build Two Agent Lanes
+
+```elixir
+alias RunicAI.Recipes.IntegratedChatAgent
+
+integrated_workflow =
+  IntegratedChatAgent.new(
+    model: model,
+    llm_opts: llm_opts,
+    agents: [
+      [id: "alpha", system: "You are alpha. Be analytical."],
+      [id: "beta", system: "You are beta. Be concise."]
+    ]
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(integrated_workflow)
+```
+
+## Route Signals To Different Agents
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+integrated_run =
+  integrated_workflow
+  |> Runic.Workflow.react_until_satisfied(%{agent_id: "alpha", user: "Remember that my API is rate limited."})
+  |> Runic.Workflow.react_until_satisfied(%{agent_id: "beta", user: "Remember that my UI is mobile first."})
+  |> Runic.Workflow.react_until_satisfied(%{agent_id: "alpha", user: "What constraint did I give you?"})
+  |> Runic.Workflow.react_until_satisfied(%{agent_id: "beta", user: "What constraint did I give you?"})
+
+Kino.DataTable.new(
+  Enum.map(IntegratedChatAgent.emissions(integrated_run), fn emission ->
+    %{
+      agent_id: emission.agent_id,
+      kind: emission.kind,
+      value: inspect(emission.value, limit: 4)
+    }
+  end)
+)
+```
+
+```elixir
+Kino.Layout.tabs(
+  Runtime: Kino.Tree.new(IntegratedChatAgent.runtime_state(integrated_run)),
+  Alpha: Kino.Tree.new(IntegratedChatAgent.session(integrated_run, "alpha")),
+  Beta: Kino.Tree.new(IntegratedChatAgent.session(integrated_run, "beta"))
+)
+```
+
+## Interactive Multi-Lane Chat
+
+Use `alpha` and `beta` in the Agent id field and notice that each lane keeps its
+own conversation.
+
+```elixir
+RunicAI.Livebook.Chat.start_integrated(
+  IntegratedChatAgent,
+  [
+    model: model,
+    llm_opts: llm_opts,
+    agents: [
+      [id: "alpha", system: "You are alpha. Be analytical."],
+      [id: "beta", system: "You are beta. Be concise."]
+    ]
+  ],
+  agent_id: "alpha",
+  initial_message: "Remember that my service is rate limited."
+)
+```

@@ -2,12 +2,41 @@
 
 ```elixir
 Mix.install([
-  {:runic_ai, path: ".."}
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
 ])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
 ```
 
-This notebook sketches the tool-agent contracts with deterministic data. Use
-the recipe guide for the full workflow.
+## What This Notebook Teaches
+
+Tool calling is the point where a model can ask your application to do work.
+RunicAI keeps that boundary explicit:
+
+* `Tool.Definition` describes a capability to the model and to the workflow
+* `Tool.Selection` chooses the visible tool set for the turn
+* `Tool.ExecutionPlan` records what will be executed
+* `Tool.CallResult` captures the actual application result
+* `Tool.Observation` converts the result back into model-visible context
+
+The recipe used here is `RunicAI.Recipes.ConversationalToolAgent`.
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Define A Tool
+
+The executor is ordinary Elixir. The schema is provider-facing and is validated
+before the executor runs.
 
 ```elixir
 alias RunicAI.Tool.Definition
@@ -15,21 +44,105 @@ alias RunicAI.Tool.Definition
 weather_tool =
   Definition.new!(
     name: "get_weather",
-    description: "Get the weather for a city.",
-    parameter_schema: [location: [type: :string, required: true]],
+    description: "Get a lightweight weather report for a city.",
+    parameter_schema: [
+      location: [type: :string, required: true]
+    ],
     executor: fn %{location: location} ->
-      {:ok, %{location: location, forecast: "sunny"}}
+      {:ok,
+       %{
+         location: location,
+         forecast: "sunny",
+         temperature_c: 23,
+         source: "local demo weather service"
+       }}
     end
   )
 
-weather_tool.name
+weather_tool
 ```
 
-```mermaid
-flowchart LR
-  model[LLM result] --> requests[Tool call requests]
-  requests --> plan[Execution plan]
-  plan --> tools[Tool executors]
-  tools --> observations[Tool observations]
-  observations --> prompt[Next prompt]
+```elixir
+single_tool_batch = RunicAI.Livebook.Tools.once_per_loop_selector()
 ```
+
+```elixir
+weather_tool |> Definition.to_req_llm_tool!()
+```
+
+## Visualize The Tool Agent Workflow
+
+```elixir
+alias RunicAI.Recipes.ConversationalToolAgent
+
+tool_workflow =
+  ConversationalToolAgent.new(
+    model: model,
+    registry: [weather_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    llm_opts: llm_opts
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(tool_workflow)
+```
+
+## Run A Full Tool Loop
+
+`react_until_resolution/3` runs the initial model turn, executes any requested
+tools, appends observations, and submits the next model turn until the agent
+answers or stops.
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+tool_run =
+  ConversationalToolAgent.react_until_resolution(
+    [
+      model: model,
+      registry: [weather_tool],
+      tool_selector: single_tool_batch,
+      tool_requirement: :required,
+      llm_opts: llm_opts
+    ],
+    %{user: "What is the weather in Paris? Use the weather tool."}
+  )
+
+ConversationalToolAgent.latest_reply_text(tool_run)
+```
+
+```elixir
+Kino.Layout.tabs(
+  "Tool selection": Kino.Tree.new(ConversationalToolAgent.latest_selection(tool_run)),
+  "Execution plan": Kino.Tree.new(ConversationalToolAgent.latest_execution_plan(tool_run)),
+  "Tool results": Kino.Tree.new(ConversationalToolAgent.latest_tool_results(tool_run)),
+  Observations: Kino.Tree.new(ConversationalToolAgent.latest_observations(tool_run)),
+  State: Kino.Tree.new(ConversationalToolAgent.latest_state(tool_run))
+)
+```
+
+## Interactive Tool Chat
+
+Try asking for weather in different cities. The widget renders model replies
+and tool batches as workflow events.
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  ConversationalToolAgent,
+  [
+    model: model,
+    registry: [weather_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    llm_opts: llm_opts
+  ],
+  initial_message: "Check the weather in Lisbon and explain what you used."
+)
+```
+
+## Design Notes
+
+RunicAI does not make tools magical. A tool call is model output until the
+workflow turns it into a `Tool.CallRequest`, plans it, executes it, and appends
+an observation. That gives you places to add policies, audit logs, retries,
+operator review, and per-tool visibility.

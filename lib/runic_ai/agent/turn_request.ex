@@ -23,7 +23,9 @@ defmodule RunicAI.Agent.TurnRequest do
 
   @state_assembly_keys [:system, :messages, :assigns, :state_metadata]
   @control_input_keys [:runtime, :review_decision, :resume_signal, :control]
-  @reserved_input_keys @request_keys ++ @state_assembly_keys ++ @control_input_keys
+  @context_input_keys [:focus, :goal]
+  @reserved_input_keys @request_keys ++
+                         @state_assembly_keys ++ @control_input_keys ++ @context_input_keys
 
   @enforce_keys [
     :state,

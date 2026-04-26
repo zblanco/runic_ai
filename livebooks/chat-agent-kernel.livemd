@@ -1,0 +1,128 @@
+# Chat Agent Kernel Deep Dive
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+`RunicAI.Recipes.ChatAgentKernel` is the smallest useful conversational agent
+in RunicAI. It is the right starting point when you need a normal chat turn
+with durable state, but you do not yet need tools, guards, retrieval, or
+multi-agent routing.
+
+The general agent shape is:
+
+```mermaid
+flowchart LR
+  user[User input] --> request[TurnRequest]
+  request --> prompt[Prompt]
+  prompt --> model[LLM call]
+  model --> turn[TurnResult]
+  turn --> state[Agent.State]
+  state --> decision[ContinueDecision]
+```
+
+RunicAI makes each box a contract or component you can inspect.
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Build The Workflow
+
+```elixir
+alias RunicAI.Recipes.ChatAgentKernel
+
+workflow =
+  ChatAgentKernel.new(
+    model: model,
+    system: "You are a senior Elixir teacher. Be concise and concrete.",
+    llm_opts: llm_opts,
+    max_turns: 6
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(workflow)
+```
+
+## Run Two Stateful Turns
+
+The first run returns `Agent.State`. The second run passes that state back in,
+so the recipe can assemble history and update the conversation.
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+first =
+  workflow
+  |> Runic.Workflow.react_until_satisfied(%{
+    user: "Remember that my demo app is called Lantern."
+  })
+
+first_state = ChatAgentKernel.latest_state(first)
+ChatAgentKernel.latest_reply_text(first)
+```
+
+```elixir
+second =
+  ChatAgentKernel.new(
+    model: model,
+    llm_opts: llm_opts,
+    system: "You are concise."
+  )
+  |> Runic.Workflow.react_until_satisfied(%{
+    state: first_state,
+    user: "What is my demo app called?"
+  })
+
+ChatAgentKernel.latest_reply_text(second)
+```
+
+```elixir
+Kino.Layout.tabs(
+  State: Kino.Tree.new(ChatAgentKernel.latest_state(second)),
+  Messages: Kino.DataTable.new(Enum.map(ChatAgentKernel.latest_state(second).conversation.messages, &Map.take(&1, [:role, :content]))),
+  Productions: Kino.Tree.new(Runic.Workflow.raw_productions(second))
+)
+```
+
+## Interactive Kernel
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  ChatAgentKernel,
+  [
+    model: model,
+    system: """
+    You are Grug, the friendly caveman. You speak in simple caveman speak with terse simple words easily understood by anyone.
+
+    Despite your simple language you are frighteningly intelligent and philosophical and a master of the socratic method despite using caveman speak.
+    """,
+    llm_opts: llm_opts,
+    max_turns: 8
+  ],
+  initial_message: "Introduce yourself and remember that I like short answers."
+)
+```
+
+## When To Move On
+
+Use this kernel until you need one of these:
+
+* tool execution: move to `ConversationalToolAgent`
+* approval, waiting, retry, fallback: move to `GuardedOperatorToolAgent`
+* summaries, memory, retrieval: move to `SummaryBackedChatAgent`
+* workflow-owned state: move to `IntegratedChatAgent`
+* child work: move to decomposition recipes

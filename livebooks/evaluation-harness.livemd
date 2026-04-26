@@ -2,21 +2,19 @@
 
 ```elixir
 Mix.install([
-  {:runic_ai, path: ".."}
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
 ])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
 ```
 
-Use evaluation cases to turn expected behavior into repeatable checks.
+## What This Notebook Teaches
 
-```elixir
-alias RunicAI.Evaluation.Case
-
-Case.new!(
-  id: "hello-case",
-  input: %{user: "say hello"},
-  expected: [{:contains_text, "hello"}]
-)
-```
+Evaluation is just another workflow boundary. RunicAI models cases,
+expectations, result scoring, metric aggregation, and final run snapshots as
+contracts so you can regression-test recipes without hand-inspecting every
+turn.
 
 ```mermaid
 flowchart LR
@@ -24,4 +22,100 @@ flowchart LR
   harness --> recipe[Recipe run]
   recipe --> results[Case results]
   results --> aggregate[Aggregate metrics]
+  aggregate --> snapshot[Evaluation.Run]
 ```
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Define Cases
+
+Expectations are intentionally simple here. Use exact checks for stable
+contracts and custom checks for fuzzy behavior.
+
+```elixir
+alias RunicAI.Evaluation.Case
+
+cases = [
+  Case.new!(
+    id: "hello",
+    input: %{user: "Say hello in one short sentence."},
+    expected: [{:contains_text, "Hello"}]
+  ),
+  Case.new!(
+    id: "runicai",
+    input: %{user: "This notebook is about RunicAI. Name the library this notebook is about."},
+    expected: [{:contains_text, "RunicAI"}]
+  )
+]
+
+Kino.DataTable.new(Enum.map(cases, &Map.take(&1, [:id, :input, :expected])))
+```
+
+## Run The Harness
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+alias RunicAI.Recipes.{ChatAgentKernel, EvaluationHarness}
+
+eval_run =
+  EvaluationHarness.run(cases,
+    recipe: ChatAgentKernel,
+    recipe_opts: [
+      model: model,
+      system: "You are a concise assistant. Include requested keywords literally.",
+      llm_opts: llm_opts
+    ]
+  )
+
+eval_run.aggregate
+```
+
+```elixir
+rows =
+  Enum.map(eval_run.results, fn result ->
+    scores = result.scores
+
+    %{
+      case: result.case_id,
+      status: result.status,
+      score: Map.get(scores, :overall),
+      expectations: "#{Map.get(scores, :passed, 0)}/#{Map.get(scores, :total, 0)}",
+      reply: RunicAI.Evaluation.Result.reply_text(result),
+      failures: inspect(result.failures)
+    }
+  end)
+
+Kino.DataTable.new(rows)
+```
+
+## Inspect The Evaluation Workflow
+
+```elixir
+evaluation_workflow =
+  EvaluationHarness.run_workflow(cases,
+    recipe: ChatAgentKernel,
+    recipe_opts: [
+      model: model,
+      system: "You are a concise assistant. Include requested keywords literally.",
+      llm_opts: llm_opts
+    ]
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(evaluation_workflow)
+```
+
+## Where To Go Next
+
+Use this harness when changing prompts, tools, guard policies, context windows,
+or recipe composition. The same cases can run against deterministic test clients
+in CI and live providers during manual release qualification.

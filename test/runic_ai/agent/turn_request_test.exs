@@ -24,6 +24,19 @@ defmodule RunicAI.Agent.TurnRequestTest do
     refute Keyword.has_key?(turn_request.llm_opts, :state_metadata)
   end
 
+  test "reserves context inputs from llm opts" do
+    turn_request =
+      TurnRequest.from_input!(
+        %{user: "Hello", focus: "deployment status", goal: "answer from context"},
+        model: "test:model",
+        temperature: 0.2
+      )
+
+    assert turn_request.llm_opts[:temperature] == 0.2
+    refute Keyword.has_key?(turn_request.llm_opts, :focus)
+    refute Keyword.has_key?(turn_request.llm_opts, :goal)
+  end
+
   test "preserves leading system messages while windowing history" do
     state =
       State.new!(

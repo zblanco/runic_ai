@@ -2,33 +2,167 @@
 
 ```elixir
 Mix.install([
-  {:runic_ai, path: ".."}
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
 ])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
 ```
 
-Context engineering keeps transcript truth separate from derived working
-context.
+## What This Notebook Teaches
+
+Context engineering is the practice of deciding what should be visible to the
+model for this turn, why it should be visible, and what provenance it carries.
+
+RunicAI separates:
+
+* transcript truth: durable user, assistant, and tool messages
+* derived context: summaries, memories, retrieval results, focus, and pressure
+* prompt projection: the final provider-facing context
 
 ```mermaid
 flowchart LR
-  transcript[Conversation transcript] --> graph[Context graph]
-  graph --> focus[Focus]
+  transcript[Conversation transcript] --> context_graph[Context graph]
+  context_graph --> focus[Focus]
   focus --> memory[Memory recall]
   focus --> retrieval[Retrieval]
   memory --> bundle[Context bundle]
   retrieval --> bundle
-  graph --> pressure[Window pressure]
+  context_graph --> pressure[Window pressure]
   pressure --> compaction[Compaction]
   compaction --> bundle
   bundle --> prompt[Prompt]
 ```
 
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Build Focus Explicitly
+
+Focus is a contract for what matters now. It should be small enough to reason
+about and rich enough to drive memory and retrieval.
+
 ```elixir
 alias RunicAI.Context.Focus
 
-Focus.new!(
-  goal: "Resolve the user's deployment issue",
-  entities: ["release", "assets", "database"],
-  constraints: ["Keep the response concise"]
+focus =
+  Focus.new!(
+    goal: "Help the user debug a production deploy.",
+    questions: ["Did assets compile?", "Did migrations run?"],
+    entities: ["release", "assets", "database"],
+    constraints: ["Keep the answer operational and concise"]
+  )
+
+focus
+```
+
+## Local Memory And Retrieval Inputs
+
+The recipe can use external stores, but a Livebook is a better place to start
+with visible local data.
+
+```elixir
+alias RunicAI.Memory.Entry
+alias RunicAI.Retrieval.Document
+
+memory_entries = [
+  Entry.new!(
+    kind: :semantic,
+    content: "The user's production app deploys with Docker and runs assets in a release step.",
+    summary: "Docker release deploy with asset build step",
+    salience: 0.9
+  )
+]
+
+retrieval_docs = [
+  Document.new!(
+    id: "deploy-runbook",
+    content:
+      "When assets are missing after deploy, verify the release image ran npm build and priv/static exists.",
+    score: 0.8,
+    metadata: %{title: "Deploy runbook"}
+  )
+]
+
+Kino.Layout.tabs(
+  Memory: Kino.DataTable.new(Enum.map(memory_entries, &Map.take(&1, [:kind, :summary, :salience]))),
+  Retrieval:
+    Kino.DataTable.new(
+      Enum.map(retrieval_docs, fn doc ->
+        %{id: doc.id, title: doc.metadata.title, score: doc.score}
+      end)
+    )
 )
 ```
+
+## Visualize The Context-Aware Workflow
+
+```elixir
+alias RunicAI.Recipes.SummaryBackedChatAgent
+
+context_workflow =
+  SummaryBackedChatAgent.new(
+    model: model,
+    system: "You are an SRE assistant. Explain only what is supported by context.",
+    memory_store: memory_entries,
+    retrieval_provider: retrieval_docs,
+    llm_opts: llm_opts
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(context_workflow)
+```
+
+## Run A Context-Aware Turn
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+context_run =
+  context_workflow
+  |> Runic.Workflow.react_until_satisfied(%{
+    user: "The deploy finished, but the app serves missing CSS. What should I check first?",
+    focus: focus
+  })
+
+SummaryBackedChatAgent.latest_reply_text(context_run)
+```
+
+```elixir
+Kino.Layout.tabs(
+  Focus: Kino.Tree.new(SummaryBackedChatAgent.latest_focus(context_run)),
+  Pressure: Kino.Tree.new(SummaryBackedChatAgent.latest_pressure_decision(context_run)),
+  Bundle: Kino.Tree.new(SummaryBackedChatAgent.latest_bundle(context_run)),
+  State: Kino.Tree.new(SummaryBackedChatAgent.latest_state(context_run))
+)
+```
+
+## Interactive Context Chat
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  SummaryBackedChatAgent,
+  [
+    model: model,
+    system: "You are an SRE assistant. Use remembered facts and retrieved context when relevant.",
+    memory_store: memory_entries,
+    retrieval_provider: retrieval_docs,
+    llm_opts: llm_opts
+  ],
+  initial_message: "What do you remember about my deploy setup?"
+)
+```
+
+## What To Notice
+
+The model does not need to know how memory or retrieval works. The workflow
+turns those sources into typed data, evaluates window pressure, and projects a
+prompt bundle at the edge. That keeps the transcript truthful and makes derived
+context replaceable.

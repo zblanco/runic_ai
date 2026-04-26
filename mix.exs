@@ -96,10 +96,16 @@ defmodule RunicAI.MixProject do
         "guides/reference/testing-strategy.md",
         "guides/reference/release-checklist.md",
         "livebooks/getting-started.livemd",
+        "livebooks/chat-agent-kernel.livemd",
         "livebooks/tool-agent.livemd",
+        "livebooks/controlled-tool-agent.livemd",
         "livebooks/context-engineering.livemd",
+        "livebooks/context-aware-agent.livemd",
+        "livebooks/integrated-stateful-agent.livemd",
+        "livebooks/subagent-decomposition.livemd",
         "livebooks/evaluation-harness.livemd",
-        "livebooks/rlm-summarizer.livemd"
+        "livebooks/rlm-summarizer.livemd",
+        "livebooks/runtime-tracing-replay.livemd"
       ],
       groups_for_extras: groups_for_extras(),
       groups_for_modules: groups_for_modules(),

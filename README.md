@@ -155,7 +155,7 @@ flowchart TD
   rule[Runic rule] --> route[Route decisions]
   reduce[Runic reducer] --> aggregate[Aggregate results]
   acc[Runic accumulator] --> state[Own workflow state]
-  recipe[RunicAI recipe] --> graph[Reusable workflow graph]
+  recipe[RunicAI recipe] --> workflow_graph[Reusable workflow graph]
 ```
 
 ### Contracts Carry Meaning

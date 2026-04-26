@@ -324,7 +324,7 @@ defmodule RunicAI.Recipes.MemoryAwareToolAgent do
       {%State{status: :running} = state, %TurnResult{kind: :tool_requests}}
       when depth + 1 < max_tool_rounds ->
         do_react_until_resolution(
-          %{state: state, focus: Map.get(input, :focus)},
+          next_resolution_input(input, state),
           opts,
           react_opts,
           depth + 1
@@ -332,6 +332,13 @@ defmodule RunicAI.Recipes.MemoryAwareToolAgent do
 
       _ ->
         workflow
+    end
+  end
+
+  defp next_resolution_input(input, %State{} = state) do
+    case Map.fetch(input, :focus) do
+      {:ok, focus} when focus not in [nil, ""] -> %{state: state, focus: focus}
+      _ -> %{state: state}
     end
   end
 

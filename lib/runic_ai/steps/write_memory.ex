@@ -105,17 +105,21 @@ defmodule RunicAI.Steps.WriteMemory do
   defp entries_from_turn_result(%State{} = state, %TurnResult{} = turn_result) do
     assistant_entry =
       case turn_result.message do
-        %Message{role: :assistant, content: content} ->
-          [
-            Entry.new!(
-              kind: :episodic,
-              content: content,
-              summary: summarize_text(content),
-              refs: latest_message_refs(state, [:assistant]),
-              salience: if(turn_result.kind == :final, do: 0.85, else: 0.6),
-              metadata: %{turn_kind: turn_result.kind}
-            )
-          ]
+        %Message{role: :assistant, content: content} when is_binary(content) ->
+          if blank?(content) do
+            []
+          else
+            [
+              Entry.new!(
+                kind: :episodic,
+                content: content,
+                summary: summarize_text(content),
+                refs: latest_message_refs(state, [:assistant]),
+                salience: if(turn_result.kind == :final, do: 0.85, else: 0.6),
+                metadata: %{turn_kind: turn_result.kind}
+              )
+            ]
+          end
 
         _ ->
           []
@@ -123,8 +127,11 @@ defmodule RunicAI.Steps.WriteMemory do
 
     semantic_entries =
       case latest_user_message(state) do
-        %Message{content: content} -> extract_semantic_entries(content, state)
-        _ -> []
+        %Message{content: content} when is_binary(content) ->
+          if blank?(content), do: [], else: extract_semantic_entries(content, state)
+
+        _ ->
+          []
       end
 
     assistant_entry ++ semantic_entries
@@ -141,16 +148,20 @@ defmodule RunicAI.Steps.WriteMemory do
         end)
         |> Enum.join(", ")
 
-      [
-        Entry.new!(
-          kind: :episodic,
-          content: tool_summary,
-          summary: "Tool activity: #{tool_summary}",
-          refs: latest_message_refs(state, [:tool]),
-          salience: 0.7,
-          metadata: %{tool_calls: length(results)}
-        )
-      ]
+      if blank?(tool_summary) do
+        []
+      else
+        [
+          Entry.new!(
+            kind: :episodic,
+            content: tool_summary,
+            summary: "Tool activity: #{tool_summary}",
+            refs: latest_message_refs(state, [:tool]),
+            salience: 0.7,
+            metadata: %{tool_calls: length(results)}
+          )
+        ]
+      end
     end
   end
 
@@ -250,4 +261,6 @@ defmodule RunicAI.Steps.WriteMemory do
 
   defp summarize_text(text) when byte_size(text) <= 160, do: text
   defp summarize_text(text), do: binary_part(text, 0, 157) <> "..."
+
+  defp blank?(text), do: String.trim(text) == ""
 end

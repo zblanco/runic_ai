@@ -1,0 +1,173 @@
+# Context-Aware Agent Recipes
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+The context-aware recipes are for conversations where raw transcript history is
+not enough. They combine focus inference, memory, retrieval, pressure handling,
+prompt bundles, and optional tools.
+
+This notebook looks at:
+
+* `SummaryBackedChatAgent`: chat plus context engineering
+* `MemoryAwareToolAgent`: context engineering plus tool calling
+* `HandoffContextBuilder`: focused handoff artifacts for another thread or role
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Shared Context Inputs
+
+```elixir
+alias RunicAI.Memory.Entry
+alias RunicAI.Retrieval.Document
+alias RunicAI.Tool.Definition
+
+memory_entries = [
+  Entry.new!(
+    kind: :semantic,
+    content: "The customer prefers brief status updates and uses the project codename Lantern.",
+    summary: "Customer prefers brief Lantern updates",
+    salience: 0.9
+  )
+]
+
+retrieval_docs = [
+  Document.new!(
+    id: "lantern-ops",
+    content:
+      "Lantern uses a staged rollout. If the health check fails, pause rollout and inspect the queue worker.",
+    score: 0.9,
+    metadata: %{title: "Lantern operations note"}
+  )
+]
+
+status_tool =
+  Definition.new!(
+    name: "get_rollout_status",
+    description: "Get demo rollout status for a project.",
+    parameter_schema: [project: [type: :string, required: true]],
+    executor: fn %{project: project} ->
+      {:ok, %{project: project, rollout: "paused", reason: "health check failed"}}
+    end
+  )
+
+single_tool_batch = RunicAI.Livebook.Tools.once_per_loop_selector()
+
+Kino.Layout.tabs(
+  Memory: Kino.Tree.new(memory_entries),
+  Retrieval: Kino.Tree.new(retrieval_docs),
+  Tool: Kino.Tree.new(status_tool)
+)
+```
+
+## Summary-Backed Chat
+
+```elixir
+alias RunicAI.Recipes.SummaryBackedChatAgent
+
+summary_workflow =
+  SummaryBackedChatAgent.new(
+    model: model,
+    system: "Use available context. Say when a fact came from memory or retrieval.",
+    memory_store: memory_entries,
+    retrieval_provider: retrieval_docs,
+    llm_opts: llm_opts
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(summary_workflow)
+```
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+summary_run =
+  summary_workflow
+  |> Runic.Workflow.react_until_satisfied(%{
+    user: "Give me a brief Lantern rollout status summary."
+  })
+
+SummaryBackedChatAgent.latest_reply_text(summary_run)
+```
+
+## Memory-Aware Tool Agent
+
+```elixir
+alias RunicAI.Recipes.MemoryAwareToolAgent
+
+tool_context_workflow =
+  MemoryAwareToolAgent.new(
+    model: model,
+    system: "Use context and tools to answer operational questions.",
+    memory_store: memory_entries,
+    retrieval_provider: retrieval_docs,
+    registry: [status_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    llm_opts: llm_opts
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(tool_context_workflow)
+```
+
+```elixir
+tool_context_run =
+  MemoryAwareToolAgent.react_until_resolution(
+    [
+      model: model,
+      system: "Use context and tools to answer operational questions.",
+      memory_store: memory_entries,
+      retrieval_provider: retrieval_docs,
+      registry: [status_tool],
+      tool_selector: single_tool_batch,
+      tool_requirement: :required,
+      llm_opts: llm_opts
+    ],
+    %{user: "Check Lantern and tell me what to do next."}
+  )
+
+MemoryAwareToolAgent.latest_reply_text(tool_context_run)
+```
+
+```elixir
+Kino.Layout.tabs(
+  Bundle: Kino.Tree.new(MemoryAwareToolAgent.latest_bundle(tool_context_run)),
+  Tools: Kino.Tree.new(MemoryAwareToolAgent.latest_tool_results(tool_context_run)),
+  State: Kino.Tree.new(MemoryAwareToolAgent.latest_state(tool_context_run))
+)
+```
+
+## Interactive Context Tool Agent
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  MemoryAwareToolAgent,
+  [
+    model: model,
+    system: "Use context and tools to answer operational questions.",
+    memory_store: memory_entries,
+    retrieval_provider: retrieval_docs,
+    registry: [status_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    llm_opts: llm_opts
+  ],
+  initial_message: "What is happening with Lantern?"
+)
+```

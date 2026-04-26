@@ -1,0 +1,129 @@
+# Runtime, Tracing, And Replay
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+RunicAI's runtime and observability pieces exist because agent workflows need to
+be operable:
+
+- harness sessions collect inputs, outputs, state, and policy decisions
+- runtime sessions give workflows addressable process ownership
+- trace events describe what happened semantically
+- replay turns a captured trajectory into a regression artifact
+- evaluation runs aggregate behavior over cases
+
+This notebook uses the harness and evaluation layer as the easiest way to see
+the operational shape.
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Build A Turn Processor Session
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+alias RunicAI.Harness.{Policy, TurnProcessor}
+alias RunicAI.Recipes.ChatAgentKernel
+
+session =
+  TurnProcessor.new_session(ChatAgentKernel,
+    recipe_opts: [
+      model: model,
+      system: "You are concise and observable.",
+      llm_opts: llm_opts
+    ],
+    policy: Policy.new!(max_reactions: 4),
+    metadata: %{notebook: "runtime-tracing-replay"}
+  )
+
+session =
+  session
+  |> TurnProcessor.submit(%{user: "Say hello and mention observability."})
+  |> TurnProcessor.drain(Policy.new!(max_reactions: 4))
+
+session
+```
+
+```elixir
+Kino.Layout.tabs(
+  Session: Kino.Tree.new(session),
+  Outputs: Kino.Tree.new(session.outputs),
+  State: Kino.Tree.new(session.state)
+)
+```
+
+## Evaluation As Release Evidence
+
+Evaluation runs are useful because they produce a compact snapshot that can be
+stored with release artifacts.
+
+```elixir
+alias RunicAI.Evaluation.Case
+alias RunicAI.Recipes.EvaluationHarness
+
+cases = [
+  Case.new!(
+    id: "observability-mention",
+    input: %{user: "Say hello and mention observability."},
+    expected: [{:contains_text, "observability"}]
+  )
+]
+
+run =
+  EvaluationHarness.run(cases,
+    recipe: ChatAgentKernel,
+    recipe_opts: [
+      model: model,
+      system: "You are concise and include requested terms literally.",
+      llm_opts: llm_opts
+    ],
+    policy: Policy.new!(max_reactions: 4)
+  )
+
+Kino.Layout.tabs(
+  Run: Kino.Tree.new(run),
+  Results: Kino.DataTable.new(Enum.map(run.results, &Map.take(&1, [:case_id, :score, :passed?]))),
+  Aggregate: Kino.Tree.new(run.aggregate)
+)
+```
+
+## Workflow Visualization
+
+```elixir
+eval_workflow =
+  EvaluationHarness.run_workflow(cases,
+    recipe: ChatAgentKernel,
+    recipe_opts: [
+      model: model,
+      system: "You are concise and include requested terms literally.",
+      llm_opts: llm_opts
+    ],
+    policy: Policy.new!(max_reactions: 4)
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(eval_workflow)
+```
+
+## Operational Takeaway
+
+The same recipe that runs in a notebook can run through a harness, an integrated
+runtime, or a runner-backed session. RunicAI's contracts give you durable
+objects to log, replay, score, and inspect without binding your application to
+one process topology.

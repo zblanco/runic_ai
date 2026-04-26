@@ -1,0 +1,173 @@
+# Controlled Tool Agent
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## Purpose
+
+Tool use needs control points. A model may request a capability, but your
+workflow decides whether the capability should run, wait, be reviewed, be
+rewritten, or halt.
+
+`RunicAI.Recipes.GuardedOperatorToolAgent` adds:
+
+* budget checks before tool execution and answer commitment
+* guard checks at `:pre_tool` and `:pre_answer`
+* `ReviewRequest` pause points
+* `Wait` pause points
+* retry and fallback around generation
+* resume via `ReviewDecision` or `ResumeSignal`
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Define A Privileged Tool
+
+```elixir
+alias RunicAI.Tool.Definition
+
+refund_tool =
+  Definition.new!(
+    name: "issue_refund",
+    description: "Issue a demo refund for an order. This is a privileged action.",
+    parameter_schema: %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ["order_id", "amount_usd", "reason"],
+      "properties" => %{
+        "order_id" => %{"type" => "string"},
+        "amount_usd" => %{"type" => "number"},
+        "reason" => %{"type" => "string"}
+      }
+    },
+    executor: fn args ->
+      amount = Map.get(args, :amount_usd) || Map.get(args, "amount_usd")
+
+      {:ok,
+       %{
+         order_id: Map.get(args, :order_id) || Map.get(args, "order_id"),
+         amount_usd: amount / 1,
+         reason: Map.get(args, :reason) || Map.get(args, "reason"),
+         status: "refund queued in demo ledger"
+       }}
+    end
+  )
+```
+
+```elixir
+single_tool_batch = RunicAI.Livebook.Tools.once_per_loop_selector()
+```
+
+## Visualize The Controlled Workflow
+
+```elixir
+alias RunicAI.Recipes.GuardedOperatorToolAgent
+
+controlled_workflow =
+  GuardedOperatorToolAgent.new(
+    model: model,
+    registry: [refund_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    pre_tool_guard: fn _guard_request -> :review end,
+    llm_opts: llm_opts
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(controlled_workflow)
+```
+
+## Pause Before The Tool Runs
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+paused =
+  GuardedOperatorToolAgent.react_until_resolution(
+    [
+      model: model,
+      registry: [refund_tool],
+      tool_selector: single_tool_batch,
+      tool_requirement: :required,
+      pre_tool_guard: fn _guard_request -> :review end,
+      llm_opts: llm_opts
+    ],
+    %{
+      user: "Issue a $12 refund for order A-100 because the package arrived late."
+    }
+  )
+
+GuardedOperatorToolAgent.latest_review_request(paused)
+```
+
+```elixir
+Kino.Layout.tabs(
+  "Pending state": Kino.Tree.new(GuardedOperatorToolAgent.latest_state(paused)),
+  "Review request": Kino.Tree.new(GuardedOperatorToolAgent.latest_review_request(paused)),
+  "Tool results": Kino.Tree.new(GuardedOperatorToolAgent.latest_tool_results(paused))
+)
+```
+
+## Approve And Resume
+
+```elixir
+review_request = GuardedOperatorToolAgent.latest_review_request(paused)
+paused_state = GuardedOperatorToolAgent.latest_state(paused)
+
+resumed =
+  GuardedOperatorToolAgent.react_until_resolution(
+    [
+      model: model,
+      registry: [refund_tool],
+      tool_selector: single_tool_batch,
+      tool_requirement: :required,
+      pre_tool_guard: fn _guard_request -> :review end,
+      llm_opts: llm_opts
+    ],
+    %{
+      state: paused_state,
+      review_decision: %{resume_key: review_request.resume_key, status: :approved}
+    }
+  )
+
+GuardedOperatorToolAgent.latest_reply_text(resumed)
+```
+
+## Interactive HITL Agent
+
+Submit a refund request in the Message tab. When the review request appears,
+switch to the Review tab and submit `approved`, `edited`, or `rejected`.
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  GuardedOperatorToolAgent,
+  [
+    model: model,
+    registry: [refund_tool],
+    tool_selector: single_tool_batch,
+    tool_requirement: :required,
+    pre_tool_guard: fn _guard_request -> :review end,
+    llm_opts: llm_opts
+  ],
+  initial_message: "Please refund order A-100 for $12 because it arrived late."
+)
+```
+
+## Design Takeaway
+
+The model can propose. The workflow authorizes. That boundary is what lets you
+use tools for real application capabilities without treating generated text as
+permission.

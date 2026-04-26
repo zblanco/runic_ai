@@ -5,6 +5,7 @@ defmodule RunicAI.Steps.ContextStepsTest do
   alias RunicAI.Agent.TurnRequest
   alias RunicAI.Agent.TurnResult
   alias RunicAI.Context.Graph
+  alias RunicAI.Message
   alias RunicAI.Retrieval.Document
   alias RunicAI.Retrieval.Result
   alias RunicAI.Steps.AssembleContextBundle
@@ -105,6 +106,22 @@ defmodule RunicAI.Steps.ContextStepsTest do
 
     assert Enum.any?(memory_result.entries, &(&1.kind == :semantic))
     assert Enum.any?(memory_result.entries, &String.contains?(&1.content, "favorite color"))
+  end
+
+  test "skips empty assistant content when writing memory for tool request turns" do
+    state =
+      State.new!(system: "You are helpful")
+      |> State.append_messages!([
+        {:user, "Check Lantern status with the rollout tool."}
+      ])
+
+    turn_result =
+      TurnResult.tool_requests!(
+        Message.new!(:assistant, ""),
+        details: %{tool_calls: [%{name: "get_rollout_status"}]}
+      )
+
+    assert WriteMemory.write!(state, turn_result) == state
   end
 
   test "retrieves local documents through the normalized retrieval step" do

@@ -2,21 +2,175 @@
 
 ```elixir
 Mix.install([
-  {:runic_ai, path: ".."}
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
 ])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
 ```
 
-RLM-style workflows keep large sources outside one expanding prompt and run
-bounded model work over slices.
+## What This Notebook Teaches
 
-```mermaid
-flowchart LR
-  source[External source] --> split[Split]
-  split --> materialize[Materialize slices]
-  materialize --> map[Map leaves]
-  map --> reduce[Reduce summaries]
-  reduce --> artifact[Materialized artifact]
+Recursive Language Model style execution is useful when the source material is
+too large, too structured, or too important to paste into one prompt. The key
+move is to keep long source material in an external environment and run bounded
+model calls over slices.
+
+RunicAI's RLM layer is inspired by:
+
+* ReAct: https://arxiv.org/abs/2210.03629
+* Recursive Language Models: https://arxiv.org/abs/2512.24601
+* lambda-RLM: https://arxiv.org/abs/2603.20105
+* lambda-RLM implementation: https://github.com/lambda-calculus-LLM/lambda-RLM
+* Slate agent-systems report: https://randomlabs.ai/blog/slate
+* Harness recursive-design discussion: https://theharness.blog/blog/recursive-by-design/
+
+The short comparison:
+
+| Approach           | What grows?                                        | What owns control?          | RunicAI lesson                      |
+| ------------------ | -------------------------------------------------- | --------------------------- | ----------------------------------- |
+| Direct long prompt | One model context                                  | Prompt instructions         | Simple, but hard to inspect         |
+| RAG                | Retrieved snippets                                 | Retriever + prompt          | Useful, but query quality matters   |
+| ReAct              | Thought/action transcript                          | Model loop                  | Great for local tool use            |
+| RLM                | External environment + recursive calls             | Programmatic scaffold       | Good for long-context decomposition |
+| lambda-RLM         | Typed combinators + bounded leaves                 | Verified functional runtime | Closest to RunicAI's bias           |
+| RunicAI RLM        | Runic workflow over refs, slices, leaves, reducers | Typed Runic workflow        | Inspectable and composable          |
+
+## Provider Setup
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
 ```
 
-Use `RunicAI.Recipes.RLMSummarizer` when a direct prompt would be too large or
-too opaque to inspect.
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## Register Source Material
+
+The source lives in an RLM environment. The workflow carries refs and slices
+until it intentionally materializes bounded text at the leaf boundary.
+
+```elixir
+alias RunicAI.RLM
+
+source_text = """
+RunicAI models AI behavior as Runic workflow graphs.
+
+It provides contracts for messages, prompts, LLM requests and results, agent
+state, tool calls, context bundles, guard decisions, waits, reviews, traces,
+evaluations, decomposition tasks, runtime sessions, and recursive long-context
+workflows.
+
+The RLM summarizer keeps source material outside the root model context. It
+splits source refs into slices, materializes bounded artifacts, maps each leaf
+with deterministic or model-backed work, and reduces leaf results into a final
+artifact with provenance.
+
+This differs from direct prompting because the workflow owns chunking,
+provenance, cost boundaries, and reduction. It differs from a raw recursive REPL
+because the public surface is typed Runic data instead of arbitrary generated
+control code.
+"""
+
+{:ok, environment} = RLM.init_environment()
+{:ok, source_ref, environment} = RLM.put_source(environment, source_text, label: "RunicAI RLM overview")
+
+source_ref
+```
+
+```elixir
+{:ok, slice_set} = RLM.split(environment, source_ref, chunk_size: 420, overlap: 40)
+{:ok, artifacts} = RLM.materialize(environment, slice_set)
+
+Kino.DataTable.new(
+  Enum.map(artifacts, fn artifact ->
+    %{
+      id: artifact.id,
+      length: String.length(artifact.content),
+      preview: String.slice(artifact.content, 0, 120)
+    }
+  end)
+)
+```
+
+## Visualize The RLM Summarizer Workflow
+
+```elixir
+alias RunicAI.Recipes.RLMSummarizer
+
+rlm_workflow =
+  RLMSummarizer.new(
+    chunk_size: 420,
+    overlap: 40
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(rlm_workflow)
+```
+
+## Run A Model-Backed Leaf Mapper
+
+Each leaf call sees one bounded artifact. The reducer then combines those leaf
+outputs. This keeps model context small while retaining provenance.
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+mapper = fn artifact ->
+  prompt = """
+  Summarize this source slice in two crisp bullets. Preserve any concrete
+  RunicAI terms.
+
+  SOURCE SLICE:
+  #{artifact.content}
+  """
+
+  {:ok, result} = RunicAI.LLM.generate_text(model, prompt, llm_opts)
+  RunicAI.LLM.Result.text(result)
+end
+
+reducer = fn leaf_results ->
+  leaf_summaries =
+    Enum.map_join(leaf_results, "\n\n", fn leaf ->
+      "- #{leaf.id}\n#{leaf.output}"
+    end)
+
+  prompt = """
+  Combine these slice summaries into one concise explanation of RunicAI RLM.
+  Mention what the workflow owns and what the model owns.
+
+  #{leaf_summaries}
+  """
+
+  {:ok, result} = RunicAI.LLM.generate_text(model, prompt, llm_opts)
+  RunicAI.LLM.Result.text(result)
+end
+
+rlm_run =
+  RLMSummarizer.react_until_resolution(
+    [
+      chunk_size: 420,
+      overlap: 40,
+      mapper: mapper,
+      reducer: reducer
+    ],
+    %{environment: environment, source_ref: source_ref}
+  )
+
+RLMSummarizer.latest_output(rlm_run)
+```
+
+```elixir
+Kino.Layout.tabs(
+  Result: Kino.Tree.new(RLMSummarizer.latest_result(rlm_run)),
+  "Raw productions": Kino.Tree.new(Runic.Workflow.raw_productions(rlm_run))
+)
+```
+
+## What To Notice
+
+The model never receives the whole source unless you choose that policy. RunicAI
+tracks refs, slices, materialized artifacts, leaf results, and reductions as
+normal workflow values. That gives you a place to budget, parallelize, replay,
+audit, or swap in a deterministic mapper.

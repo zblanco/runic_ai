@@ -2,38 +2,84 @@
 
 ```elixir
 Mix.install([
-  {:runic_ai, path: ".."}
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
 ])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
 ```
 
-## A Deterministic Model Client
+## What This Notebook Teaches
+
+RunicAI is a toolbox for building AI behavior as explicit Runic workflow data.
+The important shift is that prompts, model calls, tool calls, state updates,
+control decisions, and traceable outputs become named workflow components rather
+than hidden logic inside one loop.
+
+In this notebook you will:
+
+- configure a real ReqLLM-backed model call
+- inspect the basic `RunicAI.Message`, `RunicAI.Prompt`, and `RunicAI.LLM.Result`
+  contracts
+- build and visualize a `ChatAgentKernel`
+- run a live chat turn with `openai:gpt-5.4-mini`
+- use the shared Kino chat widget for an interactive conversation
+
+## Provider Setup
 
 ```elixir
-fake_client = fn _model, _prompt, _opts ->
-  result =
-    RunicAI.LLM.Result.new!(
-      RunicAI.Message.new!(:assistant, "hello from Livebook"),
-      finish_reason: :stop
-    )
-
-  {:ok, result}
-end
+setup = RunicAI.Livebook.Setup.inputs()
 ```
 
-## Generate Text
+```elixir
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts = RunicAI.Livebook.Setup.llm_opts(model, max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup))
+```
+
+## First Real LLM Call
+
+This is the thinnest possible RunicAI call. `RunicAI.LLM` delegates to ReqLLM by
+default, but normalizes provider output into `RunicAI.LLM.Result`.
 
 ```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
 {:ok, result} =
   RunicAI.LLM.generate_text(
-    "test:model",
-    "Say hello",
-    client: fake_client
+    model,
+    "Reply in one sentence: what is RunicAI useful for?",
+    llm_opts
   )
 
 RunicAI.LLM.Result.text(result)
 ```
 
-## Run The Chat Recipe
+## Contracts First
+
+RunicAI contracts are deliberately boring Elixir structs. That is the point:
+they can be validated, tested, persisted, replayed, rendered, and passed through
+Runic workflows.
+
+```elixir
+alias RunicAI.{Message, Prompt}
+
+prompt =
+  Prompt.new!([
+    Message.new!(:system, "You are concise."),
+    Message.new!(:user, "Explain workflow-native AI in one line.")
+  ])
+
+prompt
+```
+
+```elixir
+prompt |> Prompt.to_req_llm() |> ReqLLM.Context.to_list()
+```
+
+## Build The Smallest Chat Workflow
+
+`ChatAgentKernel` assembles a turn request, builds a prompt, calls the model,
+interprets the result, updates `Agent.State`, and emits a continue decision.
 
 ```elixir
 require Runic
@@ -41,13 +87,60 @@ require Runic
 alias Runic.Workflow
 alias RunicAI.Recipes.ChatAgentKernel
 
-workflow =
+chat_workflow =
   ChatAgentKernel.new(
-    model: "test:model",
-    system: "You are concise.",
-    client: fake_client
+    model: model,
+    system: "You teach RunicAI with crisp examples.",
+    llm_opts: llm_opts
   )
-  |> Workflow.react_until_satisfied(%{user: "Say hello."})
 
-ChatAgentKernel.latest_reply_text(workflow)
+RunicAI.Livebook.WorkflowViz.tabs(chat_workflow)
 ```
+
+## Run One Turn
+
+```elixir
+ran_chat =
+  chat_workflow
+  |> Workflow.react_until_satisfied(%{
+    user: "Give me the mental model for RunicAI in two bullets."
+  })
+
+ChatAgentKernel.latest_reply_text(ran_chat)
+```
+
+```elixir
+Kino.Layout.tabs(
+  State: Kino.Tree.new(ChatAgentKernel.latest_state(ran_chat)),
+  "Turn result": Kino.Tree.new(ChatAgentKernel.latest_turn_result(ran_chat)),
+  "Continue decision": Kino.Tree.new(ChatAgentKernel.latest_continue_decision(ran_chat)),
+  "Raw productions": Kino.Tree.new(Workflow.raw_productions(ran_chat))
+)
+```
+
+## Interactive Chat
+
+The widget below keeps `RunicAI.Agent.State` in the notebook process. Each
+message is submitted to the same recipe shape, and the transcript is rendered
+from RunicAI contracts.
+
+```elixir
+RunicAI.Livebook.Chat.start(
+  RunicAI.Recipes.ChatAgentKernel,
+  [
+    model: model,
+    system: "You are a practical RunicAI tutor. Prefer short answers with code hints.",
+    llm_opts: llm_opts
+  ],
+  initial_message: "What should I learn first?"
+)
+```
+
+## What To Notice
+
+The workflow is not a chat loop hidden inside one function. You can inspect the
+prompt boundary, the model boundary, the state update boundary, and the
+continue decision separately. That is the foundation the more advanced recipes
+build on: tools add observation messages, context engineering adds bundles and
+pressure decisions, controls add review/wait outcomes, and decomposition adds
+typed child work.
