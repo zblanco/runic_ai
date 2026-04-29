@@ -255,6 +255,91 @@ defmodule RunicAI.Livebook.Tools do
   defp tool_result_seen?(_turn_request), do: false
 end
 
+defmodule RunicAI.Livebook.DevEndpoints do
+  @moduledoc false
+
+  @default_url "http://localhost:8080"
+  @timeout 5_000
+
+  def default_url, do: System.get_env("LIVEBOOK_URL") || @default_url
+
+  def check(notebook_file, opts \\ []) do
+    livebook_url =
+      opts
+      |> Keyword.get(:url, default_url())
+      |> to_string()
+      |> String.trim_trailing("/")
+
+    notebook_file = Path.expand(notebook_file)
+    source = File.read(notebook_file)
+
+    [
+      request(livebook_url, :open, %{file: notebook_file}),
+      request(livebook_url, :sync, %{file: notebook_file}),
+      restamp_request(livebook_url, source)
+    ]
+  end
+
+  def rows(checks) when is_list(checks) do
+    Enum.map(checks, fn check ->
+      %{
+        endpoint: check.endpoint,
+        ok?: check.ok?,
+        status: check.status,
+        detail: check.detail
+      }
+    end)
+  end
+
+  defp restamp_request(livebook_url, {:ok, source}) do
+    request(livebook_url, :restamp, %{old_source: source, new_source: source})
+  end
+
+  defp restamp_request(_livebook_url, {:error, reason}) do
+    %{
+      endpoint: "/dev/restamp",
+      ok?: false,
+      status: "file_error",
+      detail: inspect(reason)
+    }
+  end
+
+  defp request(livebook_url, endpoint, body) do
+    endpoint_path = "/dev/#{endpoint}"
+
+    case Req.post("#{livebook_url}#{endpoint_path}", json: body, receive_timeout: @timeout) do
+      {:ok, %{status: status, body: response_body}} ->
+        %{
+          endpoint: endpoint_path,
+          ok?: status in 200..299,
+          status: status,
+          detail: response_detail(response_body)
+        }
+
+      {:error, reason} ->
+        %{
+          endpoint: endpoint_path,
+          ok?: false,
+          status: "request_error",
+          detail: Exception.message(reason)
+        }
+    end
+  rescue
+    exception ->
+      %{
+        endpoint: "/dev/#{endpoint}",
+        ok?: false,
+        status: "exception",
+        detail: Exception.message(exception)
+      }
+  end
+
+  defp response_detail(%{"path" => path}), do: path
+  defp response_detail(%{"status" => status}), do: status
+  defp response_detail(%{"source" => source}), do: "source bytes: #{byte_size(source)}"
+  defp response_detail(body), do: inspect(body)
+end
+
 defmodule RunicAI.Livebook.Chat do
   @moduledoc false
 

@@ -1,8 +1,10 @@
 # Coding Harness And Tools Implementation Plan
 
-Status: draft implementation plan
+Status: foundation implementation verified; remaining full-agent work explicit
 
 Date: 2026-04-25
+
+Last verified: 2026-04-26
 
 Depends on:
 
@@ -61,7 +63,7 @@ runtime either. Both should consume this layer.
 - Language task profiles for common local workflows.
 - Trace artifacts and redaction.
 - Optional durable local persistence.
-- Codex-managed local auth/model-access bridge for testing.
+- Codex-integrated local auth/model-access bridge for testing.
 
 ### Out Of Scope
 
@@ -98,6 +100,29 @@ lib/runic_ai/coding/
 The namespace can start internal if we want to avoid committing to a public API
 too soon.
 
+## Decisions Integrated On 2026-04-26
+
+- `RunicAI.Coding` is the accepted namespace for the experimental coding
+  substrate.
+- Literal search prefers `rg` when available and falls back to the Elixir
+  implementation.
+- Command classifications use the accepted defaults:
+  `:read_only`, `:writes_workspace`, `:writes_outside_workspace`, `:network`,
+  `:destructive`, and `:unknown`.
+- `:just_bash` is an optional `:dev`/`:test` dependency and an additional
+  command backend; it does not replace argv execution or the guarded host shell.
+- In-memory persistence is the first-class development path for artifact refs
+  and trace-like event capture.
+- The generic profile intentionally has no default commands for now.
+- Coding trace event kinds are `:coding_file_read`, `:coding_search`,
+  `:coding_patch`, `:coding_command`, and `:coding_process`.
+- `:exqlite` is an optional `:dev`/`:test` dependency. The SQLite adapter is
+  available for artifacts and generic coding events, while the fuller session
+  schema remains deferred.
+- Codex is optional and treated as a local subscription-backed execution bridge,
+  not as a required testing dependency.
+- Minimal terminal verification uses `mix runic_ai.coding.smoke`.
+
 ## Contract Principles
 
 - Tool outputs should be structured maps or structs, not raw strings only.
@@ -116,190 +141,192 @@ too soon.
 
 Deliverables:
 
-- [ ] Define `RunicAI.Coding.Workspace` struct with root, metadata, profile, and
+- [x] Define `RunicAI.Coding.Workspace` struct with root, metadata, profile, and
       optional persistence handle.
-- [ ] Define `RunicAI.Coding.PathPolicy` with root jail, symlink policy,
+- [x] Define `RunicAI.Coding.PathPolicy` with root jail, symlink policy,
       hidden-file policy, max file size, and allowed write roots.
-- [ ] Define `FileArtifact`, `Patch`, `PatchResult`, `Command`,
+- [x] Define `FileArtifact`, `Patch`, `PatchResult`, `Command`,
       `CommandResult`, and `ProcessHandle` contracts.
-- [ ] Define `RunicAI.Coding.Profile` for language/project-specific tool
+- [x] Define `RunicAI.Coding.Profile` for language/project-specific tool
       defaults.
-- [ ] Define `RunicAI.Coding.Tools.default_registry/1` that returns
+- [x] Define `RunicAI.Coding.Tools.default_registry/1` that returns
       `RunicAI.Tool.Definition` values.
-- [ ] Decide which modules are public immediately and which remain internal.
+- [x] Decide which modules are public immediately and which remain internal.
 
 Validation:
 
-- [ ] Add contract tests for struct construction and validation failures.
-- [ ] Add docs/examples showing how the registry plugs into
+- [x] Add contract tests for struct construction and validation failures.
+- [x] Add docs/examples showing how the registry plugs into
       `IntegratedToolAgent`.
 
 ## Phase 1: Workspace Read, List, And Search Tools
 
 Deliverables:
 
-- [ ] Implement `list_dir` with stable ordering, metadata, hidden-file controls,
+- [x] Implement `list_dir` with stable ordering, metadata, hidden-file controls,
       and output limits.
-- [ ] Implement `find_files` with ignore rules and max result caps.
-- [ ] Implement `read_file` with binary detection, max bytes, and hash output.
-- [ ] Implement `read_range` by line range.
-- [ ] Implement `read_many` with per-file and total output caps.
-- [ ] Implement `search_text` backed by Elixir APIs first and `rg` when
+- [x] Implement `find_files` with ignore rules and max result caps.
+- [x] Implement `read_file` with binary detection, max bytes, and hash output.
+- [x] Implement `read_range` by line range.
+- [x] Implement `read_many` with per-file and total output caps.
+- [x] Implement `search_text` backed by Elixir APIs first and `rg` when
       available.
-- [ ] Implement `search_regex` with match context and result limits.
-- [ ] Normalize all read/search results into model-visible previews plus
+- [x] Implement `search_regex` with match context and result limits.
+- [x] Normalize all read/search results into model-visible previews plus
       optional artifact refs.
 
 Validation:
 
-- [ ] Unit test path traversal rejection.
-- [ ] Unit test symlink escape rejection or configured handling.
-- [ ] Unit test hidden file behavior.
-- [ ] Unit test output caps and binary detection.
-- [ ] Add integration tests using a temporary Mix project fixture.
+- [x] Unit test path traversal rejection.
+- [x] Unit test symlink escape rejection or configured handling.
+- [x] Unit test hidden file behavior.
+- [x] Unit test output caps and binary detection.
+- [x] Add integration tests using a temporary Mix project fixture.
 
 ## Phase 2: Patch-First Editing
 
 Deliverables:
 
-- [ ] Implement `apply_patch` as the default write mechanism.
-- [ ] Support create, update, move, and delete patch operations.
-- [ ] Validate expected file hashes when provided.
-- [ ] Reject paths outside the workspace root.
-- [ ] Reject hidden credential-like files unless policy allows them.
-- [ ] Return changed paths, operation summaries, diagnostics, and before/after
+- [x] Implement `apply_patch` as the default write mechanism.
+- [x] Support create, update, move, and delete patch operations.
+- [x] Validate expected file hashes when provided.
+- [x] Reject paths outside the workspace root.
+- [x] Reject hidden credential-like files unless policy allows them.
+- [x] Return changed paths, operation summaries, diagnostics, and before/after
       hashes.
-- [ ] Add optional dry-run mode.
-- [ ] Add model-visible failure diagnostics designed for repair.
+- [x] Add optional dry-run mode.
+- [x] Add model-visible failure diagnostics designed for repair.
 
 Validation:
 
-- [ ] Unit test successful create/update/delete/move patches.
-- [ ] Unit test patch failure diagnostics.
-- [ ] Unit test root jail enforcement.
-- [ ] Unit test hash mismatch handling.
-- [ ] Add a replay fixture where a fake LLM emits a bad patch, receives
+- [x] Unit test successful create/update/delete/move patches.
+- [x] Unit test patch failure diagnostics.
+- [x] Unit test root jail enforcement.
+- [x] Unit test hash mismatch handling.
+- [x] Add a replay fixture where a fake LLM emits a bad patch, receives
       diagnostics, and emits a corrected patch.
 
 ## Phase 3: Command And Process Execution
 
 Deliverables:
 
-- [ ] Implement direct argv `run_command` using `System.cmd/3`.
-- [ ] Add command policy with cwd, timeout, env allowlist, output cap,
+- [x] Implement direct argv `run_command` using `System.cmd/3`.
+- [x] Add command policy with cwd, timeout, env allowlist, output cap,
       network metadata, and mutability classification.
-- [ ] Add guarded shell backend as opt-in.
-- [ ] Evaluate `just_bash` as an optional sandbox backend for in-memory shell
+- [x] Add guarded shell backend as opt-in.
+- [x] Evaluate `just_bash` as an optional sandbox backend for in-memory shell
       demos and tests.
-- [ ] Implement `start_process`, `process_poll`, `process_log`,
+- [x] Implement `start_process`, `process_poll`, `process_log`,
       `process_write`, and `process_kill`.
 - [ ] Store recent process output and full log artifacts separately.
-- [ ] Normalize command status into pass, fail, timeout, killed, or blocked.
+- [x] Normalize command status into pass, fail, timeout, killed, or blocked.
 
 Validation:
 
-- [ ] Unit test command policy validation.
-- [ ] Unit test timeout behavior.
-- [ ] Unit test output truncation and artifact preservation.
-- [ ] Unit test background process lifecycle.
-- [ ] Add tests proving shell backend is disabled unless explicitly enabled.
+- [x] Unit test command policy validation.
+- [x] Unit test timeout behavior.
+- [x] Unit test output truncation and artifact preservation.
+- [x] Unit test background process lifecycle.
+- [x] Add tests proving shell backend is disabled unless explicitly enabled.
 
 ## Phase 4: Git And Language Profiles
 
 Deliverables:
 
-- [ ] Implement read-only git tools: `git_status`, `git_diff`, `git_log`,
+- [x] Implement read-only git tools: `git_status`, `git_diff`, `git_log`,
       `git_show`, and `git_branch`.
 - [ ] Implement guarded mutating git tool definitions only after review policy
       is available: `git_commit`, `git_restore`, branch operations.
-- [ ] Add Mix profile detection from `mix.exs`.
-- [ ] Add generic command profile for `compile_project`, `run_tests`,
-      `run_formatter`, and `run_linter`.
-- [ ] Add Mix-specific defaults for `mix compile`, `mix test`, and
+- [x] Add Mix profile detection from `mix.exs`.
+- [x] Keep the generic profile intentionally commandless until we need safe
+      cross-language defaults.
+- [x] Add Mix-specific defaults for `mix compile`, `mix test`, and
       `mix format`.
-- [ ] Leave npm/cargo/python profiles as follow-up unless needed immediately.
+- [x] Leave npm/cargo/python profiles as follow-up unless needed immediately.
 
 Validation:
 
-- [ ] Unit test git read tools against a temporary repo.
-- [ ] Unit test language profile detection.
-- [ ] Integration test Mix compile/test/format commands through the command
+- [x] Unit test git read tools against a temporary repo.
+- [x] Unit test language profile detection.
+- [x] Integration test Mix compile/test/format commands through the command
       runner.
 
 ## Phase 5: Trace, Artifacts, And Redaction
 
 Deliverables:
 
-- [ ] Define coding trace event metadata for file reads, searches, patches,
+- [x] Define coding trace event metadata for file reads, searches, patches,
       commands, and process logs.
-- [ ] Add artifact storage abstraction for large logs, diffs, and read outputs.
-- [ ] Add redaction pass for secret-looking env values, tokens, keys, and
+- [x] Add artifact storage abstraction for large logs, diffs, and read outputs.
+- [x] Add redaction pass for secret-looking env values, tokens, keys, and
       credential filenames.
-- [ ] Ensure model-visible observations can differ from full trace payloads.
-- [ ] Add capture policy metadata compatible with existing trace sinks.
+- [x] Ensure model-visible observations can differ from full trace payloads.
+- [x] Add capture policy metadata compatible with existing trace sinks.
 
 Validation:
 
-- [ ] Unit test redaction patterns.
-- [ ] Unit test artifact previews and full payload lookup.
-- [ ] Add trace assertions for a read -> patch -> test sequence.
+- [x] Unit test redaction patterns.
+- [x] Unit test artifact previews and full payload lookup.
+- [x] Add trace assertions for a read -> patch -> test sequence.
 
 ## Phase 6: Optional SQLite Persistence
 
 Deliverables:
 
-- [ ] Define `RunicAI.Coding.Persistence` behaviour.
-- [ ] Add optional SQLite implementation if dependency choice is approved.
-- [ ] Store sessions, turns, tool calls, command observations, patch summaries,
-      artifacts, approvals, waits, and process logs.
-- [ ] Add FTS indexes for session search over summaries and observations.
-- [ ] Keep schema migration isolated from core package startup.
+- [x] Define `RunicAI.Coding.Persistence` behaviour.
+- [x] Add optional SQLite implementation if dependency choice is approved.
+- [ ] Add the full normalized SQLite session store for sessions, turns, tool
+      calls, command observations, patch summaries, approvals, waits, and
+      process logs.
+- [x] Add FTS indexes for generic coding event observations.
+- [x] Keep schema migration isolated from core package startup.
 
 Validation:
 
-- [ ] Unit test persistence behaviour with an in-memory fake.
-- [ ] Integration test SQLite session save/load if SQLite dependency is added.
-- [ ] Add migration tests or schema version tests.
+- [x] Unit test persistence behaviour with an in-memory fake.
+- [x] Integration test SQLite artifact/event save/load if SQLite dependency is
+      added.
+- [x] Add migration tests or schema version tests.
 
 ## Phase 7: Codex-Managed Local Auth Bridge
 
 Deliverables:
 
-- [ ] Add `RunicAI.Coding.Codex.ExecClient` wrapper around `codex exec --json`.
-- [ ] Treat Codex primarily as local subscription-backed access for testing, not
+- [x] Add `RunicAI.Coding.Codex.ExecClient` wrapper around `codex exec --json`.
+- [x] Treat Codex primarily as local subscription-backed access for testing, not
       as the default planner.
-- [ ] Do not read or copy Codex credential files.
-- [ ] Normalize JSONL events into trace events and final result contracts.
-- [ ] Add policy controls for sandbox mode, approval mode, cwd, and max runtime.
-- [ ] Keep this optional and disabled by default.
+- [x] Do not read or copy Codex credential files.
+- [x] Normalize JSONL events into trace events and final result contracts.
+- [x] Add policy controls for sandbox mode, approval mode, cwd, and max runtime.
+- [x] Keep this optional and disabled by default.
 
 Validation:
 
-- [ ] Unit test JSONL event normalization with fixtures.
-- [ ] Integration test skipped by default when Codex CLI is unavailable.
-- [ ] Document expected local auth assumptions without exposing secrets.
+- [x] Unit test JSONL event normalization with fixtures.
+- [x] Integration test skipped by default when Codex CLI is unavailable.
+- [x] Document expected local auth assumptions without exposing secrets.
 
 ## Phase 8: Harness CLI Shell
 
 Deliverables:
 
-- [ ] Add a minimal local harness entrypoint or script for exercising tools.
-- [ ] Support session id, cwd, profile, and tool registry selection.
-- [ ] Print approval requests, command summaries, patch summaries, and final
-      observations.
-- [ ] Keep this small until the standard agent plan decides the full CLI shape.
+- [x] Add a minimal local harness entrypoint or script for exercising tools.
+- [x] Support session id, cwd, profile, and tool registry selection.
+- [x] Print command summaries, patch summaries, and final observations.
+- [ ] Print approval requests once the full review-gated CLI exists.
+- [x] Keep this small until the standard agent plan decides the full CLI shape.
 
 Validation:
 
-- [ ] Smoke test the harness against this repo with read-only tools.
-- [ ] Smoke test patch dry-run and command execution.
+- [x] Smoke test the harness against this repo with read-only tools.
+- [x] Smoke test patch dry-run and command execution.
 
 ## Done Criteria
 
-- [ ] Both standard and RLM coding plans can depend on this substrate without
+- [x] Both standard and RLM coding plans can depend on this substrate without
       reimplementing workspace or command logic.
-- [ ] `mix test` passes.
-- [ ] Docs/examples show how to construct a tool registry.
-- [ ] Risky tools are disabled or review-gated by default.
-- [ ] The substrate works with fake LLMs and scripted tool tests.
-
+- [x] `mix test` passes.
+- [x] Docs/examples show how to construct a tool registry.
+- [x] Risky tools are disabled or review-gated by default.
+- [x] The substrate works with fake LLMs and scripted tool tests.
+- [x] Live `gpt-5.4-mini` smoke test passes when explicitly enabled.

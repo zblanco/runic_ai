@@ -99,7 +99,21 @@ run =
 
 Kino.Layout.tabs(
   Run: Kino.Tree.new(run),
-  Results: Kino.DataTable.new(Enum.map(run.results, &Map.take(&1, [:case_id, :score, :passed?]))),
+  Results:
+    Kino.DataTable.new(
+      Enum.map(run.results, fn result ->
+        scores = result.scores
+
+        %{
+          case: result.case_id,
+          status: result.status,
+          score: Map.get(scores, :overall),
+          expectations: "#{Map.get(scores, :passed, 0)}/#{Map.get(scores, :total, 0)}",
+          reply: RunicAI.Evaluation.Result.reply_text(result),
+          failures: inspect(result.failures)
+        }
+      end)
+    ),
   Aggregate: Kino.Tree.new(run.aggregate)
 )
 ```

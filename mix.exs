@@ -33,6 +33,8 @@ defmodule RunicAI.MixProject do
       {:runic, "~> 0.1.0-alpha.7"},
       {:req_llm, "~> 1.9"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:just_bash, "~> 0.3", only: [:dev, :test], optional: true},
+      {:exqlite, "~> 0.36", only: [:dev, :test], optional: true},
       {:tidewave, "~> 0.4", only: :dev},
       {:bandit, "~> 1.0", only: :dev}
     ]
@@ -84,6 +86,8 @@ defmodule RunicAI.MixProject do
         "guides/recipes/context-aware-agent.md",
         "guides/recipes/subagent-decomposition.md",
         "guides/recipes/integrated-stateful-agent.md",
+        "guides/recipes/coding-harness.md",
+        "guides/recipes/standard-coding-agent.md",
         "guides/recipes/evaluation-harness.md",
         "guides/recipes/rlm-summarizer.md",
         "guides/extending/components.md",
@@ -112,6 +116,7 @@ defmodule RunicAI.MixProject do
       nest_modules_by_prefix: [
         RunicAI.Agent,
         RunicAI.Candidate,
+        RunicAI.Coding,
         RunicAI.Context,
         RunicAI.Control,
         RunicAI.Decomposition,
@@ -174,6 +179,7 @@ defmodule RunicAI.MixProject do
         RunicAI.LLM.ReqLLMClient
       ],
       "Agent Turns": ~r"RunicAI\.Agent\.",
+      "Coding Harness And Tools": ~r"RunicAI\.Coding\.",
       "Workflow Steps": ~r"RunicAI\.Steps\.",
       "Workflow Rules": ~r"RunicAI\.Rules\.",
       Tools: ~r"RunicAI\.Tool\.",

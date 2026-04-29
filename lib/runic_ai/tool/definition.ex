@@ -232,7 +232,13 @@ defmodule RunicAI.Tool.Definition do
     kind = Keyword.get(opts, :kind, classify_req_llm_error(reason))
     message = Keyword.get(opts, :message, inspect(reason))
 
-    Error.from_reason(reason, kind: kind, message: message, source: __MODULE__)
+    case reason do
+      %Error{} = error ->
+        error
+
+      other ->
+        Error.from_reason(other, kind: kind, message: message, source: __MODULE__)
+    end
   end
 
   defp classify_req_llm_error(%{__struct__: struct}) do

@@ -27,6 +27,9 @@ rg -n "/h[o]me/|/Us[e]rs/|s[k]-|anthropic_api_[k]ey|openai_api_[k]ey" README.md 
 - Confirm security guidance.
 - Confirm version tag and ExDoc `source_ref`.
 - Build package locally with Hex before publishing.
+- For coding-agent releases, confirm review gates are enabled by default, shell
+  execution is opt-in, patch tools remain path-policy bounded, and deterministic
+  coding eval fixtures pass.
 
 ## Application Trial Gates
 

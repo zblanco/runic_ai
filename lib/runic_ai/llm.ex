@@ -40,7 +40,7 @@ defmodule RunicAI.LLM do
 
   @type prompt :: String.t() | Prompt.t()
   @type options :: keyword()
-  @type schema :: keyword()
+  @type schema :: keyword() | map() | struct()
 
   @callback generate_text(model(), prompt(), options()) ::
               {:ok, Result.t() | ReqLLM.Response.t()} | {:error, Error.t() | term()}
