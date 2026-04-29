@@ -107,6 +107,8 @@ defmodule RunicAI.MixProject do
         "livebooks/context-aware-agent.livemd",
         "livebooks/integrated-stateful-agent.livemd",
         "livebooks/subagent-decomposition.livemd",
+        "livebooks/standard-coding-agent.livemd",
+        "livebooks/rlm-coding-agent.livemd",
         "livebooks/evaluation-harness.livemd",
         "livebooks/rlm-summarizer.livemd",
         "livebooks/runtime-tracing-replay.livemd"

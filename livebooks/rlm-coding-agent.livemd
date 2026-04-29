@@ -1,0 +1,450 @@
+# RunicAI RLM Coding Agent
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## What This Notebook Teaches
+
+`RunicAI.Coding.RLM.Agent` is the strategic coding agent. It does not hide a
+large prompt loop. It treats planning as data, validates that data, compiles it
+into a Runic workflow, and then executes bounded nodes.
+
+It is good at:
+
+* decomposing a coding objective into a visible workflow graph
+* keeping codebase sources outside the root prompt until needed
+* validating generated workflow plans before they can mutate anything
+* mixing tools, deterministic steps, child standard agents, edits, review gates,
+  verification gates, reducers, and workflow patches
+* recording episodes, artifacts, checkpoints, scorecards, and repair needs
+
+Use the standard coding agent for direct local work. Use the RLM coding agent
+when you want the agent to first design the workflow that will do the work.
+
+## Optional Provider Setup
+
+The main cells use deterministic proposals and fake model responses. Use this
+only for the optional live-model proposal cell.
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+## Build A Demo Workspace
+
+```elixir
+alias RunicAI.Coding.Workspace
+alias RunicAI.Coding.RLM.Agent, as: RLMAgent
+alias RunicAI.Coding.RLM.{
+  CodebaseEnvironment,
+  Coordinator,
+  ProposalNode,
+  RecipeLibrary,
+  WorkflowProposal,
+  WorkflowValidator
+}
+
+root = RunicAI.Livebook.CodingDemo.sample_project!("rlm-coding-agent")
+workspace = Workspace.new!(root: root)
+objective = "Where is Demo.answer/0?"
+
+%{workspace_root: workspace.root, objective: objective}
+```
+
+## Architecture
+
+The RLM agent has two important workflow shapes:
+
+* the planned workflow, which is the inert `WorkflowProposal` and normalized
+  `RunicAI.RLM.Plan`
+* the resulting Runic workflow, which is compiled from the accepted proposal and
+  executes each node
+
+```elixir
+Kino.Mermaid.new("""
+flowchart TD
+  objective["Coding objective"] --> prepare["Prepare CodebaseEnvironment"]
+  prepare --> sources["SourceIndex + external RLM refs"]
+  sources --> coordinator["Coordinator proposes WorkflowProposal"]
+  coordinator --> validator["WorkflowValidator policy checks"]
+  validator -->|accepted| plan["WorkflowProposal.to_plan/1"]
+  validator -->|accepted| compiler["WorkflowCompiler.compile/3"]
+  compiler --> runic["Executable Runic workflow"]
+  runic --> nodes["Execute nodes in topological order"]
+  nodes --> episodes["RLM episodes + trace"]
+  episodes --> progress["ProgressGate and scorecards"]
+  progress -->|satisfied| output["Final output"]
+  progress -->|needs repair| repair["RepairLoop"]
+  repair --> nodes
+  validator -->|rejected| fallback["Fallback recipe or explicit error"]
+""")
+```
+
+## Prepare The Codebase Environment
+
+`CodebaseEnvironment` registers the repository manifest, `AGENTS.md`, and files
+as RLM sources. The proposal and workflow carry refs and summaries instead of
+blindly pasting the whole workspace into a prompt.
+
+```elixir
+{:ok, environment} = RLMAgent.prepare(workspace, index?: true, file_limit: 40)
+
+Kino.DataTable.new(RunicAI.Livebook.CodingDemo.source_rows(environment))
+```
+
+```elixir
+{:ok, artifact} = CodebaseEnvironment.materialize(environment, "lib/demo.ex")
+source_ref = List.first(artifact.refs)
+
+%{
+  artifact_id: artifact.id,
+  source_id: source_ref && source_ref.source_id,
+  preview: String.slice(artifact.content, 0, 120)
+}
+```
+
+## The Proposal Contract
+
+A proposal is inert data. It can be model-generated, recipe-seeded, or provided
+directly by your application. It cannot execute until validation accepts it.
+
+```elixir
+Kino.DataTable.new([
+  %{part: "WorkflowProposal", purpose: "Objective, sources, nodes, edges, policies, stop conditions"},
+  %{part: "ProposalNode", purpose: "A model-proposable node with id, kind, params, policy, provenance"},
+  %{part: "WorkflowValidator", purpose: "Policy checks for graph shape, tools, commands, edits, scripts, budgets"},
+  %{part: "WorkflowCompiler", purpose: "Turns accepted proposal nodes into executable Runic steps"},
+  %{part: "Episode", purpose: "Per-node status, output, artifacts, worker id, and provenance"}
+])
+```
+
+```elixir
+Kino.DataTable.new(
+  Enum.map(ProposalNode.allowed_kinds(), fn kind ->
+    %{
+      kind: inspect(kind),
+      meaning:
+        case kind do
+          :tool -> "Call a coding tool from the registry"
+          :agent -> "Call the standard coding agent as a child workflow"
+          :edit -> "Apply a validated edit patch set"
+          :verification_gate -> "Evaluate deterministic acceptance checks"
+          :reducer -> "Combine parent outputs into a report, findings, plan, or verification summary"
+          :review_gate -> "Record a review boundary in the generated graph"
+          :workflow_patch -> "Validate a bounded recursive plan patch"
+          :llm_leaf -> "Run one bounded model leaf"
+          :command -> "Run an allowed argv command when policy enables commands"
+          :script -> "Run an opt-in script node"
+          :deterministic_step -> "Run fixed local logic such as source_summary"
+        end
+    }
+  end)
+)
+```
+
+## Planned Workflow From A Recipe Seed
+
+The coordinator can use a recipe seed for high-confidence routes. This
+read-only repo-QA plan discovers files, reads the relevant files, and reduces
+the result into an answer.
+
+```elixir
+{:ok, proposal, validation_report} =
+  RLMAgent.propose(objective, environment,
+    command: :repo_qa,
+    validation_opts: [allowed_tools: ["find_files", "read_many"]]
+  )
+
+{:ok, plan} = WorkflowProposal.to_plan(proposal)
+
+Kino.Layout.tabs(
+  "Proposal graph": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.proposal_mermaid(proposal)),
+  "Proposal nodes": Kino.DataTable.new(RunicAI.Livebook.CodingDemo.proposal_rows(proposal)),
+  "Validation report": Kino.Tree.new(validation_report)
+)
+```
+
+## The Consequence RLM Plan
+
+`WorkflowProposal.to_plan/1` maps coding-specific node kinds into the generic
+RLM plan vocabulary. This is useful when you want to inspect the recursive plan
+shape independently from the compiled Runic workflow.
+
+```elixir
+Kino.Layout.tabs(
+  "RLM plan graph": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.plan_mermaid(plan)),
+  "RLM plan nodes": Kino.DataTable.new(RunicAI.Livebook.CodingDemo.plan_rows(plan)),
+  Plan: Kino.Tree.new(plan)
+)
+```
+
+## The Resulting Executable Workflow
+
+The compiler turns accepted nodes into named Runic steps and wires them by the
+proposal edges. This is the workflow that actually executes.
+
+```elixir
+{:ok, compiled} =
+  RLMAgent.compile(proposal, environment,
+    validation_opts: [allowed_tools: ["find_files", "read_many"]]
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(compiled.workflow)
+```
+
+## Execute The Repo-QA Workflow
+
+This run is fully deterministic. No model is needed because the recipe proposal
+uses coding tools and a deterministic reducer.
+
+```elixir
+{:ok, repo_qa_result} =
+  RLMAgent.run(workspace, objective,
+    command: :repo_qa,
+    validation_opts: [allowed_tools: ["find_files", "read_many"]]
+  )
+
+repo_qa_result.output
+```
+
+```elixir
+Kino.Layout.tabs(
+  Episodes: Kino.DataTable.new(RunicAI.Livebook.CodingDemo.episode_rows(repo_qa_result.episodes)),
+  Trace: Kino.Tree.new(repo_qa_result.trace),
+  Context: Kino.Tree.new(repo_qa_result.context),
+  "Compiled workflow": Kino.Tree.new(repo_qa_result.compiled)
+)
+```
+
+## Tool, HITL, And Subagent Boundaries
+
+Every node kind has a different authority boundary. Tool and command nodes go
+through registries and policies. Agent nodes call the standard coding agent and
+return a `ChildResult`. Verification gates check objective evidence. Review
+gates make review boundaries visible in the generated graph.
+
+```elixir
+Kino.Mermaid.new("""
+flowchart LR
+  proposal["Accepted proposal node"] --> kind{"kind"}
+  kind -->|tool| registry["Tool registry"]
+  registry --> tool["Tool.Definition.execute"]
+  tool --> observation["Tool output / artifact"]
+  kind -->|agent| child["Standard coding agent child"]
+  child --> child_result["ChildResult"]
+  kind -->|edit| patch_set["EditPatchSet"]
+  patch_set --> patch_result["PatchResult"]
+  kind -->|verification_gate| checks["Acceptance checks"]
+  checks --> scorecard["WorkflowScorecard"]
+  kind -->|review_gate| review["Visible review boundary"]
+  observation --> reducer["Reducer"]
+  child_result --> reducer
+  patch_result --> reducer
+  scorecard --> reducer
+""")
+```
+
+## Coordinator-Generated Subagent Plan
+
+This cell simulates a model-generated proposal by returning JSON through the LLM
+client contract. The proposal calls a standard `read_only` child agent, verifies
+that the child completed, and reduces the evidence into a report.
+
+```elixir
+generated_object = %{
+  "objective" => "Ask a child agent to explain Demo.answer/0",
+  "nodes" => [
+    %{
+      "id" => "inspect",
+      "kind" => "agent",
+      "params" => %{"mode" => "read_only", "task" => "Explain Demo.answer/0"}
+    },
+    %{
+      "id" => "verify-child",
+      "kind" => "verification_gate",
+      "params" => %{
+        "checks" => [
+          %{
+            "id" => "inspect-completed",
+            "type" => "child_status",
+            "params" => %{"child_id" => "inspect", "status" => "completed"}
+          }
+        ]
+      }
+    },
+    %{"id" => "report", "kind" => "reducer", "params" => %{"reducer" => "report"}}
+  ],
+  "edges" => [
+    %{"from" => "inspect", "to" => "verify-child"},
+    %{"from" => "verify-child", "to" => "report"}
+  ],
+  "stop_conditions" => ["child answer verified and reported"]
+}
+
+{:ok, generated_proposal, generated_report} =
+  RLMAgent.propose("Ask a child agent to explain Demo.answer/0", environment,
+    client: RunicAI.Livebook.CodingDemo.json_object_client(generated_object),
+    fallback?: false
+  )
+
+{:ok, generated_plan} = WorkflowProposal.to_plan(generated_proposal)
+
+Kino.Layout.tabs(
+  "Generated proposal": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.proposal_mermaid(generated_proposal)),
+  "Generated RLM plan": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.plan_mermaid(generated_plan)),
+  Report: Kino.Tree.new(generated_report)
+)
+```
+
+```elixir
+{:ok, child_run} =
+  RLMAgent.run(workspace, "Ask a child agent to explain Demo.answer/0",
+    proposal: generated_proposal,
+    client: RunicAI.Livebook.CodingDemo.text_client("Demo.answer/0 returns 41 from lib/demo.ex.")
+  )
+
+Kino.Layout.tabs(
+  Output: Kino.Tree.new(child_run.output),
+  "Child results": Kino.Tree.new(child_run.context.child_results),
+  Episodes: Kino.DataTable.new(RunicAI.Livebook.CodingDemo.episode_rows(child_run.episodes)),
+  Workflow: RunicAI.Livebook.WorkflowViz.tabs(child_run.workflow)
+)
+```
+
+## Deterministic Mutating Plan
+
+Mutating proposals require explicit policy. This example applies one edit and
+then proves it with a source assertion. The progress gate is disabled only to
+keep this cell fully deterministic and focused on the explicit verification
+gate; production mutating runs should keep progress verification enabled or
+provide the progress policy your application expects.
+
+```elixir
+mutation_root = RunicAI.Livebook.CodingDemo.sample_project!("rlm-coding-agent-mutation")
+mutation_workspace = Workspace.new!(root: mutation_root)
+mutation_environment = RLMAgent.prepare!(mutation_workspace, index?: true, file_limit: 40)
+
+mutation_proposal =
+  WorkflowProposal.new!(
+    "Add Demo.extra/0",
+    [
+      ProposalNode.new!("edit-demo", :edit,
+        params: %{
+          operations: [
+            %{
+              kind: "replace_file",
+              params: %{
+                path: "lib/demo.ex",
+                content: "defmodule Demo do\n  def answer, do: 41\n  def extra, do: :ok\nend\n"
+              }
+            }
+          ],
+          expected_changed_files: ["lib/demo.ex"]
+        }
+      ),
+      ProposalNode.new!("verify-extra", :verification_gate,
+        params: %{
+          checks: [
+            %{
+              id: "extra-source",
+              type: "source_contains",
+              params: %{path: "lib/demo.ex", text: "def extra"}
+            }
+          ]
+        }
+      ),
+      ProposalNode.new!("summarize", :reducer, params: %{reducer: "report"})
+    ],
+    edges: [
+      %{from: "edit-demo", to: "verify-extra"},
+      %{from: "verify-extra", to: "summarize"}
+    ],
+    stop_conditions: ["Demo.extra/0 exists in source"]
+  )
+
+mutation_validation_opts = [
+  allowed_kinds: ProposalNode.allowed_kinds(),
+  allow_mutation?: true
+]
+
+{:ok, mutation_result} =
+  RLMAgent.run(mutation_workspace, "Add Demo.extra/0",
+    proposal: mutation_proposal,
+    validation_opts: mutation_validation_opts,
+    progress_gate?: false
+  )
+
+Kino.Layout.tabs(
+  "Mutation proposal": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.proposal_mermaid(mutation_proposal)),
+  Output: Kino.Tree.new(mutation_result.output),
+  Source: Kino.Text.new(File.read!(Path.join(mutation_root, "lib/demo.ex"))),
+  Episodes: Kino.DataTable.new(RunicAI.Livebook.CodingDemo.episode_rows(mutation_result.episodes))
+)
+```
+
+## Policy Rejection
+
+Generated workflows fail closed. Commands, scripts, edits, missing verification
+contracts, cycles, unknown edges, and disallowed tools are rejected unless the
+caller explicitly enables the needed policy.
+
+```elixir
+unsafe_proposal =
+  WorkflowProposal.new!(
+    "Try an unsafe command",
+    [
+      ProposalNode.new!("shell", :command,
+        params: %{args: %{argv: ["rm", "-rf", "."]}}
+      )
+    ],
+    stop_conditions: ["command attempted"]
+  )
+
+WorkflowValidator.validate(unsafe_proposal, allowed_kinds: ProposalNode.allowed_kinds())
+```
+
+## Optional Live-Model Proposal
+
+Run this only after setting `OPENAI_API_KEY` in the setup cell. It asks the
+coordinator to generate a proposal, validates it, and renders the planned graph
+without executing it.
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts =
+  RunicAI.Livebook.Setup.llm_opts(
+    model,
+    max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup)
+  )
+
+{:ok, live_proposal, live_report} =
+  RLMAgent.propose("Explain the Demo module and cite files.", environment,
+    model: model,
+    llm_opts: llm_opts,
+    fallback?: false,
+    validation_opts: [allowed_tools: ["find_files", "read_many", "read_file", "search_text"]]
+  )
+
+Kino.Layout.tabs(
+  "Live proposal": Kino.Mermaid.new(RunicAI.Livebook.CodingDemo.proposal_mermaid(live_proposal)),
+  "Validation report": Kino.Tree.new(live_report),
+  "Proposal data": Kino.Tree.new(live_proposal)
+)
+```
+
+## How To Leverage It
+
+Start with a recipe proposal for known routes such as `:repo_qa`, `:review`, or
+`:verify`. Move to generated proposals when the objective needs dynamic
+coordination. Keep validation narrow, require explicit mutation policy for edits
+or commands, pass contracts to child agents when completion evidence matters,
+and inspect the proposal graph, RLM plan graph, compiled workflow, episodes, and
+scorecards before trusting a run in production.

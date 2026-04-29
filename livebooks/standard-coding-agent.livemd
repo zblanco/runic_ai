@@ -1,0 +1,304 @@
+# RunicAI Standard Coding Agent
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## What This Notebook Teaches
+
+`RunicAI.Coding.Agent` is the direct local coding agent. It is best when one
+agent can inspect, patch, and verify a workspace through explicit tools.
+
+It is good at:
+
+* repository questions and diff reviews
+* focused edits with structured patch evidence
+* targeted verification loops
+* local safety controls through command policy and human review
+* runtime-owned state, traces, snapshots, and resume points
+
+It is not the planner. It does not recursively design new workflows by itself.
+When you need planning, decomposition, or child agent orchestration, use the
+RLM coding agent and let it call the standard agent as a child workflow.
+
+## Optional Provider Setup
+
+The main cells below use deterministic fake LLM responses, so they do not need
+an API key. Use this setup only for the final live-model smoke cell.
+
+```elixir
+setup = RunicAI.Livebook.Setup.inputs()
+```
+
+## Build A Demo Workspace
+
+The coding agent always works through a `RunicAI.Coding.Workspace`. The
+workspace holds the root path, path policy, detected profile, optional
+persistence, and metadata used by tools and prompts.
+
+```elixir
+alias RunicAI.Coding.{Agent, Workspace}
+
+root = RunicAI.Livebook.CodingDemo.sample_project!("standard-coding-agent")
+workspace = Workspace.new!(root: root)
+
+%{workspace_root: workspace.root, profile: workspace.profile.name}
+```
+
+## Where It Fits
+
+```elixir
+Kino.DataTable.new([
+  %{
+    need: "Explain a repo or review a diff",
+    use: "Agent.read_only/3 or command: :review",
+    reason: "Read/search/git-read tools only"
+  },
+  %{
+    need: "Make a scoped edit",
+    use: "Agent.patch/3",
+    reason: "Adds apply_patch while retaining review gates"
+  },
+  %{
+    need: "Repair and verify",
+    use: "Agent.verify/3",
+    reason: "Adds compile, test, formatter, assertions, and command tools"
+  },
+  %{
+    need: "Plan a multi-agent workflow",
+    use: "RunicAI.Coding.RLM.Agent",
+    reason: "Coordinator proposes, validates, and compiles a workflow graph"
+  }
+])
+```
+
+## Tool Profiles
+
+Modes are conservative tool-visibility presets. The registry may contain more
+tools than the model can see; the selected mode controls the visible subset.
+
+```elixir
+Kino.DataTable.new(
+  Enum.map([:read_only, :patch, :verify], fn mode ->
+    %{
+      mode: inspect(mode),
+      max_turns: RunicAI.Coding.Recipe.named(mode).max_turns,
+      visible_tools: Enum.join(Agent.visible_tools(mode), ", ")
+    }
+  end)
+)
+```
+
+```elixir
+registry = Agent.default_registry(workspace, mode: :verify)
+Kino.DataTable.new(RunicAI.Livebook.CodingDemo.tool_rows(registry))
+```
+
+## The Agent Loop
+
+This is the loop owned by `RunicAI.Recipes.IntegratedToolAgent`. The model can
+request tools, but the workflow chooses visible tools, checks budget and guards,
+executes approved work, appends tool observations, and resumes from review or
+wait states.
+
+```elixir
+Kino.Mermaid.new("""
+flowchart TD
+  user["User signal"] --> kernel["Integrated agent kernel"]
+  kernel --> materialize["Materialize turn request"]
+  materialize --> select["Select visible tools"]
+  select --> attach["Attach tool schemas"]
+  attach --> prompt["Assemble prompt"]
+  prompt --> llm["LLM turn"]
+  llm --> interpret["Interpret answer or tool calls"]
+  interpret -->|answer| answer_budget["Pre-answer budget"]
+  answer_budget --> answer_guard["Pre-answer guard"]
+  answer_guard --> commit["Commit answer"]
+  interpret -->|tool requests| plan["Plan tool execution"]
+  plan --> tool_budget["Pre-tool budget"]
+  tool_budget --> tool_guard["Review gate"]
+  tool_guard -->|allow| execute["Execute tools"]
+  tool_guard -->|review or wait| pending["Pending work"]
+  pending --> resume["ReviewDecision or ResumeSignal"]
+  resume --> execute
+  execute --> observe["Append observations"]
+  observe --> kernel
+""")
+```
+
+## Visualize The Actual Workflow
+
+`RunicAI.Coding.Agent.new/2` builds the workflow without running a turn. The
+rendered workflow shows the reusable integrated kernel shape; each submitted
+signal flows through the same processor.
+
+```elixir
+workflow_shape =
+  Agent.new(workspace,
+    mode: :verify,
+    model: "test:model",
+    client: RunicAI.Livebook.CodingDemo.text_client("shape only")
+  )
+
+RunicAI.Livebook.WorkflowViz.tabs(workflow_shape)
+```
+
+## Read-Only Repository QA
+
+This deterministic client asks for `find_files`, then `read_file`, then returns
+an answer. The summary exposes the reply, visible tools, tools used, trace
+events, and any risks.
+
+```elixir
+read_workflow =
+  Agent.read_only(workspace, "Where is Demo.answer/0?",
+    model: "test:model",
+    client: RunicAI.Livebook.CodingDemo.read_only_client()
+  )
+
+Agent.summary(read_workflow)
+```
+
+```elixir
+Kino.Layout.tabs(
+  Summary: Kino.Tree.new(Agent.summary(read_workflow)),
+  "Trace events": Kino.Tree.new(Agent.trace_events(read_workflow)),
+  Runtime: Kino.Tree.new(Agent.runtime_state(read_workflow)),
+  Emissions: Kino.Tree.new(Agent.emissions(read_workflow))
+)
+```
+
+## Patch Mode
+
+Patch mode adds the structured `apply_patch` tool. A patch result records
+changed paths, operation summaries, diagnostics, and before/after hashes.
+
+```elixir
+patch_root = RunicAI.Livebook.CodingDemo.sample_project!("standard-coding-agent-patch")
+patch_workspace = Workspace.new!(root: patch_root)
+
+patch_workflow =
+  Agent.patch(patch_workspace, "Change Demo.answer/0 to return 42.",
+    model: "test:model",
+    client: RunicAI.Livebook.CodingDemo.patch_client(42)
+  )
+
+Kino.Layout.tabs(
+  Summary: Kino.Tree.new(Agent.summary(patch_workflow)),
+  Source: Kino.Text.new(File.read!(Path.join(patch_root, "lib/demo.ex")))
+)
+```
+
+## HITL Review Gate
+
+The default coding review gate allows ordinary reads and safe patches, but it
+pauses before risky work such as deletes, hidden-file writes, shell/process
+operations, formatter writes, broad patches, and mutating git commands.
+
+```elixir
+Kino.Mermaid.new("""
+sequenceDiagram
+  participant Model
+  participant Workflow
+  participant ReviewGate
+  participant Human
+  participant Tool
+
+  Model->>Workflow: apply_patch delete .env
+  Workflow->>ReviewGate: GuardRequest at :pre_tool
+  ReviewGate-->>Workflow: ReviewDecision required
+  Workflow-->>Human: ReviewRequest with exact tool call
+  Human->>Workflow: approve, reject, edit, or cancel
+  Workflow->>Tool: execute approved or rewritten plan
+  Tool-->>Workflow: PatchResult observation
+  Workflow->>Model: observation in next turn
+""")
+```
+
+```elixir
+review_root =
+  "standard-coding-agent-review"
+  |> RunicAI.Livebook.CodingDemo.sample_project!()
+  |> RunicAI.Livebook.CodingDemo.add_old_file!()
+
+review_workspace = Workspace.new!(root: review_root)
+
+paused =
+  Agent.patch(review_workspace, "Remove the obsolete lib/old.ex file.",
+    model: "test:model",
+    client: RunicAI.Livebook.CodingDemo.destructive_patch_client()
+  )
+
+review_request = Agent.latest_review_request(paused)
+RunicAI.Livebook.CodingDemo.review_summary(review_request)
+```
+
+```elixir
+alias Runic.Workflow
+alias RunicAI.Coding.Review
+
+resumed =
+  Workflow.react_until_satisfied(paused, %{
+    review_decision: Review.allow(review_request)
+  })
+
+%{
+  old_file_exists?: File.exists?(Path.join(review_root, "lib/old.ex")),
+  summary: Agent.summary(resumed)
+}
+```
+
+## Sessions And Snapshots
+
+`RunicAI.Coding.Session` adapts the same agent to the runtime harness. Use it
+when your application wants durable snapshots, trace capture, interruption
+summaries, or a `RunicAI.Runtime.SessionSpec`.
+
+```elixir
+alias RunicAI.Coding.Session
+
+session =
+  Session.new(workspace,
+    mode: :read_only,
+    model: "test:model",
+    client: RunicAI.Livebook.CodingDemo.text_client("Demo.answer/0 returns 41.")
+  )
+  |> Session.submit(%{agent_id: "coding", user: "Explain Demo.answer/0."})
+
+Kino.Tree.new(Session.snapshot(session))
+```
+
+## Optional Live-Model Smoke
+
+Run this only after setting `OPENAI_API_KEY` in the setup cell.
+
+```elixir
+RunicAI.Livebook.Setup.require_openai_key!()
+
+model = RunicAI.Livebook.Setup.read_model!(setup)
+llm_opts =
+  RunicAI.Livebook.Setup.llm_opts(
+    model,
+    max_output_tokens: RunicAI.Livebook.Setup.read_max_output_tokens(setup)
+  )
+
+live_workflow =
+  Agent.read_only(workspace, "Explain the Demo module and cite the file you inspected.",
+    model: model,
+    llm_opts: llm_opts
+  )
+
+Agent.summary(live_workflow)
+```
+
+## Design Takeaways
+
+Use the standard coding agent when one workflow-owned loop is enough. Pick the
+smallest mode that exposes the needed tools, keep command policy narrow, keep
+review gates on for risky local effects, and use summaries plus trace events as
+the application-facing evidence of what happened.

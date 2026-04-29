@@ -255,6 +255,292 @@ defmodule RunicAI.Livebook.Tools do
   defp tool_result_seen?(_turn_request), do: false
 end
 
+defmodule RunicAI.Livebook.CodingDemo do
+  @moduledoc false
+
+  def sample_project!(prefix \\ "runic-ai-coding-livebook") do
+    root =
+      System.tmp_dir!()
+      |> Path.join("#{prefix}-#{System.unique_integer([:positive])}")
+      |> Path.expand()
+
+    File.mkdir_p!(Path.join(root, "lib"))
+    File.mkdir_p!(Path.join(root, "test"))
+
+    File.write!(Path.join(root, "AGENTS.md"), """
+    Prefer focused changes.
+    Run targeted tests before broad test suites.
+    """)
+
+    File.write!(Path.join(root, "mix.exs"), mix_project_source())
+    File.write!(Path.join(root, "lib/demo.ex"), demo_source(41))
+    File.write!(Path.join(root, "test/demo_test.exs"), demo_test_source(41))
+
+    root
+  end
+
+  def add_old_file!(root) do
+    File.write!(Path.join(root, "lib/old.ex"), "defmodule Old, do: nil\n")
+    root
+  end
+
+  def demo_source(value) when is_integer(value) do
+    """
+    defmodule Demo do
+      def answer, do: #{value}
+    end
+    """
+  end
+
+  def demo_test_source(value) when is_integer(value) do
+    """
+    defmodule DemoTest do
+      use ExUnit.Case, async: true
+
+      test "answer" do
+        assert Demo.answer() == #{value}
+      end
+    end
+    """
+  end
+
+  def result(text) when is_binary(text) do
+    RunicAI.LLM.Result.new!(RunicAI.Message.new!(:assistant, text),
+      finish_reason: :stop,
+      usage: %{input_tokens: 10, output_tokens: 5, total_tokens: 15}
+    )
+  end
+
+  def tool_call(name, arguments, opts \\ []) when is_binary(name) and is_map(arguments) do
+    ReqLLM.ToolCall.new(Keyword.get(opts, :id), name, Jason.encode!(arguments))
+  end
+
+  def tool_response(tool_calls, text \\ "") when is_list(tool_calls) and is_binary(text) do
+    message = ReqLLM.Context.assistant(text, tool_calls: tool_calls)
+
+    %ReqLLM.Response{
+      id: "livebook-test-#{System.unique_integer([:positive])}",
+      model: "test:fake-model",
+      context: ReqLLM.Context.new([message]),
+      message: message,
+      usage: %{input_tokens: 10, output_tokens: 5, total_tokens: 15},
+      finish_reason: :tool_calls
+    }
+  end
+
+  def text_client(text) when is_binary(text) do
+    fn _model, _prompt, _opts -> {:ok, result(text)} end
+  end
+
+  def read_only_client do
+    fn _model, prompt, _opts ->
+      case tool_count(prompt) do
+        0 ->
+          {:ok,
+           tool_response([
+             tool_call("find_files", %{path: ".", query: "demo", limit: 10}, id: "call_find")
+           ])}
+
+        1 ->
+          {:ok,
+           tool_response([
+             tool_call("read_file", %{path: "lib/demo.ex"}, id: "call_read")
+           ])}
+
+        _ ->
+          {:ok, result("Demo.answer/0 is defined in lib/demo.ex and returns 41.")}
+      end
+    end
+  end
+
+  def patch_client(value) when is_integer(value) do
+    fn _model, prompt, _opts ->
+      case tool_count(prompt) do
+        0 ->
+          {:ok,
+           tool_response([
+             tool_call(
+               "apply_patch",
+               %{operations: [%{op: "update", path: "lib/demo.ex", content: demo_source(value)}]},
+               id: "call_patch"
+             )
+           ])}
+
+        _ ->
+          {:ok, result("Changed files: lib/demo.ex. Verification: not run.")}
+      end
+    end
+  end
+
+  def destructive_patch_client do
+    fn _model, prompt, _opts ->
+      case tool_count(prompt) do
+        0 ->
+          {:ok,
+           tool_response([
+             tool_call(
+               "apply_patch",
+               %{operations: [%{op: "delete", path: "lib/old.ex"}]},
+               id: "call_delete"
+             )
+           ])}
+
+        _ ->
+          {:ok, result("Reviewed deletion was applied. Changed files: lib/old.ex.")}
+      end
+    end
+  end
+
+  def json_object_client(object) when is_map(object) do
+    json = Jason.encode!(object)
+    fn _model, _prompt, _opts -> {:ok, result(json)} end
+  end
+
+  def source_rows(environment) do
+    environment
+    |> RunicAI.Coding.RLM.CodebaseEnvironment.source_summaries()
+    |> Enum.map(fn row ->
+      %{
+        id: Map.get(row, :id),
+        path: Map.get(row, :path),
+        kind: Map.get(row, :kind),
+        size: Map.get(row, :size) || get_in(row, [:metadata, :size])
+      }
+    end)
+  end
+
+  def tool_rows(registry) do
+    registry.tools
+    |> Enum.map(fn tool ->
+      %{
+        name: tool.name,
+        description: tool.description
+      }
+    end)
+  end
+
+  def proposal_rows(proposal) do
+    Enum.map(proposal.nodes, fn node ->
+      %{
+        id: node.id,
+        kind: node.kind,
+        params: inspect(node.params, printable_limit: 200)
+      }
+    end)
+  end
+
+  def plan_rows(plan) do
+    Enum.map(plan.nodes, fn node ->
+      %{
+        id: node.id,
+        op: node.op,
+        parents: Enum.join(node.parent_ids, ", ")
+      }
+    end)
+  end
+
+  def episode_rows(episodes) do
+    Enum.map(episodes, fn episode ->
+      %{
+        id: episode.id,
+        node: episode.parent_node_id,
+        worker: episode.worker_id,
+        status: episode.status
+      }
+    end)
+  end
+
+  def proposal_mermaid(proposal) do
+    node_lines =
+      Enum.map(proposal.nodes, fn node ->
+        ~s(  #{mermaid_id(node.id)}["#{escape_label(node.id)}<br/>#{node.kind}"])
+      end)
+
+    edge_lines =
+      Enum.map(proposal.edges, fn edge ->
+        "  #{mermaid_id(edge.from)} --> #{mermaid_id(edge.to)}"
+      end)
+
+    Enum.join(["flowchart LR" | node_lines ++ edge_lines], "\n")
+  end
+
+  def plan_mermaid(plan) do
+    node_lines =
+      Enum.map(plan.nodes, fn node ->
+        ~s(  #{mermaid_id(node.id)}["#{escape_label(node.id)}<br/>#{node.op}"])
+      end)
+
+    edge_lines =
+      plan.nodes
+      |> Enum.flat_map(fn node ->
+        Enum.map(node.parent_ids, fn parent_id ->
+          "  #{mermaid_id(parent_id)} --> #{mermaid_id(node.id)}"
+        end)
+      end)
+
+    Enum.join(["flowchart LR" | node_lines ++ edge_lines], "\n")
+  end
+
+  def review_summary(nil), do: nil
+
+  def review_summary(review_request) do
+    guard_decision = Map.get(review_request.details, :guard_decision)
+    review_payload = review_payload(guard_decision)
+
+    %{
+      checkpoint: review_request.checkpoint,
+      resume_key: review_request.resume_key,
+      reason: field(review_payload, :reason),
+      subject: review_request.subject
+    }
+  end
+
+  defp review_payload(%{details: details}) when is_map(details) do
+    field(details, :review_request)
+  end
+
+  defp review_payload(_guard_decision), do: nil
+
+  defp field(nil, _key), do: nil
+  defp field(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
+  defp tool_count(prompt), do: prompt |> prompt_messages() |> Enum.count(&(&1.role == :tool))
+
+  defp prompt_messages(%RunicAI.Prompt{messages: messages}), do: messages
+  defp prompt_messages(%ReqLLM.Context{} = context), do: ReqLLM.Context.to_list(context)
+  defp prompt_messages(_prompt), do: []
+
+  defp mix_project_source do
+    """
+    defmodule Demo.MixProject do
+      use Mix.Project
+
+      def project do
+        [
+          app: :demo,
+          version: "0.1.0",
+          elixir: "~> 1.18",
+          deps: []
+        ]
+      end
+    end
+    """
+  end
+
+  defp mermaid_id(id) do
+    id
+    |> to_string()
+    |> String.replace(~r/[^a-zA-Z0-9_]/, "_")
+    |> then(&"n_#{&1}")
+  end
+
+  defp escape_label(label) do
+    label
+    |> to_string()
+    |> String.replace("\"", "\\\"")
+  end
+end
+
 defmodule RunicAI.Livebook.DevEndpoints do
   @moduledoc false
 
