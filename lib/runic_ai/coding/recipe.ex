@@ -12,7 +12,7 @@ defmodule RunicAI.Coding.Recipe do
   @read_tools ~w(list_dir find_files read_file read_range read_many search_text search_regex)
   @git_read_tools ~w(git_status git_diff git_log git_show git_branch)
   @patch_tools ~w(apply_patch)
-  @verification_tools ~w(compile_project run_tests run_formatter)
+  @verification_tools ~w(compile_project run_tests run_formatter project_command runtime_smoke source_assert changed_file_inventory)
 
   @valid_modes [:read_only, :patch, :verify]
 

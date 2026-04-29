@@ -5,6 +5,7 @@ defmodule RunicAI.Coding.StandardAgentTest do
   alias RunicAI.Coding.Patch
   alias RunicAI.Coding.Prompt
   alias RunicAI.Coding.Recipe
+  alias RunicAI.Coding.StandardAgent.ObjectiveGate
   alias RunicAI.Coding.Workspace
   alias RunicAI.LLM.TestClient
   alias RunicAI.Prompt, as: TurnPrompt
@@ -256,7 +257,149 @@ defmodule RunicAI.Coding.StandardAgentTest do
     assert summary.risks == []
   end
 
+  test "objective gate continues after premature final answer until evidence is satisfied" do
+    root = passing_mix_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, %TurnPrompt{messages: messages}, _opts ->
+      case {tool_count(messages), assistant_count(messages)} do
+        {0, _} ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call("run_tests", %{args: ["test/smoke_test.exs"]}, id: "call_1")
+           ])}
+
+        {1, 1} ->
+          {:ok, TestClient.result("Done.")}
+
+        {1, _} ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call(
+               "apply_patch",
+               %{
+                 operations: [
+                   %{op: "update", path: "lib/smoke.ex", content: smoke_with_extra_source()}
+                 ]
+               },
+               id: "call_2"
+             )
+           ])}
+
+        {2, _} ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call("run_tests", %{args: ["test/smoke_test.exs"]}, id: "call_3")
+           ])}
+
+        _ ->
+          {:ok, TestClient.result("Changed files: lib/smoke.ex. Verification: run_tests pass.")}
+      end
+    end
+
+    workflow =
+      Agent.verify(workspace, "Add Smoke.extra/0.",
+        model: "test:model",
+        client: client,
+        objective_gate?: true,
+        max_turns: 6
+      )
+
+    summary = Agent.summary(workflow)
+    evaluation = Agent.objective_evaluation(workflow, workspace, "Add Smoke.extra/0.")
+
+    assert File.read!(Path.join(root, "lib/smoke.ex")) == smoke_with_extra_source()
+    assert summary.changed_files == ["lib/smoke.ex"]
+    assert "apply_patch" in summary.tools_used
+    assert ObjectiveGate.satisfied?(evaluation)
+  end
+
+  test "standard objective gate uses shared scorecard latest command evidence" do
+    root = passing_mix_project()
+    workspace = Workspace.new!(root: root)
+
+    context = %{
+      changed_files: ["lib/smoke.ex"],
+      command_results: [
+        %{argv: ["mix", "test"], cwd: root, status: :fail, output_preview: "old failure"},
+        %{argv: ["mix", "test"], cwd: root, status: :pass, output_preview: "1 test, 0 failures"}
+      ]
+    }
+
+    evaluation = ObjectiveGate.evaluate(workspace, "Fix tests.", context)
+
+    assert evaluation.status == :objective_satisfied
+    assert evaluation.blocking_acceptance == []
+  end
+
+  test "standard objective gate normalizes malformed argv and relative cwd evidence" do
+    root = passing_mix_project()
+    workspace = Workspace.new!(root: root)
+
+    context = %{
+      changed_files: ["mix.exs"],
+      command_results: [
+        %{argv: ["mix test"], cwd: ".", status: :blocked, output_preview: "blocked by policy"},
+        %{argv: ["mix", "test"], cwd: root, status: :pass, output_preview: "1 test, 0 failures"}
+      ]
+    }
+
+    evaluation = ObjectiveGate.evaluate(workspace, "Verify project.", context)
+
+    assert evaluation.status == :objective_satisfied
+    assert evaluation.blocking_acceptance == []
+    assert [%{argv: ["mix", "test"], status: :pass}] = evaluation.latest_command_results
+  end
+
+  test "standard objective gate treats wrong-directory failure as superseded repair evidence" do
+    root = passing_mix_project()
+    nested = Path.join(root, "field_service_poc")
+    File.mkdir_p!(nested)
+    workspace = Workspace.new!(root: root)
+
+    context = %{
+      changed_files: ["field_service_poc/lib/app.ex"],
+      command_results: [
+        %{argv: ["mix", "test"], cwd: root, status: :fail, output_preview: "no mix.exs"},
+        %{
+          argv: ["mix", "test"],
+          cwd: nested,
+          status: :pass,
+          output_preview: "4 tests, 0 failures"
+        }
+      ]
+    }
+
+    evaluation = ObjectiveGate.evaluate(workspace, "Verify nested project.", context)
+
+    assert evaluation.status == :objective_satisfied
+    assert evaluation.blocking_acceptance == []
+
+    assert [%{argv: ["mix", "test"], cwd: ^nested, status: :pass}] =
+             evaluation.latest_command_results
+  end
+
+  test "standard objective gate keeps latest failed verification blocking" do
+    root = passing_mix_project()
+    workspace = Workspace.new!(root: root)
+
+    context = %{
+      changed_files: ["lib/smoke.ex"],
+      command_results: [
+        %{argv: ["mix", "test"], cwd: root, status: :pass, output_preview: "1 test, 0 failures"},
+        %{argv: ["mix", "test"], cwd: root, status: :fail, output_preview: "1 failure"}
+      ]
+    }
+
+    evaluation = ObjectiveGate.evaluate(workspace, "Fix tests.", context)
+
+    assert evaluation.status == :objective_incomplete
+    assert [%{status: :fail}] = evaluation.latest_command_results
+    assert [%{status: :fail, type: :command_passes}] = evaluation.blocking_acceptance
+  end
+
   defp tool_count(messages), do: messages |> tool_messages() |> length()
+  defp assistant_count(messages), do: messages |> Enum.count(&(&1.role == :assistant))
   defp tool_messages(messages), do: Enum.filter(messages, &(&1.role == :tool))
 
   defp sample_project do
@@ -302,6 +445,12 @@ defmodule RunicAI.Coding.StandardAgentTest do
     root
   end
 
+  defp passing_mix_project do
+    root = failing_mix_project()
+    File.write!(Path.join(root, "lib/smoke.ex"), smoke_source(42))
+    root
+  end
+
   defp demo_source(answer) do
     """
     defmodule Demo do
@@ -314,6 +463,15 @@ defmodule RunicAI.Coding.StandardAgentTest do
     """
     defmodule Smoke do
       def answer, do: #{answer}
+    end
+    """
+  end
+
+  defp smoke_with_extra_source do
+    """
+    defmodule Smoke do
+      def answer, do: 42
+      def extra, do: :ok
     end
     """
   end

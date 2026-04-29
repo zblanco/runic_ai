@@ -38,6 +38,7 @@ defmodule RunicAI.Coding.Prompt do
       "- Summarize the concrete change or answer.",
       "- List changed files when patches were applied.",
       "- List verification commands and their pass/fail/timeout status when commands were run.",
+      "- Report objective status when an objective gate or scorecard is active.",
       "- Call out unresolved risks, skipped verification, or remaining failures.",
       custom
     ]
@@ -161,6 +162,14 @@ defmodule RunicAI.Coding.Prompt do
     Run broader Mix compile/test/format commands when the risk or previous output warrants it.
     After failed verification, repair within the remaining turn budget and verify again.
     Stop when verification passes or the repair budget is exhausted.
+    Use an OODA loop for nontrivial work: observe the current workspace and
+    tool results, orient against the requested objective and evidence, decide
+    the next smallest repair or verification action, then act through tools.
+    Do not treat generated scaffold tests as sufficient proof for a feature
+    objective. When creating a nested project, run verification from that
+    project's directory. If delegate or subagent tools are available, use them
+    only for clearly separable work and integrate their results through the
+    same verification evidence.
     """
   end
 
@@ -170,6 +179,8 @@ defmodule RunicAI.Coding.Prompt do
     In apply_patch operations, use create only for paths that do not exist and update for paths that already exist.
     Run the available Mix compile, test, or formatter tools to verify changes.
     Repair failed verification within the remaining turn budget.
+    For nontrivial work, continue until concrete evidence supports the user
+    objective or until remaining risks must be reported explicitly.
     """
   end
 

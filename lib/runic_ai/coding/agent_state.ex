@@ -14,7 +14,7 @@ defmodule RunicAI.Coding.AgentState do
   alias RunicAI.Recipes.IntegratedToolAgent
   alias RunicAI.Trace.Event
 
-  @verification_tools ~w(compile_project run_tests run_formatter run_linter)
+  @verification_tools ~w(compile_project run_tests run_formatter run_linter project_command runtime_smoke source_assert)
 
   @type summary :: %{
           required(:status) => atom() | nil,
@@ -24,7 +24,9 @@ defmodule RunicAI.Coding.AgentState do
           required(:changed_files) => [String.t()],
           required(:patches) => [map()],
           required(:verifications) => [map()],
-          required(:risks) => [String.t()]
+          required(:risks) => [String.t()],
+          required(:objective_status) => atom() | nil,
+          required(:objective_scorecard) => map() | nil
         }
 
   @spec summary(Workflow.t() | SessionState.t() | nil, String.t() | atom()) :: summary()
@@ -50,7 +52,9 @@ defmodule RunicAI.Coding.AgentState do
       changed_files: changed_files(patches),
       patches: patches,
       verifications: verifications,
-      risks: risks(verifications)
+      risks: risks(verifications),
+      objective_status: nil,
+      objective_scorecard: nil
     }
   end
 
@@ -63,7 +67,9 @@ defmodule RunicAI.Coding.AgentState do
       changed_files: [],
       patches: [],
       verifications: [],
-      risks: ["coding session was not found"]
+      risks: ["coding session was not found"],
+      objective_status: nil,
+      objective_scorecard: nil
     }
   end
 
@@ -140,6 +146,9 @@ defmodule RunicAI.Coding.AgentState do
       %{
         tool: message.name,
         status: atomish(result, :status),
+        command: field(result, :command),
+        argv: field(result, :argv),
+        cwd: field(result, :cwd),
         exit_status: field(result, :exit_status),
         output_preview: field(result, :output_preview) || field(result, :output),
         truncated?: field(result, :truncated?) || false,

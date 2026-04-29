@@ -16,6 +16,7 @@ defmodule RunicAI.Coding.Agent do
   alias RunicAI.Coding.Recipe
   alias RunicAI.Coding.RecipeSelector
   alias RunicAI.Coding.ReviewGate
+  alias RunicAI.Coding.StandardAgent.ObjectiveGate
   alias RunicAI.Coding.Tools
   alias RunicAI.Coding.Workspace
   alias RunicAI.Control.BudgetPolicy
@@ -60,13 +61,72 @@ defmodule RunicAI.Coding.Agent do
       when is_binary(task) and is_list(opts) do
     workspace = Workspace.from_input!(workspace_input)
     recipe = recipe_from_task(task, opts)
+    opts = Keyword.put_new(opts, :objective, task)
 
-    workspace
-    |> new(Keyword.put(opts, :recipe, recipe))
-    |> Workflow.react_until_satisfied(%{
-      agent_id: Keyword.get(opts, :agent_id, @default_agent_id),
-      user: Prompt.user(task, workspace, recipe, opts)
-    })
+    workflow =
+      workspace
+      |> new(Keyword.put(opts, :recipe, recipe))
+      |> Workflow.react_until_satisfied(%{
+        agent_id: Keyword.get(opts, :agent_id, @default_agent_id),
+        user: Prompt.user(task, workspace, recipe, opts)
+      })
+
+    maybe_run_objective_loop(workflow, workspace, task, recipe, opts)
+  end
+
+  defp maybe_run_objective_loop(
+         %Workflow{} = workflow,
+         %Workspace{} = workspace,
+         objective,
+         recipe,
+         opts
+       ) do
+    if Keyword.get(opts, :objective_gate?, false) do
+      objective_opts =
+        opts
+        |> Keyword.put_new(:require_changes?, recipe.mode in [:patch, :verify])
+        |> Keyword.put_new(:require_verification?, recipe.mode == :verify)
+
+      run_objective_loop(
+        workflow,
+        workspace,
+        objective,
+        recipe,
+        objective_opts,
+        Keyword.get(opts, :objective_gate_max_iterations, 4)
+      )
+    else
+      workflow
+    end
+  end
+
+  defp run_objective_loop(%Workflow{} = workflow, _workspace, _objective, _recipe, _opts, 0),
+    do: workflow
+
+  defp run_objective_loop(
+         %Workflow{} = workflow,
+         %Workspace{} = workspace,
+         objective,
+         recipe,
+         opts,
+         iterations_left
+       ) do
+    evaluation = objective_evaluation(workflow, workspace, objective, opts)
+
+    if evaluation && ObjectiveGate.satisfied?(evaluation) do
+      workflow
+    else
+      repair_prompt =
+        (evaluation && evaluation.repair_prompt) ||
+          "Continue repairing the objective with concrete verification evidence."
+
+      workflow
+      |> Workflow.react_until_satisfied(%{
+        agent_id: Keyword.get(opts, :agent_id, @default_agent_id),
+        user: repair_prompt <> "\n\nRun mode:\n" <> to_string(recipe.mode)
+      })
+      |> run_objective_loop(workspace, objective, recipe, opts, iterations_left - 1)
+    end
   end
 
   @spec read_only(Workspace.t() | keyword() | map() | Path.t(), String.t(), keyword()) ::
@@ -104,6 +164,22 @@ defmodule RunicAI.Coding.Agent do
   @spec summary(Workflow.t(), String.t() | atom()) :: AgentState.summary()
   def summary(%Workflow{} = workflow, agent_id \\ @default_agent_id) do
     AgentState.summary(workflow, agent_id)
+  end
+
+  @spec objective_evaluation(
+          Workflow.t(),
+          Workspace.t() | keyword() | map() | Path.t(),
+          String.t(),
+          keyword()
+        ) ::
+          map() | nil
+  def objective_evaluation(%Workflow{} = workflow, workspace_input, objective, opts \\ [])
+      when is_binary(objective) and is_list(opts) do
+    with %{} = session <-
+           IntegratedToolAgent.session(workflow, Keyword.get(opts, :agent_id, @default_agent_id)) do
+      workspace = Workspace.from_input!(workspace_input)
+      ObjectiveGate.evaluate(workspace, objective, session, opts)
+    end
   end
 
   @spec trace_events(Workflow.t(), String.t() | atom()) :: [RunicAI.Trace.Event.t()]
@@ -256,10 +332,31 @@ defmodule RunicAI.Coding.Agent do
       pre_tool_guard: pre_tool_guard_from_opts(opts),
       pre_answer_guard: Keyword.get(opts, :pre_answer_guard),
       stop_pattern: Keyword.get(opts, :stop_pattern),
-      continue_when: Keyword.get(opts, :continue_when),
+      continue_when: continue_when_from_opts(workspace, recipe, opts),
       final_pattern: Keyword.get(opts, :final_pattern),
       final_when: Keyword.get(opts, :final_when)
     ]
+  end
+
+  defp continue_when_from_opts(%Workspace{} = workspace, %Recipe{} = recipe, opts) do
+    cond do
+      Keyword.has_key?(opts, :continue_when) ->
+        Keyword.fetch!(opts, :continue_when)
+
+      Keyword.get(opts, :objective_gate?, false) ->
+        objective = Keyword.get(opts, :objective, "")
+
+        ObjectiveGate.continue_when(
+          workspace,
+          objective,
+          opts
+          |> Keyword.put_new(:max_turns, recipe.max_turns)
+          |> Keyword.put_new(:require_changes?, recipe.mode in [:patch, :verify])
+        )
+
+      true ->
+        nil
+    end
   end
 
   defp budget_policy_from_opts(_recipe, opts) do
@@ -302,6 +399,8 @@ defmodule RunicAI.Coding.Agent do
     |> Map.merge(%{
       coding_agent?: true,
       workspace_root: workspace.root,
+      objective: Keyword.get(opts, :objective),
+      objective_gate?: Keyword.get(opts, :objective_gate?, false),
       mode: recipe.mode,
       recipe: recipe.name,
       dry_run?: recipe.dry_run?
