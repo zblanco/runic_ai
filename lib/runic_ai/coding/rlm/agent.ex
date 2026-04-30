@@ -72,11 +72,19 @@ defmodule RunicAI.Coding.RLM.Agent do
           {:ok, run_result()} | {:error, Error.t()}
   def run(workspace_input, objective, opts \\ [])
       when is_binary(objective) and is_list(opts) do
-    RuntimeBudget.run(fn -> run_unbounded(workspace_input, objective, opts) end,
+    run_id = Checkpoint.run_id(opts)
+    opts = Keyword.put_new(opts, :run_id, run_id)
+
+    fn -> run_unbounded(workspace_input, objective, opts) end
+    |> RuntimeBudget.run(
       timeout_ms: Keyword.get(opts, :max_runtime_ms),
       stage: :rlm_agent_run,
       objective: objective
     )
+    |> tap(fn
+      {:error, error} -> emit_stage(opts, :failed, :error, %{error: error})
+      _other -> :ok
+    end)
   end
 
   defp run_unbounded(workspace_input, objective, opts) do
@@ -87,8 +95,15 @@ defmodule RunicAI.Coding.RLM.Agent do
       |> Keyword.put_new(:run_id, run_id)
       |> put_run_metadata(run_id, objective)
 
+    emit_stage(opts, :started, :running, %{objective: objective})
+
     with {:ok, environment} <- prepare(workspace_input, opts),
          persistence = environment.workspace.persistence,
+         :ok <-
+           emit_stage(opts, :environment_prepared, :ok, %{
+             workspace_root: environment.workspace.root,
+             source_count: map_size(environment.source_index.refs_by_id)
+           }),
          _prepared_ref <-
            Checkpoint.record_best_effort(
              persistence,
@@ -108,6 +123,11 @@ defmodule RunicAI.Coding.RLM.Agent do
              run_id: run_id,
              input: %{objective: objective}
            ),
+         :ok <-
+           emit_stage(opts, :proposal_received, report.status, %{
+             proposal: proposal,
+             validation_report: report
+           }),
          {:ok, compiled} <-
            Checkpoint.result(
              persistence,
@@ -116,6 +136,7 @@ defmodule RunicAI.Coding.RLM.Agent do
              run_id: run_id,
              proposal_id: proposal.id
            ),
+         :ok <- emit_stage(opts, :compile_completed, :ok, %{compiled: compiled}),
          {:ok, execution} <-
            Checkpoint.result(
              persistence,
@@ -125,7 +146,8 @@ defmodule RunicAI.Coding.RLM.Agent do
              end,
              run_id: run_id,
              proposal_id: proposal.id
-           ) do
+           ),
+         :ok <- emit_stage(opts, :execution_completed, :ok, execution) do
       initial_result =
         Map.merge(execution, %{
           proposal: proposal,
@@ -135,16 +157,32 @@ defmodule RunicAI.Coding.RLM.Agent do
         })
         |> ProgressGate.apply(opts)
 
+      emit_stage(opts, :progress_gate_completed, :ok, %{
+        objective_scorecard: Map.get(initial_result, :objective_scorecard),
+        repair_needs: get_in(initial_result, [:context, :repair_needs])
+      })
+
       with {:ok, result} <- maybe_repair(initial_result, environment, opts) do
         result =
           if Keyword.get(opts, :persist?, not is_nil(environment.workspace.persistence)) do
             case Persistence.persist(result) do
-              {:ok, ref} -> Map.put(result, :persistence_ref, ref)
-              {:error, error} -> Map.put(result, :persistence_error, error)
+              {:ok, ref} ->
+                emit_stage(opts, :persistence_completed, :ok, %{persistence_ref: ref})
+                Map.put(result, :persistence_ref, ref)
+
+              {:error, error} ->
+                emit_stage(opts, :persistence_completed, :error, %{error: error})
+                Map.put(result, :persistence_error, error)
             end
           else
             result
           end
+
+        emit_stage(opts, :completed, :ok, %{
+          objective_scorecard: Map.get(result, :objective_scorecard),
+          repair_status: Map.get(result, :repair_status),
+          persistence_ref: Map.get(result, :persistence_ref)
+        })
 
         {:ok, result}
       end
@@ -204,5 +242,29 @@ defmodule RunicAI.Coding.RLM.Agent do
     else
       {:ok, result}
     end
+  end
+
+  defp emit_stage(opts, stage, status, data) do
+    sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+
+    if is_function(sink, 1) do
+      event = %{
+        id:
+          "rlm-stage:#{Keyword.get(opts, :run_id)}:#{stage}:#{System.unique_integer([:positive])}",
+        run_id: Keyword.get(opts, :run_id),
+        stage: stage,
+        status: status,
+        at: DateTime.utc_now(),
+        data: data
+      }
+
+      try do
+        sink.(event)
+      rescue
+        _exception -> :ok
+      end
+    end
+
+    :ok
   end
 end

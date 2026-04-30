@@ -6,10 +6,9 @@ FieldService smoke runner, and live mini smoke verification are implemented
 
 Date: 2026-04-29
 
-Last verified: 2026-04-29 (`mix compile --warnings-as-errors`;
+Last verified: 2026-04-30 (`mix compile --warnings-as-errors`;
 `mix test test/runic_ai/coding/standard_agent_test.exs`;
-`mix test test/runic_ai/coding/standard_agent_test.exs
-test/runic_ai/coding/standard_agent_remaining_test.exs`; `mix test`; live
+`mix test test/runic_ai/coding/standard_agent_remaining_test.exs`; `mix test`; live
 `openai:gpt-5.4-mini` FieldService smoke)
 
 Motivated by:
@@ -207,7 +206,7 @@ Deliverables:
 
 Validation:
 
-- [ ] Dry fixture can run with scripted/fake clients without network.
+- [x] Dry fixture can run with scripted/fake clients without network.
 - [x] Live smoke can run with `openai:gpt-5.4-mini`.
 - [x] Baseline result records whether the current standard agent succeeds,
       partially succeeds, or overclaims completion.
@@ -265,7 +264,7 @@ Validation:
       forces continuation or incomplete final answer.
 - [x] Scripted model fixes missing implementation activity after passing tests;
       gate permits final success.
-- [ ] Scripted model exhausts repair budget; summary reports incomplete
+- [x] Scripted model exhausts repair budget; summary reports incomplete
       scorecard and risks.
 
 ## Phase 3: Workspace Delta And Repair Attempt Evidence
@@ -274,22 +273,22 @@ Deliverables:
 
 - [x] Add shared `WorkspaceDelta` and `RepairAttempt` modules usable by
       StandardAgent and RLM.
-- [ ] Capture before/after snapshots around each mutating action group or
+- [x] Capture before/after snapshots around each mutating action group or
       repair turn.
-- [ ] Record created, modified, deleted, and changed paths in the agent
+- [x] Record created, modified, deleted, and changed paths in the agent
       summary.
-- [ ] Attach repair attempt evidence to session metadata or trace events.
-- [ ] Make timeout/exhaustion observations salvageable: if files changed before
+- [x] Attach repair attempt evidence to session metadata or trace events.
+- [x] Make timeout/exhaustion observations salvageable: if files changed before
       the budget stopped the agent, the next orientation step should verify the
       workspace rather than discard the attempt.
-- [ ] Preserve checkpoint/persistence hooks through existing RunicAI coding
+- [x] Preserve checkpoint/persistence hooks through existing RunicAI coding
       persistence instead of adding a new storage mechanism.
 
 Validation:
 
-- [ ] Unit test workspace delta excludes build/dependency directories.
-- [ ] Unit test timed/exhausted repair attempt still reports changed files.
-- [ ] Session resume preserves repair attempt evidence.
+- [x] Unit test workspace delta excludes build/dependency directories.
+- [x] Unit test timed/exhausted repair attempt still reports changed files.
+- [x] Session resume preserves repair attempt evidence.
 
 ## Phase 4: Prompt And ReAct Loop Contract
 
@@ -307,14 +306,14 @@ Deliverables:
       creating a nested project.
 - [x] Add guidance to use semantic objective requirements and deterministic
       checks as the acceptance checklist.
-- [ ] Keep read-only and patch-only prompts lightweight; the full OODA contract
+- [x] Keep read-only and patch-only prompts lightweight; the full OODA contract
       should primarily apply to verify mode and named repair recipes.
 
 Validation:
 
-- [ ] Prompt tests assert OODA/scorecard language only appears where intended.
-- [ ] Existing read-only prompt tests remain concise and unchanged in behavior.
-- [ ] Scripted nested-project task verifies commands run in the generated
+- [x] Prompt tests assert OODA/scorecard language only appears where intended.
+- [x] Existing read-only prompt tests remain concise and unchanged in behavior.
+- [x] Scripted nested-project task verifies commands run in the generated
       project directory.
 
 ## Phase 5: Command And Verification Freshness
@@ -336,7 +335,7 @@ Validation:
 - [x] Failing `mix test` at workspace root followed by passing `mix test` in a
       nested project results in satisfied command evidence.
 - [x] Failed latest command remains blocking.
-- [ ] Source assertions and runtime smokes appear in summaries and trace events.
+- [x] Source assertions and runtime smokes appear in summaries and trace events.
 
 ## Phase 6: StandardAgent FieldService OODA Smoke
 
@@ -368,20 +367,20 @@ Validation:
 
 Deliverables:
 
-- [ ] Add deterministic StandardAgent regression fixtures based on the
+- [x] Add deterministic StandardAgent regression fixtures based on the
       FieldService smoke.
-- [ ] Store representative successful and failed trajectories.
-- [ ] Add compact report generation shared with the RLM smoke where possible.
-- [ ] Report should separate:
+- [x] Store representative successful and failed trajectories.
+- [x] Add compact report generation shared with the RLM smoke where possible.
+- [x] Report should separate:
       model trajectory, tool evidence, objective scorecard, independent
       verification, and residual risk.
-- [ ] Add a comparison section for StandardAgent vs RLM on the same exercise.
+- [x] Add a comparison section for StandardAgent vs RLM on the same exercise.
 
 Validation:
 
-- [ ] Regression fixtures can run in tests without live LLM calls.
-- [ ] Live smoke artifacts are readable without requiring the original process.
-- [ ] Report makes overclaiming obvious when the model says complete but the
+- [x] Regression fixtures can run in tests without live LLM calls.
+- [x] Live smoke artifacts are readable without requiring the original process.
+- [x] Report makes overclaiming obvious when the model says complete but the
       scorecard or independent verifier disagrees.
 
 ## Expected Outcome

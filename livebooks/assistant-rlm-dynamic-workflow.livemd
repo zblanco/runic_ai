@@ -1,0 +1,470 @@
+# Assistant RLM Dynamic Workflow Walkthrough
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.19"},
+  {:runic_ai, path: "~/wrk/runic_ai"}
+])
+
+Code.require_file("support/runic_ai_livebook.exs", __DIR__)
+```
+
+## What This Notebook Teaches
+
+This notebook explains one real assistant RLM run from the terminal harness:
+
+```sh
+mix runic_ai.agent \
+  "Read /home/doops/wrk/runic_ai/tmp/wandering-inn-10-59-t.md and write a wiki-style chapter page
+  in .docs with overview, events by actor, notable characters, plot points,
+  reveals, and takeaways." \
+  --agent assistant \
+  --input tmp/wandering-inn-10-59-t.md \
+  --output .docs/wandering-inn-10-59-t-summary.md \
+  --allow-generated-functions tier1 \
+  --write-policy docs-only \
+  --detail expanded \
+  --jsonl tmp/wandering-inn-10-59-t.assistant-rlm.jsonl \
+  --max-runtime-ms 900000
+```
+
+The important idea is not "chapter summarization." The important idea is that
+the assistant route treated the request as a workflow-generation problem:
+
+* parse a terminal command into an objective, source, output, policy, and trace
+  target
+* generate an inert workflow blueprint as data
+* validate graph, function-tier, and write-policy constraints
+* compile the blueprint into trusted Runic components backed by anonymous
+  functions and generic RLM components
+* run bounded LLM calls over materialized slices instead of pushing the whole
+  chapter into one prompt
+* write a durable artifact and produce an evidence scorecard
+
+This notebook reads the JSONL trace from the completed run, reconstructs the
+workflow, and shows the prompts that were used by the generated LLM nodes.
+
+## Load The Trace
+
+The notebook is replaying evidence from the terminal harness. It does not make
+another provider call.
+
+```elixir
+project_root = Path.expand("..", __DIR__)
+trace_path = Path.join(project_root, "tmp/wandering-inn-10-59-t.assistant-rlm.jsonl")
+artifact_path = Path.join(project_root, ".docs/wandering-inn-10-59-t-summary.md")
+
+events =
+  trace_path
+  |> File.stream!()
+  |> Stream.map(&String.trim/1)
+  |> Stream.reject(&(&1 == ""))
+  |> Enum.map(&Jason.decode!/1)
+
+%{
+  trace_path: Path.relative_to(trace_path, project_root),
+  event_count: length(events),
+  artifact_path: Path.relative_to(artifact_path, project_root),
+  artifact_exists?: File.exists?(artifact_path)
+}
+```
+
+```elixir
+event_rows =
+  Enum.map(events, fn event ->
+    %{
+      at: event["at"],
+      phase: event["phase"],
+      kind: event["kind"],
+      status: event["status"],
+      title: event["title"]
+    }
+  end)
+
+Kino.DataTable.new(event_rows)
+```
+
+## Terminal Harness Path
+
+`mix runic_ai.agent` is intentionally a presentation layer around backend
+agents. The Mix task parses CLI options, opens the JSONL sink, starts the
+assistant runner, and then renders normalized `RunicAI.Terminal.Event` values.
+
+For this run:
+
+* `--agent assistant` selected `RunicAI.Terminal.AssistantRunner`
+* `--input` declared a source path for the generated workflow
+* `--output` declared the artifact target
+* `--allow-generated-functions tier1` allowed parameterized built-ins and the
+  restricted expression interpreter, but no arbitrary Elixir source execution
+* `--write-policy docs-only` restricted writes to `.docs`
+* `--jsonl` made the run replayable by this notebook
+
+```elixir
+Kino.Mermaid.new("""
+flowchart TD
+  MixTask["Mix.Tasks.RunicAi.Agent<br/>parse argv"]
+  Options["CliOptions<br/>agent/input/output/policy/jsonl"]
+  Runner["AgentRunner<br/>presentation + JSONL sink"]
+  AssistantRunner["AssistantRunner<br/>task wrapper + stage events"]
+  Agent["RunicAI.Assistant.RLM.Agent"]
+  Events["RunicAI.Terminal.Event<br/>presentation-neutral events"]
+  Presenter["EventPresenter<br/>expanded terminal output"]
+  JSONL["JsonlSink<br/>tmp/wandering-inn-10-59-t.assistant-rlm.jsonl"]
+
+  MixTask --> Options
+  Options --> Runner
+  Runner --> AssistantRunner
+  AssistantRunner --> Agent
+  Agent -. "stage maps" .-> AssistantRunner
+  AssistantRunner --> Events
+  Events --> Presenter
+  Events --> JSONL
+""")
+```
+
+## What The Assistant Generated
+
+The assistant route generated a workflow blueprint named
+`assistant:generic_report`. In this first implementation the coordinator chose a
+generic fallback shape because the command had a clear source file, a target
+artifact, and a report-style objective. That choice is still dynamic workflow
+generation: the workflow is built as data, validated, compiled, and executed for
+this request. It is not a hard-coded chapter extractor.
+
+```elixir
+proposal_event = Enum.find(events, &(&1["phase"] == "proposed"))
+proposal = proposal_event["data"]["proposal"]
+
+node_rows =
+  Enum.map(proposal["nodes"], fn node ->
+    %{
+      id: node["id"],
+      kind: node["kind"],
+      dependencies: Enum.join(node["dependencies"], ", "),
+      params: inspect(node["params"], printable_limit: 180)
+    }
+  end)
+
+Kino.Layout.tabs(
+  "Blueprint nodes": Kino.DataTable.new(node_rows),
+  "Blueprint data": Kino.Tree.new(proposal)
+)
+```
+
+```elixir
+Kino.Mermaid.new("""
+flowchart LR
+  Source["source_1<br/>tmp/wandering-inn-10-59-t.md"]
+  Split["split_sources<br/>source_splitter<br/>paragraph split<br/>43 slices"]
+  Materialize["materialize_slices<br/>source_materializer<br/>20 retained<br/>truncated: true"]
+  Map["extract_slice_notes<br/>llm_map<br/>20 slice-note calls"]
+  Synthesize["synthesize_report<br/>llm_leaf<br/>hierarchical reduce"]
+  Write["write_artifact<br/>artifact_writer<br/>.docs/wandering-inn-10-59-t-summary.md"]
+  Verify["verify_objective<br/>verification<br/>objective_satisfied"]
+
+  Source --> Split
+  Split --> Materialize
+  Materialize --> Map
+  Map --> Synthesize
+  Synthesize --> Write
+  Write --> Verify
+""")
+```
+
+## Why This Workflow Shape
+
+The objective was a long-document synthesis task with a durable artifact target.
+A direct prompt would have poor auditability and could hit context limits. The
+generated graph uses a safer decomposition:
+
+```elixir
+Kino.DataTable.new([
+  %{
+    pressure: "Long source document",
+    workflow_decision: "split_sources",
+    reason: "Create bounded source slices with provenance instead of one giant prompt."
+  },
+  %{
+    pressure: "Model context and cost limits",
+    workflow_decision: "materialize_slices",
+    reason: "Cap slice bytes and total bytes before LLM calls."
+  },
+  %{
+    pressure: "Need coherent coverage",
+    workflow_decision: "extract_slice_notes",
+    reason: "Ask the model for useful notes per slice, keeping each call bounded."
+  },
+  %{
+    pressure: "Need one wiki-style page",
+    workflow_decision: "synthesize_report",
+    reason: "Reduce mapped notes into a single report rather than concatenating raw slice output."
+  },
+  %{
+    pressure: "Durable deliverable",
+    workflow_decision: "write_artifact",
+    reason: "Write through workspace path policy using docs-only mutation."
+  },
+  %{
+    pressure: "Evidence of completion",
+    workflow_decision: "verify_objective",
+    reason: "Check that the requested artifact exists and record an objective scorecard."
+  }
+])
+```
+
+## Architecture Concepts
+
+RunicAI separates the generated plan from the trusted runtime. The model or
+coordinator can propose data, but trusted Elixir code owns validation,
+compilation, file access, and LLM invocation.
+
+```elixir
+Kino.Mermaid.new("""
+flowchart TD
+  Objective["Objective + sources + policies"]
+  Manifest["Capability manifest<br/>component types<br/>function tiers<br/>write policy<br/>budgets"]
+  Blueprint["WorkflowBlueprint<br/>inert data"]
+  Components["ComponentBlueprints<br/>type + params + edges"]
+  Functions["FunctionBlueprints<br/>Tier 0 built-ins<br/>Tier 1 expressions"]
+  Validator["BlueprintValidator<br/>graph + policy checks"]
+  Compiler["WorkflowCompiler<br/>trusted closure construction"]
+  Runic["Runic workflow graph"]
+  Runtime["Sequential execution in this run<br/>events + episodes + artifacts"]
+
+  Objective --> Manifest
+  Manifest --> Blueprint
+  Blueprint --> Components
+  Blueprint --> Functions
+  Components --> Validator
+  Functions --> Validator
+  Validator --> Compiler
+  Compiler --> Runic
+  Runic --> Runtime
+""")
+```
+
+The safety boundary is the key design point:
+
+* Tier 0: parameterized built-ins such as `join`, `get`, `template`, `dedupe_by`
+* Tier 1: a restricted expression language interpreted by trusted code
+* Tier 2: arbitrary Elixir function blueprints are not executed by this path
+  unless a future review-gated validator accepts them
+* writes are routed through workspace path policy, and this run only allowed
+  `.docs`
+
+## The Prompts In The Generated Workflow
+
+The run produced three prompt templates in the generated blueprint:
+
+* per-slice map prompt
+* group-reduce prompt
+* final synthesis prompt
+
+```elixir
+node_by_id = Map.new(proposal["nodes"], &{&1["id"], &1})
+
+map_prompt = node_by_id["extract_slice_notes"]["params"]["prompt"]
+group_prompt = node_by_id["synthesize_report"]["params"]["group_prompt"]
+final_prompt = node_by_id["synthesize_report"]["params"]["prompt"]
+
+prompt_markdown = fn prompt ->
+  prompt
+  |> String.split("\n")
+  |> Enum.map(&("    " <> &1))
+  |> Enum.join("\n")
+  |> Kino.Markdown.new()
+end
+
+Kino.Layout.tabs(
+  "Map prompt": prompt_markdown.(map_prompt),
+  "Group reduce prompt": prompt_markdown.(group_prompt),
+  "Final synthesis prompt": prompt_markdown.(final_prompt)
+)
+```
+
+The map prompt is deliberately generic. It does not know about this chapter's
+characters or plot taxonomy. It asks for concrete facts, actors, entities,
+decisions, claims, evidence, uncertainties, and source references because those
+are broadly useful for many assistant report tasks.
+
+The final prompt also stays generic. The requested sections came from the user
+objective, so the model could shape the final wiki page around overview, events,
+characters, plot points, reveals, and takeaways without RunicAI shipping a
+fiction-specific extractor module.
+
+## Runtime Evidence From The Trace
+
+The JSONL trace includes both live stage events and final result artifacts. This
+is enough to reconstruct the run after the fact.
+
+```elixir
+node_completed =
+  events
+  |> Enum.filter(&(&1["phase"] == "node_completed"))
+  |> Enum.map(fn event ->
+    data = event["data"]["data"]
+    output = data["output"] || %{}
+
+    %{
+      at: event["at"],
+      node_id: data["node_id"],
+      type: data["type"],
+      status: event["status"],
+      output: inspect(output, printable_limit: 220)
+    }
+  end)
+
+Kino.DataTable.new(node_completed)
+```
+
+```elixir
+scorecard_event = Enum.find(events, &(&1["phase"] == "scorecard"))
+scorecard = scorecard_event["data"]["scorecard"]
+
+Kino.Tree.new(scorecard)
+```
+
+## The Long-Document Map/Reduce Shape
+
+The source splitter found 43 paragraph slices. The materializer retained 20
+slices under the configured byte budget. Those 20 slices became 20 LLM map
+calls. The reduce node used `max_group_items: 12`, so the effective reduce shape
+was two group reductions followed by one final synthesis.
+
+```elixir
+Kino.Mermaid.new("""
+flowchart TD
+  Chapter["Long chapter file"]
+  Split["paragraph split<br/>43 slices"]
+  Materialize["materialize budget<br/>20 retained<br/>truncated: true"]
+
+  subgraph MapPhase["LLM map phase"]
+    S1["slice 1"]
+    S2["slice 2"]
+    SMid["..."]
+    S20["slice 20"]
+  end
+
+  Notes["20 slice-note outputs"]
+
+  subgraph ReducePhase["LLM reduce phase"]
+    G1["group reduce<br/>items 1-12"]
+    G2["group reduce<br/>items 13-20"]
+    Final["final synthesis<br/>wiki-style page"]
+  end
+
+  Artifact[".docs/wandering-inn-10-59-t-summary.md<br/>15,240 bytes"]
+
+  Chapter --> Split --> Materialize
+  Materialize --> S1
+  Materialize --> S2
+  Materialize --> SMid
+  Materialize --> S20
+  S1 --> Notes
+  S2 --> Notes
+  SMid --> Notes
+  S20 --> Notes
+  Notes --> G1
+  Notes --> G2
+  G1 --> Final
+  G2 --> Final
+  Final --> Artifact
+""")
+```
+
+## Timeline
+
+Most of the runtime was in the model-backed map and reduce calls. Splitting,
+materialization, writing, and verification were local and effectively
+instantaneous.
+
+```elixir
+Kino.Mermaid.new("""
+gantt
+  title Assistant RLM Run Timing From JSONL Trace
+  dateFormat HH:mm:ss
+  axisFormat %H:%M:%S
+
+  section Setup
+  Terminal start and manifest       :done, setup, 17:12:06, 1s
+  Blueprint proposal and validation :done, plan, 17:12:06, 1s
+
+  section Workflow Nodes
+  split_sources                     :done, split, 17:12:06, 1s
+  materialize_slices                :done, materialize, 17:12:06, 1s
+  extract_slice_notes               :done, map, 17:12:06, 17:16:09
+  synthesize_report                 :done, reduce, 17:16:09, 17:17:31
+  write_artifact                    :done, write, 17:17:31, 1s
+  verify_objective                  :done, verify, 17:17:31, 1s
+""")
+```
+
+## What The Artifact Looked Like
+
+```elixir
+artifact_text = File.read!(artifact_path)
+
+%{
+  bytes: byte_size(artifact_text),
+  first_800_chars: String.slice(artifact_text, 0, 800)
+}
+```
+
+## Where Dynamic Generation Shows Up
+
+This run used the current generic coordinator fallback, not an LLM-generated
+blueprint proposal. Even so, the important runtime path is the same one that a
+model-generated blueprint would use:
+
+```elixir
+Kino.DataTable.new([
+  %{
+    layer: "Terminal harness",
+    responsibility: "Collect objective, input, output, policy, model, detail, and JSONL options."
+  },
+  %{
+    layer: "Assistant coordinator",
+    responsibility: "Generate a WorkflowBlueprint for this objective from the capability manifest."
+  },
+  %{
+    layer: "Blueprint validator",
+    responsibility: "Reject invalid graphs, unsafe function tiers, bad edges, missing stop conditions, and disallowed writes."
+  },
+  %{
+    layer: "Workflow compiler",
+    responsibility: "Turn accepted component blueprints into trusted Runic steps and anonymous functions."
+  },
+  %{
+    layer: "RLM components",
+    responsibility: "Split, materialize, map LLM calls, reduce, write artifacts, and verify outputs."
+  },
+  %{
+    layer: "Terminal events",
+    responsibility: "Normalize stage, node, episode, scorecard, and artifact data for CLI, JSONL, or future UI renderers."
+  }
+])
+```
+
+The long-term RLM direction is for the assistant to synthesize more of the
+workflow blueprint itself, including task-specific prompts and Tier 1 reducer
+expressions. The architectural point is that generated behavior enters as data
+and is forced through the same validation and compilation boundary before it can
+touch files or call models.
+
+## What To Notice
+
+This approach differs from a single "summarize this file" prompt in several
+practical ways:
+
+* the workflow shape is inspectable before and after execution
+* source chunking and materialization are explicit, budgeted steps
+* prompts are attached to named nodes and can be audited from the trace
+* output writing is a workflow node governed by workspace policy
+* success is represented by a scorecard event, not just by the final model text
+* the JSONL trace is presentation-neutral evidence that can feed terminal,
+  docs, Livebook, or future UI renderers
+
+That is the core RunicAI RLM bet: let language models help design and execute
+bounded workflows, while RunicAI owns the contracts, graph validation,
+capability boundaries, and observability.

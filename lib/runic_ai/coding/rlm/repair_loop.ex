@@ -90,6 +90,11 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     repair_objective = repair_objective(result, repair_needs, iteration, repair_opts)
     repair_workspace = repair_workspace(environment.workspace, result, repair_opts)
 
+    emit_stage(opts, :repair_attempt_started, :running, %{
+      iteration: iteration,
+      repair_needs: Enum.map(repair_needs, &repair_need_summary/1)
+    })
+
     attempt =
       run_repair_attempt(
         repair_workspace,
@@ -123,6 +128,8 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       repair_needs: Enum.map(repair_needs(result.context), &repair_need_summary/1)
     }
 
+    emit_stage(opts, :repair_attempt_completed, attempt.status, event)
+
     if satisfied?(result) do
       {:ok, mark_repair_status(result, :satisfied, history ++ [event])}
     else
@@ -133,6 +140,30 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
   defp fail_on_incomplete?(opts) do
     repair_opts = Keyword.get(opts, :repair_opts, [])
     Keyword.get(repair_opts, :fail_on_incomplete?, Keyword.get(opts, :fail_on_incomplete?, true))
+  end
+
+  defp emit_stage(opts, stage, status, data) do
+    sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+
+    if is_function(sink, 1) do
+      event = %{
+        id:
+          "rlm-stage:#{Keyword.get(opts, :run_id)}:#{stage}:#{System.unique_integer([:positive])}",
+        run_id: Keyword.get(opts, :run_id),
+        stage: stage,
+        status: status,
+        at: DateTime.utc_now(),
+        data: data
+      }
+
+      try do
+        sink.(event)
+      rescue
+        _exception -> :ok
+      end
+    end
+
+    :ok
   end
 
   defp ensure_context(result) do
