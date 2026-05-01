@@ -14,8 +14,27 @@ defmodule RunicAI.Terminal.CliOptions do
   @modes [:read_only, :patch, :verify]
   @generated_function_policies [:tier0, :tier1, :tier2_review]
   @write_policies [:none, :docs_only, :workspace_review]
+  @renderers [:auto, :text, :owl]
+  @color_modes [:auto, :always, :never]
+  @themes [:runic, :plain]
+  @progress_modes [:auto, :off]
+  @unicode_modes [:auto, :always, :never]
+  @graph_modes [:text, :mermaid, :mmdflux]
 
-  @enforce_keys [:agent, :cwd, :detail, :approve, :interactive?, :mode]
+  @enforce_keys [
+    :agent,
+    :cwd,
+    :detail,
+    :approve,
+    :interactive?,
+    :mode,
+    :renderer,
+    :color,
+    :theme,
+    :progress,
+    :unicode,
+    :graph
+  ]
   defstruct [
     :objective,
     :jsonl_path,
@@ -35,7 +54,13 @@ defmodule RunicAI.Terminal.CliOptions do
     approve: :ask,
     interactive?: false,
     help?: false,
-    mode: :verify
+    mode: :verify,
+    renderer: :auto,
+    color: :auto,
+    theme: :runic,
+    progress: :auto,
+    unicode: :auto,
+    graph: :text
   ]
 
   @type t :: %__MODULE__{}
@@ -61,6 +86,12 @@ defmodule RunicAI.Terminal.CliOptions do
           output: :string,
           allow_generated_functions: :string,
           write_policy: :string,
+          renderer: :string,
+          color: :string,
+          theme: :string,
+          progress: :string,
+          unicode: :string,
+          graph: :string,
           help: :boolean
         ],
         aliases: [c: :cwd, h: :help]
@@ -86,6 +117,15 @@ defmodule RunicAI.Terminal.CliOptions do
              @write_policies,
              :write_policy
            ),
+         {:ok, renderer} <-
+           normalize_choice(Keyword.get(opts, :renderer, "auto"), @renderers, :renderer),
+         {:ok, color} <- normalize_choice(Keyword.get(opts, :color, "auto"), @color_modes, :color),
+         {:ok, theme} <- normalize_choice(Keyword.get(opts, :theme, "runic"), @themes, :theme),
+         {:ok, progress} <-
+           normalize_choice(Keyword.get(opts, :progress, "auto"), @progress_modes, :progress),
+         {:ok, unicode} <-
+           normalize_choice(Keyword.get(opts, :unicode, "auto"), @unicode_modes, :unicode),
+         {:ok, graph} <- normalize_choice(Keyword.get(opts, :graph, "text"), @graph_modes, :graph),
          {:ok, input_paths} <- normalize_input_paths(Keyword.get_values(opts, :input), cwd),
          {:ok, output_path} <- normalize_workspace_path(Keyword.get(opts, :output), cwd, :output),
          {:ok, client, client_label} <- normalize_client(Keyword.get(opts, :client)),
@@ -118,7 +158,13 @@ defmodule RunicAI.Terminal.CliOptions do
          allow_generated_functions: allow_generated_functions,
          write_policy: write_policy,
          help?: Keyword.get(opts, :help, false),
-         mode: mode
+         mode: mode,
+         renderer: renderer,
+         color: color,
+         theme: theme,
+         progress: progress,
+         unicode: unicode,
+         graph: graph
        }}
     end
   end
@@ -140,6 +186,12 @@ defmodule RunicAI.Terminal.CliOptions do
       --output PATH
       --allow-generated-functions tier0|tier1|tier2-review
       --write-policy none|docs-only|workspace-review
+      --renderer auto|text|owl
+      --color auto|always|never
+      --theme runic|plain
+      --progress auto|off
+      --unicode auto|always|never
+      --graph text|mermaid|mmdflux
       --interactive
       --jsonl PATH
       --detail hidden|collapsed|expanded

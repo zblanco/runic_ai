@@ -51,6 +51,12 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
       {:error, Error.from_exception(exception, source: __MODULE__)}
   end
 
+  def run(%Workspace{} = workspace, %{sources: sources}, opts) when is_list(sources),
+    do: run(workspace, sources, opts)
+
+  def run(%Workspace{} = workspace, %{"sources" => sources}, opts) when is_list(sources),
+    do: run(workspace, sources, opts)
+
   def run(_workspace, sources, _opts) do
     {:error,
      Error.validation("source splitter requires a list of sources",
@@ -196,7 +202,7 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
     strategy = strategy(opts)
     max_bytes = integer_opt(opts, :max_bytes, @default_max_bytes)
 
-    units = units_for(source.text, strategy)
+    units = units_for(source.text, strategy, max_bytes)
 
     units =
       if strategy == :markdown_heading do
@@ -224,7 +230,7 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
     end)
   end
 
-  defp units_for(text, :lines) do
+  defp units_for(text, :lines, _max_bytes) do
     text
     |> String.split("\n", trim: false)
     |> Enum.with_index(1)
@@ -233,7 +239,7 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
     end)
   end
 
-  defp units_for(text, :markdown_heading) do
+  defp units_for(text, :markdown_heading, _max_bytes) do
     lines = String.split(text, "\n", trim: false)
 
     lines
@@ -265,7 +271,7 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
     end)
   end
 
-  defp units_for(text, :paragraph) do
+  defp units_for(text, :paragraph, _max_bytes) do
     text
     |> String.split("\n", trim: false)
     |> Enum.with_index(1)
@@ -298,8 +304,32 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
     end)
   end
 
-  defp units_for(text, :bytes), do: units_for(text, :lines)
-  defp units_for(text, _strategy), do: units_for(text, :paragraph)
+  defp units_for(text, :bytes, max_bytes), do: byte_units(text, max_bytes)
+  defp units_for(text, _strategy, max_bytes), do: units_for(text, :paragraph, max_bytes)
+
+  defp byte_units(text, max_bytes) do
+    text
+    |> String.graphemes()
+    |> Enum.reduce({[], "", 1, 1}, fn grapheme, {units, current, start_line, current_line} ->
+      next = current <> grapheme
+      next_line = current_line + if(grapheme == "\n", do: 1, else: 0)
+
+      if byte_size(next) > max_bytes and current != "" do
+        unit = %{text: current, start_line: start_line, end_line: current_line}
+        {[unit | units], grapheme, next_line, next_line}
+      else
+        {units, next, start_line, next_line}
+      end
+    end)
+    |> case do
+      {units, "", _start_line, _current_line} ->
+        units
+
+      {units, current, start_line, current_line} ->
+        [%{text: current, start_line: start_line, end_line: current_line} | units]
+    end
+    |> Enum.reverse()
+  end
 
   defp pack_units(units, max_bytes) do
     units

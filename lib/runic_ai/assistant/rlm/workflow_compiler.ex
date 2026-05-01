@@ -14,10 +14,18 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
   alias RunicAI.Error
   alias RunicAI.RLM.Components.ArtifactWriter
   alias RunicAI.RLM.Components.BlueprintTransform
+  alias RunicAI.RLM.Components.BudgetLedger
+  alias RunicAI.RLM.Components.DocumentCompare
   alias RunicAI.RLM.Components.HierarchicalReduce
   alias RunicAI.RLM.Components.LLMMap
+  alias RunicAI.RLM.Components.ObjectiveScorecard
+  alias RunicAI.RLM.Components.RecordGroup
+  alias RunicAI.RLM.Components.RecordMap
+  alias RunicAI.RLM.Components.ReportComposer
+  alias RunicAI.RLM.Components.SourceDiscovery
   alias RunicAI.RLM.Components.SourceMaterializer
   alias RunicAI.RLM.Components.SourceSplitter
+  alias RunicAI.RLM.Components.TabularParser
 
   @default_model "openai:gpt-5.4-mini"
 
@@ -163,6 +171,7 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
          context
          |> Map.from_struct()
          |> Map.put(:blueprint_edges, blueprint.edges)
+         |> Map.put(:budget_ledger, BudgetLedger.new!(get(blueprint.policies, :budgets, %{})))
          |> Map.put(:latest_output, nil)}
 
       {:error, error} ->
@@ -208,7 +217,8 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
       type: component.type
     })
 
-    with {:ok, output} <- dispatch(component, context, opts) do
+    with {:ok, output} <- dispatch(component, context, opts),
+         {:ok, context} <- record_budget(context, component, output) do
       context =
         context
         |> put_in([:outputs, component.id], output)
@@ -236,8 +246,20 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     end
   end
 
-  defp dispatch(%ComponentBlueprint{type: :source_splitter, params: params}, context, _opts) do
-    SourceSplitter.run(context.workspace, get(params, :sources, context.sources), params)
+  defp dispatch(
+         %ComponentBlueprint{type: :source_discovery, params: params} = component,
+         context,
+         _opts
+       ) do
+    SourceDiscovery.run(context.workspace, source_input(component, context, params), params)
+  end
+
+  defp dispatch(
+         %ComponentBlueprint{type: :source_splitter, params: params} = component,
+         context,
+         _opts
+       ) do
+    SourceSplitter.run(context.workspace, source_input(component, context, params), params)
   end
 
   defp dispatch(
@@ -248,8 +270,38 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     SourceMaterializer.run(parent_input(component, context), params)
   end
 
+  defp dispatch(
+         %ComponentBlueprint{type: :tabular_parser, params: params} = component,
+         context,
+         _opts
+       ) do
+    TabularParser.run(parent_input(component, context), params, workspace: context.workspace)
+  end
+
   defp dispatch(%ComponentBlueprint{type: :llm_map, params: params} = component, context, opts) do
     LLMMap.run(parent_input(component, context), params, llm_component_opts(context, opts))
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :record_map, params: params} = component, context, opts) do
+    RecordMap.run(parent_input(component, context), params, llm_component_opts(context, opts))
+  end
+
+  defp dispatch(
+         %ComponentBlueprint{type: :record_group, params: params} = component,
+         context,
+         opts
+       ) do
+    RecordGroup.run(parent_input(component, context), params,
+      max_tier: max_function_tier(context, opts)
+    )
+  end
+
+  defp dispatch(
+         %ComponentBlueprint{type: :document_compare, params: params} = component,
+         context,
+         _opts
+       ) do
+    DocumentCompare.run(parent_input(component, context), params, workspace: context.workspace)
   end
 
   defp dispatch(%ComponentBlueprint{type: :llm_leaf, params: params} = component, context, opts) do
@@ -260,6 +312,14 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
       Map.put(params, :strategy, :llm_reduce),
       llm_component_opts(context, opts)
     )
+  end
+
+  defp dispatch(
+         %ComponentBlueprint{type: :report_composer, params: params} = component,
+         context,
+         _opts
+       ) do
+    ReportComposer.run(parent_input(component, context), params)
   end
 
   defp dispatch(
@@ -310,11 +370,16 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
   end
 
   defp dispatch(
-         %ComponentBlueprint{type: :verification, params: params} = component,
+         %ComponentBlueprint{type: type, params: params} = component,
          context,
          _opts
-       ) do
-    {:ok, verify(context, component, parent_input(component, context), params)}
+       )
+       when type in [:verification, :objective_scorecard] do
+    ObjectiveScorecard.run(context.workspace, context, parent_input(component, context), params)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :budget_ledger, params: params}, context, _opts) do
+    BudgetLedger.run(context, params)
   end
 
   defp dispatch(%ComponentBlueprint{type: type}, _context, _opts) do
@@ -325,48 +390,12 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
      )}
   end
 
-  defp verify(context, component, parent_output, params) do
-    required_artifact = get(params, :artifact_path, nil) || artifact_path_from_outputs(context)
-    required_sections = List.wrap(get(params, :required_sections, []))
-    text = output_text(parent_output) || artifact_text(context, required_artifact) || ""
-
-    artifact_status =
-      cond do
-        is_nil(required_artifact) -> :not_required
-        artifact_exists?(context.workspace, required_artifact) -> :present
-        true -> :missing
-      end
-
-    missing_sections =
-      required_sections
-      |> Enum.reject(fn section ->
-        String.contains?(String.downcase(text), String.downcase(to_string(section)))
-      end)
-
-    objective_status =
-      if artifact_status != :missing and missing_sections == [] and String.trim(text) != "" do
-        :objective_satisfied
-      else
-        :objective_incomplete
-      end
-
-    %{
-      id: "scorecard:#{component.id}",
-      objective_status: objective_status,
-      artifact_status: artifact_status,
-      artifact_path: required_artifact,
-      required_sections: required_sections,
-      missing_sections: missing_sections,
-      source_count: length(context.sources),
-      residual_risks: residual_risks(artifact_status, missing_sections, text)
-    }
-  end
-
   defp record_output(context, %ComponentBlueprint{type: :artifact_writer}, output) do
     update_in(context, [:artifacts], &append(&1, output))
   end
 
-  defp record_output(context, %ComponentBlueprint{type: :verification}, output) do
+  defp record_output(context, %ComponentBlueprint{type: type}, output)
+       when type in [:verification, :objective_scorecard] do
     update_in(context, [:scorecards], &append(&1, output))
   end
 
@@ -377,6 +406,28 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
 
   defp latest_scorecard(nil), do: nil
   defp latest_scorecard(context), do: List.last(context.scorecards || [])
+
+  defp record_budget(context, %ComponentBlueprint{} = component, output) do
+    case BudgetLedger.record(Map.get(context, :budget_ledger), component, output) do
+      {:ok, ledger} -> {:ok, Map.put(context, :budget_ledger, ledger)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp source_input(component, context, params) do
+    explicit = get(params, :sources, nil) || get(params, :paths, nil) || get(params, :globs, nil)
+
+    cond do
+      not is_nil(explicit) ->
+        List.wrap(explicit)
+
+      match?(%ComponentBlueprint{}, component) and parent_outputs(component, context) != [] ->
+        parent_input(component, context)
+
+      true ->
+        context.sources
+    end
+  end
 
   defp parent_input(%ComponentBlueprint{} = component, context) do
     parents = parent_ids(component.id, context.blueprint_edges || context[:blueprint_edges] || [])
@@ -525,50 +576,6 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
 
   defp trace(component, status),
     do: %{node_id: component.id, type: component.type, status: status}
-
-  defp artifact_path_from_outputs(context) do
-    context.artifacts
-    |> List.last()
-    |> case do
-      nil -> nil
-      artifact -> get(artifact, :path, nil)
-    end
-  end
-
-  defp artifact_text(context, path) when is_binary(path) do
-    with {:ok, resolved} <- Workspace.resolve_path(context.workspace, path, :read),
-         {:ok, text} <- File.read(resolved.path) do
-      text
-    else
-      _other -> nil
-    end
-  end
-
-  defp artifact_text(_context, _path), do: nil
-
-  defp artifact_exists?(workspace, path) do
-    with {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read) do
-      File.regular?(resolved.path)
-    else
-      _other -> false
-    end
-  end
-
-  defp residual_risks(:missing, _missing_sections, _text),
-    do: ["required artifact was not written"]
-
-  defp residual_risks(_artifact_status, missing_sections, _text) when missing_sections != [] do
-    ["missing requested sections: #{Enum.join(missing_sections, ", ")}"]
-  end
-
-  defp residual_risks(_artifact_status, _missing_sections, text) do
-    if String.trim(text) == "", do: ["final output was empty"], else: []
-  end
-
-  defp output_text(%{text: text}) when is_binary(text), do: text
-  defp output_text(%{"text" => text}) when is_binary(text), do: text
-  defp output_text(value) when is_binary(value), do: value
-  defp output_text(_value), do: nil
 
   defp llm_component_opts(context, opts) do
     opts

@@ -17,6 +17,7 @@ defmodule RunicAI.Assistant.RLM.ExecutionContext do
     episodes: [],
     scorecards: [],
     budgets: %{},
+    budget_ledger: nil,
     policies: %{},
     event_sink: nil,
     metadata: %{}
@@ -32,6 +33,7 @@ defmodule RunicAI.Assistant.RLM.ExecutionContext do
           episodes: [map()],
           scorecards: [map()],
           budgets: map(),
+          budget_ledger: map() | nil,
           policies: map(),
           event_sink: (map() -> term()) | nil,
           metadata: map()

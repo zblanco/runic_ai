@@ -194,7 +194,7 @@ defmodule RunicAI.Integrated.RuntimeState do
   defp replace_session(%__MODULE__{} = runtime_state, %SessionState{} = session_state) do
     runtime_state
     |> drop_indexes(session_state.agent.id)
-    |> then(fn runtime ->
+    |> then(fn %__MODULE__{} = runtime ->
       %__MODULE__{
         runtime
         | agents: Map.put(runtime.agents, session_state.agent.id, session_state)

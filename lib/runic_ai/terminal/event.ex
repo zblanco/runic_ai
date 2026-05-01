@@ -792,13 +792,22 @@ defmodule RunicAI.Terminal.Event do
   defp maybe_append(events, nil), do: events
   defp maybe_append(events, event), do: events ++ [event]
 
-  defp rlm_kind(stage) when stage in [:episode_completed, :node_completed, :execution_started],
-    do: :rlm_node
+  defp rlm_kind(stage)
+       when stage in [
+              :episode_completed,
+              :node_started,
+              :node_completed,
+              :node_failed,
+              :execution_started,
+              :execution_completed
+            ],
+       do: :rlm_node
 
-  defp rlm_kind(stage) when stage in [:repair_attempt_started, :repair_attempt_completed],
-    do: :repair
+  defp rlm_kind(stage)
+       when stage in [:repair_attempt_started, :repair_attempt_completed, :repair_completed],
+       do: :repair
 
-  defp rlm_kind(stage) when stage in [:progress_gate_completed, :scorecard],
+  defp rlm_kind(stage) when stage in [:progress_gate_completed, :scorecard, :scorecard_completed],
     do: :summary
 
   defp rlm_kind(_stage), do: :rlm_plan

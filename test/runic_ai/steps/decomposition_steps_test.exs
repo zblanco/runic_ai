@@ -177,7 +177,10 @@ defmodule RunicAI.Steps.DecompositionStepsTest do
 
     assignments = [
       Assignment.new!(fail_task, fail_role, inheritance: InheritancePolicy.new!(), input: %{}),
-      Assignment.new!(review_task, review_role, inheritance: InheritancePolicy.new!(), input: %{}),
+      Assignment.new!(review_task, review_role,
+        inheritance: InheritancePolicy.new!(),
+        input: %{}
+      ),
       Assignment.new!(wait_task, wait_role, inheritance: InheritancePolicy.new!(), input: %{}),
       Assignment.new!(blocked_task, review_role,
         inheritance: InheritancePolicy.new!(),

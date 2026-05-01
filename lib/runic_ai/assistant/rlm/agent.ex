@@ -75,7 +75,22 @@ defmodule RunicAI.Assistant.RLM.Agent do
   defp repair_and_execute(workspace, objective, opts, run_id, event_sink, error) do
     emit(event_sink, run_id, :validation_completed, :error, %{error: error})
 
-    with {:ok, repair} <- RepairLoop.fallback_repair(workspace, objective, error, opts),
+    repair =
+      case Keyword.fetch(opts, :blueprint) do
+        {:ok, invalid_blueprint} ->
+          RepairLoop.validation_repair(workspace, objective, invalid_blueprint, error, opts)
+
+        :error ->
+          {:error, error}
+      end
+
+    repair =
+      case repair do
+        {:ok, repair} -> {:ok, repair}
+        {:error, _repair_error} -> RepairLoop.fallback_repair(workspace, objective, error, opts)
+      end
+
+    with {:ok, repair} <- repair,
          blueprint = repair.blueprint,
          {:ok, report} <- BlueprintValidator.validate(blueprint, validation_opts(opts)) do
       emit(event_sink, run_id, :repair_completed, :ok, %{
@@ -121,17 +136,92 @@ defmodule RunicAI.Assistant.RLM.Agent do
           scorecard: scorecard
         })
 
-        {:ok,
-         result
-         |> Map.put(:scorecard, scorecard)
-         |> Map.put(:objective_scorecard, scorecard)
-         |> Map.put(:repair_history, repair_history)
-         |> Map.put(:persistence_ref, nil)}
+        execution_result =
+          result
+          |> Map.put(:scorecard, scorecard)
+          |> Map.put(:objective_scorecard, scorecard)
+          |> Map.put(:repair_history, repair_history)
+          |> Map.put(:persistence_ref, nil)
+
+        maybe_repair_scorecard(
+          workspace,
+          objective,
+          blueprint,
+          opts,
+          run_id,
+          event_sink,
+          repair_history,
+          execution_result
+        )
 
       {:error, %Error{} = error} ->
         emit(event_sink, run_id, :execution_failed, :error, %{error: error})
         {:error, error}
     end
+  end
+
+  defp maybe_repair_scorecard(
+         workspace,
+         objective,
+         blueprint,
+         opts,
+         run_id,
+         event_sink,
+         repair_history,
+         execution_result
+       ) do
+    scorecard = execution_result.scorecard
+
+    if scorecard_repair_needed?(scorecard, repair_history, opts) do
+      emit(event_sink, run_id, :scorecard_repair_started, :running, %{
+        scorecard: scorecard,
+        residual_risks: Map.get(scorecard || %{}, :residual_risks, [])
+      })
+
+      case RepairLoop.scorecard_repair(workspace, objective, blueprint, scorecard, opts) do
+        {:ok, repair} ->
+          blueprint = repair.blueprint
+
+          with {:ok, report} <- BlueprintValidator.validate(blueprint, validation_opts(opts)) do
+            emit(event_sink, run_id, :repair_completed, :ok, %{
+              strategy: repair.strategy,
+              reason: repair.reason,
+              blueprint_id: blueprint.id
+            })
+
+            execute_blueprint(
+              workspace,
+              objective,
+              blueprint,
+              report,
+              Keyword.put(opts, :repair_scorecard?, false),
+              run_id,
+              event_sink,
+              repair_history ++ [Map.drop(repair, [:blueprint])]
+            )
+          else
+            {:error, %Error{} = error} ->
+              emit(event_sink, run_id, :scorecard_repair_completed, :error, %{error: error})
+              {:ok, execution_result}
+          end
+
+        {:error, %Error{} = error} ->
+          emit(event_sink, run_id, :scorecard_repair_completed, :error, %{error: error})
+          {:ok, execution_result}
+      end
+    else
+      {:ok, execution_result}
+    end
+  end
+
+  defp scorecard_repair_needed?(scorecard, repair_history, opts) do
+    Keyword.get(opts, :repair_scorecard?, true) and result_status(scorecard) == :blocked and
+      not Enum.any?(repair_history, fn repair ->
+        Map.get(repair, :strategy) in [
+          :scorecard_diagnostic_repair,
+          "scorecard_diagnostic_repair"
+        ]
+      end)
   end
 
   defp workspace_from_input(%Workspace{} = workspace, _opts), do: Workspace.validate(workspace)

@@ -1,11 +1,13 @@
 # General Purpose Dynamic RLM Workflow Generation Implementation Plan
 
-Status: in progress; first dynamic assistant RLM vertical slice implemented
+Status: in progress; dynamic proposal, shared components, smoke harness,
+scorecard repair, and live fallback/dynamic matrices implemented
 
 Date: 2026-04-30
 
-Last verified: 2026-04-30 via `mix compile --warnings-as-errors`,
-`mix test test/runic_ai/assistant test/runic_ai/terminal`, and `mix test`
+Last verified: 2026-05-01 via `mix compile --warnings-as-errors`, `mix test`,
+live provider ping, fallback smoke matrix, dynamic smoke matrix, and focused
+post-repair live reruns for Scenarios G/H
 
 Motivated by:
 
@@ -64,6 +66,24 @@ The phase is successful when RunicAI can answer:
 "Can an RLM assistant design its own Runic workflow for a non-coding task, (hell or even a coding task if it needs to)
 compile it without generated files/modules, run it over bounded sources, repair
 bad graph/function choices, and produce a durable artifact with evidence?"
+
+2026-05-01 matrix note:
+
+- The live fallback matrix is recorded in
+  `tmp/assistant_smoke/reports/assistant-rlm-smoke-matrix-fallback.md`.
+- The live dynamic matrix is recorded in
+  `tmp/assistant_smoke/reports/assistant-rlm-smoke-matrix-dynamic.md`.
+- Dynamic proposal generated materially different shapes for long-document,
+  tabular, directory, codebase, and comparison tasks.
+- The smoke harness now checks artifact existence, required sections,
+  fixture-specific source cues, artifact quality, objective scorecard status,
+  and expected workflow capabilities.
+- Runtime scorecards now accept required source cues and artifact-quality
+  checks. Scorecard failures trigger one bounded in-loop repair attempt, and
+  smoke runs persist per-run JSON details in `tmp/assistant_smoke/runs`.
+- `LLMMap` now serializes structured records into `{{text}}` when no text field
+  exists, which lets generated workflows map over outputs like
+  `DocumentCompare` instead of silently giving the model an empty text prompt.
 
 ## Non-Goal: Domain Extractor Library
 
@@ -354,7 +374,7 @@ coding RLM path carry unrelated semantics:
 
 ```sh
 mix runic_ai.agent \
-  "Summarize tmp/wandering-inn-10-59-t.md as a wiki page and write it to .docs" \
+  "Summarize tmp/wandering-inn-10-59-t.md as a wiki page and write it to tmp/assistant_smoke/artifacts" \
   --agent assistant \
   --cwd . \
   --detail expanded \
@@ -411,7 +431,7 @@ Validation:
 Deliverables:
 
 - [x] Extract or add `RunicAI.RLM.Components.SourceSplitter`.
-- [ ] Support markdown heading, paragraph, line, byte, and existing structural
+- [x] Support markdown heading, paragraph, line, byte, and existing structural
       slice modes with provenance.
 - [x] Extract or add `SourceMaterializer` with max bytes per slice and max total
       bytes per node.
@@ -428,7 +448,7 @@ Validation:
 
 - [x] Unit test splitter provenance and overlap behavior.
 - [x] Unit test materialization caps on a large text fixture.
-- [ ] Unit test LLM map with scripted clients and bounded concurrency.
+- [x] Unit test LLM map with scripted clients and bounded concurrency.
 - [x] Unit test hierarchical reduce keeps parent outputs under configured caps.
 - [x] Unit test artifact writer allows `.docs` and blocks unsafe paths.
 
@@ -466,17 +486,19 @@ Deliverables:
 - [x] Compile each component blueprint into a named Runic component.
 - [x] Support fan-out/fan-in over map and reduce components.
 - [x] Attach provenance and blueprint ids to node outputs and trace events.
-- [ ] Carry budgets into generated LLM calls, materialization calls, and reduce
+- [x] Carry budgets into generated LLM calls, materialization calls, and reduce
       nodes.
 - [x] Return structured compile errors instead of raising when possible.
 - [ ] Preserve compiled graph summaries for terminal display and persistence.
+      Graph summaries are returned in the compiled result and terminal events;
+      durable persistence remains open.
 
 Validation:
 
 - [x] Unit test component compilation for each blueprint type.
 - [x] Unit test graph construction with fan-out/fan-in.
 - [x] Unit test invalid function blueprint blocks workflow compilation.
-- [ ] Integration test blueprint -> Runic workflow -> deterministic execution.
+- [x] Integration test blueprint -> Runic workflow -> deterministic execution.
 
 ## Phase 4: General Assistant RLM Coordinator
 
@@ -487,20 +509,22 @@ Deliverables:
 - [x] Provide the coordinator a capability manifest:
       component types, function tiers, source limits, allowed writes, LLM models,
       child-agent availability, and terminal review policy.
-- [ ] Add fallback blueprints for high-confidence generic shapes:
+- [x] Add fallback blueprints for high-confidence generic shapes:
       split/map/reduce/report, inspect/search/report, classify/group/report,
       compare/synthesize/report, and artifact-write report.
 - [x] Keep fallbacks generic and parameterized; they should not encode fiction,
       meeting, research, ticket, or code-review domain schemas.
 - [x] Allow generated prompts/schemas inside `LLMMap` and `LLMLeaf` nodes.
 - [ ] Support plan repair from blueprint validation and compile diagnostics.
+      Validation-diagnostic and scorecard-diagnostic repair are implemented;
+      compile/runtime repair remains open.
 
 Validation:
 
 - [x] Scripted coordinator test for document synthesis workflow generation.
-- [ ] Scripted coordinator test for tabular/data cleaning workflow generation.
+- [x] Scripted coordinator test for tabular/data cleaning workflow generation.
 - [ ] Test invalid generated blueprint falls back to safe generic workflow.
-- [ ] Test repaired blueprint replaces only the invalid subgraph.
+- [x] Test repaired blueprint replaces an invalid generated graph.
 
 ## Phase 5: Execution, Evidence, And Repair
 
@@ -508,20 +532,25 @@ Deliverables:
 
 - [x] Add `RunicAI.Assistant.RLM.Agent.run/3`.
 - [x] Emit stage events compatible with `RunicAI.Terminal.Event`.
-- [ ] Execute compiled workflow with bounded budgets.
+- [x] Execute compiled workflow with bounded budgets.
 - [x] Record episodes/artifacts for each generated node.
 - [x] Add objective/evidence scorecard for assistant outputs:
       required artifacts, required sections/schema, source coverage, provenance,
-      residual risks, and output quality checks.
+      required source cues, residual risks, and output quality checks.
 - [ ] Implement repair loop over validation, compile, runtime, and scorecard
       failures.
-- [ ] Persist generated blueprint, compiled graph summary, intermediate
+      Validation failure repair and one bounded scorecard repair attempt are
+      implemented; compile/runtime repairs are still future work.
+- [x] Persist generated blueprint, compiled graph summary, intermediate
       artifacts, final artifact, scorecard, and repair history.
 
 Validation:
 
 - [ ] Unit test scorecard failure for missing artifact.
-- [ ] Unit test scorecard failure for missing required sections/schema.
+- [x] Unit test scorecard failure for missing required sections/schema.
+- [x] Unit test scorecard failure for missing required source cues and artifact
+      quality.
+- [x] Unit test scorecard failure triggers one bounded repair attempt.
 - [ ] Unit test runtime node failure triggers targeted blueprint repair.
 - [x] Integration test full run with scripted LLM clients and generated
       split/map/reduce/write workflow.
@@ -556,7 +585,8 @@ Objective:
 
 ```text
 Read tmp/wandering-inn-10-59-t.md coherently without stuffing the full chapter
-into one prompt. Write a wiki-style chapter page under .docs with:
+into one prompt. Write a wiki-style chapter page under
+tmp/assistant_smoke/artifacts with:
 
 - high-level overview,
 - events that happened and by who,
@@ -575,7 +605,7 @@ source file
   -> generated LLM map prompt/schema for per-slice facts
   -> generated reducer for dedupe/entity/thread merging
   -> generated synthesis prompt for wiki page
-  -> artifact writer to .docs
+  -> artifact writer to tmp/assistant_smoke/artifacts
   -> scorecard verifies requested sections and artifact exists
 ```
 
@@ -587,7 +617,7 @@ mix runic_ai.agent \
   "with overview, events by actor, notable characters, plot points, reveals, and takeaways." \
   --agent assistant \
   --input tmp/wandering-inn-10-59-t.md \
-  --output .docs/wandering-inn-10-59-t-summary.md \
+  --output tmp/assistant_smoke/artifacts/wandering-inn-10-59-t-summary.md \
   --allow-generated-functions tier1 \
   --write-policy docs-only \
   --detail expanded \
@@ -632,8 +662,8 @@ Fixture: add `tmp/assistant_meeting_transcript.md`.
 Task:
 
 ```text
-Turn this transcript into .docs/assistant-meeting-actions.md with decisions,
-action items, owners, deadlines, open questions, and risks.
+Turn this transcript into tmp/assistant_smoke/artifacts/assistant-meeting-actions.md
+with decisions, action items, owners, deadlines, open questions, and risks.
 ```
 
 Capability pressure:
@@ -670,7 +700,7 @@ Task:
 
 ```text
 Cluster tickets into themes, summarize customer impact, identify repeated
-failure modes, and write .docs/assistant-ticket-themes.md.
+failure modes, and write tmp/assistant_smoke/artifacts/assistant-ticket-themes.md.
 ```
 
 Capability pressure:
@@ -706,7 +736,8 @@ Task:
 
 ```text
 Build a high-level architecture report for RunicAI, focusing on runtime,
-RLM, terminal harness, and coding-agent boundaries. Write it to .docs.
+RLM, terminal harness, and coding-agent boundaries. Write it to
+tmp/assistant_smoke/artifacts.
 ```
 
 Capability pressure:
@@ -725,7 +756,7 @@ Task:
 
 ```text
 Infer cleanup rules, produce a cleaned preview, explain uncertain rows, and
-write a cleanup plan to .docs.
+write a cleanup plan to tmp/assistant_smoke/artifacts.
 ```
 
 Capability pressure:
@@ -743,7 +774,7 @@ Task:
 
 ```text
 Compare the documents, identify material changes, affected stakeholders, and
-open questions. Write a migration brief to .docs.
+open questions. Write a migration brief to tmp/assistant_smoke/artifacts.
 ```
 
 Capability pressure:

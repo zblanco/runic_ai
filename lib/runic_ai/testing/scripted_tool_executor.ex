@@ -31,7 +31,7 @@ defmodule RunicAI.Testing.ScriptedToolExecutor do
     registry = Registry.from_input!(registry_input)
 
     tools =
-      Enum.map(registry.tools, fn definition ->
+      Enum.map(registry.tools, fn %Definition{} = definition ->
         case Map.get(scripts_by_name, definition.name) do
           nil ->
             definition

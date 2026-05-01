@@ -21,30 +21,29 @@ defmodule RunicAI.RLM.Components.LLMMap do
       |> Enum.take(limit)
       |> Enum.with_index(1)
 
+    max_concurrency = integer_opt(params, :max_concurrency, 1)
+    model = model_name(params, opts)
+    llm_opts = llm_opts(opts)
+
     results =
-      Enum.reduce_while(selected, {:ok, []}, fn {record, index}, {:ok, acc} ->
-        prompt = prompt_for(record, index, input, params, opts)
-        model = model_name(params, opts)
-        llm_opts = llm_opts(opts)
+      selected
+      |> Task.async_stream(
+        fn {record, index} ->
+          map_one(record, index, input, params, opts, model, llm_opts)
+        end,
+        max_concurrency: max(max_concurrency, 1),
+        ordered: true,
+        timeout: :infinity
+      )
+      |> Enum.reduce_while({:ok, []}, fn
+        {:ok, {:ok, item}}, {:ok, acc} ->
+          {:cont, {:ok, [item | acc]}}
 
-        case LLM.generate_text(model, prompt, llm_opts) do
-          {:ok, %Result{} = result} ->
-            item = %{
-              id: get(record, :id, "item_#{index}"),
-              index: index,
-              text: Result.text(result),
-              input: Map.drop(Map.new(record), [:text]),
-              provenance: get(record, :provenance, [])
-            }
+        {:ok, {:error, %Error{} = error}}, {:ok, _acc} ->
+          {:halt, {:error, error}}
 
-            {:cont, {:ok, [item | acc]}}
-
-          {:retry, %Error{} = error} ->
-            {:halt, {:error, error}}
-
-          {:error, %Error{} = error} ->
-            {:halt, {:error, error}}
-        end
+        {:exit, reason}, {:ok, _acc} ->
+          {:halt, {:error, Error.from_reason(reason, source: __MODULE__)}}
       end)
 
     with {:ok, items} <- results do
@@ -53,12 +52,35 @@ defmodule RunicAI.RLM.Components.LLMMap do
          items: Enum.reverse(items),
          count: length(items),
          input_count: length(records),
+         max_concurrency: max_concurrency,
          truncated?: length(records) > limit
        }}
     end
   rescue
     exception ->
       {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp map_one(record, index, input, params, opts, model, llm_opts) do
+    prompt = prompt_for(record, index, input, params, opts)
+
+    case LLM.generate_text(model, prompt, llm_opts) do
+      {:ok, %Result{} = result} ->
+        {:ok,
+         %{
+           id: get(record, :id, "item_#{index}"),
+           index: index,
+           text: Result.text(result),
+           input: Map.drop(Map.new(record), [:text]),
+           provenance: get(record, :provenance, [])
+         }}
+
+      {:retry, %Error{} = error} ->
+        {:error, error}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
   end
 
   defp prompt_for(record, index, input, params, opts) do
@@ -77,7 +99,8 @@ defmodule RunicAI.RLM.Components.LLMMap do
 
     data = %{
       objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
-      text: get(record, :text, ""),
+      text: record_text(record),
+      record: record,
       source_path: get(record, :path, get(record, :source_path, "")),
       index: index,
       start_line: get(record, :start_line, ""),
@@ -103,6 +126,36 @@ defmodule RunicAI.RLM.Components.LLMMap do
   defp records(%{"items" => items}) when is_list(items), do: items
   defp records(values) when is_list(values), do: values
   defp records(value), do: List.wrap(value)
+
+  defp record_text(record) do
+    get(record, :text, nil) ||
+      get(record, :content, nil) ||
+      structured_text(record)
+  end
+
+  defp structured_text(value) when is_map(value) or is_list(value) do
+    case Jason.encode(json_safe(value), pretty: true) do
+      {:ok, json} -> json
+      {:error, _error} -> inspect(value, limit: 60, printable_limit: 8_000)
+    end
+  end
+
+  defp structured_text(value), do: to_string(value)
+
+  defp json_safe(%_struct{} = value), do: value |> Map.from_struct() |> json_safe()
+
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, value} -> {to_string(key), json_safe(value)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_atom(value), do: Atom.to_string(value)
+
+  defp json_safe(value)
+       when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value),
+       do: value
+
+  defp json_safe(value), do: inspect(value, limit: 20, printable_limit: 2_000)
 
   defp llm_opts(opts) do
     []

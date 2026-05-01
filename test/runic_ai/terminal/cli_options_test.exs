@@ -28,7 +28,40 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.detail == :expanded
     assert opts.approve == :never
     assert opts.max_turns == 3
+    assert opts.renderer == :auto
+    assert opts.color == :auto
+    assert opts.theme == :runic
     assert String.starts_with?(opts.jsonl_path, cwd)
+  end
+
+  test "parses presentation options" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "summarize repo",
+               "--cwd",
+               cwd,
+               "--renderer",
+               "owl",
+               "--color",
+               "always",
+               "--theme",
+               "plain",
+               "--progress",
+               "off",
+               "--unicode",
+               "never",
+               "--graph",
+               "mermaid"
+             ])
+
+    assert opts.renderer == :owl
+    assert opts.color == :always
+    assert opts.theme == :plain
+    assert opts.progress == :off
+    assert opts.unicode == :never
+    assert opts.graph == :mermaid
   end
 
   test "allows help without an objective" do

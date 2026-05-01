@@ -11,9 +11,9 @@ defmodule RunicAI.Terminal.AgentRunner do
   alias RunicAI.ReviewRequest
   alias RunicAI.Terminal.AssistantRunner
   alias RunicAI.Terminal.CliOptions
-  alias RunicAI.Terminal.EventPresenter
   alias RunicAI.Terminal.JsonlSink
   alias RunicAI.Terminal.RLMRunner
+  alias RunicAI.Terminal.Renderer
   alias RunicAI.Terminal.StandardRunner
 
   @spec run(CliOptions.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
@@ -31,14 +31,15 @@ defmodule RunicAI.Terminal.AgentRunner do
 
     with {:ok, jsonl} <- JsonlSink.open(options.jsonl_path) do
       try do
-        output_fun.(EventPresenter.render_header(header_opts(options)))
+        renderer = Renderer.new(options, opts)
+        output_fun.(Renderer.render_header(renderer, header_opts(options, renderer)))
 
-        event_sink = event_sink(options, jsonl, output_fun)
+        event_sink = event_sink(jsonl, output_fun, renderer)
 
         if options.interactive? do
-          run_interactive(options, event_sink, input_fun, output_fun)
+          run_interactive(options, event_sink, input_fun, output_fun, renderer)
         else
-          run_once(options, event_sink, input_fun, output_fun)
+          run_once(options, event_sink, input_fun, output_fun, renderer)
         end
       after
         JsonlSink.close(jsonl)
@@ -46,8 +47,8 @@ defmodule RunicAI.Terminal.AgentRunner do
     end
   end
 
-  defp run_once(%CliOptions{} = options, event_sink, input_fun, output_fun) do
-    runner_opts = runner_opts(options, event_sink, input_fun, output_fun)
+  defp run_once(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer) do
+    runner_opts = runner_opts(options, event_sink, input_fun, output_fun, renderer)
 
     result =
       case options.agent do
@@ -56,11 +57,11 @@ defmodule RunicAI.Terminal.AgentRunner do
         :rlm -> RLMRunner.run(options.objective, runner_opts)
       end
 
-    render_final(result, output_fun)
+    render_final(result, output_fun, renderer)
     result
   end
 
-  defp run_interactive(%CliOptions{} = options, event_sink, input_fun, output_fun) do
+  defp run_interactive(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer) do
     initial =
       case options.objective do
         nil ->
@@ -70,7 +71,14 @@ defmodule RunicAI.Terminal.AgentRunner do
           :ok
 
         objective ->
-          run_interactive_objective(options, objective, event_sink, input_fun, output_fun)
+          run_interactive_objective(
+            options,
+            objective,
+            event_sink,
+            input_fun,
+            output_fun,
+            renderer
+          )
       end
 
     case initial do
@@ -78,11 +86,11 @@ defmodule RunicAI.Terminal.AgentRunner do
         {:error, error}
 
       _other ->
-        interactive_loop(options, event_sink, input_fun, output_fun, nil)
+        interactive_loop(options, event_sink, input_fun, output_fun, renderer, nil)
     end
   end
 
-  defp interactive_loop(options, event_sink, input_fun, output_fun, last_result) do
+  defp interactive_loop(options, event_sink, input_fun, output_fun, renderer, last_result) do
     case input_fun.("runic_ai> ") do
       nil ->
         {:ok, last_result || %{status: :completed}}
@@ -92,15 +100,22 @@ defmodule RunicAI.Terminal.AgentRunner do
 
         cond do
           objective in ["", "\n"] ->
-            interactive_loop(options, event_sink, input_fun, output_fun, last_result)
+            interactive_loop(options, event_sink, input_fun, output_fun, renderer, last_result)
 
           objective in [":quit", "/quit", "quit"] ->
             {:ok, last_result || %{status: :completed}}
 
           true ->
-            case run_interactive_objective(options, objective, event_sink, input_fun, output_fun) do
+            case run_interactive_objective(
+                   options,
+                   objective,
+                   event_sink,
+                   input_fun,
+                   output_fun,
+                   renderer
+                 ) do
               {:ok, result} ->
-                interactive_loop(options, event_sink, input_fun, output_fun, result)
+                interactive_loop(options, event_sink, input_fun, output_fun, renderer, result)
 
               {:error, %Error{} = error} ->
                 {:error, error}
@@ -109,12 +124,12 @@ defmodule RunicAI.Terminal.AgentRunner do
     end
   end
 
-  defp run_interactive_objective(options, objective, event_sink, input_fun, output_fun) do
+  defp run_interactive_objective(options, objective, event_sink, input_fun, output_fun, renderer) do
     options = %{options | objective: objective}
-    run_once(options, event_sink, input_fun, output_fun)
+    run_once(options, event_sink, input_fun, output_fun, renderer)
   end
 
-  defp runner_opts(%CliOptions{} = options, event_sink, input_fun, output_fun) do
+  defp runner_opts(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer) do
     [
       cwd: options.cwd,
       model: options.model,
@@ -128,7 +143,7 @@ defmodule RunicAI.Terminal.AgentRunner do
       max_generated_function_tier: max_generated_function_tier(options.allow_generated_functions),
       write_policy: options.write_policy,
       event_sink: event_sink,
-      review_decider: review_decider(options, input_fun, output_fun)
+      review_decider: review_decider(options, input_fun, output_fun, renderer)
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
@@ -137,19 +152,19 @@ defmodule RunicAI.Terminal.AgentRunner do
   defp max_generated_function_tier(:tier1), do: :tier1
   defp max_generated_function_tier(:tier2_review), do: :tier2
 
-  defp event_sink(options, jsonl, output_fun) do
+  defp event_sink(jsonl, output_fun, renderer) do
     fn event ->
       _ = JsonlSink.write_event(jsonl, event)
 
       event
-      |> EventPresenter.render_event(detail: options.detail)
+      |> then(&Renderer.render_event(renderer, &1))
       |> output_fun.()
 
       :ok
     end
   end
 
-  defp review_decider(%CliOptions{} = options, input_fun, output_fun) do
+  defp review_decider(%CliOptions{} = options, input_fun, output_fun, renderer) do
     fn request, context ->
       case options.approve do
         :never ->
@@ -159,17 +174,17 @@ defmodule RunicAI.Terminal.AgentRunner do
           if safe_review?(request) do
             {:ok, Review.allow(request, reason: "review approved by --approve safe")}
           else
-            ask_review(request, context, input_fun, output_fun)
+            ask_review(request, context, input_fun, output_fun, renderer)
           end
 
         :ask ->
-          ask_review(request, context, input_fun, output_fun)
+          ask_review(request, context, input_fun, output_fun, renderer)
       end
     end
   end
 
-  defp ask_review(%ReviewRequest{} = request, _context, input_fun, output_fun) do
-    output_fun.(EventPresenter.render_review_prompt(request))
+  defp ask_review(%ReviewRequest{} = request, _context, input_fun, output_fun, renderer) do
+    output_fun.(Renderer.render_review_prompt(renderer, request))
 
     case input_fun.("> ") do
       nil ->
@@ -206,25 +221,30 @@ defmodule RunicAI.Terminal.AgentRunner do
       request.details[:risk] in [:low, "low"]
   end
 
-  defp render_final({:ok, result}, output_fun) when is_map(result) do
+  defp render_final({:ok, result}, output_fun, renderer) when is_map(result) do
     result
-    |> EventPresenter.render_final_report()
+    |> then(&Renderer.render_final_report(renderer, &1))
     |> output_fun.()
   end
 
-  defp render_final({:error, %Error{} = error}, output_fun) do
+  defp render_final({:error, %Error{} = error}, output_fun, _renderer) do
     output_fun.("Final report\n  status: error\n  error: #{error.message}")
   end
 
-  defp header_opts(%CliOptions{} = options) do
+  defp header_opts(%CliOptions{} = options, %Renderer{} = renderer) do
     %{
       session_id: options.session_id,
       cwd: options.cwd,
       agent: options.agent,
       model: options.model || "default",
       client: options.client_label || "default",
+      mode: options.mode,
+      approve: options.approve,
       detail: options.detail,
-      jsonl_path: options.jsonl_path
+      jsonl_path: options.jsonl_path,
+      renderer: renderer.name,
+      theme: renderer.theme,
+      color: renderer.color
     }
   end
 end

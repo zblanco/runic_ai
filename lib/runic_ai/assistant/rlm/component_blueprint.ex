@@ -6,13 +6,21 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
   alias RunicAI.Error
 
   @types [
+    :source_discovery,
     :source_splitter,
     :source_materializer,
+    :tabular_parser,
     :llm_map,
+    :record_map,
+    :record_group,
+    :document_compare,
     :llm_leaf,
+    :report_composer,
     :blueprint_transform,
     :blueprint_reduce,
     :artifact_writer,
+    :objective_scorecard,
+    :budget_ledger,
     :verification
   ]
 
@@ -30,13 +38,21 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
   ]
 
   @type type ::
-          :source_splitter
+          :source_discovery
+          | :source_splitter
           | :source_materializer
+          | :tabular_parser
           | :llm_map
+          | :record_map
+          | :record_group
+          | :document_compare
           | :llm_leaf
+          | :report_composer
           | :blueprint_transform
           | :blueprint_reduce
           | :artifact_writer
+          | :objective_scorecard
+          | :budget_ledger
           | :verification
 
   @type t :: %__MODULE__{

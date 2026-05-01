@@ -696,8 +696,11 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
   defp answer_pause_state(%TurnRequest{} = turn_request, %State{} = projected_state) do
     state_with_user_message =
       case turn_request.input_message do
-        %Message{} = input_message -> State.append_messages!(turn_request.state, [input_message])
-        _ -> turn_request.state
+        %Message{} = input_message ->
+          %State{} = State.append_messages!(turn_request.state, [input_message])
+
+        _ ->
+          %State{} = turn_request.state
       end
 
     %State{

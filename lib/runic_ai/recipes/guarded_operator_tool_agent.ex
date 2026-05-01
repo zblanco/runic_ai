@@ -1241,8 +1241,11 @@ defmodule RunicAI.Recipes.GuardedOperatorToolAgent do
   defp answer_state_from_bundle(%{turn_request: turn_request, projected_state: projected_state}) do
     state_with_user_message =
       case turn_request.input_message do
-        %Message{} = input_message -> State.append_messages!(turn_request.state, [input_message])
-        _ -> turn_request.state
+        %Message{} = input_message ->
+          %State{} = State.append_messages!(turn_request.state, [input_message])
+
+        _ ->
+          %State{} = turn_request.state
       end
 
     %State{

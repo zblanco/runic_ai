@@ -145,7 +145,7 @@ defmodule RunicAI.Agent.State do
 
   @spec with_pending_action(t(), term() | nil) :: {:ok, t()} | {:error, Error.t()}
   def with_pending_action(%__MODULE__{} = state, pending_action) do
-    with {:ok, state} <- validate(state) do
+    with {:ok, %__MODULE__{} = state} <- validate(state) do
       {:ok, %__MODULE__{state | pending_action: pending_action}}
     end
   end
@@ -204,7 +204,7 @@ defmodule RunicAI.Agent.State do
   @spec apply_turn_result(t(), RunicAI.Agent.TurnRequest.t(), TurnResult.t()) ::
           {:ok, t()} | {:error, Error.t()}
   def apply_turn_result(%__MODULE__{} = state, turn_request, %TurnResult{} = turn_result) do
-    with {:ok, state} <- validate(state),
+    with {:ok, %__MODULE__{} = state} <- validate(state),
          {:ok, turn_request} <- RunicAI.Agent.TurnRequest.validate(turn_request),
          {:ok, turn_result} <- TurnResult.validate(turn_result),
          {:ok, conversation} <-
