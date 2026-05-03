@@ -6,11 +6,13 @@ defmodule RunicAI.Terminal.StandardRunner do
   events through a callback. It does not print, prompt, or know about Mix.
   """
 
+  alias RunicAI.Agent.ContinueDecision
   alias RunicAI.Coding.Review
   alias RunicAI.Coding.Session, as: CodingSession
   alias RunicAI.Error
   alias RunicAI.Harness.Policy
   alias RunicAI.Harness.Session
+  alias RunicAI.Integrated.Emission
   alias RunicAI.ReviewRequest
   alias RunicAI.Runtime
   alias RunicAI.Terminal.Event
@@ -205,18 +207,67 @@ defmodule RunicAI.Terminal.StandardRunner do
 
   defp final_result(%Session{} = session) do
     snapshot = CodingSession.snapshot(session)
+    summary = maybe_put_halt_error(snapshot.summary, halt_reason(session.outputs))
 
     %{
       agent: :standard,
-      status: session.status,
+      status: final_status(session.status, summary),
       session_id: session.id,
       session: session,
       snapshot: snapshot,
-      summary: snapshot.summary,
+      summary: summary,
       outputs: session.outputs,
       trajectory: session.trajectory
     }
   end
+
+  defp final_status(_session_status, %{last_error: last_error}) when is_binary(last_error),
+    do: :error
+
+  defp final_status(:idle, %{reply: reply}) when is_binary(reply) and reply != "", do: :completed
+  defp final_status(:completed, %{status: status}) when status in [:halted, "halted"], do: :error
+  defp final_status(session_status, _summary), do: session_status
+
+  defp maybe_put_halt_error(summary, nil), do: summary
+
+  defp maybe_put_halt_error(summary, reason) when is_map(summary) do
+    case Map.get(summary, :last_error, Map.get(summary, "last_error")) do
+      error when is_binary(error) and error != "" ->
+        summary
+
+      _other ->
+        Map.put(summary, :last_error, "halted: #{reason}")
+    end
+  end
+
+  defp halt_reason(outputs) when is_list(outputs) do
+    outputs
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{emissions: emissions} when is_list(emissions) ->
+        Enum.find_value(emissions, &halt_emission_reason/1)
+
+      %{"emissions" => emissions} when is_list(emissions) ->
+        Enum.find_value(emissions, &halt_emission_reason/1)
+
+      _output ->
+        nil
+    end)
+  end
+
+  defp halt_emission_reason(%Emission{
+         kind: :status,
+         value: %ContinueDecision{action: :halt, reason: reason}
+       }),
+       do: reason
+
+  defp halt_emission_reason(%{
+         "kind" => "status",
+         "value" => %{"action" => "halt", "reason" => reason}
+       }),
+       do: reason
+
+  defp halt_emission_reason(_emission), do: nil
 
   defp started_event(session_id, cwd, opts) do
     Event.new!(:status,

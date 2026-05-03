@@ -38,12 +38,17 @@ defmodule RunicAI.Terminal.CliOptions do
   defstruct [
     :objective,
     :jsonl_path,
+    :sqlite_path,
     :model,
     :client,
     :client_label,
     :max_turns,
     :max_runtime_ms,
+    :max_concurrency,
+    :max_llm_map_concurrency,
+    :max_llm_map_calls,
     :session_id,
+    async?: nil,
     input_paths: [],
     output_path: nil,
     allow_generated_functions: :tier1,
@@ -76,10 +81,15 @@ defmodule RunicAI.Terminal.CliOptions do
           client: :string,
           interactive: :boolean,
           jsonl: :string,
+          sqlite: :string,
           detail: :string,
           approve: :string,
+          async: :boolean,
           max_turns: :integer,
           max_runtime_ms: :integer,
+          max_concurrency: :integer,
+          max_llm_map_concurrency: :integer,
+          max_llm_map_calls: :integer,
           session_id: :string,
           mode: :string,
           input: :string,
@@ -130,6 +140,7 @@ defmodule RunicAI.Terminal.CliOptions do
          {:ok, output_path} <- normalize_workspace_path(Keyword.get(opts, :output), cwd, :output),
          {:ok, client, client_label} <- normalize_client(Keyword.get(opts, :client)),
          {:ok, jsonl_path} <- normalize_jsonl_path(Keyword.get(opts, :jsonl), cwd),
+         {:ok, sqlite_path} <- normalize_sqlite_path(Keyword.get(opts, :sqlite), cwd),
          {:ok, objective} <-
            normalize_objective(
              rest,
@@ -137,7 +148,14 @@ defmodule RunicAI.Terminal.CliOptions do
              Keyword.get(opts, :help, false)
            ),
          :ok <- validate_positive(Keyword.get(opts, :max_turns), :max_turns),
-         :ok <- validate_positive(Keyword.get(opts, :max_runtime_ms), :max_runtime_ms) do
+         :ok <- validate_positive(Keyword.get(opts, :max_runtime_ms), :max_runtime_ms),
+         :ok <- validate_positive(Keyword.get(opts, :max_concurrency), :max_concurrency),
+         :ok <-
+           validate_positive(
+             Keyword.get(opts, :max_llm_map_concurrency),
+             :max_llm_map_concurrency
+           ),
+         :ok <- validate_positive(Keyword.get(opts, :max_llm_map_calls), :max_llm_map_calls) do
       {:ok,
        %__MODULE__{
          objective: objective,
@@ -148,10 +166,15 @@ defmodule RunicAI.Terminal.CliOptions do
          client_label: client_label,
          interactive?: Keyword.get(opts, :interactive, false),
          jsonl_path: jsonl_path,
+         sqlite_path: sqlite_path,
          detail: detail,
          approve: approve,
+         async?: Keyword.get(opts, :async),
          max_turns: Keyword.get(opts, :max_turns),
          max_runtime_ms: Keyword.get(opts, :max_runtime_ms),
+         max_concurrency: Keyword.get(opts, :max_concurrency),
+         max_llm_map_concurrency: Keyword.get(opts, :max_llm_map_concurrency),
+         max_llm_map_calls: Keyword.get(opts, :max_llm_map_calls),
          session_id: Keyword.get(opts, :session_id),
          input_paths: input_paths,
          output_path: output_path,
@@ -194,13 +217,53 @@ defmodule RunicAI.Terminal.CliOptions do
       --graph text|mermaid|mmdflux
       --interactive
       --jsonl PATH
+      --sqlite PATH
       --detail hidden|collapsed|expanded
       --approve never|safe|ask
+      --async / --no-async
+      --max-concurrency N
+      --max-llm-map-concurrency N
+      --max-llm-map-calls N
       --max-turns N
       --max-runtime-ms N
       --session-id ID
     """
   end
+
+  @spec concurrency_opts(t()) :: keyword()
+  def concurrency_opts(%__MODULE__{} = options) do
+    [
+      async: resolved_async(options),
+      max_concurrency: resolved_max_concurrency(options),
+      max_llm_map_concurrency: resolved_max_llm_map_concurrency(options),
+      max_llm_map_calls: resolved_max_llm_map_calls(options)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp resolved_async(%__MODULE__{async?: async}) when is_boolean(async), do: async
+  defp resolved_async(%__MODULE__{agent: :assistant}), do: true
+  defp resolved_async(%__MODULE__{}), do: nil
+
+  defp resolved_max_concurrency(%__MODULE__{max_concurrency: concurrency})
+       when is_integer(concurrency),
+       do: concurrency
+
+  defp resolved_max_concurrency(%__MODULE__{agent: :assistant}), do: 4
+  defp resolved_max_concurrency(%__MODULE__{}), do: nil
+
+  defp resolved_max_llm_map_concurrency(%__MODULE__{max_llm_map_concurrency: concurrency})
+       when is_integer(concurrency),
+       do: concurrency
+
+  defp resolved_max_llm_map_concurrency(%__MODULE__{agent: :assistant}), do: 4
+  defp resolved_max_llm_map_concurrency(%__MODULE__{}), do: nil
+
+  defp resolved_max_llm_map_calls(%__MODULE__{max_llm_map_calls: calls}) when is_integer(calls),
+    do: calls
+
+  defp resolved_max_llm_map_calls(%__MODULE__{agent: :assistant}), do: 80
+  defp resolved_max_llm_map_calls(%__MODULE__{}), do: nil
 
   defp validate_invalid([]), do: :ok
 
@@ -305,6 +368,30 @@ defmodule RunicAI.Terminal.CliOptions do
      Error.validation("runic_ai.agent --jsonl must be a non-empty path",
        source: __MODULE__,
        details: %{jsonl: path}
+     )}
+  end
+
+  defp normalize_sqlite_path(nil, _cwd), do: {:ok, nil}
+
+  defp normalize_sqlite_path(path, cwd) when is_binary(path) and path != "" do
+    expanded = Path.expand(path, cwd)
+
+    if within?(expanded, cwd) or within?(expanded, System.tmp_dir!()) do
+      {:ok, expanded}
+    else
+      {:error,
+       Error.validation("runic_ai.agent --sqlite must be inside --cwd or the system tmp dir",
+         source: __MODULE__,
+         details: %{sqlite: path, cwd: cwd, tmp: System.tmp_dir!()}
+       )}
+    end
+  end
+
+  defp normalize_sqlite_path(path, _cwd) do
+    {:error,
+     Error.validation("runic_ai.agent --sqlite must be a non-empty path",
+       source: __MODULE__,
+       details: %{sqlite: path}
      )}
   end
 

@@ -438,7 +438,9 @@ The follow-on UI path depends on whether the no-dependency CLI proves the event
 model and control flow:
 
 - If the CLI is useful but visually plain, add an Owl renderer over
-  `RunicAI.Terminal.Event`.
+  `RunicAI.Terminal.Event`. This follow-on is now tracked and partially
+  implemented in
+  `.docs/034-owl-bunt-cli-terminal-presentation-enhancement-plan.md`.
 - If developers need panes, modal HITL controls, non-blocking input, and
   scrollback, revisit TermUI after the OTP compatibility decision.
 - If the project wants to own terminal mechanics on OTP 27, do a focused

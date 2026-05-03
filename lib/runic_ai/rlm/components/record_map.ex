@@ -14,8 +14,7 @@ defmodule RunicAI.RLM.Components.RecordMap do
   def run(input, params \\ %{}, opts \\ []) when is_list(opts) do
     params = opts_map(params)
     records = records(input)
-    limit = integer_opt(params, :limit, length(records))
-    selected = records |> Enum.take(limit) |> Enum.with_index(1)
+    selected = items(input, params)
 
     with {:ok, mapped} <- map_records(selected, input, params, opts) do
       {:ok,
@@ -24,7 +23,7 @@ defmodule RunicAI.RLM.Components.RecordMap do
          items: mapped,
          count: length(mapped),
          input_count: length(records),
-         truncated?: length(records) > limit
+         truncated?: length(records) > length(selected)
        }}
     end
   rescue
@@ -32,60 +31,77 @@ defmodule RunicAI.RLM.Components.RecordMap do
       {:error, Error.from_exception(exception, source: __MODULE__)}
   end
 
-  defp map_records(selected, input, params, opts) do
+  @spec items(term(), map() | keyword()) :: [{term(), pos_integer()}]
+  def items(input, params \\ %{}) do
+    params = opts_map(params)
+    records = records(input)
+    limit = integer_opt(params, :limit, integer_opt(params, :max_items, length(records)))
+
+    records
+    |> Enum.take(limit)
+    |> Enum.with_index(1)
+  end
+
+  @spec map_item(term(), pos_integer(), term(), map() | keyword(), keyword()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def map_item(record, index, input, params \\ %{}, opts \\ []) when is_list(opts) do
+    params = opts_map(params)
+
     cond do
       function = get(params, :function, nil) ->
-        transform_records(selected, function, opts)
+        transform_item(record, index, function, opts)
 
       prompt = get(params, :prompt, nil) || get(params, :prompt_template, nil) ->
-        llm_records(selected, input, prompt, params, opts)
+        llm_item(record, index, input, prompt, params, opts)
 
       true ->
-        {:ok, Enum.map(selected, fn {record, _index} -> record end)}
+        {:ok, record}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp map_records(selected, input, params, opts) do
+    Enum.reduce_while(selected, {:ok, []}, fn {record, index}, {:ok, acc} ->
+      case map_item(record, index, input, params, opts) do
+        {:ok, item} -> {:cont, {:ok, acc ++ [item]}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  defp transform_item(record, index, function, opts) do
+    case BlueprintTransform.apply(function, record_data(record),
+           max_tier: Keyword.get(opts, :max_tier, :tier1)
+         ) do
+      {:ok, output} -> {:ok, mapped_record(record, index, output)}
+      {:error, %Error{} = error} -> {:error, error}
     end
   end
 
-  defp transform_records(selected, function, opts) do
-    selected
-    |> Enum.reduce_while({:ok, []}, fn {record, index}, {:ok, acc} ->
-      case BlueprintTransform.apply(function, record_data(record),
-             max_tier: Keyword.get(opts, :max_tier, :tier1)
-           ) do
-        {:ok, output} ->
-          mapped = mapped_record(record, index, output)
-          {:cont, {:ok, acc ++ [mapped]}}
-
-        {:error, %Error{} = error} ->
-          {:halt, {:error, error}}
-      end
-    end)
-  end
-
-  defp llm_records(selected, input, prompt_template, params, opts) do
+  defp llm_item(record, index, input, prompt_template, params, opts) do
     model = get(params, :model, nil) || Keyword.get(opts, :model) || @default_model
     llm_opts = llm_opts(opts)
 
-    selected
-    |> Enum.reduce_while({:ok, []}, fn {record, index}, {:ok, acc} ->
-      prompt =
-        render_template(prompt_template, %{
-          objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
-          record: record_data(record),
-          input: input,
-          index: index
-        })
+    prompt =
+      render_template(prompt_template, %{
+        objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
+        record: record_data(record),
+        input: input,
+        index: index
+      })
 
-      case LLM.generate_text(model, prompt, llm_opts) do
-        {:ok, %Result{} = result} ->
-          {:cont, {:ok, acc ++ [mapped_record(record, index, Result.text(result))]}}
+    case LLM.generate_text(model, prompt, llm_opts) do
+      {:ok, %Result{} = result} ->
+        {:ok, mapped_record(record, index, Result.text(result))}
 
-        {:retry, %Error{} = error} ->
-          {:halt, {:error, error}}
+      {:retry, %Error{} = error} ->
+        {:error, error}
 
-        {:error, %Error{} = error} ->
-          {:halt, {:error, error}}
-      end
-    end)
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
   end
 
   defp mapped_record(record, index, output) do
@@ -148,8 +164,10 @@ defmodule RunicAI.RLM.Components.RecordMap do
   defp opts_map(opts) when is_list(opts), do: Map.new(opts)
   defp opts_map(opts) when is_map(opts), do: opts
 
-  defp get(map, key, default) when is_map(map),
+  defp get(map, key, default) when is_map(map) and is_atom(key),
     do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+
+  defp get(map, key, default) when is_map(map), do: Map.get(map, key, default)
 
   defp get(_map, _key, default), do: default
 end

@@ -3,8 +3,8 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
   Prompt and schema helpers for assistant workflow blueprint proposal.
   """
 
-  alias RunicAI.Assistant.RLM.ComponentBlueprint
   alias RunicAI.Assistant.RLM.FunctionBlueprint
+  alias RunicAI.RLM.ComponentCatalog
 
   @spec schema() :: keyword()
   def schema do
@@ -66,6 +66,9 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       preserve original identifiers, names, addresses, timelines, policy terms,
       and invalid values when the objective asks for cleanup or comparison.
     - prefer `document_compare` for old/new or multi-document comparison tasks.
+    - `llm_map` and `record_map` are native Runic map components. Fan them into
+      `blueprint_reduce` before connecting to synthesis, composition, artifact,
+      or scorecard nodes.
     - prefer `report_composer` when deterministic section assembly is enough;
       use `llm_leaf` when synthesis needs a model.
     - do not connect raw `source_discovery`, `tabular_parser`, or
@@ -117,14 +120,10 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
   end
 
   defp shape_example(opts) do
-    %{
-      id: "assistant:generated_workflow",
-      objective: "user objective here",
-      sources:
-        Enum.map(Keyword.get(opts, :input_paths, []), fn path ->
-          %{id: Path.basename(path), path: path}
-        end),
-      components: [
+    output_path = Keyword.get(opts, :output_path)
+
+    components =
+      [
         %{
           id: "discover",
           type: "source_discovery",
@@ -142,35 +141,53 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
           params: %{prompt: "Extract objective-relevant notes from {{text}}."}
         },
         %{
+          id: "join_notes",
+          type: "blueprint_reduce",
+          params: %{strategy: "join"}
+        },
+        %{
           id: "synthesize",
           type: "llm_leaf",
           params: %{
             strategy: "llm_reduce",
             prompt: "Write the requested report from these notes: {{items}}"
           }
-        },
-        %{id: "write", type: "artifact_writer", params: %{path: Keyword.get(opts, :output_path)}},
-        %{
-          id: "score",
-          type: "objective_scorecard",
-          params: %{
-            artifact_path: Keyword.get(opts, :output_path),
-            required_sections: Keyword.get(opts, :required_sections, []),
-            required_source_cues:
-              Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
-            require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
-          }
         }
-      ],
-      edges: [
+      ] ++
+        writer_example_components(output_path) ++
+        [
+          %{
+            id: "score",
+            type: "objective_scorecard",
+            params: %{
+              artifact_path: output_path,
+              required_sections: Keyword.get(opts, :required_sections, []),
+              required_source_cues:
+                Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
+              require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
+            }
+          }
+        ]
+
+    edges =
+      [
         %{from: "discover", to: "split"},
         %{from: "split", to: "materialize"},
         %{from: "materialize", to: "extract"},
-        %{from: "extract", to: "synthesize"},
-        %{from: "synthesize", to: "write"},
-        %{from: "write", to: "score"}
-      ],
-      stop_conditions: ["artifact written", "objective scorecard satisfied"],
+        %{from: "extract", to: "join_notes"},
+        %{from: "join_notes", to: "synthesize"}
+      ] ++ writer_example_edges(output_path)
+
+    %{
+      id: "assistant:generated_workflow",
+      objective: "user objective here",
+      sources:
+        Enum.map(Keyword.get(opts, :input_paths, []), fn path ->
+          %{id: Path.basename(path), path: path}
+        end),
+      components: components,
+      edges: edges,
+      stop_conditions: stop_conditions(output_path),
       policies: %{
         generated_functions: %{max_tier: "tier1"},
         budgets: %{max_nodes: 20, max_llm_calls: 80, max_runtime_ms: 900_000}
@@ -200,6 +217,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
             "For objective {{objective}}, turn this record into concise analysis: {{record}}."
         }
       },
+      %{id: "join_classifications", type: "blueprint_reduce", params: %{strategy: "join"}},
       %{
         id: "group",
         type: "record_group",
@@ -215,20 +233,42 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
         id: "compose",
         type: "report_composer",
         params: %{title: "Report", sections: Keyword.get(opts, :required_sections, ["Summary"])}
-      },
-      %{id: "write", type: "artifact_writer", params: %{path: Keyword.get(opts, :output_path)}},
-      %{
-        id: "score",
-        type: "objective_scorecard",
-        params: %{
-          artifact_path: Keyword.get(opts, :output_path),
-          required_source_cues:
-            Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
-          require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
-        }
       }
-    ]
+    ] ++
+      writer_example_components(Keyword.get(opts, :output_path)) ++
+      [
+        %{
+          id: "score",
+          type: "objective_scorecard",
+          params: %{
+            artifact_path: Keyword.get(opts, :output_path),
+            required_source_cues:
+              Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
+            require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
+          }
+        }
+      ]
   end
+
+  defp writer_example_components(nil), do: []
+  defp writer_example_components(""), do: []
+
+  defp writer_example_components(output_path) do
+    [%{id: "write", type: "artifact_writer", params: %{path: output_path}}]
+  end
+
+  defp writer_example_edges(nil), do: [%{from: "synthesize", to: "score"}]
+  defp writer_example_edges(""), do: writer_example_edges(nil)
+
+  defp writer_example_edges(_output_path) do
+    [%{from: "synthesize", to: "write"}, %{from: "write", to: "score"}]
+  end
+
+  defp stop_conditions(nil),
+    do: ["final assistant output produced", "objective scorecard satisfied"]
+
+  defp stop_conditions(""), do: stop_conditions(nil)
+  defp stop_conditions(_output_path), do: ["artifact written", "objective scorecard satisfied"]
 
   defp json_safe(value) do
     case Jason.encode(value) do
@@ -240,7 +280,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
   @spec manifest(keyword()) :: map()
   def manifest(opts \\ []) do
     %{
-      components: Enum.map(ComponentBlueprint.types(), &Atom.to_string/1),
+      components: Enum.map(ComponentCatalog.types(), &Atom.to_string/1),
       function_tiers: Enum.map(FunctionBlueprint.tiers(), &Atom.to_string/1),
       tier0_operations: Enum.map(FunctionBlueprint.tier0_ops(), &Atom.to_string/1),
       default_model: Keyword.get(opts, :model, "openai:gpt-5.4-mini"),

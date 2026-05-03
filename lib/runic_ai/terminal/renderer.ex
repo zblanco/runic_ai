@@ -60,7 +60,11 @@ defmodule RunicAI.Terminal.Renderer do
   end
 
   def render_event(%__MODULE__{} = renderer, %Event{} = event) do
-    EventPresenter.render_event(event, detail: renderer.detail)
+    EventPresenter.render_event(event,
+      detail: renderer.detail,
+      graph: renderer.graph,
+      color: renderer.color
+    )
   end
 
   @spec render_final_report(t(), map()) :: String.t()

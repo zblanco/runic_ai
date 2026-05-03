@@ -1,4 +1,10 @@
 # Used by "mix format"
 [
-  inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}", "scripts/**/*.{ex,exs}"]
+  import_deps: [:ecto_sql],
+  inputs: [
+    "{mix,.formatter}.exs",
+    "{config,lib,test}/**/*.{ex,exs}",
+    "priv/**/*.{ex,exs}",
+    "scripts/**/*.{ex,exs}"
+  ]
 ]

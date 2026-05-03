@@ -1,7 +1,8 @@
 # General Purpose Dynamic RLM Workflow Generation Implementation Plan
 
 Status: in progress; dynamic proposal, shared components, smoke harness,
-scorecard repair, and live fallback/dynamic matrices implemented
+scorecard repair, Runic-native compiler/executor migration, and live
+fallback/dynamic matrices implemented
 
 Date: 2026-04-30
 
@@ -489,9 +490,9 @@ Deliverables:
 - [x] Carry budgets into generated LLM calls, materialization calls, and reduce
       nodes.
 - [x] Return structured compile errors instead of raising when possible.
-- [ ] Preserve compiled graph summaries for terminal display and persistence.
-      Graph summaries are returned in the compiled result and terminal events;
-      durable persistence remains open.
+- [x] Preserve compiled graph summaries for terminal display and persistence.
+      Graph summaries now include blueprint metadata plus compiled Runic
+      workflow serializer data; durable runner persistence remains open.
 
 Validation:
 
@@ -517,7 +518,8 @@ Deliverables:
 - [x] Allow generated prompts/schemas inside `LLMMap` and `LLMLeaf` nodes.
 - [ ] Support plan repair from blueprint validation and compile diagnostics.
       Validation-diagnostic and scorecard-diagnostic repair are implemented;
-      compile/runtime repair remains open.
+      runtime node repair now has one bounded blueprint repair pass; Runic port
+      mismatch compile diagnostics are structured for repair prompts.
 
 Validation:
 
@@ -540,7 +542,9 @@ Deliverables:
 - [ ] Implement repair loop over validation, compile, runtime, and scorecard
       failures.
       Validation failure repair and one bounded scorecard repair attempt are
-      implemented; compile/runtime repairs are still future work.
+      implemented; runtime node failures now trigger one bounded blueprint
+      repair pass; Runic port mismatch compile diagnostics are normalized, but
+      dedicated compile-repair attempts are still future work.
 - [x] Persist generated blueprint, compiled graph summary, intermediate
       artifacts, final artifact, scorecard, and repair history.
 
@@ -551,7 +555,7 @@ Validation:
 - [x] Unit test scorecard failure for missing required source cues and artifact
       quality.
 - [x] Unit test scorecard failure triggers one bounded repair attempt.
-- [ ] Unit test runtime node failure triggers targeted blueprint repair.
+- [x] Unit test runtime node failure triggers targeted blueprint repair.
 - [x] Integration test full run with scripted LLM clients and generated
       split/map/reduce/write workflow.
 

@@ -24,12 +24,16 @@ defmodule RunicAI.RLM.TraceSummary do
       "",
       "- Status: #{field(summary, :scorecard_status) || "unknown"}",
       "- Nodes generated: #{field(summary, :nodes_generated) || 0}",
+      "- Nodes executed: #{field(summary, :nodes_executed) || 0}",
       "- Component types: #{inline_list(field(summary, :component_types) || [])}",
+      "- Component counts: #{component_counts_line(field(summary, :component_counts) || %{})}",
       "- Source count: #{field(summary, :source_count) || 0}",
       "- Slice count: #{field(summary, :slice_count) || 0}",
       "- Materialized count: #{field(summary, :materialized_count) || 0}",
       "- LLM map calls: #{field(summary, :llm_map_count) || 0}",
-      "- Reduce groups: #{field(summary, :reduce_group_count) || 0}",
+      "- Reduce calls: #{field(summary, :reduce_group_count) || 0}",
+      "- Artifact writes: #{field(summary, :artifact_writes) || 0}",
+      "- Runtime elapsed ms: #{field(summary, :elapsed_ms) || 0}",
       "- Artifact: #{artifact_line(field(summary, :write_result))}",
       "- Repairs: #{length(field(summary, :repair_history) || [])}",
       "",
@@ -51,33 +55,61 @@ defmodule RunicAI.RLM.TraceSummary do
   defp summarize_result(result, events) do
     blueprint = field(result, :blueprint) || field(result, :proposal) || %{}
     context = field(result, :context) || %{}
-    outputs = field(context, :outputs) || %{}
+    outputs = field(result, :intermediate_outputs) || field(context, :outputs) || %{}
     scorecard = field(result, :scorecard) || field(result, :objective_scorecard)
     artifacts = field(result, :artifacts) || field(context, :artifacts) || []
-    budget = field(context, :budget_ledger) || get_in_map(scorecard, [:budget_summary])
+
+    budget =
+      field(result, :budget_summary) || field(context, :budget_ledger) ||
+        get_in_map(scorecard, [:budget_summary])
+
+    metrics =
+      field(result, :execution_metrics) ||
+        get_in_map(budget, [:metrics]) ||
+        %{}
+
     component_types_by_id = component_types_by_id(blueprint)
 
     %{
       nodes_generated: length(field(blueprint, :components) || field(blueprint, :nodes) || []),
+      nodes_executed: metric(metrics, :nodes_executed, 0),
       component_types: component_types(blueprint),
+      component_counts: metric(metrics, :component_counts, %{}),
       source_count:
-        max_value(outputs, component_types_by_id, [:source_count, :count], [
-          :source_discovery,
-          :source_splitter
-        ]),
+        metric(
+          metrics,
+          :source_count,
+          max_value(outputs, component_types_by_id, [:source_count, :count], [
+            :source_discovery,
+            :source_splitter
+          ])
+        ),
       slice_count:
-        max_value(outputs, component_types_by_id, [:slice_count, :count], [:source_splitter]),
+        metric(
+          metrics,
+          :slice_count,
+          max_value(outputs, component_types_by_id, [:slice_count, :count], [:source_splitter])
+        ),
       materialized_count:
-        max_value(outputs, component_types_by_id, [:materialized_count, :count], [
-          :source_materializer
-        ]),
-      llm_map_count:
-        max_value(outputs, component_types_by_id, [:llm_map_count, :count], [:llm_map]),
+        metric(
+          metrics,
+          :materialized_count,
+          max_value(outputs, component_types_by_id, [:materialized_count, :count], [
+            :source_materializer
+          ])
+        ),
+      llm_map_count: metric(metrics, :llm_map_calls, 0),
       reduce_group_count:
-        max_value(outputs, component_types_by_id, [:reduce_group_count, :groups], [
-          :llm_leaf,
-          :blueprint_reduce
-        ]),
+        metric(
+          metrics,
+          :reduce_calls,
+          max_value(outputs, component_types_by_id, [:reduce_group_count, :groups], [
+            :llm_leaf,
+            :blueprint_reduce
+          ])
+        ),
+      artifact_writes: metric(metrics, :artifact_writes, 0),
+      elapsed_ms: metric(metrics, :elapsed_ms, 0),
       write_result: List.last(List.wrap(artifacts)),
       scorecard_status: field(scorecard || %{}, :objective_status),
       scorecard: scorecard,
@@ -166,6 +198,24 @@ defmodule RunicAI.RLM.TraceSummary do
 
   defp inline_list([]), do: "none"
   defp inline_list(values), do: values |> Enum.map(&"`#{&1}`") |> Enum.join(", ")
+
+  defp component_counts_line(counts) when is_map(counts) and map_size(counts) > 0 do
+    counts
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.map(fn {key, value} -> "`#{key}`=#{value}" end)
+    |> Enum.join(", ")
+  end
+
+  defp component_counts_line(_counts), do: "none"
+
+  defp metric(metrics, key, default) when is_map(metrics) do
+    case field(metrics, key) do
+      nil -> default
+      value -> value
+    end
+  end
+
+  defp metric(_metrics, _key, default), do: default
 
   defp get_in_map(map, keys) do
     Enum.reduce_while(keys, map, fn key, acc ->

@@ -122,6 +122,8 @@ defmodule RunicAI.Terminal.Theme do
     dim: :light_black
   }
 
+  @known_tokens @hex |> Map.keys() |> Enum.sort()
+
   @spec format(IO.chardata(), token(), keyword()) :: String.t()
   def format(data, token, opts \\ []) do
     theme = Keyword.get(opts, :theme, :runic)
@@ -166,7 +168,7 @@ defmodule RunicAI.Terminal.Theme do
   def style_attrs(token) do
     %{
       token: token,
-      hex: Map.fetch!(@hex, token),
+      hex: token_hex(token),
       bunt: bunt_sequence(token),
       owl: owl_sequence(token)
     }
@@ -200,6 +202,18 @@ defmodule RunicAI.Terminal.Theme do
 
   defp emit?(_other), do: false
 
-  defp bunt_sequence(token), do: Map.fetch!(@bunt, token)
-  defp owl_sequence(token), do: Map.fetch!(@owl, token)
+  defp token_hex(token), do: fetch_token!(@hex, token)
+  defp bunt_sequence(token), do: fetch_token!(@bunt, token)
+  defp owl_sequence(token), do: fetch_token!(@owl, token)
+
+  defp fetch_token!(tokens, token) do
+    case Map.fetch(tokens, token) do
+      {:ok, value} ->
+        value
+
+      :error ->
+        raise ArgumentError,
+              "unknown terminal theme token #{inspect(token)}; valid tokens: #{inspect(@known_tokens)}"
+    end
+  end
 end

@@ -42,4 +42,14 @@ defmodule RunicAI.Terminal.ThemeTest do
     assert attrs.token == :primary
     assert attrs.bunt in [:aquamarine, [:bright, :aqua]]
   end
+
+  test "raises a useful error for unknown theme tokens" do
+    assert_raise ArgumentError, ~r/unknown terminal theme token :bogus/, fn ->
+      Theme.style_attrs(:bogus)
+    end
+
+    assert_raise ArgumentError, ~r/valid tokens:/, fn ->
+      Theme.format("bad", :bogus, color: :never)
+    end
+  end
 end

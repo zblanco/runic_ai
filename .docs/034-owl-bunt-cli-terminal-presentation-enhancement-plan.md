@@ -1,10 +1,20 @@
 # Owl And Bunt CLI Terminal Presentation Enhancement Plan
 
-Status: first Owl/Bunt renderer slice implemented; live blocks, rewrite, and
-mmdflux graph rendering remain deferred
+Status: Owl/Bunt renderer slice implemented; source-diagram Mermaid-to-terminal
+mmdflux tooling implemented for the standard agent with Markdown,
+Livebook/Kino, and bounded directory discovery; runtime graph presenter and
+review rewrite mapping implemented; live blocks and large model/terminal
+artifact separation remain deferred
 
-Last verified: 2026-05-01 (`mix deps.get`; `mix compile --warnings-as-errors`;
-`mix test test/runic_ai/terminal`; `mix test`; `mix runic_ai.agent --help`)
+Last verified: 2026-05-02 (`mix compile --warnings-as-errors`; `mix test`;
+`git diff --check`; focused `mix test test/runic_ai/terminal
+test/runic_ai/coding/tools_test.exs`). Earlier 2026-05-01 manual verification
+covered `mix deps.get`, `mix runic_ai.agent --help`, and focused
+Mermaid/mmdflux standard-agent smokes, including Livebook/Kino diagram
+extraction and final-report diagram rendering.
+
+Last re-evaluated: 2026-05-02 after interactive source-diagram rendering smokes
+against guide and Livebook Mermaid content.
 
 Date: 2026-05-01
 
@@ -135,6 +145,66 @@ For this plan, treat mmdflux as an optional graph renderer:
 4. Consider a minimal Rust NIF wrapper later, ideally in an optional namespace
    or dependency path, so the base CLI does not require Rust.
 
+Follow-up implementation note: the standard coding agent now has interim
+read-only `extract_diagrams` and `render_mermaid` tools for developer prompts
+such as "render the Mermaid diagram from this guide using MMDFLUX." These tools
+are intentionally separate from the future terminal `GraphPresenter`:
+`extract_diagrams` lists Mermaid candidates from raw `.mmd` files, Markdown
+Mermaid fences, and Livebook `Kino.Mermaid.new("""...""")` calls while marking
+dynamic `Kino.Mermaid.new(expression)` calls as non-renderable;
+`render_mermaid` selects by index or nearby/fuzzy query text, accepts inline
+Mermaid source, shells out to `mmdflux` only when the binary is present, and
+returns a structured `:pass`, `:fail`, or `:blocked` observation without
+mutating the workspace. The terminal presenter recognizes successful mmdflux
+tool observations and prints the rendered diagram block even in collapsed mode
+so "render this diagram" requests produce visible terminal output. Standard-agent
+summaries also carry bounded rendered diagrams into the final report; the Owl
+renderer appends them after the boxed summary to preserve terminal line art.
+Search result line previews are also bounded so generated one-line docs
+artifacts cannot inflate the next LLM request before the agent reaches the
+diagram tools.
+
+## Graph Rendering Re-Evaluation
+
+The graph-rendering iteration changed the shape of the remaining work. The
+original Phase 5 treated mmdflux mostly as an optional terminal graph renderer.
+The live smokes showed two distinct needs:
+
+1. Developer source-diagram tooling.
+   A developer asks the standard agent to find, extract, render, and discuss
+   Mermaid diagrams already present in guides, README files, and Livebooks.
+   This is now useful enough to keep as a first-class read-only coding tool
+   surface: `extract_diagrams` plus `render_mermaid`.
+
+2. Runtime graph presentation.
+   RunicAI should render generated Runic/RLM workflow data as adjacency text,
+   Mermaid source, or mmdflux output. This is still the future
+   `RunicAI.Terminal.GraphPresenter` track and should consume normalized graph
+   data, not source files.
+
+Lessons from the smokes:
+
+- File-scoped extraction is reliable, but directory-level prompts currently
+  tempt the model into broad `list_dir` / `search_text` exploration. Add a
+  bounded project diagram inventory route before relying on open-ended search
+  for source diagrams.
+- Follow-up prompts in interactive mode need better target carryover. A prompt
+  like "now render the Mermaid diagrams" should reuse the previous diagram file
+  or candidate set when one exists, rather than restarting discovery from `.`.
+- Rendered ANSI diagrams are terminal artifacts. They should be visible in tool
+  logs and final reports, but model-facing observations should stay concise or
+  artifact-backed for large diagrams so line art does not become prompt bloat.
+- Owl boxes are appropriate for final-report metadata and prose. Wide mmdflux
+  line art should stay outside boxed key/value reports or inside a dedicated
+  preformatted block.
+- Dynamic `Kino.Mermaid.new(expression)` calls should remain listed but
+  non-renderable by default. Evaluating notebook code just to render diagrams
+  needs a separate explicit safety plan.
+
+Plan adjustment: finish the source-diagram tooling hardening before building the
+runtime `GraphPresenter`. Then reuse the same rendering/output discipline for
+runtime workflow graphs.
+
 ## Proposed Command Shape
 
 Keep the existing command as the stable entry point:
@@ -218,11 +288,14 @@ Deliverables:
       Implemented as focused `OwlPresenter` and `Theme` tests rather than a
       runtime module.
 - [x] Verify output with ANSI disabled, `NO_COLOR=1`, and non-TTY capture.
-- [ ] Document any Owl/Bunt incompatibilities in this plan.
+- [x] Document any Owl/Bunt incompatibilities in this plan. Current notes:
+      final-report prose uses boxes instead of nested Owl tables because long
+      markdown replies can create visual row drift; live screen/spinner support
+      remains deferred until the static renderer and event stream are stable.
 
 Validation:
 
-- [ ] Unit test that renderer selection falls back to text in non-TTY mode.
+- [x] Unit test that renderer selection falls back to text in non-TTY mode.
 - [x] Unit test that `--color never` removes ANSI sequences.
 - [x] Unit test that `--unicode never` renders ASCII-safe borders and graph
       markers.
@@ -248,7 +321,7 @@ Validation:
 
 - [x] Unit test token lookup for runic and plain themes.
 - [x] Unit test `NO_COLOR` and `--color never` behavior.
-- [ ] Unit test unknown token failure messages.
+- [x] Unit test unknown token failure messages.
 
 ## Phase 2: Owl Event Timeline Renderer
 
@@ -271,7 +344,7 @@ Deliverables:
 Validation:
 
 - [x] Unit test event rendering with ANSI disabled.
-- [ ] Unit test representative event kinds:
+- [x] Unit test representative event kinds:
       `:status`, `:message`, `:tool`, `:hitl`, `:rlm_plan`, `:rlm_node`,
       `:verification`, `:repair`, `:error`, and `:summary`.
 - [x] Compare one standard fixture rendered by text and Owl to ensure no data is
@@ -283,18 +356,18 @@ Deliverables:
 
 - [x] Replace the current plain `[a] approve [d] deny [s] final stop` prompt
       with an Owl review box when `--renderer owl`.
-- [ ] Use `Owl.IO.select/2` or `Owl.IO.confirm/1` for approve, deny, and final
+- [x] Use `Owl.IO.select/2` or `Owl.IO.confirm/1` for approve, deny, and final
       stop decisions.
-- [ ] Add rewrite support using `Owl.IO.open_in_editor/2` when
+- [x] Add rewrite support using `Owl.IO.open_in_editor/2` when
       `ELIXIR_EDITOR` is available.
 - [x] Keep plain stdin prompt behavior for non-TTY and text renderer paths.
-- [ ] Make blocked non-interactive review decisions render a clear, styled
+- [x] Make blocked non-interactive review decisions render a clear, styled
       blocked event before exiting.
 
 Validation:
 
-- [ ] Unit test decision mapping without invoking real stdin.
-- [ ] Unit test rewrite text handoff at the review boundary.
+- [x] Unit test decision mapping without invoking real stdin.
+- [x] Unit test rewrite text handoff at the review boundary.
 - [ ] Manual smoke a review-gated scripted standard-agent run.
 
 ## Phase 4: Final Reports, Tables, And Progress Blocks
@@ -315,7 +388,7 @@ Deliverables:
       count or fixture-backed scripted stages.
 - [ ] Ensure live blocks flush and stop cleanly on success, error, timeout, and
       user interruption.
-- [ ] If live blocks are too much for this first style iteration, keep them as
+- [x] If live blocks are too much for this first style iteration, keep them as
       the next enhancement after the static Owl/Bunt renderer is stable.
 
 Validation:
@@ -329,26 +402,76 @@ Validation:
 
 Deliverables:
 
-- [ ] Add `RunicAI.Terminal.GraphPresenter` with pure graph data input.
-- [ ] Keep current adjacency list as the default graph renderer.
-- [ ] Add Mermaid generation for:
-      RLM proposed workflow, RLM compiled workflow, assistant generated
-      workflow, and standard-agent OODA phase summary.
-- [ ] Add `--graph mermaid` to print Mermaid source in expanded mode.
-- [ ] Add `--graph mmdflux` only when the `mmdflux` binary is found.
-- [ ] Shell out with a narrow command wrapper:
-      `mmdflux --format text`, stdin Mermaid, bounded timeout, bounded output,
-      and explicit color handling through either `NO_COLOR=1` or
-      `--color always` based on the RunicAI color mode.
-- [ ] Record mmdflux failures as graph-rendering warnings, not agent failures.
-- [ ] Write a separate NIF feasibility note before adding Rustler or a native
+- [x] Add interim read-only standard-agent tools, `extract_diagrams` and
+      `render_mermaid`, for Mermaid fenced blocks, Livebook/Kino literal
+      diagrams, nearby query text selection, and inline Mermaid source. This
+      covers practical developer requests before the terminal graph presenter
+      exists.
+- [x] Add `RunicAI.Terminal.GraphPresenter` with pure graph data input.
+- [x] Keep current adjacency list as the default graph renderer.
+- [x] Add Mermaid generation for normalized dependency graphs, including RLM
+      proposed workflows and assistant/RLM graph-shaped proposal data.
+- [ ] Extend Mermaid generation to compiled workflow data that lacks normalized
+      nodes and to a standard-agent OODA phase summary.
+- [x] Add `--graph mermaid` to print Mermaid source in expanded mode.
+- [x] Add `--graph mmdflux` only when the `mmdflux` binary is found.
+- [x] Shell out with a narrow command wrapper for the interim tool:
+      `mmdflux --format text --color auto|always|off`, temporary `.mmd` input
+      outside the workspace, and structured blocked output when the binary is
+      missing.
+- [x] Surface successful interim `mmdflux` tool observations in the terminal
+      event stream so collapsed output shows the rendered ANSI diagram instead
+      of only an inspected tool-result map.
+- [x] Carry bounded `render_mermaid` observations into the standard-agent final
+      report, with Owl rendering diagrams outside the summary box to avoid
+      wrapping and alignment drift.
+- [x] Add a bounded project diagram inventory path, either as `find_diagrams`
+      or a directory mode for `extract_diagrams`. It should scan only relevant
+      Markdown, Livebook, `.mmd`, and `.mermaid` files; respect ignore lists;
+      cap candidate counts and previews; and avoid generated `doc/dist` blobs.
+- [x] Add interactive target carryover for source diagrams so follow-up prompts
+      can reuse the previous diagram file/candidate set instead of restarting
+      discovery from the workspace root.
+- [ ] Split terminal-facing rendered diagram artifacts from model-facing tool
+      observations when output is large. The model should receive status,
+      source metadata, and a short preview or artifact reference; the terminal
+      renderer can still print the full bounded diagram.
+- [x] Add the final terminal graph-presenter wrapper with bounded timeout,
+      bounded output, and explicit color handling through either `NO_COLOR=1`
+      or `--color always` based on the RunicAI color mode.
+- [x] Record mmdflux failures as graph-rendering warnings, not agent failures.
+- [x] Write a separate NIF feasibility note before adding Rustler or a native
       extension to the main dependency graph.
 
 Validation:
 
-- [ ] Unit test Mermaid generation with deterministic graph fixtures.
-- [ ] Unit test mmdflux command wrapper with a fake executable.
-- [ ] Manual smoke with a real `mmdflux` binary if available.
+- [x] Unit test Mermaid generation with deterministic graph fixtures.
+- [x] Unit test the interim `render_mermaid` wrapper with a Mermaid fenced
+      markdown fixture, accepting `:blocked` when the binary is unavailable.
+- [x] Unit test nearby query text selection for Mermaid fenced blocks.
+- [x] Unit test Livebook `Kino.Mermaid.new("""...""")` extraction, loose query
+      selection, and rendering through the interim tools.
+- [x] Unit test dynamic `Kino.Mermaid.new(expression)` candidates are listed but
+      not rendered by default.
+- [x] Unit test bounded `search_text` previews for generated one-line docs
+      artifacts.
+- [x] Unit test the coding review gate allows `extract_diagrams` and
+      `render_mermaid` as safe read-only visualization tools.
+- [x] Unit test standard-agent summaries and final report renderers include
+      rendered Mermaid diagrams.
+- [x] Unit test project-level diagram inventory ignores generated docs and
+      caps candidate previews.
+- [x] Unit test interactive follow-up context can render the previously
+      extracted source diagrams without broad workspace discovery.
+- [ ] Unit test large rendered diagrams are summarized for the model while
+      remaining available to terminal/final-report rendering.
+- [x] Manual smoke with a real `mmdflux` binary:
+      `mix runic_ai.agent "Can you render me a mermaid diagram using MMDFLUX from the guides/mental-model.md document in this project?" --agent standard --cwd . --renderer text --detail collapsed --mode read_only --max-turns 6 --approve never`
+- [x] Manual smoke with a real `mmdflux` binary and nearby query text:
+      `mix runic_ai.agent "Get the general agent shape diagram from livebooks/chat-agent-kernel.livemd in this project and render it using MMDFlux" --agent standard --cwd . --renderer text --detail collapsed --mode read_only --max-turns 6 --approve never`
+- [x] Manual smoke with a real `mmdflux` binary and Livebook/Kino diagram
+      extraction:
+      `mix runic_ai.agent "Now let's do the same and render a mermaid graph from the livebooks/rlm-coding-agent.livemd notebook that describes RLM agents (use mmdflux tool)" --agent standard --cwd . --renderer text --detail collapsed --mode read_only --max-turns 6 --approve never`
 
 ## Phase 6: Documentation And Verification
 
@@ -356,9 +479,9 @@ Deliverables:
 
 - [x] Update `Mix.Tasks.RunicAi.Agent` docs with renderer, color, progress,
       Unicode, and graph options.
-- [ ] Add examples for text fallback, Owl default, JSONL export, review prompt,
+- [x] Add examples for text fallback, Owl default, JSONL export, review prompt,
       and RLM graph output.
-- [ ] Update `.docs/030` checklist or status line to point at this follow-on
+- [x] Update `.docs/030` checklist or status line to point at this follow-on
       enhancement plan rather than treating Owl as deferred indefinitely.
 - [ ] Capture a short manual verification report under `.docs` or `tmp` if a
       live model smoke is used.
@@ -370,6 +493,11 @@ Validation:
 - [x] `mix test test/runic_ai/terminal`
 - [x] `mix test`
 - [x] Manual: `mix runic_ai.agent --help`
+- [x] Manual: standard agent rendered the Mermaid diagram from
+      `guides/mental-model.md` through `render_mermaid` and `mmdflux`.
+- [x] Manual: standard agent rendered the "general agent shape" Mermaid diagram
+      from `livebooks/chat-agent-kernel.livemd` through `render_mermaid` query
+      selection and `mmdflux`.
 - [ ] Manual: `mix runic_ai.agent "summarize this repo's terminal harness" --agent standard --cwd . --renderer owl --detail collapsed`
 - [ ] Manual: `mix runic_ai.agent "plan a small docs-only change" --agent rlm --cwd . --renderer owl --graph text`
 
@@ -379,9 +507,12 @@ Validation:
 2. Add theme tokens and color fallback rules.
 3. Add Owl event/header/final-report rendering.
 4. Add Owl review prompt and rewrite support.
-5. Add live status blocks and progress spinners.
-6. Add graph presenter and optional mmdflux adapter.
-7. Update docs and manual verification.
+5. Harden source-diagram tooling: project diagram inventory, interactive target
+   carryover, and artifact-backed rendered output.
+6. Add live status blocks and progress spinners.
+7. Add runtime graph presenter and optional mmdflux adapter over normalized
+   graph data.
+8. Update docs and manual verification.
 
 The key constraint is that the enhanced CLI must remain a renderer over
 `RunicAI.Terminal.Event`. If a desired display cannot be built from current

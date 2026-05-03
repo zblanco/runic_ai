@@ -96,6 +96,8 @@ defmodule RunicAI.Tool.Definition do
 
   @spec validate_arguments(t(), map()) :: {:ok, map()} | {:error, Error.t()}
   def validate_arguments(%__MODULE__{} = definition, arguments) when is_map(arguments) do
+    arguments = coerce_model_arguments(definition, arguments)
+
     validation_tool =
       ReqLLM.Tool.new!(
         name: definition.name,
@@ -130,7 +132,7 @@ defmodule RunicAI.Tool.Definition do
   @spec execute(t(), map()) :: {:ok, term()} | {:error, Error.t()}
   def execute(%__MODULE__{} = definition, arguments) when is_map(arguments) do
     with {:ok, req_tool} <- to_req_llm_tool(definition) do
-      case ReqLLM.Tool.execute(req_tool, arguments) do
+      case ReqLLM.Tool.execute(req_tool, coerce_model_arguments(definition, arguments)) do
         {:ok, result} ->
           {:ok, result}
 
@@ -227,6 +229,74 @@ defmodule RunicAI.Tool.Definition do
        source: __MODULE__
      )}
   end
+
+  defp coerce_model_arguments(%__MODULE__{parameter_schema: parameter_schema}, arguments) do
+    parameter_schema
+    |> schema_entries()
+    |> Enum.reduce(arguments, fn {key, spec}, acc ->
+      case argument_value(acc, key) do
+        {:ok, argument_key, value} ->
+          Map.put(acc, argument_key, coerce_value(schema_type(spec), value))
+
+        :error ->
+          acc
+      end
+    end)
+  end
+
+  defp schema_entries(schema) when is_map(schema), do: Map.to_list(schema)
+  defp schema_entries(schema) when is_list(schema), do: schema
+
+  defp argument_value(arguments, key) do
+    cond do
+      Map.has_key?(arguments, key) ->
+        {:ok, key, Map.fetch!(arguments, key)}
+
+      is_atom(key) and Map.has_key?(arguments, Atom.to_string(key)) ->
+        string_key = Atom.to_string(key)
+        {:ok, string_key, Map.fetch!(arguments, string_key)}
+
+      true ->
+        :error
+    end
+  end
+
+  defp schema_type(spec) when is_map(spec) do
+    Map.get(spec, :type, Map.get(spec, "type"))
+  end
+
+  defp schema_type(spec) when is_list(spec), do: Keyword.get(spec, :type)
+  defp schema_type(_spec), do: nil
+
+  defp coerce_value(type, value) when type in [:pos_integer, :non_neg_integer, :integer] do
+    coerce_integer(value)
+  end
+
+  defp coerce_value(:boolean, value), do: coerce_boolean(value)
+  defp coerce_value({:list, :string}, value) when is_binary(value), do: [value]
+  defp coerce_value(_type, value), do: value
+
+  defp coerce_integer(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> Integer.parse()
+    |> case do
+      {integer, ""} -> integer
+      _other -> value
+    end
+  end
+
+  defp coerce_integer(value), do: value
+
+  defp coerce_boolean(value) when is_binary(value) do
+    case String.downcase(String.trim(value)) do
+      "true" -> true
+      "false" -> false
+      _other -> value
+    end
+  end
+
+  defp coerce_boolean(value), do: value
 
   defp normalize_req_llm_error(reason, opts) do
     kind = Keyword.get(opts, :kind, classify_req_llm_error(reason))

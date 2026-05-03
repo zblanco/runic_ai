@@ -6,9 +6,11 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
   failures and repair the graph without relying on exception strings.
   """
 
+  alias RunicAI.Assistant.RLM.BlueprintGraph
   alias RunicAI.Assistant.RLM.FunctionBlueprint
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Error
+  alias RunicAI.RLM.ComponentCatalog
 
   @default_max_nodes 20
 
@@ -34,10 +36,11 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
           |> check_components_present(blueprint)
           |> check_stop_conditions(blueprint)
           |> check_unique_ids(blueprint)
-          |> check_edges(blueprint)
-          |> check_cycles(blueprint)
+          |> check_catalog(blueprint)
+          |> check_graph(blueprint)
           |> check_budgets(blueprint, opts)
           |> check_function_policies(blueprint, opts)
+          |> check_artifact_writers(blueprint)
 
         %{
           status:
@@ -111,48 +114,37 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
     end
   end
 
-  defp check_edges(diagnostics, %WorkflowBlueprint{} = blueprint) do
-    ids = MapSet.new(WorkflowBlueprint.component_ids(blueprint))
-
-    blueprint.edges
-    |> Enum.reduce(diagnostics, fn edge, diagnostics ->
-      cond do
-        not MapSet.member?(ids, edge.from) ->
-          [
-            diagnostic(:error, :unknown_edge_source, "edge references an unknown source node", %{
-              edge: edge
-            })
-            | diagnostics
-          ]
-
-        not MapSet.member?(ids, edge.to) ->
-          [
-            diagnostic(:error, :unknown_edge_target, "edge references an unknown target node", %{
-              edge: edge
-            })
-            | diagnostics
-          ]
-
-        edge.from == edge.to ->
-          [
-            diagnostic(:error, :self_edge, "edge cannot point to the same node", %{edge: edge})
-            | diagnostics
-          ]
-
-        true ->
+  defp check_catalog(diagnostics, %WorkflowBlueprint{} = blueprint) do
+    Enum.reduce(blueprint.components, diagnostics, fn component, diagnostics ->
+      case ComponentCatalog.spec_from_blueprint(component, blueprint_id: blueprint.id) do
+        {:ok, _spec} ->
           diagnostics
+
+        {:error, %Error{} = error} ->
+          [
+            diagnostic(:error, error_code(error, :invalid_component_params), error.message, %{
+              component_id: component.id,
+              error: error
+            })
+            | diagnostics
+          ]
       end
     end)
   end
 
-  defp check_cycles(diagnostics, %WorkflowBlueprint{} = blueprint) do
-    case topological_order(blueprint.components, blueprint.edges) do
-      {:ok, _components} ->
-        diagnostics
+  defp check_graph(diagnostics, %WorkflowBlueprint{} = blueprint) do
+    graph_diagnostics =
+      blueprint
+      |> BlueprintGraph.diagnostics()
+      |> Enum.reject(
+        &(&1.code in [
+            :duplicate_component_ids,
+            :invalid_component_params,
+            :unknown_component_type
+          ])
+      )
 
-      {:error, :cycle} ->
-        [diagnostic(:error, :cycle, "workflow blueprint graph must be acyclic") | diagnostics]
-    end
+    Enum.reduce(graph_diagnostics, diagnostics, &[&1 | &2])
   end
 
   defp check_budgets(diagnostics, %WorkflowBlueprint{} = blueprint, opts) do
@@ -216,6 +208,30 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
     end)
   end
 
+  defp check_artifact_writers(diagnostics, %WorkflowBlueprint{} = blueprint) do
+    Enum.reduce(blueprint.components, diagnostics, fn
+      %{id: id, type: :artifact_writer, params: params}, diagnostics ->
+        path = params[:path] || params["path"]
+
+        if is_binary(path) and String.trim(path) != "" do
+          diagnostics
+        else
+          [
+            diagnostic(
+              :error,
+              :invalid_artifact_writer_path,
+              "artifact_writer components require a non-empty path",
+              %{component_id: id, path: path}
+            )
+            | diagnostics
+          ]
+        end
+
+      _component, diagnostics ->
+        diagnostics
+    end)
+  end
+
   defp max_generated_function_tier(%WorkflowBlueprint{} = blueprint, opts) do
     tier =
       opts[:max_generated_function_tier] ||
@@ -232,55 +248,10 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
   defp normalize_max_tier("tier2"), do: :tier2
   defp normalize_max_tier(_tier), do: :tier1
 
-  defp topological_order(components, edges) do
-    by_id = Map.new(components, &{&1.id, &1})
-    ids = Map.keys(by_id)
+  defp error_code(%Error{details: details}, default) when is_map(details),
+    do: Map.get(details, :code, default)
 
-    Enum.reduce_while(ids, {[], MapSet.new(), MapSet.new()}, fn id,
-                                                                {ordered, visiting, visited} ->
-      case visit(id, by_id, edges, ordered, visiting, visited) do
-        {:ok, ordered, visited} -> {:cont, {ordered, visiting, visited}}
-        {:error, :cycle} -> {:halt, {:error, :cycle}}
-      end
-    end)
-    |> case do
-      {:error, :cycle} -> {:error, :cycle}
-      {ordered, _visiting, _visited} -> {:ok, ordered}
-    end
-  end
-
-  defp visit(id, by_id, edges, ordered, visiting, visited) do
-    cond do
-      MapSet.member?(visited, id) ->
-        {:ok, ordered, visited}
-
-      MapSet.member?(visiting, id) ->
-        {:error, :cycle}
-
-      true ->
-        visiting = MapSet.put(visiting, id)
-
-        children =
-          edges
-          |> Enum.filter(&(&1.from == id))
-          |> Enum.map(& &1.to)
-
-        Enum.reduce_while(children, {:ok, ordered, visited}, fn child, {:ok, ordered, visited} ->
-          case visit(child, by_id, edges, ordered, visiting, visited) do
-            {:ok, ordered, visited} -> {:cont, {:ok, ordered, visited}}
-            {:error, :cycle} -> {:halt, {:error, :cycle}}
-          end
-        end)
-        |> case do
-          {:error, :cycle} ->
-            {:error, :cycle}
-
-          {:ok, ordered, visited} ->
-            component = Map.fetch!(by_id, id)
-            {:ok, [component | ordered], MapSet.put(visited, id)}
-        end
-    end
-  end
+  defp error_code(_error, default), do: default
 
   defp diagnostic(severity, code, message, details \\ %{}) do
     %{severity: severity, code: code, message: message, details: details}

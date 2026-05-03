@@ -8,6 +8,7 @@ defmodule RunicAI.Terminal.EventPresenter do
 
   alias RunicAI.ReviewRequest
   alias RunicAI.Terminal.Event
+  alias RunicAI.Terminal.GraphPresenter
 
   @type detail_mode :: :hidden | :collapsed | :expanded
 
@@ -23,6 +24,10 @@ defmodule RunicAI.Terminal.EventPresenter do
       "  model: #{value(opts, :model, "default")}",
       "  client: #{value(opts, :client, "default")}",
       "  detail: #{value(opts, :detail, :collapsed)}",
+      header_line("async", value(opts, :async, nil)),
+      header_line("max concurrency", value(opts, :max_concurrency, nil)),
+      header_line("LLM map concurrency", value(opts, :max_llm_map_concurrency, nil)),
+      header_line("LLM map calls", value(opts, :max_llm_map_calls, nil)),
       jsonl_line(opts)
     ]
     |> Enum.reject(&is_nil/1)
@@ -35,7 +40,7 @@ defmodule RunicAI.Terminal.EventPresenter do
 
     [
       summary_line(event),
-      detail_lines(event, detail_mode)
+      detail_lines(event, detail_mode, opts)
     ]
     |> List.flatten()
     |> Enum.reject(&(&1 in [nil, ""]))
@@ -64,7 +69,7 @@ defmodule RunicAI.Terminal.EventPresenter do
       maybe_line("Path", request.details[:path] || request.details["path"]),
       maybe_line("Command", command_preview(request.details)),
       "",
-      "[a] approve  [d] deny  [s] final stop"
+      review_decision_line(request)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
@@ -86,22 +91,30 @@ defmodule RunicAI.Terminal.EventPresenter do
     "[#{time}] #{String.upcase(Atom.to_string(event.status))} #{phase} #{event.title}"
   end
 
-  defp detail_lines(_event, :hidden), do: []
+  defp detail_lines(_event, :hidden, _opts), do: []
 
-  defp detail_lines(%Event{detail: detail}, :collapsed) when is_binary(detail) and detail != "" do
-    ["  #{single_line(detail)}"]
+  defp detail_lines(%Event{} = event, :collapsed, _opts) do
+    case mermaid_tool_output(event) do
+      nil -> collapsed_detail(event.detail)
+      output -> mermaid_tool_output_lines(output)
+    end
   end
 
-  defp detail_lines(%Event{kind: :rlm_plan, phase: :proposed, data: data}, :expanded) do
+  defp detail_lines(%Event{kind: :rlm_plan, phase: :proposed, data: data}, :expanded, opts) do
     proposal = data["proposal"] || data[:proposal] || %{}
-
-    [
-      "  objective: #{proposal["objective"] || proposal[:objective]}",
-      proposal_nodes(proposal)
-    ]
+    render_graph_detail(proposal, opts)
   end
 
-  defp detail_lines(%Event{kind: :summary, phase: :scorecard, data: data}, :expanded) do
+  defp detail_lines(%Event{kind: :rlm_plan, phase: :compiled, data: data}, :expanded, opts) do
+    graph = data["compiled"] || data[:compiled] || %{}
+
+    case render_graph_detail(graph, opts) do
+      [] -> expanded_detail(nil, data)
+      lines -> lines
+    end
+  end
+
+  defp detail_lines(%Event{kind: :summary, phase: :scorecard, data: data}, :expanded, _opts) do
     scorecard = data["scorecard"] || data[:scorecard] || %{}
     risks = scorecard["residual_risks"] || scorecard[:residual_risks] || []
     changed = scorecard["changed_files"] || scorecard[:changed_files] || []
@@ -112,7 +125,22 @@ defmodule RunicAI.Terminal.EventPresenter do
     ]
   end
 
-  defp detail_lines(%Event{detail: detail, data: data}, :expanded) do
+  defp detail_lines(%Event{} = event, :expanded, _opts) do
+    case mermaid_tool_output(event) do
+      nil -> expanded_detail(event.detail, event.data)
+      output -> mermaid_tool_output_lines(output)
+    end
+  end
+
+  defp detail_lines(_event, _mode, _opts), do: []
+
+  defp collapsed_detail(detail) when is_binary(detail) and detail != "" do
+    ["  #{single_line(detail)}"]
+  end
+
+  defp collapsed_detail(_detail), do: []
+
+  defp expanded_detail(detail, data) do
     detail = if is_binary(detail) and detail != "", do: ["  #{detail}"], else: []
 
     data_lines =
@@ -126,18 +154,25 @@ defmodule RunicAI.Terminal.EventPresenter do
     detail ++ data_lines
   end
 
-  defp detail_lines(_event, _mode), do: []
+  defp render_graph_detail(graph, opts) do
+    graph = graph["graph_summary"] || graph[:graph_summary] || graph
 
-  defp proposal_nodes(proposal) do
-    proposal
-    |> Map.get("nodes", Map.get(proposal, :nodes, []))
-    |> Enum.map(fn node ->
-      id = node["id"] || node[:id]
-      kind = node["kind"] || node[:kind] || node["type"] || node[:type]
-      deps = node["dependencies"] || node[:dependencies] || []
-      dep_text = if deps == [], do: "root", else: Enum.join(deps, ", ")
-      "  [#{id}] #{kind} <- #{dep_text}"
-    end)
+    nodes =
+      graph["nodes"] || graph[:nodes] || graph["components"] || graph[:components] ||
+        get_in(graph, ["runic", "native_nodes"]) ||
+        get_in(graph, [:runic, :native_nodes]) ||
+        []
+
+    if nodes == [] do
+      []
+    else
+      graph
+      |> GraphPresenter.render_lines(
+        mode: Keyword.get(opts, :graph, :text),
+        color: Keyword.get(opts, :color, :auto)
+      )
+      |> Enum.map(&("  " <> &1))
+    end
   end
 
   defp render_standard_final_report(result) do
@@ -148,12 +183,16 @@ defmodule RunicAI.Terminal.EventPresenter do
       "Final report",
       "  status: #{Map.get(result, :status)}",
       "  session: #{Map.get(result, :session_id)}",
+      maybe_line("  agent status", summary[:status] || summary["status"]),
       maybe_list("  changed files", summary[:changed_files] || summary["changed_files"]),
       maybe_list("  tools used", summary[:tools_used] || summary["tools_used"]),
+      rendered_diagram_report_lines(summary),
       maybe_line("  objective", summary[:objective_status] || summary["objective_status"]),
+      maybe_line("  error", summary[:last_error] || summary["last_error"]),
       maybe_list("  risks", summary[:risks] || summary["risks"]),
       maybe_line("  reply", summary[:reply] || summary["reply"])
     ]
+    |> List.flatten()
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
@@ -215,9 +254,129 @@ defmodule RunicAI.Terminal.EventPresenter do
     end
   end
 
+  defp mermaid_tool_output(%Event{data: data}) when is_map(data) do
+    data
+    |> field(:output)
+    |> unwrap_tool_output()
+    |> case do
+      output when is_map(output) ->
+        command = field(output, :command)
+
+        if is_binary(command) and String.starts_with?(command, "mmdflux") do
+          output
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp mermaid_tool_output(_event), do: nil
+
+  defp unwrap_tool_output(output) when is_map(output) do
+    nested = field(output, :output)
+
+    if is_map(nested) do
+      nested
+    else
+      output
+    end
+  end
+
+  defp unwrap_tool_output(output), do: output
+
+  defp mermaid_tool_output_lines(output) do
+    rendered = field(output, :rendered)
+
+    [
+      maybe_line("  mmdflux", field(output, :status)),
+      maybe_line("  source", mermaid_source_label(output)),
+      maybe_line("  error", field(output, :error)),
+      rendered_header(rendered),
+      rendered && indent_block(rendered, "    ")
+    ]
+    |> List.flatten()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp rendered_diagram_report_lines(summary) do
+    diagrams = summary[:rendered_diagrams] || summary["rendered_diagrams"] || []
+
+    case diagrams do
+      [] ->
+        nil
+
+      diagrams ->
+        [
+          "  rendered diagrams:"
+          | diagrams
+            |> Enum.with_index(1)
+            |> Enum.flat_map(fn {diagram, index} ->
+              rendered_diagram_lines(diagram, index)
+            end)
+        ]
+    end
+  end
+
+  defp rendered_diagram_lines(diagram, index) do
+    rendered = field(diagram, :rendered)
+
+    [
+      "    #{index}. #{rendered_diagram_label(diagram)}",
+      maybe_line("       status", field(diagram, :status)),
+      maybe_line("       error", field(diagram, :error)),
+      rendered && indent_block(rendered, "       ")
+    ]
+    |> List.flatten()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp rendered_diagram_label(diagram) do
+    [
+      field(diagram, :path),
+      field(diagram, :heading) && "heading #{field(diagram, :heading)}",
+      field(diagram, :diagram_index) && "diagram #{field(diagram, :diagram_index)}",
+      field(diagram, :line_start) && "line #{field(diagram, :line_start)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(", ")
+    |> case do
+      "" -> "inline Mermaid source"
+      label -> label
+    end
+  end
+
+  defp mermaid_source_label(output) do
+    [
+      field(output, :path),
+      field(output, :heading) && "heading #{field(output, :heading)}",
+      field(output, :diagram_index) && "diagram #{field(output, :diagram_index)}",
+      field(output, :line_start) && "line #{field(output, :line_start)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(", ")
+    |> case do
+      "" -> nil
+      label -> label
+    end
+  end
+
+  defp rendered_header(rendered) when is_binary(rendered) and rendered != "", do: "  rendered:"
+  defp rendered_header(_rendered), do: nil
+
+  defp indent_block(text, prefix) do
+    text
+    |> String.trim_trailing()
+    |> String.split("\n", trim: false)
+    |> Enum.map(&(prefix <> &1))
+  end
+
   defp jsonl_line(%{jsonl_path: nil}), do: nil
   defp jsonl_line(%{jsonl_path: path}), do: "  jsonl: #{path}"
   defp jsonl_line(_opts), do: nil
+
+  defp header_line(_label, nil), do: nil
+  defp header_line(label, value), do: "  #{label}: #{value}"
 
   defp maybe_line(_label, nil), do: nil
   defp maybe_line(_label, ""), do: nil
@@ -246,8 +405,34 @@ defmodule RunicAI.Terminal.EventPresenter do
 
   defp command_preview(_details), do: nil
 
-  defp value(opts, key, default),
-    do: Map.get(opts, key) || Map.get(opts, Atom.to_string(key)) || default
+  defp review_decision_line(%ReviewRequest{options: options}) do
+    [
+      if(:approve in options, do: "[a] approve"),
+      if(:reject in options, do: "[d] deny"),
+      if(:edit in options, do: "[r] rewrite"),
+      if(:cancel in options, do: "[s] final stop")
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("  ")
+  end
+
+  defp value(opts, key, default) do
+    case Map.fetch(opts, key) do
+      {:ok, value} when not is_nil(value) ->
+        value
+
+      _other ->
+        case Map.fetch(opts, Atom.to_string(key)) do
+          {:ok, value} when not is_nil(value) -> value
+          _other -> default
+        end
+    end
+  end
+
+  defp field(map, key) when is_map(map),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(_map, _key), do: nil
 
   defp single_line(text) do
     text

@@ -49,6 +49,31 @@ defmodule RunicAI.Terminal.OwlPresenterTest do
     assert rendered =~ "lib/demo.ex"
   end
 
+  test "renders representative event kinds through Owl without losing titles" do
+    events =
+      [
+        {:status, :session, :running, "Status"},
+        {:message, :assistant, :ok, "Message"},
+        {:tool, :call, :ok, "Tool"},
+        {:hitl, :review, :review, "HITL"},
+        {:rlm_plan, :proposed, :ok, "RLM plan"},
+        {:rlm_node, :episode, :ok, "RLM node"},
+        {:verification, :observation, :ok, "Verification"},
+        {:repair, :attempt, :ok, "Repair"},
+        {:error, :run, :error, "Error"},
+        {:summary, :output, :ok, "Summary"}
+      ]
+
+    for {kind, phase, status, title} <- events do
+      rendered =
+        kind
+        |> Event.new!(phase: phase, status: status, title: title, detail: "detail", data: %{})
+        |> OwlPresenter.render_event(detail: :collapsed, color: :never, theme: :runic, width: 100)
+
+      assert rendered =~ title
+    end
+  end
+
   test "renders review prompts through the Owl presenter" do
     request =
       ReviewRequest.new!(:destructive_patch,
@@ -98,5 +123,39 @@ defmodule RunicAI.Terminal.OwlPresenterTest do
     assert rendered =~ "**RunicAI** is a workflow-native framework."
     assert rendered =~ "## What it provides"
     assert rendered =~ "- Tool-using agents"
+  end
+
+  test "preserves rendered diagrams in boxed final reports" do
+    rendered =
+      OwlPresenter.render_final_report(
+        %{
+          agent: :standard,
+          status: :completed,
+          session_id: "session-1",
+          summary: %{
+            tools_used: ["render_mermaid"],
+            rendered_diagrams: [
+              %{
+                status: :pass,
+                path: "guides/stateless-vs-stateful-agents.md",
+                heading: "Shared inner turn flow",
+                diagram_index: 3,
+                line_start: 120,
+                rendered: "┌─────────────┐\n│ Agent.State │"
+              }
+            ],
+            reply: "Rendered."
+          }
+        },
+        color: :never,
+        unicode: :always,
+        theme: :runic,
+        width: 90
+      )
+
+    assert rendered =~ "Rendered diagrams"
+    assert rendered =~ "guides/stateless-vs-stateful-agents.md"
+    assert rendered =~ "┌─────────────┐"
+    assert rendered =~ "│ Agent.State │"
   end
 end

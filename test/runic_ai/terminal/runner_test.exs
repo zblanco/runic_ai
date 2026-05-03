@@ -6,7 +6,11 @@ defmodule RunicAI.Terminal.RunnerTest do
   alias RunicAI.Coding.RLM.WorkflowScorecard
   alias RunicAI.Coding.RLM.WorkflowValidationReport
   alias RunicAI.LLM.TestClient
+  alias RunicAI.Persistence.Queries
+  alias RunicAI.Persistence.SQLite
+  alias RunicAI.Terminal.AgentRunner
   alias RunicAI.Terminal.AssistantRunner
+  alias RunicAI.Terminal.CliOptions
   alias RunicAI.Terminal.RLMRunner
   alias RunicAI.Terminal.StandardRunner
 
@@ -27,6 +31,7 @@ defmodule RunicAI.Terminal.RunnerTest do
              )
 
     assert result.agent == :standard
+    assert result.status == :completed
     assert result.summary.reply == "This repo is empty."
 
     emitted = Elixir.Agent.get(events, & &1)
@@ -98,6 +103,64 @@ defmodule RunicAI.Terminal.RunnerTest do
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :blueprint_proposed))
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :proposed))
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :scorecard))
+  end
+
+  test "agent runner writes matching live JSONL and SQLite terminal event counts" do
+    root = tmp_dir()
+    jsonl_path = Path.join(root, "trace.jsonl")
+    sqlite_path = Path.join(root, "runs.db")
+
+    run_fun = fn _cwd, _objective, opts ->
+      opts[:event_sink].(%{
+        run_id: opts[:run_id],
+        stage: :node_started,
+        status: :running,
+        data: %{
+          runnable: %{
+            id: "runnable:1",
+            node: "assistant_node_1_plan",
+            component_id: "plan",
+            component_type: "blueprint_proposer"
+          },
+          input: %{objective: "persist this"}
+        }
+      })
+
+      {:ok, assistant_result()}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "persist this",
+        "--agent",
+        "assistant",
+        "--cwd",
+        root,
+        "--jsonl",
+        jsonl_path,
+        "--sqlite",
+        sqlite_path
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    {:ok, store} = SQLite.open(database: sqlite_path)
+    on_exit(fn -> SQLite.close(store) end)
+
+    jsonl_count =
+      jsonl_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> length()
+
+    assert jsonl_count == length(Queries.run_timeline(store, result.run_id))
+    assert Queries.runnable_events(store, result.run_id) != []
+    assert Queries.scorecards_for_run(store, result.run_id) != []
+    assert Queries.artifacts_for_run(store, result.run_id) != []
   end
 
   defp rlm_result do

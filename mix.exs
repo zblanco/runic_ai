@@ -32,11 +32,12 @@ defmodule RunicAI.MixProject do
     [
       {:runic, "~> 0.1.0-alpha.7"},
       {:req_llm, "~> 1.9"},
+      {:ecto_sql, "~> 3.13"},
+      {:ecto_sqlite3, "~> 0.22"},
       {:owl, "~> 0.13"},
       {:bunt, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:just_bash, "~> 0.3", only: [:dev, :test], optional: true},
-      {:exqlite, "~> 0.36", only: [:dev, :test], optional: true},
       {:tidewave, "~> 0.4", only: :dev},
       {:bandit, "~> 1.0", only: :dev}
     ]

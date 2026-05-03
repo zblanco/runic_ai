@@ -1,7 +1,8 @@
 # Assistant RLM General-Purpose Completion And Smoke Plan
 
 Status: implementation slice landed; fallback and dynamic live matrices run;
-scorecard repair/progression artifacts added
+scorecard repair/progression artifacts added; Runic-native compiler/executor
+migration in progress
 
 Date: 2026-04-30
 
@@ -25,7 +26,9 @@ The first assistant RLM vertical slice works:
 - workflow contracts: `WorkflowBlueprint`, `ComponentBlueprint`,
   `FunctionBlueprint`, `ExecutionContext`
 - validator: graph shape, stop conditions, component ids, function tier policy
-- compiler: accepted blueprint to Runic workflow plus sequential execution path
+- compiler/executor: accepted blueprint to Runic workflow, Runic
+  `Workflow.add/3` port validation, Runic run-context-backed component
+  adapters, scheduler policies, and three-phase Runic execution
 - generic components:
   - `SourceDiscovery`
   - `SourceSplitter`
@@ -64,7 +67,7 @@ The first assistant RLM vertical slice works:
     matrix writer
   - per-run JSON detail artifacts under `tmp/assistant_smoke/runs`, including
     blueprint, compiled graph summary, validation report, scorecard,
-    repair history, and intermediate-output previews
+    repair history, and Runic-production-derived intermediate-output previews
   - `SmokeExpectation` deterministic checks for artifact, required sections,
     scorecard, and expected workflow capabilities; source-cue and artifact
     quality observations now come from the runtime `ObjectiveScorecard` when

@@ -16,6 +16,7 @@ defmodule RunicAI.Coding.ReviewGate do
 
   @always_allow ~w(
     list_dir find_files read_file read_range read_many search_text search_regex
+    extract_diagrams render_mermaid
     git_status git_diff git_log git_show git_branch
     compile_project run_tests run_linter
     source_assert changed_file_inventory

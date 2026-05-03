@@ -14,22 +14,15 @@ defmodule RunicAI.RLM.Components.LLMMap do
   def run(input, params \\ %{}, opts \\ []) when is_list(opts) do
     params = opts_map(params)
     records = records(input)
-    limit = integer_opt(params, :limit, length(records))
-
-    selected =
-      records
-      |> Enum.take(limit)
-      |> Enum.with_index(1)
+    selected = items(input, params)
 
     max_concurrency = integer_opt(params, :max_concurrency, 1)
-    model = model_name(params, opts)
-    llm_opts = llm_opts(opts)
 
     results =
       selected
       |> Task.async_stream(
         fn {record, index} ->
-          map_one(record, index, input, params, opts, model, llm_opts)
+          map_item(record, index, input, params, opts)
         end,
         max_concurrency: max(max_concurrency, 1),
         ordered: true,
@@ -53,9 +46,33 @@ defmodule RunicAI.RLM.Components.LLMMap do
          count: length(items),
          input_count: length(records),
          max_concurrency: max_concurrency,
-         truncated?: length(records) > limit
+         truncated?: length(records) > length(selected)
        }}
     end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @spec items(term(), map() | keyword()) :: [{term(), pos_integer()}]
+  def items(input, params \\ %{}) do
+    params = opts_map(params)
+    records = records(input)
+    limit = integer_opt(params, :limit, integer_opt(params, :max_items, length(records)))
+
+    records
+    |> Enum.take(limit)
+    |> Enum.with_index(1)
+  end
+
+  @spec map_item(term(), pos_integer(), term(), map() | keyword(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def map_item(record, index, input, params \\ %{}, opts \\ []) when is_list(opts) do
+    params = opts_map(params)
+    model = model_name(params, opts)
+    llm_opts = llm_opts(opts)
+
+    map_one(record, index, input, params, opts, model, llm_opts)
   rescue
     exception ->
       {:error, Error.from_exception(exception, source: __MODULE__)}
@@ -191,8 +208,10 @@ defmodule RunicAI.RLM.Components.LLMMap do
       @default_model
   end
 
-  defp get(map, key, default) when is_map(map),
+  defp get(map, key, default) when is_map(map) and is_atom(key),
     do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+
+  defp get(map, key, default) when is_map(map), do: Map.get(map, key, default)
 
   defp get(_map, _key, default), do: default
 end

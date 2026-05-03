@@ -7,6 +7,9 @@ defmodule Mix.Tasks.RunicAi.Agent do
       mix runic_ai.agent --interactive --agent standard --cwd .
       mix runic_ai.agent "inspect the harness" --jsonl tmp/trace.jsonl
       mix runic_ai.agent "inspect the harness" --renderer owl --theme runic
+      mix runic_ai.agent "summarize this repo" --renderer text --color never
+      mix runic_ai.agent "plan a docs-only change" --agent rlm --renderer owl --graph mermaid
+      mix runic_ai.agent "render diagrams from guides/mental-model.md with mmdflux" --agent standard --mode read_only
 
   Presentation options:
 
@@ -16,6 +19,13 @@ defmodule Mix.Tasks.RunicAi.Agent do
     * `--progress auto|off`
     * `--unicode auto|always|never`
     * `--graph text|mermaid|mmdflux`
+
+  Execution options:
+
+    * `--async` / `--no-async`
+    * `--max-concurrency N`
+    * `--max-llm-map-concurrency N`
+    * `--max-llm-map-calls N`
   """
 
   use Mix.Task

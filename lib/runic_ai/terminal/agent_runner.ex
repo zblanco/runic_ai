@@ -8,12 +8,15 @@ defmodule RunicAI.Terminal.AgentRunner do
 
   alias RunicAI.Coding.Review
   alias RunicAI.Error
+  alias RunicAI.Persistence.SQLite
   alias RunicAI.ReviewRequest
   alias RunicAI.Terminal.AssistantRunner
   alias RunicAI.Terminal.CliOptions
+  alias RunicAI.Terminal.InteractiveContext
   alias RunicAI.Terminal.JsonlSink
   alias RunicAI.Terminal.RLMRunner
   alias RunicAI.Terminal.Renderer
+  alias RunicAI.Terminal.ReviewPrompt
   alias RunicAI.Terminal.StandardRunner
 
   @spec run(CliOptions.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
@@ -29,26 +32,28 @@ defmodule RunicAI.Terminal.AgentRunner do
     output_fun = Keyword.get(opts, :output_fun, &IO.puts/1)
     input_fun = Keyword.get(opts, :input_fun, &IO.gets/1)
 
-    with {:ok, jsonl} <- JsonlSink.open(options.jsonl_path) do
+    with {:ok, jsonl} <- JsonlSink.open(options.jsonl_path),
+         {:ok, persistence} <- open_persistence(options, opts) do
       try do
         renderer = Renderer.new(options, opts)
         output_fun.(Renderer.render_header(renderer, header_opts(options, renderer)))
 
-        event_sink = event_sink(jsonl, output_fun, renderer)
+        event_sink = event_sink(jsonl, persistence_store(persistence), output_fun, renderer)
 
         if options.interactive? do
           run_interactive(options, event_sink, input_fun, output_fun, renderer)
         else
-          run_once(options, event_sink, input_fun, output_fun, renderer)
+          run_once(options, event_sink, input_fun, output_fun, renderer, opts)
         end
       after
+        close_persistence(persistence)
         JsonlSink.close(jsonl)
       end
     end
   end
 
-  defp run_once(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer) do
-    runner_opts = runner_opts(options, event_sink, input_fun, output_fun, renderer)
+  defp run_once(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer, opts) do
+    runner_opts = runner_opts(options, event_sink, input_fun, output_fun, renderer, opts)
 
     result =
       case options.agent do
@@ -77,7 +82,8 @@ defmodule RunicAI.Terminal.AgentRunner do
             event_sink,
             input_fun,
             output_fun,
-            renderer
+            renderer,
+            nil
           )
       end
 
@@ -112,7 +118,8 @@ defmodule RunicAI.Terminal.AgentRunner do
                    event_sink,
                    input_fun,
                    output_fun,
-                   renderer
+                   renderer,
+                   last_result
                  ) do
               {:ok, result} ->
                 interactive_loop(options, event_sink, input_fun, output_fun, renderer, result)
@@ -124,12 +131,20 @@ defmodule RunicAI.Terminal.AgentRunner do
     end
   end
 
-  defp run_interactive_objective(options, objective, event_sink, input_fun, output_fun, renderer) do
-    options = %{options | objective: objective}
-    run_once(options, event_sink, input_fun, output_fun, renderer)
+  defp run_interactive_objective(
+         options,
+         objective,
+         event_sink,
+         input_fun,
+         output_fun,
+         renderer,
+         last_result
+       ) do
+    options = %{options | objective: InteractiveContext.add_carryover(objective, last_result)}
+    run_once(options, event_sink, input_fun, output_fun, renderer, [])
   end
 
-  defp runner_opts(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer) do
+  defp runner_opts(%CliOptions{} = options, event_sink, input_fun, output_fun, renderer, opts) do
     [
       cwd: options.cwd,
       model: options.model,
@@ -143,8 +158,10 @@ defmodule RunicAI.Terminal.AgentRunner do
       max_generated_function_tier: max_generated_function_tier(options.allow_generated_functions),
       write_policy: options.write_policy,
       event_sink: event_sink,
-      review_decider: review_decider(options, input_fun, output_fun, renderer)
+      review_decider: review_decider(options, input_fun, output_fun, renderer, event_sink),
+      run_fun: Keyword.get(opts, :run_fun)
     ]
+    |> Keyword.merge(CliOptions.concurrency_opts(options))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
@@ -152,9 +169,10 @@ defmodule RunicAI.Terminal.AgentRunner do
   defp max_generated_function_tier(:tier1), do: :tier1
   defp max_generated_function_tier(:tier2_review), do: :tier2
 
-  defp event_sink(jsonl, output_fun, renderer) do
+  defp event_sink(jsonl, persistence, output_fun, renderer) do
     fn event ->
       _ = JsonlSink.write_event(jsonl, event)
+      _ = write_persistence_event(persistence, event)
 
       event
       |> then(&Renderer.render_event(renderer, &1))
@@ -164,11 +182,43 @@ defmodule RunicAI.Terminal.AgentRunner do
     end
   end
 
-  defp review_decider(%CliOptions{} = options, input_fun, output_fun, renderer) do
+  defp open_persistence(%CliOptions{sqlite_path: nil}, opts) do
+    {:ok, {:external, Keyword.get(opts, :persistence)}}
+  end
+
+  defp open_persistence(%CliOptions{sqlite_path: path}, opts) do
+    case Keyword.fetch(opts, :persistence) do
+      {:ok, persistence} ->
+        {:ok, {:external, persistence}}
+
+      :error ->
+        case SQLite.open(database: path, migrate?: true) do
+          {:ok, store} -> {:ok, {:owned, store}}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp persistence_store({_ownership, store}), do: store
+
+  defp close_persistence({:owned, %RunicAI.Persistence.SQLite.Store{} = store}),
+    do: SQLite.close(store)
+
+  defp close_persistence(_persistence), do: :ok
+
+  defp write_persistence_event(%RunicAI.Persistence.SQLite.Store{} = store, event) do
+    SQLite.record_terminal_event(store, event)
+  end
+
+  defp write_persistence_event(_persistence, _event), do: :ok
+
+  defp review_decider(%CliOptions{} = options, input_fun, output_fun, renderer, event_sink) do
     fn request, context ->
       case options.approve do
         :never ->
-          {:ok, Review.deny(request, reason: "review denied by --approve never")}
+          reason = "review denied by --approve never"
+          emit_review_blocked(event_sink, request, context, reason)
+          {:ok, Review.deny(request, reason: reason)}
 
         :safe ->
           if safe_review?(request) do
@@ -186,33 +236,20 @@ defmodule RunicAI.Terminal.AgentRunner do
   defp ask_review(%ReviewRequest{} = request, _context, input_fun, output_fun, renderer) do
     output_fun.(Renderer.render_review_prompt(renderer, request))
 
-    case input_fun.("> ") do
-      nil ->
-        {:error,
-         Error.validation("review prompt reached EOF before a decision",
-           source: __MODULE__,
-           details: %{resume_key: request.resume_key}
-         )}
+    prompt_opts =
+      if renderer.name == :owl do
+        [renderer: :owl]
+      else
+        [renderer: :text, input_fun: input_fun]
+      end
 
-      input ->
-        case String.trim(String.downcase(input)) do
-          value when value in ["a", "approve", "allow", "y", "yes"] ->
-            {:ok, Review.allow(request, reason: "approved in terminal")}
+    ReviewPrompt.decide(request, prompt_opts)
+  end
 
-          value when value in ["d", "deny", "reject", "n", "no"] ->
-            {:ok, Review.deny(request, reason: "denied in terminal")}
+  defp emit_review_blocked(event_sink, request, context, reason) do
+    event = ReviewPrompt.blocked_event(request, Map.take(context, [:session_id]), reason)
 
-          value when value in ["s", "stop", "cancel", "final_stop"] ->
-            {:ok, Review.final_stop(request, reason: "stopped in terminal")}
-
-          _other ->
-            {:error,
-             Error.validation("unknown review decision",
-               source: __MODULE__,
-               details: %{input: input, valid: ["approve", "deny", "final stop"]}
-             )}
-        end
-    end
+    event_sink.(event)
   end
 
   defp safe_review?(%ReviewRequest{} = request) do
@@ -246,5 +283,6 @@ defmodule RunicAI.Terminal.AgentRunner do
       theme: renderer.theme,
       color: renderer.color
     }
+    |> Map.merge(Map.new(CliOptions.concurrency_opts(options)))
   end
 end

@@ -28,6 +28,10 @@ defmodule RunicAI.Terminal.OwlPresenter do
         field_line("detail", value(opts, :detail, :collapsed)),
         field_line("renderer", value(opts, :renderer, :owl)),
         field_line("theme", value(opts, :theme, :runic)),
+        maybe_field_line("async", value(opts, :async, nil)),
+        maybe_field_line("concurrency", value(opts, :max_concurrency, nil)),
+        maybe_field_line("llm map", value(opts, :max_llm_map_concurrency, nil)),
+        maybe_field_line("map calls", value(opts, :max_llm_map_calls, nil)),
         maybe_field_line("jsonl", value(opts, :jsonl_path, nil))
       ]
       |> Enum.reject(&is_nil/1)
@@ -45,7 +49,11 @@ defmodule RunicAI.Terminal.OwlPresenter do
 
     [summary | detail_lines] =
       event
-      |> EventPresenter.render_event(detail: detail)
+      |> EventPresenter.render_event(
+        detail: detail,
+        graph: Keyword.get(opts, :graph, :text),
+        color: Keyword.get(opts, :color, :auto)
+      )
       |> String.split("\n")
 
     token = Theme.token_for(event)
@@ -61,10 +69,16 @@ defmodule RunicAI.Terminal.OwlPresenter do
 
   @spec render_final_report(map(), keyword()) :: String.t()
   def render_final_report(result, opts \\ []) when is_map(result) do
-    result
-    |> final_report_content(opts)
-    |> box("Final report", opts)
-    |> Theme.format(:text, opts)
+    boxed_report =
+      result
+      |> without_rendered_diagrams()
+      |> final_report_content(opts)
+      |> box("Final report", opts)
+      |> Theme.format(:text, opts)
+
+    [boxed_report, rendered_diagram_blocks(result, opts)]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n")
   end
 
   @spec render_review_prompt(ReviewRequest.t(), keyword()) :: String.t()
@@ -96,6 +110,91 @@ defmodule RunicAI.Terminal.OwlPresenter do
     |> Enum.reduce([], &accumulate_report_line/2)
     |> Enum.reverse()
     |> Enum.reject(&(&1.field == ""))
+  end
+
+  defp without_rendered_diagrams(result) do
+    update_summary(result, fn summary ->
+      summary
+      |> Map.delete(:rendered_diagrams)
+      |> Map.delete("rendered_diagrams")
+    end)
+  end
+
+  defp update_summary(result, fun) do
+    cond do
+      is_map(Map.get(result, :summary)) ->
+        Map.update!(result, :summary, fun)
+
+      is_map(Map.get(result, "summary")) ->
+        Map.update!(result, "summary", fun)
+
+      true ->
+        result
+    end
+  end
+
+  defp rendered_diagram_blocks(result, opts) do
+    diagrams = rendered_diagrams(result)
+
+    if diagrams == [] do
+      nil
+    else
+      width = terminal_width(opts)
+
+      diagrams
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {diagram, index} ->
+        rendered_diagram_lines(diagram, index, width)
+      end)
+      |> then(&(["", "Rendered diagrams"] ++ &1))
+      |> Enum.join("\n")
+      |> Theme.format(:text, opts)
+    end
+  end
+
+  defp rendered_diagrams(result) do
+    summary = Map.get(result, :summary) || Map.get(result, "summary") || %{}
+    summary[:rendered_diagrams] || summary["rendered_diagrams"] || []
+  end
+
+  defp rendered_diagram_lines(diagram, index, width) do
+    rendered = field(diagram, :rendered)
+
+    [
+      "",
+      "#{index}. #{rendered_diagram_label(diagram)}",
+      maybe_diagram_line("   status", field(diagram, :status)),
+      maybe_diagram_line("   error", field(diagram, :error)),
+      rendered && rendered_block(rendered, width)
+    ]
+    |> List.flatten()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp rendered_diagram_label(diagram) do
+    [
+      field(diagram, :path),
+      field(diagram, :heading) && "heading #{field(diagram, :heading)}",
+      field(diagram, :diagram_index) && "diagram #{field(diagram, :diagram_index)}",
+      field(diagram, :line_start) && "line #{field(diagram, :line_start)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(", ")
+    |> case do
+      "" -> "inline Mermaid source"
+      label -> label
+    end
+  end
+
+  defp maybe_diagram_line(_label, nil), do: nil
+  defp maybe_diagram_line(_label, ""), do: nil
+  defp maybe_diagram_line(label, value), do: "#{label}: #{value}"
+
+  defp rendered_block(rendered, width) do
+    rendered
+    |> String.trim_trailing()
+    |> String.split("\n", trim: false)
+    |> Enum.map(&truncate(&1, width))
   end
 
   defp accumulate_report_line("Final report", rows), do: rows
@@ -133,6 +232,15 @@ defmodule RunicAI.Terminal.OwlPresenter do
 
   defp report_row(%{field: field, value: ""}, _width), do: "#{field}:"
 
+  defp report_row(%{field: "rendered diagrams", value: value}, width) do
+    lines =
+      value
+      |> String.split("\n")
+      |> Enum.map(&truncate(&1, max(width - 2, 16)))
+
+    multiline_report_row("rendered diagrams", lines)
+  end
+
   defp report_row(%{field: field, value: value}, width) do
     lines = wrap_text(value, width - 2)
 
@@ -162,12 +270,18 @@ defmodule RunicAI.Terminal.OwlPresenter do
       "objective",
       "changed files",
       "tools used",
+      "rendered diagrams",
       "artifacts",
       "risks",
       "reply",
       "persistence"
     ]
   end
+
+  defp field(map, key) when is_map(map),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(_map, _key), do: nil
 
   defp wrap_text(value, width) do
     value
@@ -260,8 +374,18 @@ defmodule RunicAI.Terminal.OwlPresenter do
   defp maybe_field_line(_label, nil), do: nil
   defp maybe_field_line(label, value), do: field_line(label, value)
 
-  defp value(opts, key, default),
-    do: Map.get(opts, key) || Map.get(opts, Atom.to_string(key)) || default
+  defp value(opts, key, default) do
+    case Map.fetch(opts, key) do
+      {:ok, value} when not is_nil(value) ->
+        value
+
+      _other ->
+        case Map.fetch(opts, Atom.to_string(key)) do
+          {:ok, value} when not is_nil(value) -> value
+          _other -> default
+        end
+    end
+  end
 
   defp terminal_width(opts) do
     Keyword.get(opts, :width) || Owl.IO.columns() || 100

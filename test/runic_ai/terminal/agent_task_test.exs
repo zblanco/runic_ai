@@ -14,4 +14,16 @@ defmodule RunicAI.Terminal.AgentTaskTest do
     assert output =~ "Usage:"
     assert output =~ "mix runic_ai.agent"
   end
+
+  test "prints help for the durable runs inspection task" do
+    Mix.Task.reenable("runic_ai.runs")
+
+    output =
+      capture_io(fn ->
+        Mix.Task.run("runic_ai.runs", ["--help"])
+      end)
+
+    assert output =~ "Usage:"
+    assert output =~ "mix runic_ai.runs"
+  end
 end

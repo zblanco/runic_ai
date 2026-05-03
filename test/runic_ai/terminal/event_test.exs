@@ -87,4 +87,38 @@ defmodule RunicAI.Terminal.EventTest do
     assert Enum.any?(events, &(&1.phase == :validated))
     assert Enum.any?(events, &(&1.phase == :scorecard and &1.status == :ok))
   end
+
+  test "normalizes Runic runnable lifecycle stages into JSON-safe trace events" do
+    event =
+      Event.from_rlm_stage(
+        %{
+          run_id: "run-1",
+          stage: :node_completed,
+          status: :ok,
+          data: %{
+            node: "assistant_node_3_map",
+            input: "%{record: 1}",
+            output: "%{text: \"ok\"}",
+            runnable: %{
+              id: 42,
+              node: "assistant_node_3_map",
+              component_id: "map",
+              component_type: :record_map,
+              policy: %{max_retries: 1, executor_opts: %{max_concurrency: 1}}
+            }
+          }
+        },
+        agent: :assistant
+      )
+
+    json = Event.to_json_map(event)
+
+    assert json.session_id == "run-1"
+    assert json.kind == :rlm_node
+    assert json.phase == :node_completed
+    assert json.data["data"]["runnable"]["id"] == 42
+    assert json.data["data"]["runnable"]["component_id"] == "map"
+    assert json.data["data"]["runnable"]["component_type"] == "record_map"
+    assert json.data["data"]["runnable"]["policy"]["executor_opts"]["max_concurrency"] == 1
+  end
 end

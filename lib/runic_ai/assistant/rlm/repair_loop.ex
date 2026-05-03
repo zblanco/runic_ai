@@ -9,6 +9,7 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
 
   alias RunicAI.Assistant.RLM.BlueprintProposalPrompt
   alias RunicAI.Assistant.RLM.BlueprintValidator
+  alias RunicAI.Assistant.RLM.ComponentBlueprint
   alias RunicAI.Assistant.RLM.Coordinator
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Coding.Workspace
@@ -145,6 +146,45 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
     end
   end
 
+  @spec runtime_repair(Workspace.t(), String.t(), WorkflowBlueprint.t(), Error.t(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def runtime_repair(
+        %Workspace{} = workspace,
+        objective,
+        %WorkflowBlueprint{} = blueprint,
+        %Error{} = error,
+        opts \\ []
+      ) do
+    case targeted_runtime_repair(blueprint, error, opts) do
+      {:ok, blueprint, reason} ->
+        {:ok,
+         %{
+           status: :repaired,
+           strategy: :runtime_diagnostic_repair,
+           reason: reason,
+           diagnostics: diagnostics(error),
+           blueprint: blueprint
+         }}
+
+      :error ->
+        with {:ok, blueprint} <-
+               Coordinator.fallback_blueprint(
+                 workspace,
+                 runtime_repair_objective(objective, error),
+                 Keyword.delete(opts, :blueprint)
+               ) do
+          {:ok,
+           %{
+             status: :repaired,
+             strategy: :runtime_fallback_blueprint,
+             reason: error.message,
+             diagnostics: diagnostics(error),
+             blueprint: blueprint
+           }}
+        end
+    end
+  end
+
   defp generate_repair_object(model, prompt, llm_opts) do
     case LLM.generate_text(model, prompt, llm_opts) do
       {:ok, %Result{} = result} ->
@@ -256,9 +296,138 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
     |> Enum.uniq()
   end
 
+  defp targeted_runtime_repair(%WorkflowBlueprint{} = blueprint, %Error{} = error, opts) do
+    if artifact_writer_path_failure?(error) do
+      repair_artifact_writer_paths(blueprint, Keyword.get(opts, :output_path))
+    else
+      :error
+    end
+  end
+
+  defp repair_artifact_writer_paths(%WorkflowBlueprint{} = blueprint, output_path)
+       when is_binary(output_path) and output_path != "" do
+    missing_path_ids = blank_artifact_writer_ids(blueprint)
+
+    if missing_path_ids == [] do
+      :error
+    else
+      components =
+        Enum.map(blueprint.components, fn
+          %ComponentBlueprint{id: id, type: :artifact_writer, params: params} = component ->
+            if id in missing_path_ids do
+              %{component | params: Map.put(params || %{}, :path, output_path)}
+            else
+              component
+            end
+
+          component ->
+            component
+        end)
+
+      {:ok, %{blueprint | components: components},
+       "filled missing artifact writer path from requested output path"}
+    end
+  end
+
+  defp repair_artifact_writer_paths(%WorkflowBlueprint{} = blueprint, _output_path) do
+    missing_path_ids = blank_artifact_writer_ids(blueprint)
+
+    if missing_path_ids == [] do
+      :error
+    else
+      {:ok,
+       %{
+         blueprint
+         | components:
+             Enum.reject(blueprint.components, fn component ->
+               component.id in missing_path_ids
+             end),
+           edges: reconnect_edges(blueprint.edges, missing_path_ids),
+           stop_conditions: non_artifact_stop_conditions(blueprint.stop_conditions),
+           metadata:
+             Map.put(blueprint.metadata || %{}, :runtime_repair, %{
+               removed_components: missing_path_ids,
+               reason: :artifact_writer_missing_path
+             })
+       }, "removed artifact writer components that had no requested output path"}
+    end
+  end
+
+  defp artifact_writer_path_failure?(%Error{} = error) do
+    error.message == "artifact writer requires a non-empty path" or
+      blank?(get(error.details, :path, :not_found))
+  end
+
+  defp blank_artifact_writer_ids(%WorkflowBlueprint{} = blueprint) do
+    blueprint.components
+    |> Enum.filter(fn
+      %ComponentBlueprint{type: :artifact_writer, params: params} ->
+        blank?(get(params, :path, nil))
+
+      _component ->
+        false
+    end)
+    |> Enum.map(& &1.id)
+  end
+
+  defp reconnect_edges(edges, removed_ids) do
+    removed = MapSet.new(removed_ids)
+
+    bridges =
+      removed_ids
+      |> Enum.flat_map(fn id ->
+        parents = edges |> Enum.filter(&(&1.to == id)) |> Enum.map(& &1.from)
+        children = edges |> Enum.filter(&(&1.from == id)) |> Enum.map(& &1.to)
+
+        for parent <- parents,
+            child <- children,
+            parent != child,
+            not MapSet.member?(removed, parent),
+            not MapSet.member?(removed, child) do
+          %{from: parent, to: child}
+        end
+      end)
+
+    edges
+    |> Enum.reject(&(MapSet.member?(removed, &1.from) or MapSet.member?(removed, &1.to)))
+    |> Kernel.++(bridges)
+    |> Enum.uniq()
+  end
+
+  defp non_artifact_stop_conditions(stop_conditions) do
+    stop_conditions
+    |> List.wrap()
+    |> Enum.map(fn condition ->
+      condition
+      |> to_string()
+      |> String.replace("artifact written", "final assistant output produced")
+    end)
+    |> case do
+      [] -> ["final assistant output produced", "objective scorecard checked"]
+      conditions -> Enum.uniq(conditions)
+    end
+  end
+
+  defp runtime_repair_objective(objective, %Error{} = error) do
+    """
+    #{objective}
+
+    Runtime repair diagnostics:
+    - #{error.message}
+
+    Produce a conservative assistant workflow that satisfies the objective while
+    avoiding the failed runtime action when it was not explicitly requested.
+    """
+  end
+
   defp maybe_put_output_path(opts, nil), do: opts
   defp maybe_put_output_path(opts, ""), do: opts
   defp maybe_put_output_path(opts, path), do: Keyword.put(opts, :output_path, path)
+
+  defp blank?(nil), do: true
+  defp blank?(""), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   defp nested_report(%Error{details: details}), do: details[:report] || details["report"]
   defp nested_report(%{details: details}), do: details[:report] || details["report"]

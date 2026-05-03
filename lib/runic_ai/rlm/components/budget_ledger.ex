@@ -50,12 +50,18 @@ defmodule RunicAI.RLM.Components.BudgetLedger do
 
   @spec run(map() | keyword(), map() | keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(input, params \\ %{}) do
-    ledger =
-      input
-      |> ledger_from_input(params)
-      |> summary()
+    params = opts_map(params)
+    ledger = ledger_from_input(input, params)
 
-    {:ok, ledger}
+    if ledger_input?(input) do
+      {:ok, summary(ledger)}
+    else
+      component = %{type: get(params, :component_type, get(params, :type, :budget_ledger))}
+
+      with {:ok, ledger} <- record(ledger, component, input) do
+        {:ok, summary(ledger)}
+      end
+    end
   end
 
   @spec record(t() | map() | nil, ComponentBlueprint.t() | map(), term()) ::
@@ -107,6 +113,13 @@ defmodule RunicAI.RLM.Components.BudgetLedger do
     do: normalize_ledger(ledger)
 
   defp ledger_from_input(_input, params), do: new!(params)
+
+  defp ledger_input?(%__MODULE__{}), do: true
+  defp ledger_input?(%{budget_ledger: _ledger}), do: true
+  defp ledger_input?(%{"budget_ledger" => _ledger}), do: true
+  defp ledger_input?(%{limits: _limits, metrics: _metrics}), do: true
+  defp ledger_input?(%{"limits" => _limits, "metrics" => _metrics}), do: true
+  defp ledger_input?(_input), do: false
 
   defp normalize_ledger(%__MODULE__{} = ledger), do: ledger
 
@@ -243,6 +256,7 @@ defmodule RunicAI.RLM.Components.BudgetLedger do
   defp component_type(%ComponentBlueprint{type: type}), do: type
   defp component_type(%{type: type}) when is_atom(type), do: type
   defp component_type(%{"type" => type}) when is_binary(type), do: normalize_key(type)
+  defp component_type(%{type: type}) when is_binary(type), do: normalize_key(type)
   defp component_type(_component), do: :unknown
 
   defp source_count(%{sources: sources}) when is_list(sources), do: length(sources)

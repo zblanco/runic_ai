@@ -21,7 +21,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
     :workflow_patch
   ]
 
-  @read_tools ~w(list_dir find_files read_file read_range read_many search_text search_regex git_status git_diff git_log git_show git_branch)
+  @read_tools ~w(list_dir find_files read_file read_range read_many search_text search_regex extract_diagrams render_mermaid git_status git_diff git_log git_show git_branch)
   @verify_tools ~w(compile_project run_tests run_linter source_assert changed_file_inventory project_command runtime_smoke)
   @patch_tools ~w(apply_patch run_formatter)
   @allowed_commands ~w(mix git)

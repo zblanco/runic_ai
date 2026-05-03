@@ -8,23 +8,28 @@ defmodule RunicAI.Coding.AgentState do
   """
 
   alias Runic.Workflow
+  alias RunicAI.Agent.TurnResult
   alias RunicAI.Coding.RepairAttempt
   alias RunicAI.Coding.RLM.RepairAttempt, as: RepairAttemptStruct
   alias RunicAI.Coding.StandardAgent.ObjectiveGate
   alias RunicAI.Coding.TraceRedactor
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Error
   alias RunicAI.Integrated.SessionState
   alias RunicAI.Message
   alias RunicAI.Recipes.IntegratedToolAgent
   alias RunicAI.Trace.Event
 
   @verification_tools ~w(compile_project run_tests run_formatter run_linter project_command runtime_smoke source_assert)
+  @rendered_diagram_max_count 6
+  @rendered_diagram_max_bytes 8_000
 
   @type summary :: %{
           required(:status) => atom() | nil,
           required(:reply) => String.t() | nil,
           required(:visible_tools) => [String.t()],
           required(:tools_used) => [String.t()],
+          required(:rendered_diagrams) => [map()],
           required(:changed_files) => [String.t()],
           required(:created_files) => [String.t()],
           required(:modified_files) => [String.t()],
@@ -34,6 +39,7 @@ defmodule RunicAI.Coding.AgentState do
           required(:repair_attempts) => [map()],
           required(:verifications) => [map()],
           required(:risks) => [String.t()],
+          required(:last_error) => String.t() | nil,
           required(:objective_status) => atom() | nil,
           required(:objective_scorecard) => map() | nil
         }
@@ -54,13 +60,16 @@ defmodule RunicAI.Coding.AgentState do
     workspace_delta = aggregate_delta(patches)
     repair_attempts = repair_attempt_summaries(session, patches)
     verifications = verification_summaries(tool_messages)
+    rendered_diagrams = rendered_diagram_summaries(tool_messages)
     objective_evaluation = objective_evaluation(session)
+    last_error = latest_error(session)
 
     %{
       status: session.status,
       reply: latest_assistant_reply(session),
       visible_tools: visible_tools(session),
       tools_used: tools_used(session),
+      rendered_diagrams: rendered_diagrams,
       changed_files: changed_files(workspace_delta),
       created_files: workspace_delta.created,
       modified_files: workspace_delta.modified,
@@ -69,7 +78,8 @@ defmodule RunicAI.Coding.AgentState do
       patches: patches,
       repair_attempts: repair_attempts,
       verifications: verifications,
-      risks: risks(verifications, objective_evaluation),
+      risks: risks(verifications, objective_evaluation, last_error),
+      last_error: last_error,
       objective_status: objective_status(objective_evaluation),
       objective_scorecard: scorecard_summary(objective_evaluation)
     }
@@ -81,6 +91,7 @@ defmodule RunicAI.Coding.AgentState do
       reply: nil,
       visible_tools: [],
       tools_used: [],
+      rendered_diagrams: [],
       changed_files: [],
       created_files: [],
       modified_files: [],
@@ -90,6 +101,7 @@ defmodule RunicAI.Coding.AgentState do
       repair_attempts: [],
       verifications: [],
       risks: ["coding session was not found"],
+      last_error: nil,
       objective_status: nil,
       objective_scorecard: nil
     }
@@ -191,6 +203,39 @@ defmodule RunicAI.Coding.AgentState do
         metadata: map_field(result, :metadata)
       }
     end)
+  end
+
+  defp rendered_diagram_summaries(tool_messages) do
+    tool_messages
+    |> Enum.filter(&(&1.name == "render_mermaid"))
+    |> Enum.map(fn message ->
+      result = message |> tool_payload() |> result_payload()
+      rendered = field(result, :rendered)
+
+      %{
+        status: atomish(result, :status),
+        source: field(result, :source),
+        path: field(result, :path),
+        heading: field(result, :heading),
+        container: field(result, :container),
+        diagram_index: field(result, :diagram_index),
+        requested_diagram_index: field(result, :requested_diagram_index),
+        line_start: field(result, :line_start),
+        line_end: field(result, :line_end),
+        command: field(result, :command),
+        format: field(result, :format),
+        color: field(result, :color),
+        exit_status: field(result, :exit_status),
+        rendered: rendered_preview(rendered),
+        rendered_truncated?: rendered_truncated?(rendered),
+        tool_truncated?: field(result, :truncated?) || false,
+        error: field(result, :error)
+      }
+    end)
+    |> Enum.filter(fn diagram ->
+      diagram.rendered not in [nil, ""] or diagram.error not in [nil, ""]
+    end)
+    |> Enum.take(@rendered_diagram_max_count)
   end
 
   defp aggregate_delta(patches) do
@@ -316,12 +361,16 @@ defmodule RunicAI.Coding.AgentState do
     }
   end
 
-  defp risks(verifications, objective_evaluation) do
+  defp risks(verifications, objective_evaluation, last_error) do
     []
     |> Kernel.++(verification_risks(verifications))
     |> Kernel.++(objective_risks(objective_evaluation))
+    |> Kernel.++(error_risks(last_error))
     |> Enum.uniq()
   end
+
+  defp error_risks(nil), do: []
+  defp error_risks(last_error), do: ["turn ended with error: #{last_error}"]
 
   defp verification_risks([]), do: ["verification was not run"]
 
@@ -356,6 +405,30 @@ defmodule RunicAI.Coding.AgentState do
 
   defp objective_status(nil), do: nil
   defp objective_status(%{status: status}), do: status
+
+  defp latest_error(%SessionState{
+         agent_state: %{last_turn_result: %TurnResult{kind: :error} = result}
+       }) do
+    result.details
+    |> field(:error)
+    |> case do
+      %Error{} = error -> error_summary(error)
+      nil -> error_summary(result.raw)
+      other -> error_summary(other)
+    end
+  end
+
+  defp latest_error(%SessionState{}), do: nil
+
+  defp error_summary(%Error{} = error) do
+    [to_string(error.kind), error.message]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(": ")
+  end
+
+  defp error_summary(nil), do: nil
+  defp error_summary(error) when is_binary(error), do: error
+  defp error_summary(error), do: inspect(error, limit: 5, printable_limit: 300)
 
   defp objective_evaluation(%SessionState{} = session) do
     metadata = session.agent_state.metadata || %{}
@@ -531,6 +604,18 @@ defmodule RunicAI.Coding.AgentState do
 
   defp result_payload(payload), do: field(payload, :result) || %{}
 
+  defp rendered_preview(rendered) when is_binary(rendered) do
+    truncate_utf8(rendered, @rendered_diagram_max_bytes)
+  end
+
+  defp rendered_preview(_rendered), do: nil
+
+  defp rendered_truncated?(rendered) when is_binary(rendered) do
+    byte_size(rendered) > @rendered_diagram_max_bytes
+  end
+
+  defp rendered_truncated?(_rendered), do: false
+
   defp workspace_root(%SessionState{} = session) do
     field(session.agent_state.metadata || %{}, :workspace_root) ||
       get_in(session.metadata, [Access.key(:turn_defaults), :metadata, :workspace_root])
@@ -570,6 +655,24 @@ defmodule RunicAI.Coding.AgentState do
       value when is_binary(value) -> value
       nil -> nil
       value -> inspect(value)
+    end
+  end
+
+  defp truncate_utf8(value, max_bytes) when byte_size(value) <= max_bytes, do: value
+
+  defp truncate_utf8(value, max_bytes) do
+    value
+    |> binary_part(0, max_bytes)
+    |> valid_utf8_prefix()
+  end
+
+  defp valid_utf8_prefix(value) do
+    if String.valid?(value) do
+      value
+    else
+      value
+      |> binary_part(0, byte_size(value) - 1)
+      |> valid_utf8_prefix()
     end
   end
 end

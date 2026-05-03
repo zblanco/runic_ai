@@ -3,31 +3,19 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
   Compiles accepted assistant workflow blueprints into executable Runic graphs.
   """
 
-  require Runic
-
   alias Runic.Workflow
+  alias Runic.Workflow.SchedulerPolicy
+  alias RunicAI.Assistant.RLM.BlueprintGraph
   alias RunicAI.Assistant.RLM.BlueprintValidator
-  alias RunicAI.Assistant.RLM.ComponentBlueprint
-  alias RunicAI.Assistant.RLM.ExecutionContext
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
-  alias RunicAI.RLM.Components.ArtifactWriter
-  alias RunicAI.RLM.Components.BlueprintTransform
-  alias RunicAI.RLM.Components.BudgetLedger
-  alias RunicAI.RLM.Components.DocumentCompare
-  alias RunicAI.RLM.Components.HierarchicalReduce
-  alias RunicAI.RLM.Components.LLMMap
-  alias RunicAI.RLM.Components.ObjectiveScorecard
-  alias RunicAI.RLM.Components.RecordGroup
-  alias RunicAI.RLM.Components.RecordMap
-  alias RunicAI.RLM.Components.ReportComposer
-  alias RunicAI.RLM.Components.SourceDiscovery
-  alias RunicAI.RLM.Components.SourceMaterializer
-  alias RunicAI.RLM.Components.SourceSplitter
-  alias RunicAI.RLM.Components.TabularParser
-
-  @default_model "openai:gpt-5.4-mini"
+  alias RunicAI.RLM.ComponentFactory
+  alias RunicAI.RLM.ComponentSpec
+  alias RunicAI.RLM.ComponentRuntime
+  alias RunicAI.RLM.WorkflowExecutor
+  alias RunicAI.RLM.WorkflowMetrics
+  alias RunicAI.RLM.WorkflowResults
 
   @type compiled :: %{
           required(:workflow) => Workflow.t(),
@@ -35,7 +23,10 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
           required(:validation_report) => BlueprintValidator.report(),
           required(:node_names) => %{String.t() => String.t()},
           required(:output_name) => String.t(),
-          required(:graph_summary) => map()
+          required(:component_specs) => [map()],
+          required(:graph_summary) => map(),
+          required(:run_context_requirements) => map(),
+          required(:scheduler_policies) => [term()]
         }
 
   @spec compile(WorkflowBlueprint.t() | map(), Workspace.t(), keyword()) ::
@@ -43,57 +34,55 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
   def compile(blueprint_input, %Workspace{} = workspace, opts \\ []) when is_list(opts) do
     with {:ok, blueprint} <- WorkflowBlueprint.from_input(blueprint_input),
          {:ok, report} <- BlueprintValidator.validate(blueprint, validation_opts(opts)),
-         {:ok, ordered} <- topological_order(blueprint),
-         {:ok, context} <- initial_context(workspace, blueprint, opts) do
+         {:ok, blueprint_graph} <- BlueprintGraph.build(blueprint),
+         {:ok, base_context} <- ComponentRuntime.initial_context(workspace, blueprint, opts) do
+      ordered = Enum.map(blueprint_graph.ordered_specs, & &1.blueprint)
+
       node_names =
-        blueprint.components
+        blueprint_graph.ordered_specs
         |> Enum.with_index(1)
-        |> Map.new(fn {component, index} ->
-          {component.id, "assistant_node_#{index}_#{safe_name(component.id)}"}
+        |> Map.new(fn {spec, index} ->
+          {spec.id, "assistant_node_#{index}_#{safe_name(spec.id)}"}
         end)
 
       input_name = "assistant_input"
 
-      input_step =
-        Runic.step(fn input -> Map.put(context, :input, input || %{}) end,
-          name: input_name
-        )
+      compile_opts = opts
 
-      compile_opts = Keyword.put(opts, :node_names, node_names)
+      Workflow.new(name: "assistant_rlm:#{safe_name(blueprint.id)}")
+      |> Workflow.add(ComponentFactory.input_step(name: input_name))
+      |> build_workflow(blueprint_graph, node_names, input_name, compile_opts)
+      |> case do
+        {:ok, workflow} ->
+          output_name =
+            Map.fetch!(node_names, BlueprintGraph.output_component_id(blueprint_graph))
 
-      workflow =
-        ordered
-        |> Enum.reduce(
-          Workflow.new(name: "assistant_rlm:#{safe_name(blueprint.id)}")
-          |> Workflow.add(input_step),
-          fn component, workflow ->
-            parents = parent_ids(component.id, blueprint.edges)
-
-            to =
-              if parents == [] do
-                input_name
-              else
-                Enum.map(parents, &Map.fetch!(node_names, &1))
-              end
-
-            Workflow.add(workflow, node_step(component, length(List.wrap(to)), compile_opts),
-              to: to
+          workflow =
+            workflow
+            |> attach_scheduler_policies(blueprint_graph, node_names, blueprint)
+            |> Workflow.put_run_context(
+              runtime_context(base_context, blueprint_graph, node_names, opts)
             )
+
+          with :ok <- validate_run_context(workflow) do
+            {:ok,
+             %{
+               workflow: workflow,
+               blueprint: blueprint,
+               validation_report: report,
+               ordered_components: ordered,
+               node_names: node_names,
+               output_name: output_name,
+               component_specs: Enum.map(blueprint_graph.ordered_specs, &ComponentSpec.summary/1),
+               graph_summary: graph_summary(blueprint_graph, workflow, node_names, opts),
+               run_context_requirements: Workflow.required_context_keys(workflow),
+               scheduler_policies: workflow.scheduler_policies
+             }}
           end
-        )
 
-      output_name = Map.fetch!(node_names, output_component_id(blueprint, ordered))
-
-      {:ok,
-       %{
-         workflow: workflow,
-         blueprint: blueprint,
-         validation_report: report,
-         ordered_components: ordered,
-         node_names: node_names,
-         output_name: output_name,
-         graph_summary: graph_summary(blueprint, ordered)
-       }}
+        {:error, %Error{} = error} ->
+          {:error, error}
+      end
     end
   end
 
@@ -101,486 +90,169 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
           {:ok, map()} | {:error, Error.t()}
   def run(blueprint_input, %Workspace{} = workspace, input \\ %{}, opts \\ [])
       when is_map(input) and is_list(opts) do
+    started_at_ms = System.monotonic_time(:millisecond)
+
     with {:ok, compiled} <- compile(blueprint_input, workspace, opts),
-         {:ok, context} <- execute_once(compiled, workspace, input, opts) do
-      {:ok,
-       %{
-         blueprint: compiled.blueprint,
-         proposal: compiled.blueprint,
-         validation_report: compiled.validation_report,
-         compiled: Map.drop(compiled, [:workflow, :ordered_components]),
-         workflow: compiled.workflow,
-         context: context,
-         output: latest_output(context),
-         artifacts: Map.get(context || %{}, :artifacts, []),
-         trace: Map.get(context || %{}, :trace, []),
-         episodes: Map.get(context || %{}, :episodes, []),
-         scorecard: latest_scorecard(context)
-       }}
+         {:ok, workflow} <-
+           WorkflowExecutor.run(compiled.workflow, input, executor_opts(opts, compiled)) do
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+      {:ok, result(compiled, workflow, elapsed_ms: elapsed_ms)}
     end
   end
 
-  @spec result(compiled(), Workflow.t()) :: map()
-  def result(compiled, %Workflow{} = workflow) do
-    context = workflow |> Workflow.raw_productions(compiled.output_name) |> List.last()
+  @spec result(compiled(), Workflow.t(), keyword()) :: map()
+  def result(compiled, %Workflow{} = workflow, opts \\ []) do
+    extracted = WorkflowResults.extract(workflow, compiled, opts)
 
     %{
       blueprint: compiled.blueprint,
       proposal: compiled.blueprint,
       validation_report: compiled.validation_report,
-      compiled: Map.drop(compiled, [:workflow]),
+      compiled: Map.drop(compiled, [:workflow, :ordered_components]),
       workflow: workflow,
-      context: context,
-      output: latest_output(context),
-      artifacts: Map.get(context || %{}, :artifacts, []),
-      trace: Map.get(context || %{}, :trace, []),
-      episodes: Map.get(context || %{}, :episodes, []),
-      scorecard: latest_scorecard(context)
+      output: extracted.output,
+      artifacts: extracted.artifacts,
+      scorecard: extracted.scorecard,
+      budget_summary: extracted.budget_summary,
+      execution_metrics: extracted.execution_metrics,
+      native_nodes: extracted.native_nodes,
+      facts: extracted.facts,
+      intermediate_outputs: extracted.intermediate_outputs,
+      component_results: extracted.component_results
     }
   end
 
-  defp execute_once(compiled, %Workspace{} = workspace, input, opts) do
-    with {:ok, context} <- initial_context(workspace, compiled.blueprint, opts) do
-      context = Map.put(context, :input, input || %{})
+  defp build_workflow(workflow, %BlueprintGraph{} = blueprint_graph, node_names, input_name, opts) do
+    initial = %{workflow: workflow, native_maps: %{}}
 
-      compiled.ordered_components
-      |> Enum.reduce_while({:ok, context}, fn component, {:ok, context} ->
-        case execute_node(component, context, opts) do
-          {:ok, context} -> {:cont, {:ok, context}}
-          {:error, %Error{} = error} -> {:halt, {:error, error}}
+    Enum.reduce_while(blueprint_graph.ordered_specs, {:ok, initial}, fn spec, {:ok, state} ->
+      parents = BlueprintGraph.parent_ids(blueprint_graph, spec.id)
+
+      to =
+        if parents == [] do
+          input_name
+        else
+          Enum.map(parents, &Map.fetch!(node_names, &1))
         end
-      end)
-    end
-  end
 
-  defp initial_context(workspace, blueprint, opts) do
-    ExecutionContext.new(workspace, blueprint.objective,
-      sources: blueprint.sources,
-      policies: blueprint.policies,
-      budgets: get(blueprint.policies, :budgets, %{}),
-      event_sink: Keyword.get(opts, :event_sink),
-      metadata: %{
-        run_id: Keyword.get(opts, :run_id),
-        model: Keyword.get(opts, :model),
-        write_policy: Keyword.get(opts, :write_policy)
-      }
-    )
+      case add_spec_component(state, spec, parents, to, node_names, opts) do
+        {:ok, state} -> {:cont, {:ok, state}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
     |> case do
-      {:ok, context} ->
-        {:ok,
-         context
-         |> Map.from_struct()
-         |> Map.put(:blueprint_edges, blueprint.edges)
-         |> Map.put(:budget_ledger, BudgetLedger.new!(get(blueprint.policies, :budgets, %{})))
-         |> Map.put(:latest_output, nil)}
-
-      {:error, error} ->
-        {:error, error}
-    end
-  end
-
-  defp node_step(component, 1, opts) do
-    Runic.step(fn context -> execute_node!(component, merge_contexts([context]), opts) end,
-      name: Keyword.fetch!(opts, :node_names) |> Map.fetch!(component.id)
-    )
-  end
-
-  defp node_step(component, 2, opts) do
-    Runic.step(
-      fn left, right -> execute_node!(component, merge_contexts([left, right]), opts) end,
-      name: Keyword.fetch!(opts, :node_names) |> Map.fetch!(component.id)
-    )
-  end
-
-  defp node_step(component, 3, opts) do
-    Runic.step(fn a, b, c -> execute_node!(component, merge_contexts([a, b, c]), opts) end,
-      name: Keyword.fetch!(opts, :node_names) |> Map.fetch!(component.id)
-    )
-  end
-
-  defp node_step(component, _parent_count, opts) do
-    Runic.step(fn a, b, c, d -> execute_node!(component, merge_contexts([a, b, c, d]), opts) end,
-      name: Keyword.fetch!(opts, :node_names) |> Map.fetch!(component.id)
-    )
-  end
-
-  defp execute_node!(%ComponentBlueprint{} = component, context, opts) do
-    case execute_node(component, context, opts) do
-      {:ok, context} -> context
-      {:error, %Error{} = error} -> raise ArgumentError, error.message
-    end
-  end
-
-  defp execute_node(%ComponentBlueprint{} = component, context, opts) do
-    emit_stage(context, :node_started, :running, %{
-      node_id: component.id,
-      type: component.type
-    })
-
-    with {:ok, output} <- dispatch(component, context, opts),
-         {:ok, context} <- record_budget(context, component, output) do
-      context =
-        context
-        |> put_in([:outputs, component.id], output)
-        |> Map.put(:latest_output, output)
-        |> record_output(component, output)
-        |> update_in([:episodes], &append(&1, episode(component, :satisfied, output)))
-        |> update_in([:trace], &append(&1, trace(component, :satisfied)))
-
-      emit_stage(context, :node_completed, :ok, %{
-        node_id: component.id,
-        type: component.type,
-        output: output_summary(output)
-      })
-
-      {:ok, context}
-    else
-      {:error, %Error{} = error} ->
-        emit_stage(context, :node_failed, :error, %{
-          node_id: component.id,
-          type: component.type,
-          error: error
-        })
-
-        {:error, error}
-    end
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :source_discovery, params: params} = component,
-         context,
-         _opts
-       ) do
-    SourceDiscovery.run(context.workspace, source_input(component, context, params), params)
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :source_splitter, params: params} = component,
-         context,
-         _opts
-       ) do
-    SourceSplitter.run(context.workspace, source_input(component, context, params), params)
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :source_materializer, params: params} = component,
-         context,
-         _opts
-       ) do
-    SourceMaterializer.run(parent_input(component, context), params)
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :tabular_parser, params: params} = component,
-         context,
-         _opts
-       ) do
-    TabularParser.run(parent_input(component, context), params, workspace: context.workspace)
-  end
-
-  defp dispatch(%ComponentBlueprint{type: :llm_map, params: params} = component, context, opts) do
-    LLMMap.run(parent_input(component, context), params, llm_component_opts(context, opts))
-  end
-
-  defp dispatch(%ComponentBlueprint{type: :record_map, params: params} = component, context, opts) do
-    RecordMap.run(parent_input(component, context), params, llm_component_opts(context, opts))
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :record_group, params: params} = component,
-         context,
-         opts
-       ) do
-    RecordGroup.run(parent_input(component, context), params,
-      max_tier: max_function_tier(context, opts)
-    )
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :document_compare, params: params} = component,
-         context,
-         _opts
-       ) do
-    DocumentCompare.run(parent_input(component, context), params, workspace: context.workspace)
-  end
-
-  defp dispatch(%ComponentBlueprint{type: :llm_leaf, params: params} = component, context, opts) do
-    parent = parent_input(component, context)
-
-    HierarchicalReduce.run(
-      parent,
-      Map.put(params, :strategy, :llm_reduce),
-      llm_component_opts(context, opts)
-    )
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :report_composer, params: params} = component,
-         context,
-         _opts
-       ) do
-    ReportComposer.run(parent_input(component, context), params)
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :blueprint_transform, params: params} = component,
-         context,
-         opts
-       ) do
-    function = get(params, :function, %{tier: :tier0, op: :identity})
-
-    BlueprintTransform.apply(function, parent_input(component, context),
-      max_tier: max_function_tier(context, opts)
-    )
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :blueprint_reduce, params: params} = component,
-         context,
-         opts
-       ) do
-    case get(params, :function, nil) do
-      nil ->
-        HierarchicalReduce.run(
-          parent_input(component, context),
-          Map.put(params, :strategy, :join),
-          opts
-        )
-
-      function ->
-        BlueprintTransform.apply(function, parent_input(component, context),
-          max_tier: max_function_tier(context, opts)
-        )
-    end
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: :artifact_writer, params: params} = component,
-         context,
-         opts
-       ) do
-    params =
-      params
-      |> Map.put_new(
-        :write_policy,
-        Keyword.get(opts, :write_policy, get(context.policies, :write_policy, :docs_only))
-      )
-
-    ArtifactWriter.run(context.workspace, parent_input(component, context), params)
-  end
-
-  defp dispatch(
-         %ComponentBlueprint{type: type, params: params} = component,
-         context,
-         _opts
-       )
-       when type in [:verification, :objective_scorecard] do
-    ObjectiveScorecard.run(context.workspace, context, parent_input(component, context), params)
-  end
-
-  defp dispatch(%ComponentBlueprint{type: :budget_ledger, params: params}, context, _opts) do
-    BudgetLedger.run(context, params)
-  end
-
-  defp dispatch(%ComponentBlueprint{type: type}, _context, _opts) do
-    {:error,
-     Error.validation("unsupported assistant component type",
-       source: __MODULE__,
-       details: %{type: type}
-     )}
-  end
-
-  defp record_output(context, %ComponentBlueprint{type: :artifact_writer}, output) do
-    update_in(context, [:artifacts], &append(&1, output))
-  end
-
-  defp record_output(context, %ComponentBlueprint{type: type}, output)
-       when type in [:verification, :objective_scorecard] do
-    update_in(context, [:scorecards], &append(&1, output))
-  end
-
-  defp record_output(context, _component, _output), do: context
-
-  defp latest_output(nil), do: nil
-  defp latest_output(context), do: Map.get(context, :latest_output)
-
-  defp latest_scorecard(nil), do: nil
-  defp latest_scorecard(context), do: List.last(context.scorecards || [])
-
-  defp record_budget(context, %ComponentBlueprint{} = component, output) do
-    case BudgetLedger.record(Map.get(context, :budget_ledger), component, output) do
-      {:ok, ledger} -> {:ok, Map.put(context, :budget_ledger, ledger)}
+      {:ok, %{workflow: workflow}} -> {:ok, workflow}
       {:error, %Error{} = error} -> {:error, error}
     end
   end
 
-  defp source_input(component, context, params) do
-    explicit = get(params, :sources, nil) || get(params, :paths, nil) || get(params, :globs, nil)
+  defp add_spec_component(
+         state,
+         %ComponentSpec{execution_shape: :map} = spec,
+         _parents,
+         to,
+         node_names,
+         _opts
+       ) do
+    node_name = Map.fetch!(node_names, spec.id)
+    items_name = native_map_items_name(node_name)
 
-    cond do
-      not is_nil(explicit) ->
-        List.wrap(explicit)
-
-      match?(%ComponentBlueprint{}, component) and parent_outputs(component, context) != [] ->
-        parent_input(component, context)
-
-      true ->
-        context.sources
+    with {:ok, workflow} <-
+           workflow_add(
+             state.workflow,
+             ComponentFactory.map_items_step(spec, name: items_name),
+             to,
+             spec
+           ),
+         {:ok, map_component} <- ComponentFactory.native_map(spec, name: node_name),
+         {:ok, workflow} <- workflow_add(workflow, map_component, items_name, spec) do
+      {:ok,
+       %{state | workflow: workflow, native_maps: Map.put(state.native_maps, spec.id, node_name)}}
     end
   end
 
-  defp parent_input(%ComponentBlueprint{} = component, context) do
-    parents = parent_ids(component.id, context.blueprint_edges || context[:blueprint_edges] || [])
+  defp add_spec_component(
+         state,
+         %ComponentSpec{execution_shape: :reduce} = spec,
+         parents,
+         _to,
+         node_names,
+         _opts
+       ) do
+    node_name = Map.fetch!(node_names, spec.id)
+    reduce_name = native_reduce_name(node_name)
 
-    case parent_outputs(component, context) do
-      [single] when length(parents) <= 1 -> single
-      outputs -> outputs
-    end
-  end
+    case native_map_parent(parents, state.native_maps) do
+      {:ok, map_name} ->
+        map_component = Workflow.get_component(state.workflow, map_name)
 
-  defp parent_outputs(%ComponentBlueprint{} = component, context) do
-    component.inputs
-    |> case do
-      [] -> parent_ids(component.id, context.blueprint_edges || [])
-      inputs -> inputs
-    end
-    |> Enum.map(&Map.get(context.outputs, &1))
-    |> Enum.reject(&is_nil/1)
-  end
+        with {:ok, reduce_component} <-
+               ComponentFactory.native_reduce(spec, map_name, name: reduce_name),
+             {:ok, workflow} <-
+               workflow_add(state.workflow, reduce_component, map_component, spec),
+             {:ok, workflow} <-
+               workflow_add(
+                 workflow,
+                 ComponentFactory.reduce_finalize_step(spec, name: node_name),
+                 reduce_component.fan_in,
+                 spec
+               ) do
+          {:ok, %{state | workflow: workflow}}
+        end
 
-  defp merge_contexts(contexts) do
-    contexts
-    |> List.wrap()
-    |> List.flatten()
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reduce(%{}, fn context, acc ->
-      acc
-      |> Map.merge(context, fn
-        :outputs, left, right -> Map.merge(left || %{}, right || %{})
-        :artifacts, left, right -> Enum.uniq((left || []) ++ (right || []))
-        :trace, left, right -> Enum.uniq((left || []) ++ (right || []))
-        :episodes, left, right -> Enum.uniq((left || []) ++ (right || []))
-        :scorecards, left, right -> Enum.uniq((left || []) ++ (right || []))
-        _key, _left, right -> right
-      end)
-    end)
-  end
-
-  defp topological_order(%WorkflowBlueprint{} = blueprint) do
-    by_id = Map.new(blueprint.components, &{&1.id, &1})
-    ids = WorkflowBlueprint.component_ids(blueprint)
-    incoming = Map.new(ids, &{&1, parent_ids(&1, blueprint.edges)})
-    roots = Enum.filter(ids, &(Map.get(incoming, &1, []) == []))
-
-    build_order(roots, incoming, blueprint.edges, by_id, [])
-    |> case do
-      {:ok, ordered} when length(ordered) == length(ids) ->
-        {:ok, ordered}
-
-      {:ok, _ordered} ->
+      :error ->
         {:error,
-         Error.validation("assistant workflow graph contains a cycle", source: __MODULE__)}
-
-      {:error, error} ->
-        {:error, error}
+         Error.validation("reduce-shaped assistant component requires a native map parent",
+           source: __MODULE__,
+           details: %{code: :missing_native_map_parent, component_id: spec.id, type: spec.type}
+         )}
     end
   end
 
-  defp build_order([], _incoming, _edges, _by_id, ordered), do: {:ok, Enum.reverse(ordered)}
-
-  defp build_order([id | queue], incoming, edges, by_id, ordered) do
-    children = edges |> Enum.filter(&(&1.from == id)) |> Enum.map(& &1.to)
-
-    {incoming, queue} =
-      Enum.reduce(children, {incoming, queue}, fn child, {incoming, queue} ->
-        next_parents = incoming |> Map.get(child, []) |> List.delete(id)
-        incoming = Map.put(incoming, child, next_parents)
-
-        queue =
-          if next_parents == [] and child not in queue do
-            queue ++ [child]
-          else
-            queue
-          end
-
-        {incoming, queue}
-      end)
-
-    build_order(queue, incoming, edges, by_id, [Map.fetch!(by_id, id) | ordered])
+  defp add_spec_component(state, %ComponentSpec{} = spec, _parents, to, node_names, opts) do
+    with {:ok, runic_component} <-
+           ComponentFactory.to_runic(spec,
+             name: Map.fetch!(node_names, spec.id),
+             native_shapes?: Keyword.get(opts, :native_shapes?, true)
+           ) do
+      with {:ok, workflow} <- workflow_add(state.workflow, runic_component, to, spec) do
+        {:ok, %{state | workflow: workflow}}
+      end
+    end
   end
 
-  defp output_component_id(%WorkflowBlueprint{} = blueprint, ordered) do
-    parent_ids =
-      blueprint.edges
-      |> Enum.map(& &1.from)
-      |> MapSet.new()
-
-    ordered
-    |> Enum.reject(&MapSet.member?(parent_ids, &1.id))
-    |> List.last()
+  defp native_map_parent(parents, native_maps) do
+    parents
+    |> Enum.find_value(fn parent ->
+      case Map.fetch(native_maps, parent) do
+        {:ok, name} -> {:ok, name}
+        :error -> nil
+      end
+    end)
     |> case do
-      nil -> List.last(ordered).id
-      component -> component.id
+      {:ok, name} -> {:ok, name}
+      nil -> :error
     end
   end
 
-  defp parent_ids(id, edges) do
-    edges
-    |> Enum.filter(&(&1.to == id))
-    |> Enum.map(& &1.from)
-  end
-
-  defp graph_summary(%WorkflowBlueprint{} = blueprint, ordered) do
-    %{
-      id: blueprint.id,
-      objective: blueprint.objective,
-      nodes:
-        Enum.map(ordered, fn component ->
-          %{
-            id: component.id,
-            type: component.type,
-            inputs: parent_ids(component.id, blueprint.edges),
-            outputs: component.outputs
-          }
-        end),
-      edges: blueprint.edges,
-      stop_conditions: blueprint.stop_conditions
-    }
-  end
-
-  defp output_summary(output) do
-    cond do
-      is_map(output) and Map.has_key?(output, :path) ->
-        Map.take(output, [:status, :path, :bytes])
-
-      is_map(output) and Map.has_key?(output, :count) ->
-        Map.take(output, [:count, :strategy, :truncated?])
-
-      is_map(output) and Map.has_key?(output, :text) ->
-        %{text_preview: preview(output.text)}
-
-      true ->
-        %{preview: preview(output)}
-    end
-  end
-
-  defp episode(component, status, output) do
-    %{
-      id: "episode:#{component.id}",
-      node_id: component.id,
-      type: component.type,
-      status: status,
-      output: output_summary(output)
-    }
-  end
-
-  defp trace(component, status),
-    do: %{node_id: component.id, type: component.type, status: status}
-
-  defp llm_component_opts(context, opts) do
-    opts
-    |> Keyword.put(:objective, context.objective)
-    |> Keyword.put(:model, Keyword.get(opts, :model) || @default_model)
+  defp workflow_add(workflow, runic_component, to, %ComponentSpec{} = spec) do
+    {:ok, Workflow.add(workflow, runic_component, to: to)}
+  rescue
+    exception in [Runic.IncompatiblePortError] ->
+      {:error,
+       Error.validation("assistant workflow component port contracts are incompatible",
+         source: __MODULE__,
+         details: %{
+           code: :port_type_mismatch,
+           component_id: spec.id,
+           type: spec.type,
+           to: List.wrap(to),
+           reasons: exception.reasons,
+           message: Exception.message(exception),
+           producer: component_name(exception.producer),
+           consumer: component_name(exception.consumer)
+         }
+       )}
   end
 
   defp validation_opts(opts) do
@@ -591,40 +263,338 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
-  defp max_function_tier(context, opts) do
-    Keyword.get(opts, :max_generated_function_tier) ||
-      get_in(context.policies, [:generated_functions, :max_tier]) ||
-      get_in(context.policies, ["generated_functions", "max_tier"]) ||
-      :tier1
+  defp runtime_context(base_context, %BlueprintGraph{} = blueprint_graph, node_names, opts) do
+    global = %{
+      base_context: base_context,
+      workspace: base_context.workspace,
+      objective: base_context.objective,
+      sources: base_context.sources,
+      policies: base_context.policies,
+      budgets: base_context.budgets,
+      metadata: base_context.metadata,
+      event_sink: base_context.event_sink,
+      opts: opts,
+      components_by_id: Map.new(blueprint_graph.ordered_specs, &{&1.id, &1.blueprint}),
+      component_policies_by_id: component_policies_by_id(blueprint_graph)
+    }
+
+    component_context =
+      blueprint_graph.ordered_specs
+      |> Enum.flat_map(fn spec ->
+        name = Map.fetch!(node_names, spec.id)
+        context = component_context(spec, opts)
+
+        [{name, context} | internal_component_contexts(spec, name, context)]
+      end)
+      |> Map.new()
+
+    Map.put(component_context, :_global, global)
   end
 
-  defp emit_stage(context, stage, status, data) do
-    sink = context.event_sink
+  defp component_context(%ComponentSpec{} = spec, opts) do
+    %{
+      component: spec.blueprint,
+      component_id: spec.id,
+      component_type: spec.type,
+      params: spec.params,
+      spec: spec,
+      opts: opts
+    }
+  end
 
-    if is_function(sink, 1) do
-      try do
-        sink.(%{
-          run_id: get_in(context, [:metadata, :run_id]),
-          stage: stage,
-          status: status,
-          data: data
-        })
-      rescue
-        _exception -> :ok
-      end
+  defp internal_component_contexts(%ComponentSpec{execution_shape: :map}, name, context) do
+    [{native_map_items_name(name), context}]
+  end
+
+  defp internal_component_contexts(_spec, _name, _context), do: []
+
+  defp validate_run_context(%Workflow{} = workflow) do
+    context = Workflow.get_run_context(workflow)
+
+    case Workflow.validate_run_context(workflow, context) do
+      :ok ->
+        :ok
+
+      {:error, missing} ->
+        {:error,
+         Error.validation("assistant workflow runtime context is incomplete",
+           source: __MODULE__,
+           details: %{code: :missing_runtime_context, missing: missing}
+         )}
     end
-
-    :ok
   end
 
-  defp preview(value) when is_binary(value) do
-    if String.length(value) > 220, do: String.slice(value, 0, 220) <> "...", else: value
+  defp attach_scheduler_policies(
+         %Workflow{} = workflow,
+         %BlueprintGraph{} = blueprint_graph,
+         node_names,
+         %WorkflowBlueprint{} = blueprint
+       ) do
+    workflow
+    |> attach_budget_policy(blueprint)
+    |> then(fn workflow ->
+      Enum.reduce(blueprint_graph.ordered_specs, workflow, fn spec, workflow ->
+        case scheduler_policy(spec) do
+          nil ->
+            workflow
+
+          policy ->
+            Workflow.add_scheduler_policy(
+              workflow,
+              name_matcher(Map.fetch!(node_names, spec.id)),
+              policy
+            )
+        end
+      end)
+    end)
   end
 
-  defp preview(value), do: inspect(value, limit: 12, printable_limit: 220)
+  defp attach_budget_policy(%Workflow{} = workflow, %WorkflowBlueprint{} = blueprint) do
+    case positive_integer(
+           get_in(blueprint.policies, [:budgets, :max_runtime_ms]) ||
+             get_in(blueprint.policies, ["budgets", "max_runtime_ms"])
+         ) do
+      nil ->
+        workflow
 
-  defp append(nil, value), do: [value]
-  defp append(values, value) when is_list(values), do: values ++ [value]
+      max_runtime_ms ->
+        Workflow.append_scheduler_policy(workflow, :default, %{timeout_ms: max_runtime_ms})
+    end
+  end
+
+  defp scheduler_policy(%ComponentSpec{} = spec) do
+    spec.type
+    |> preset_policy()
+    |> Map.merge(native_execution_policy(spec))
+    |> Map.merge(policy_overrides(spec.policy))
+    |> reject_empty_policy()
+  end
+
+  defp name_matcher(name), do: {:name, Regex.compile!("^#{Regex.escape(to_string(name))}$")}
+
+  defp preset_policy(type) when type in [:llm_map, :record_map, :llm_leaf] do
+    SchedulerPolicy.llm_policy() |> policy_map()
+  end
+
+  defp preset_policy(type)
+       when type in [
+              :source_discovery,
+              :source_splitter,
+              :source_materializer,
+              :tabular_parser,
+              :document_compare,
+              :artifact_writer
+            ] do
+    SchedulerPolicy.io_policy() |> policy_map() |> Map.put(:on_failure, :halt)
+  end
+
+  defp preset_policy(_type), do: %{}
+
+  defp policy_overrides(policy) when is_map(policy) do
+    scheduler = get(policy, :scheduler, nil)
+
+    scheduler
+    |> scheduler_preset()
+    |> Map.merge(policy_value(policy, :max_retries, ["max_retries", "retries"]))
+    |> Map.merge(policy_value(policy, :timeout_ms, ["timeout_ms", "timeout"]))
+    |> Map.merge(policy_value(policy, :base_delay_ms, ["base_delay_ms"]))
+    |> Map.merge(policy_value(policy, :max_delay_ms, ["max_delay_ms"]))
+    |> Map.merge(
+      enum_policy_value(policy, :backoff, ["backoff"], [:none, :linear, :exponential, :jitter])
+    )
+    |> Map.merge(enum_policy_value(policy, :on_failure, ["on_failure"], [:halt, :skip]))
+    |> Map.merge(
+      enum_policy_value(policy, :execution_mode, ["execution_mode"], [:sync, :async, :durable])
+    )
+    |> Map.merge(
+      enum_policy_value(policy, :priority, ["priority"], [:low, :normal, :high, :critical])
+    )
+  end
+
+  defp policy_overrides(_policy), do: %{}
+
+  defp native_execution_policy(%ComponentSpec{type: type} = spec)
+       when type in [:llm_map, :record_map] do
+    spec.params
+    |> get(:max_concurrency, nil)
+    |> positive_integer()
+    |> case do
+      nil -> %{}
+      max_concurrency -> %{executor_opts: [max_concurrency: max_concurrency]}
+    end
+  end
+
+  defp native_execution_policy(_spec), do: %{}
+
+  defp component_policies_by_id(%BlueprintGraph{} = blueprint_graph) do
+    blueprint_graph.ordered_specs
+    |> Enum.map(fn spec -> {spec.id, scheduler_policy(spec)} end)
+    |> Enum.reject(fn {_id, policy} -> is_nil(policy) end)
+    |> Map.new()
+  end
+
+  defp scheduler_preset(:llm), do: SchedulerPolicy.llm_policy() |> policy_map()
+  defp scheduler_preset("llm"), do: SchedulerPolicy.llm_policy() |> policy_map()
+  defp scheduler_preset(:io), do: SchedulerPolicy.io_policy() |> policy_map()
+  defp scheduler_preset("io"), do: SchedulerPolicy.io_policy() |> policy_map()
+  defp scheduler_preset(:fast_fail), do: SchedulerPolicy.fast_fail() |> policy_map()
+  defp scheduler_preset("fast_fail"), do: SchedulerPolicy.fast_fail() |> policy_map()
+  defp scheduler_preset("fast-fail"), do: SchedulerPolicy.fast_fail() |> policy_map()
+  defp scheduler_preset(_scheduler), do: %{}
+
+  defp policy_map(%SchedulerPolicy{} = policy) do
+    policy
+    |> Map.from_struct()
+    |> Map.take([:max_retries, :backoff, :base_delay_ms, :max_delay_ms, :timeout_ms, :on_failure])
+  end
+
+  defp policy_value(policy, key, aliases) do
+    value =
+      [key | aliases]
+      |> Enum.find_value(fn key -> get(policy, key, nil) end)
+
+    case positive_integer(value) do
+      nil -> %{}
+      integer -> %{key => integer}
+    end
+  end
+
+  defp enum_policy_value(policy, key, aliases, allowed) do
+    value =
+      [key | aliases]
+      |> Enum.find_value(fn key -> get(policy, key, nil) end)
+      |> normalize_policy_atom()
+
+    if value in allowed, do: %{key => value}, else: %{}
+  end
+
+  defp normalize_policy_atom(value) when is_atom(value), do: value
+
+  defp normalize_policy_atom(value) when is_binary(value) do
+    case value do
+      "none" -> :none
+      "linear" -> :linear
+      "exponential" -> :exponential
+      "jitter" -> :jitter
+      "halt" -> :halt
+      "skip" -> :skip
+      "sync" -> :sync
+      "async" -> :async
+      "durable" -> :durable
+      "low" -> :low
+      "normal" -> :normal
+      "high" -> :high
+      "critical" -> :critical
+      _other -> nil
+    end
+  end
+
+  defp normalize_policy_atom(_value), do: nil
+
+  defp reject_empty_policy(policy) when map_size(policy) == 0, do: nil
+  defp reject_empty_policy(policy), do: policy
+
+  defp graph_summary(
+         %BlueprintGraph{} = blueprint_graph,
+         %Workflow{} = workflow,
+         node_names,
+         opts
+       ) do
+    blueprint_graph
+    |> BlueprintGraph.summary(node_names: node_names)
+    |> Map.put(:runic, %{
+      edgelist: Enum.map(Workflow.to_edgelist(workflow), &edgelist_entry/1),
+      build_log_count: length(Workflow.build_log(workflow)),
+      required_context_keys: json_context_requirements(Workflow.required_context_keys(workflow)),
+      scheduler_policy_count: length(workflow.scheduler_policies),
+      native_nodes:
+        workflow
+        |> WorkflowMetrics.runtime_nodes(%{
+          component_specs: Enum.map(blueprint_graph.ordered_specs, &ComponentSpec.summary/1),
+          node_names: node_names
+        })
+        |> Enum.map(&Map.drop(&1, [:last_output])),
+      serializers: graph_serializers(workflow, opts)
+    })
+  end
+
+  defp graph_serializers(%Workflow{} = workflow, opts) do
+    if Keyword.get(opts, :include_graph_serializers?, true) do
+      %{
+        mermaid: Runic.Workflow.Serializers.Mermaid.serialize(workflow),
+        dot: Runic.Workflow.Serializers.DOT.serialize(workflow),
+        cytoscape: Runic.Workflow.Serializers.Cytoscape.serialize(workflow)
+      }
+    else
+      %{}
+    end
+  end
+
+  defp edgelist_entry({from, to}) do
+    %{from: inspect(from), to: inspect(to)}
+  end
+
+  defp edgelist_entry({from, to, label}) do
+    %{from: inspect(from), to: inspect(to), label: inspect(label)}
+  end
+
+  defp edgelist_entry(entry), do: inspect(entry)
+
+  defp json_context_requirements(requirements) do
+    Map.new(requirements, fn {component, keys} ->
+      {to_string(component),
+       Enum.map(keys, fn
+         {key, :required} -> %{key: key, required?: true}
+         {key, {:optional, default}} -> %{key: key, required?: false, default: inspect(default)}
+       end)}
+    end)
+  end
+
+  defp executor_opts(opts, compiled) do
+    opts
+    |> Keyword.take([
+      :async,
+      :max_concurrency,
+      :timeout,
+      :scheduler_policies,
+      :scheduler_policies_mode,
+      :execution_mode,
+      :runner_name,
+      :workflow_id,
+      :persist_runner?
+    ])
+    |> Keyword.put_new(:timeout, :infinity)
+    |> maybe_put_deadline(compiled)
+  end
+
+  defp maybe_put_deadline(opts, compiled) do
+    max_runtime_ms =
+      get_in(compiled.blueprint.policies, [:budgets, :max_runtime_ms]) ||
+        get_in(compiled.blueprint.policies, ["budgets", "max_runtime_ms"])
+
+    case positive_integer(max_runtime_ms) do
+      nil -> opts
+      ms -> Keyword.put_new(opts, :deadline_at, System.monotonic_time(:millisecond) + ms)
+    end
+  end
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: value
+
+  defp positive_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer > 0 -> integer
+      _other -> nil
+    end
+  end
+
+  defp positive_integer(_value), do: nil
+
+  defp component_name(%{name: name}) when not is_nil(name), do: name
+  defp component_name(%{hash: hash}) when not is_nil(hash), do: hash
+  defp component_name(component), do: inspect(component)
+
+  defp native_map_items_name(name), do: "#{name}_items"
+  defp native_reduce_name(name), do: "#{name}_fan_in"
 
   defp safe_name(value) do
     value
@@ -637,8 +607,10 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     end
   end
 
-  defp get(map, key, default) when is_map(map),
+  defp get(map, key, default) when is_map(map) and is_atom(key),
     do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+
+  defp get(map, key, default) when is_map(map), do: Map.get(map, key, default)
 
   defp get(_map, _key, default), do: default
 end

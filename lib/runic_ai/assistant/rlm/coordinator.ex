@@ -351,10 +351,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
           %{
             prompt: map_prompt(),
             limit: Keyword.get(opts, :max_llm_map_calls, 80),
-            max_concurrency: Keyword.get(opts, :max_llm_map_concurrency, 1)
+            max_concurrency: Keyword.get(opts, :max_llm_map_concurrency, 4)
           }
           |> maybe_put_model(opts)
       ),
+      ComponentBlueprint.new!("join_slice_notes", :blueprint_reduce, params: %{strategy: :join}),
       ComponentBlueprint.new!("synthesize_report", :llm_leaf,
         params:
           %{
@@ -371,7 +372,8 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       %{from: "discover_sources", to: "split_sources"},
       %{from: "split_sources", to: "materialize_slices"},
       %{from: "materialize_slices", to: "extract_slice_notes"},
-      %{from: "extract_slice_notes", to: "synthesize_report"}
+      %{from: "extract_slice_notes", to: "join_slice_notes"},
+      %{from: "join_slice_notes", to: "synthesize_report"}
     ]
 
     {components, edges, "synthesize_report"}

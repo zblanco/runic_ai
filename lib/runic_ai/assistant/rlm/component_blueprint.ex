@@ -4,25 +4,7 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
   """
 
   alias RunicAI.Error
-
-  @types [
-    :source_discovery,
-    :source_splitter,
-    :source_materializer,
-    :tabular_parser,
-    :llm_map,
-    :record_map,
-    :record_group,
-    :document_compare,
-    :llm_leaf,
-    :report_composer,
-    :blueprint_transform,
-    :blueprint_reduce,
-    :artifact_writer,
-    :objective_scorecard,
-    :budget_ledger,
-    :verification
-  ]
+  alias RunicAI.RLM.ComponentCatalog
 
   @enforce_keys [:id, :type]
   @derive Jason.Encoder
@@ -134,31 +116,34 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
   end
 
   @spec types() :: [type()]
-  def types, do: @types
+  def types, do: ComponentCatalog.types()
 
-  defp normalize_type(type) when type in @types, do: {:ok, type}
+  defp normalize_type(type) when is_atom(type) do
+    if type in ComponentCatalog.types() do
+      {:ok, type}
+    else
+      invalid_type(type)
+    end
+  end
 
   defp normalize_type(type) when is_binary(type) do
     normalized = type |> String.downcase() |> String.replace("-", "_")
 
-    case Enum.find(@types, &(Atom.to_string(&1) == normalized)) do
-      nil ->
-        {:error,
-         Error.validation("invalid assistant component blueprint type",
-           source: __MODULE__,
-           details: %{type: type, valid: @types}
-         )}
-
-      type ->
-        {:ok, type}
+    ComponentCatalog.types()
+    |> Enum.find(&(Atom.to_string(&1) == normalized))
+    |> case do
+      nil -> invalid_type(type)
+      type -> {:ok, type}
     end
   end
 
-  defp normalize_type(type) do
+  defp normalize_type(type), do: invalid_type(type)
+
+  defp invalid_type(type) do
     {:error,
      Error.validation("invalid assistant component blueprint type",
        source: __MODULE__,
-       details: %{type: type, valid: @types}
+       details: %{type: type, valid: ComponentCatalog.types()}
      )}
   end
 

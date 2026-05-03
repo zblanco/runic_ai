@@ -31,7 +31,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
 
     assert result.scorecard.objective_status == :objective_satisfied
     assert File.read!(Path.join(root, ".docs/report.md")) =~ "High Level Overview"
-    assert Enum.any?(result.episodes, &(&1.node_id == "write"))
+    assert result.intermediate_outputs["write"].status == :written
   end
 
   test "assistant agent builds the generic fallback workflow and emits stages" do
@@ -136,6 +136,59 @@ defmodule RunicAI.Assistant.RLMAgentTest do
     assert Enum.any?(emitted, &(&1.stage == :scorecard_repair_started))
   end
 
+  test "assistant repairs runtime writer failures with a bounded fallback blueprint" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "chapter.md"), "Ada arrived.\n\nBea found the key.\n")
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Write a high level report",
+        [
+          ComponentBlueprint.new!("split", :source_splitter,
+            params: %{strategy: :paragraph, max_bytes: 100}
+          ),
+          ComponentBlueprint.new!("materialize", :source_materializer),
+          ComponentBlueprint.new!("map", :llm_map),
+          ComponentBlueprint.new!("join", :blueprint_reduce),
+          ComponentBlueprint.new!("synthesize", :llm_leaf),
+          ComponentBlueprint.new!("write", :artifact_writer,
+            params: %{path: "tmp/report.md", write_policy: :docs_only}
+          ),
+          ComponentBlueprint.new!("verify", :verification)
+        ],
+        sources: ["chapter.md"],
+        edges: [
+          %{from: "split", to: "materialize"},
+          %{from: "materialize", to: "map"},
+          %{from: "map", to: "join"},
+          %{from: "join", to: "synthesize"},
+          %{from: "synthesize", to: "write"},
+          %{from: "write", to: "verify"}
+        ],
+        stop_conditions: ["artifact written"]
+      )
+
+    assert {:ok, result} =
+             Agent.run(root, "Write a high level report",
+               blueprint: blueprint,
+               input_paths: ["chapter.md"],
+               client: scripted_client(),
+               model: "test:model",
+               write_policy: :docs_only,
+               event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
+             )
+
+    assert result.status == :ok
+    refute File.exists?(Path.join(root, "tmp/report.md"))
+    assert [%{strategy: :runtime_fallback_blueprint}] = result.repair_history
+
+    emitted = Elixir.Agent.get(events, & &1)
+    assert Enum.any?(emitted, &(&1.stage == :execution_failed))
+    assert Enum.any?(emitted, &(&1.stage == :repair_attempt_started))
+    assert Enum.any?(emitted, &(&1.stage == :repair_completed))
+  end
+
   test "smoke runner writes a scenario report with comparable trace summary" do
     root = tmp_dir()
 
@@ -152,11 +205,27 @@ defmodule RunicAI.Assistant.RLMAgentTest do
     assert File.exists?(Path.join(root, smoke.run_path))
     report = File.read!(Path.join(root, smoke.report_path))
     assert report =~ "Trace Summary"
+    assert report =~ "Runic Graph"
+    assert report =~ "Native Runtime Nodes"
+    assert report =~ "Mermaid"
     assert report =~ "Expected Vs Observed"
 
     assert {:ok, run_details} = Jason.decode(File.read!(Path.join(root, smoke.run_path)))
     assert is_map(run_details["graph_summary"])
     assert is_map(run_details["intermediate_outputs"])
+    assert run_details["trace_summary"]["nodes_executed"] > 0
+    assert run_details["execution_metrics"]["nodes_executed"] > 0
+    assert is_list(run_details["native_nodes"])
+
+    assert Enum.any?(
+             run_details["native_nodes"],
+             &(&1["production_count"] > 0)
+           )
+
+    assert Enum.any?(
+             run_details["events"],
+             &(get_in(&1, ["data", "runnable", "node"]) != nil)
+           )
 
     assert File.read!(Path.join(root, "tmp/assistant_research_brief.md")) =~
              "Recursive Language Models"
@@ -171,6 +240,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
         ),
         ComponentBlueprint.new!("materialize", :source_materializer),
         ComponentBlueprint.new!("map", :llm_map),
+        ComponentBlueprint.new!("join", :blueprint_reduce),
         ComponentBlueprint.new!("synthesize", :llm_leaf),
         ComponentBlueprint.new!("write", :artifact_writer,
           params: %{path: path, write_policy: :docs_only}
@@ -181,7 +251,8 @@ defmodule RunicAI.Assistant.RLMAgentTest do
       edges: [
         %{from: "split", to: "materialize"},
         %{from: "materialize", to: "map"},
-        %{from: "map", to: "synthesize"},
+        %{from: "map", to: "join"},
+        %{from: "join", to: "synthesize"},
         %{from: "synthesize", to: "write"},
         %{from: "write", to: "verify"}
       ],

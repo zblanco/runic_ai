@@ -5,8 +5,10 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
   alias RunicAI.Assistant.RLM.ComponentBlueprint
   alias RunicAI.Assistant.RLM.Coordinator
   alias RunicAI.Assistant.RLM.FunctionBlueprint
+  alias RunicAI.Assistant.RLM.RepairLoop
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Error
   alias RunicAI.LLM.TestClient
 
   test "constructs and validates a workflow blueprint" do
@@ -45,6 +47,55 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert Enum.any?(report.diagnostics, &(&1.code == :duplicate_component_ids))
     assert Enum.any?(report.diagnostics, &(&1.code == :unknown_edge_source))
     assert Enum.any?(report.diagnostics, &(&1.code == :missing_stop_conditions))
+  end
+
+  test "rejects artifact writers without concrete paths" do
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Write report",
+        [
+          ComponentBlueprint.new!("compose", :report_composer),
+          ComponentBlueprint.new!("write", :artifact_writer, params: %{path: nil})
+        ],
+        edges: [%{from: "compose", to: "write"}],
+        stop_conditions: ["artifact written"]
+      )
+
+    report = BlueprintValidator.report(blueprint)
+
+    assert report.status == :rejected
+    assert Enum.any?(report.diagnostics, &(&1.code == :invalid_artifact_writer_path))
+  end
+
+  test "runtime repair removes blank artifact writers when no output path was requested" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Summarize",
+        [
+          ComponentBlueprint.new!("compose", :report_composer),
+          ComponentBlueprint.new!("write", :artifact_writer, params: %{path: nil}),
+          ComponentBlueprint.new!("score", :objective_scorecard)
+        ],
+        edges: [%{from: "compose", to: "write"}, %{from: "write", to: "score"}],
+        stop_conditions: ["artifact written", "objective scorecard checked"]
+      )
+
+    error =
+      Error.validation("artifact writer requires a non-empty path",
+        details: %{path: nil}
+      )
+
+    assert {:ok, repair} = RepairLoop.runtime_repair(workspace, "Summarize", blueprint, error)
+
+    assert repair.strategy == :runtime_diagnostic_repair
+    assert Enum.map(repair.blueprint.components, & &1.id) == ["compose", "score"]
+    assert repair.blueprint.edges == [%{from: "compose", to: "score"}]
+    assert "final assistant output produced" in repair.blueprint.stop_conditions
+    assert {:ok, report} = BlueprintValidator.validate(repair.blueprint)
+    assert report.status == :accepted
   end
 
   test "rejects generated functions above policy tier" do

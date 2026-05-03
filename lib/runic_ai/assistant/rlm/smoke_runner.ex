@@ -46,7 +46,15 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
           report_path = report_path(scenario, opts)
 
           run_path =
-            maybe_persist_run!(workspace.root, scenario, summary, result, expectation, opts)
+            maybe_persist_run!(
+              workspace.root,
+              scenario,
+              summary,
+              result,
+              expectation,
+              events,
+              opts
+            )
 
           matrix_entry = matrix_entry(scenario, summary, expectation, report_path, run_path)
 
@@ -222,7 +230,7 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
     File.write!(absolute, report_markdown(scenario, summary, result, expectation, opts))
   end
 
-  defp maybe_persist_run!(root, scenario, summary, result, expectation, opts) do
+  defp maybe_persist_run!(root, scenario, summary, result, expectation, events, opts) do
     if Keyword.get(opts, :persist_run?, true) do
       path = run_path(scenario, opts)
       absolute = Path.join(root, path)
@@ -230,14 +238,16 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
 
       File.write!(
         absolute,
-        Jason.encode!(run_payload(scenario, summary, result, expectation, opts), pretty: true)
+        Jason.encode!(run_payload(scenario, summary, result, expectation, events, opts),
+          pretty: true
+        )
       )
 
       path
     end
   end
 
-  defp run_payload(scenario, summary, result, expectation, opts) do
+  defp run_payload(scenario, summary, result, expectation, events, opts) do
     %{
       scenario: %{
         id: scenario.id,
@@ -260,9 +270,12 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
       scorecard: json_safe(result.scorecard),
       expectation: json_safe(expectation),
       trace_summary: json_safe(summary),
+      execution_metrics: json_safe(result.execution_metrics || %{}),
+      native_nodes: json_safe(result.native_nodes || []),
+      events: json_safe(event_summaries(events)),
       artifacts: json_safe(result.artifacts || []),
       repair_history: json_safe(result.repair_history || []),
-      intermediate_outputs: intermediate_outputs(result.context)
+      intermediate_outputs: intermediate_outputs(result)
     }
   end
 
@@ -392,6 +405,8 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
       "",
       TraceSummary.markdown(summary, title: "Trace Summary"),
       "",
+      graph_markdown(result),
+      "",
       SmokeExpectation.markdown(expectation),
       "",
       "## Manual Review Checklist",
@@ -428,7 +443,74 @@ defmodule RunicAI.Assistant.RLM.SmokeRunner do
     }
   end
 
+  defp graph_markdown(result) do
+    graph_summary = get(result.compiled || %{}, :graph_summary, %{})
+    runic = get(graph_summary, :runic, %{})
+
+    native_nodes =
+      case result.native_nodes || [] do
+        [] -> get(runic, :native_nodes, [])
+        nodes -> nodes
+      end
+
+    serializers = get(runic, :serializers, %{})
+
+    [
+      "## Runic Graph",
+      "",
+      "- Runtime nodes: #{length(native_nodes)}",
+      "- Scheduler policies: #{get(runic, :scheduler_policy_count, 0)}",
+      "",
+      "### Native Runtime Nodes",
+      "",
+      runtime_node_table(native_nodes),
+      "",
+      "### Mermaid",
+      "",
+      "```mermaid",
+      get(serializers, :mermaid, ""),
+      "```"
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
+  end
+
+  defp runtime_node_table([]), do: "No runtime node summary was recorded."
+
+  defp runtime_node_table(nodes) do
+    rows =
+      Enum.map(nodes, fn node ->
+        "| `#{get(node, :name, "")}` | `#{get(node, :id, "")}` | `#{get(node, :type, "")}` | `#{get(node, :kind, "")}` | #{get(node, :production_count, 0)} |"
+      end)
+
+    [
+      "| Node | Component | Type | Kind | Productions |",
+      "| --- | --- | --- | --- | ---: |",
+      rows
+    ]
+  end
+
+  defp event_summaries(events) do
+    Enum.map(events, fn event ->
+      %{
+        run_id: get(event, :run_id, nil),
+        stage: get(event, :stage, nil),
+        status: get(event, :status, nil),
+        data: json_safe(get(event, :data, %{}))
+      }
+    end)
+  end
+
   defp intermediate_outputs(nil), do: %{}
+
+  defp intermediate_outputs(%{intermediate_outputs: outputs}) when is_map(outputs) do
+    outputs
+    |> Enum.map(fn {id, output} -> {id, output_summary(output)} end)
+    |> Map.new()
+    |> json_safe()
+  end
+
+  defp intermediate_outputs(%{context: context}), do: intermediate_outputs(context)
 
   defp intermediate_outputs(context) when is_map(context) do
     context

@@ -101,6 +101,66 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.output_path == ".docs/chapter.md"
     assert opts.allow_generated_functions == :tier2_review
     assert opts.write_policy == :docs_only
+
+    assert CliOptions.concurrency_opts(opts) == [
+             async: true,
+             max_concurrency: 4,
+             max_llm_map_concurrency: 4,
+             max_llm_map_calls: 80
+           ]
+  end
+
+  test "parses explicit concurrency options" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "summarize chapter",
+               "--agent",
+               "assistant",
+               "--cwd",
+               cwd,
+               "--no-async",
+               "--max-concurrency",
+               "2",
+               "--max-llm-map-concurrency",
+               "3",
+               "--max-llm-map-calls",
+               "12"
+             ])
+
+    assert opts.async? == false
+    assert opts.max_concurrency == 2
+    assert opts.max_llm_map_concurrency == 3
+    assert opts.max_llm_map_calls == 12
+
+    assert CliOptions.concurrency_opts(opts) == [
+             async: false,
+             max_concurrency: 2,
+             max_llm_map_concurrency: 3,
+             max_llm_map_calls: 12
+           ]
+  end
+
+  test "does not add concurrency defaults to standard agent unless requested" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} = CliOptions.parse(["inspect", "--agent", "standard", "--cwd", cwd])
+    assert CliOptions.concurrency_opts(opts) == []
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "inspect",
+               "--agent",
+               "standard",
+               "--cwd",
+               cwd,
+               "--async",
+               "--max-concurrency",
+               "2"
+             ])
+
+    assert CliOptions.concurrency_opts(opts) == [async: true, max_concurrency: 2]
   end
 
   test "rejects JSONL paths outside the workspace and tmp dir" do
@@ -110,6 +170,15 @@ defmodule RunicAI.Terminal.CliOptionsTest do
              CliOptions.parse(["do work", "--cwd", cwd, "--jsonl", "/etc/runic-ai.jsonl"])
 
     assert error.message =~ "--jsonl"
+  end
+
+  test "parses SQLite persistence path inside the workspace" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse(["do work", "--cwd", cwd, "--sqlite", ".runic_ai/runs.db"])
+
+    assert opts.sqlite_path == Path.join([cwd, ".runic_ai", "runs.db"])
   end
 
   defp tmp_dir do

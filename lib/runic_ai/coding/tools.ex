@@ -28,6 +28,22 @@ defmodule RunicAI.Coding.Tools do
   @default_list_limit 200
   @default_find_limit 1_000
   @default_search_limit 100
+  @default_search_line_max_bytes 1_000
+  @default_diagram_limit 20
+  @default_diagram_preview_max_bytes 2_000
+  @default_diagram_file_limit 1_000
+  @diagram_file_extensions ~w(.md .livemd .mmd .mermaid)
+  @default_diagram_ignore @default_find_ignore ++ ~w(doc/dist docs/dist priv/static/doc/dist)
+  @diagram_context_lines 16
+  @mermaid_fence_regex ~r/```[ \t]*(?:mermaid|mmd|mmdflux)[^\n]*\n(.*?)\n```/is
+  @diagram_query_stopwords ~w(
+    can could diagram diagrams document file from get graph into lets mermaid mmdflux notebook now
+    project render rendered same that the this tool using with you livebooks describes describe
+  )
+  @mmdflux_formats ~w(text ascii)
+  @mmdflux_colors ~w(auto always off)
+  @mmdflux_timeout_ms 10_000
+  @mmdflux_max_output_bytes 80_000
 
   @spec default_registry(Workspace.t() | keyword() | map() | Path.t(), keyword()) :: Registry.t()
   def default_registry(workspace_input, opts \\ []) when is_list(opts) do
@@ -217,6 +233,68 @@ defmodule RunicAI.Coding.Tools do
     with {:ok, pattern} <- non_empty_string(pattern, :pattern),
          {:ok, regex} <- compile_regex(pattern, flags) do
       search(workspace, args, {:regex, regex})
+    end
+  end
+
+  @spec extract_diagrams(Workspace.t(), map()) :: {:ok, map()} | {:error, Error.t()}
+  def extract_diagrams(%Workspace{} = workspace, args) when is_map(args) do
+    path = arg(args, :path, nil)
+    query = arg(args, :query, nil)
+    limit = arg(args, :limit, @default_diagram_limit)
+    include_hidden? = arg(args, :include_hidden, false)
+    ignore = arg(args, :ignore, @default_diagram_ignore)
+    include_source? = arg(args, :include_source, false) == true
+    max_source_bytes = arg(args, :max_source_bytes, @default_diagram_preview_max_bytes)
+
+    with {:ok, limit} <- positive_integer(limit, :limit),
+         {:ok, ignore} <- string_list(ignore, :ignore),
+         {:ok, max_source_bytes} <- positive_integer(max_source_bytes, :max_source_bytes),
+         {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read) do
+      cond do
+        File.regular?(resolved.path) ->
+          extract_diagrams_from_file(
+            workspace,
+            resolved,
+            query,
+            limit,
+            include_source?,
+            max_source_bytes
+          )
+
+        File.dir?(resolved.path) ->
+          extract_diagrams_from_directory(
+            workspace,
+            resolved,
+            query,
+            limit,
+            include_source?,
+            max_source_bytes,
+            include_hidden?,
+            ignore
+          )
+
+        true ->
+          {:error,
+           Error.validation("path must be a directory or regular file",
+             source: __MODULE__,
+             details: %{path: resolved.relative}
+           )}
+      end
+    end
+  end
+
+  @spec render_mermaid(Workspace.t(), map()) :: {:ok, map()} | {:error, Error.t()}
+  def render_mermaid(%Workspace{} = workspace, args) when is_map(args) do
+    diagram_index = arg(args, :diagram_index, 1)
+    format = arg(args, :format, "text")
+    color = arg(args, :color, "auto")
+    query = arg(args, :query, nil)
+
+    with {:ok, diagram_index} <- positive_integer(diagram_index, :diagram_index),
+         {:ok, format} <- mmdflux_format(format),
+         {:ok, color} <- mmdflux_color(color),
+         {:ok, source, source_metadata} <- mermaid_source(workspace, args, diagram_index, query) do
+      render_mermaid_source(source, format, color, source_metadata)
     end
   end
 
@@ -506,6 +584,35 @@ defmodule RunicAI.Coding.Tools do
         ],
         fn args -> search_regex(workspace, args) end,
         %{category: :coding, mutates?: false}
+      ),
+      definition(
+        "extract_diagrams",
+        "List Mermaid diagrams from a workspace file or bounded source directory. Finds raw .mmd files, Markdown Mermaid fences, and static or dynamic Kino.Mermaid Livebook calls. Use this before rendering when the requested diagram is described loosely.",
+        [
+          path: [type: :string, required: true],
+          query: [type: :string],
+          limit: [type: :pos_integer, default: @default_diagram_limit],
+          include_hidden: [type: :boolean, default: false],
+          ignore: [type: {:list, :string}, default: @default_diagram_ignore],
+          include_source: [type: :boolean, default: false],
+          max_source_bytes: [type: :pos_integer, default: @default_diagram_preview_max_bytes]
+        ],
+        fn args -> extract_diagrams(workspace, args) end,
+        %{category: :coding_visualization, mutates?: false}
+      ),
+      definition(
+        "render_mermaid",
+        "Render Mermaid source, a Mermaid fenced code block, a bounded directory candidate, or a static Kino.Mermaid.new triple-quoted Livebook diagram as terminal text using mmdflux. Prefer this directly for Mermaid/MMDFLUX requests; pass path plus optional query text near the desired diagram. Use format text unless ASCII-only output is required.",
+        [
+          source: [type: :string],
+          path: [type: :string],
+          query: [type: :string],
+          diagram_index: [type: :pos_integer, default: 1],
+          format: [type: :string, default: "text"],
+          color: [type: :string, default: "auto"]
+        ],
+        fn args -> render_mermaid(workspace, args) end,
+        %{category: :coding_visualization, mutates?: false}
       ),
       definition(
         "source_assert",
@@ -934,6 +1041,695 @@ defmodule RunicAI.Coding.Tools do
     end
   end
 
+  defp extract_diagrams_from_file(
+         workspace,
+         resolved,
+         query,
+         limit,
+         include_source?,
+         max_source_bytes
+       ) do
+    with {:ok, content, sha256} <- read_text_content(workspace, resolved) do
+      diagrams =
+        resolved.relative
+        |> extract_mermaid_diagrams(content)
+        |> with_file_metadata(resolved.relative, sha256)
+
+      normalized_query = normalize_query(query)
+      selected = selected_diagram(diagrams, 1, normalized_query)
+
+      {:ok,
+       %{
+         path: resolved.relative,
+         sha256: sha256,
+         count: length(diagrams),
+         truncated?: length(diagrams) > limit,
+         query: normalized_query,
+         selected_diagram_index: selected && selected.index,
+         diagrams:
+           diagrams
+           |> Enum.take(limit)
+           |> Enum.map(
+             &diagram_candidate_output(&1, include_source?, max_source_bytes, normalized_query)
+           )
+       }}
+    end
+  end
+
+  defp extract_diagrams_from_directory(
+         workspace,
+         resolved,
+         query,
+         limit,
+         include_source?,
+         max_source_bytes,
+         include_hidden?,
+         ignore
+       ) do
+    normalized_query = normalize_query(query)
+
+    files =
+      workspace
+      |> walk_files(
+        resolved.path,
+        resolved.relative,
+        include_hidden?,
+        ignore,
+        nil,
+        @default_diagram_file_limit
+      )
+      |> Enum.map(& &1.path)
+      |> Enum.filter(&diagram_source_file?/1)
+
+    {diagrams, scanned, errors, truncated?} =
+      files
+      |> Enum.reduce_while({[], 0, [], false}, fn path, {diagrams, scanned, errors, truncated?} ->
+        if length(diagrams) > limit do
+          {:halt, {diagrams, scanned, errors, true}}
+        else
+          case diagrams_from_path(workspace, path) do
+            {:ok, file_diagrams} ->
+              next = diagrams ++ file_diagrams
+              {:cont, {next, scanned + 1, errors, truncated? or length(next) > limit}}
+
+            {:error, error} ->
+              {:cont, {diagrams, scanned + 1, [diagram_scan_error(path, error) | errors], true}}
+          end
+        end
+      end)
+
+    diagrams = assign_global_diagram_indexes(diagrams)
+    selected = selected_diagram(diagrams, 1, normalized_query)
+    diagram_files = diagrams |> Enum.map(& &1.path) |> Enum.uniq()
+
+    {:ok,
+     %{
+       path: resolved.relative,
+       directory?: true,
+       files_scanned: scanned,
+       diagram_files: diagram_files,
+       diagram_file_count: length(diagram_files),
+       count: length(diagrams),
+       truncated?: truncated? or length(files) >= @default_diagram_file_limit,
+       query: normalized_query,
+       selected_diagram_index: selected && selected.index,
+       scan_errors: Enum.reverse(errors),
+       diagrams:
+         diagrams
+         |> Enum.take(limit)
+         |> Enum.map(
+           &diagram_candidate_output(&1, include_source?, max_source_bytes, normalized_query)
+         )
+     }}
+  end
+
+  defp diagrams_from_path(workspace, path) do
+    with {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read),
+         {:ok, content, sha256} <- read_text_content(workspace, resolved) do
+      diagrams =
+        resolved.relative
+        |> extract_mermaid_diagrams(content)
+        |> with_file_metadata(resolved.relative, sha256)
+
+      {:ok, diagrams}
+    end
+  end
+
+  defp with_file_metadata(diagrams, path, sha256) do
+    Enum.map(diagrams, fn diagram ->
+      diagram
+      |> Map.put(:path, path)
+      |> Map.put(:sha256, sha256)
+      |> Map.put(:file_diagram_index, diagram.index)
+    end)
+  end
+
+  defp assign_global_diagram_indexes(diagrams) do
+    diagrams
+    |> Enum.with_index(1)
+    |> Enum.map(fn {diagram, index} -> Map.put(diagram, :index, index) end)
+  end
+
+  defp diagram_scan_error(path, %Error{} = error),
+    do: %{path: path, error: error.message, details: error.details}
+
+  defp diagram_source_file?(path), do: Path.extname(path) in @diagram_file_extensions
+
+  defp mermaid_source(workspace, args, diagram_index, query) do
+    case {arg(args, :source, nil), arg(args, :path, nil)} do
+      {source, _path} when is_binary(source) and source != "" ->
+        {:ok, String.trim(source), %{source: :inline, diagram_count: 1, diagram_index: 1}}
+
+      {_source, path} when is_binary(path) and path != "" ->
+        mermaid_source_from_path(workspace, path, diagram_index, query)
+
+      _other ->
+        {:error,
+         Error.validation("render_mermaid requires source or path",
+           source: __MODULE__,
+           details: %{args: args}
+         )}
+    end
+  end
+
+  defp mermaid_source_from_path(workspace, path, diagram_index, query) do
+    with {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read) do
+      cond do
+        File.regular?(resolved.path) ->
+          mermaid_source_from_file(workspace, resolved, diagram_index, query)
+
+        File.dir?(resolved.path) ->
+          mermaid_source_from_directory(workspace, resolved, diagram_index, query)
+
+        true ->
+          {:error,
+           Error.validation("path must be a directory or regular file",
+             source: __MODULE__,
+             details: %{path: resolved.relative}
+           )}
+      end
+    end
+  end
+
+  defp mermaid_source_from_file(workspace, resolved, diagram_index, query) do
+    with {:ok, content, sha256} <- read_text_content(workspace, resolved),
+         {:ok, diagram, diagram_count} <-
+           select_mermaid_diagram(resolved.relative, content, diagram_index, query) do
+      {:ok, diagram.source,
+       source_metadata(
+         :file,
+         resolved.relative,
+         sha256,
+         diagram,
+         diagram_count,
+         diagram_index,
+         query
+       )}
+    end
+  end
+
+  defp mermaid_source_from_directory(workspace, resolved, diagram_index, query) do
+    with {:ok, output} <-
+           extract_diagrams(workspace, %{
+             path: resolved.relative,
+             query: query,
+             limit: max(diagram_index, @default_diagram_limit),
+             include_source: true,
+             max_source_bytes: workspace.path_policy.max_file_bytes
+           }) do
+      diagrams = output.diagrams
+      normalized_query = output.query
+      selected_index = output.selected_diagram_index || diagram_index
+
+      case Enum.find(diagrams, &(&1.index == selected_index)) ||
+             Enum.at(diagrams, diagram_index - 1) do
+        %{renderable?: true, source: source} = diagram when is_binary(source) and source != "" ->
+          {:ok, source,
+           source_metadata(
+             :directory,
+             diagram.path,
+             diagram.sha256,
+             diagram,
+             output.count,
+             diagram_index,
+             normalized_query
+           )
+           |> Map.merge(%{
+             directory: resolved.relative,
+             diagram_file_count: output.diagram_file_count,
+             files_scanned: output.files_scanned
+           })}
+
+        %{renderable?: false} = diagram ->
+          {:error,
+           Error.validation("selected Mermaid diagram is dynamic and cannot be rendered directly",
+             source: __MODULE__,
+             details: %{
+               path: diagram.path,
+               diagram_index: diagram.index,
+               file_diagram_index: diagram.file_diagram_index,
+               container: diagram.container,
+               line_start: diagram.line_start,
+               line_end: diagram.line_end,
+               heading: diagram.heading
+             }
+           )}
+
+        _other ->
+          {:error,
+           Error.validation("Mermaid diagram was not found",
+             source: __MODULE__,
+             details: %{
+               path: resolved.relative,
+               diagram_index: diagram_index,
+               diagram_count: output.count
+             }
+           )}
+      end
+    end
+  end
+
+  defp source_metadata(source_kind, path, sha256, diagram, diagram_count, diagram_index, query) do
+    %{
+      source: source_kind,
+      path: path,
+      sha256: sha256,
+      diagram_count: diagram_count,
+      diagram_index: diagram.index,
+      file_diagram_index: Map.get(diagram, :file_diagram_index),
+      requested_diagram_index: diagram_index,
+      query: query,
+      container: diagram.container,
+      line_start: diagram.line_start,
+      line_end: diagram.line_end,
+      heading: diagram.heading
+    }
+  end
+
+  defp select_mermaid_diagram(path, content, diagram_index, query) do
+    diagrams = extract_mermaid_diagrams(path, content)
+    normalized_query = normalize_query(query)
+    selected = selected_diagram(diagrams, diagram_index, normalized_query)
+
+    case selected do
+      %{source: source, renderable?: true} = diagram when is_binary(source) and source != "" ->
+        {:ok, diagram, length(diagrams)}
+
+      %{renderable?: false} = diagram ->
+        {:error,
+         Error.validation("selected Mermaid diagram is dynamic and cannot be rendered directly",
+           source: __MODULE__,
+           details: %{
+             path: path,
+             diagram_index: diagram.index,
+             container: diagram.container,
+             line_start: diagram.line_start,
+             line_end: diagram.line_end,
+             heading: diagram.heading,
+             expression: diagram.expression
+           }
+         )}
+
+      _other ->
+        {:error,
+         Error.validation("Mermaid diagram was not found",
+           source: __MODULE__,
+           details: %{path: path, diagram_index: diagram_index, diagram_count: length(diagrams)}
+         )}
+    end
+  end
+
+  defp extract_mermaid_diagrams(path, content) do
+    diagrams =
+      if mermaid_file?(path) do
+        [
+          %{
+            source: String.trim(content),
+            context: content,
+            container: :mermaid_file,
+            renderable?: true,
+            line_start: 1,
+            line_end: content_line_count(content),
+            heading: nil,
+            expression: nil
+          }
+        ]
+      else
+        extract_mermaid_fences(content) ++ extract_kino_mermaid_blocks(content)
+      end
+
+    diagrams
+    |> Enum.reject(fn diagram ->
+      diagram.renderable? and (not is_binary(diagram.source) or diagram.source == "")
+    end)
+    |> Enum.sort_by(&{&1.line_start || 0, &1.container})
+    |> Enum.with_index(1)
+    |> Enum.map(fn {diagram, index} -> Map.put(diagram, :index, index) end)
+  end
+
+  defp extract_mermaid_fences(content) do
+    @mermaid_fence_regex
+    |> Regex.scan(content, return: :index)
+    |> Enum.map(fn [{start, length}, {source_start, source_length}] ->
+      source = content |> binary_part(source_start, source_length) |> String.trim()
+      line_start = line_number_at(content, start)
+
+      %{
+        source: source,
+        context: diagram_context(content, line_start, source),
+        container: :markdown_fence,
+        renderable?: true,
+        line_start: line_start,
+        line_end: line_number_at(content, start + length),
+        heading: heading_before_line(content, line_start),
+        expression: nil
+      }
+    end)
+    |> Enum.reject(&(&1.source == ""))
+  end
+
+  defp extract_kino_mermaid_blocks(content) do
+    content
+    |> String.split("\n", trim: false)
+    |> Enum.with_index(1)
+    |> scan_kino_mermaid_lines([], content)
+  end
+
+  defp scan_kino_mermaid_lines([], acc, _content), do: Enum.reverse(acc)
+
+  defp scan_kino_mermaid_lines([{line, line_no} | rest], acc, content) do
+    if String.contains?(line, "Kino.Mermaid.new(") do
+      case consume_kino_mermaid_literal(line, line_no, rest) do
+        {:ok, source, line_end, remaining} ->
+          diagram = %{
+            source: source,
+            context: diagram_context(content, line_no, source),
+            container: :kino_mermaid_literal,
+            renderable?: true,
+            line_start: line_no,
+            line_end: line_end,
+            heading: heading_before_line(content, line_no),
+            expression: nil
+          }
+
+          scan_kino_mermaid_lines(remaining, [diagram | acc], content)
+
+        :not_literal ->
+          expression = String.trim(line)
+
+          diagram = %{
+            source: nil,
+            context: diagram_context(content, line_no, expression),
+            container: :kino_mermaid_dynamic,
+            renderable?: false,
+            line_start: line_no,
+            line_end: line_no,
+            heading: heading_before_line(content, line_no),
+            expression: expression
+          }
+
+          scan_kino_mermaid_lines(rest, [diagram | acc], content)
+      end
+    else
+      scan_kino_mermaid_lines(rest, acc, content)
+    end
+  end
+
+  defp consume_kino_mermaid_literal(line, line_no, rest) do
+    with {:ok, _before, after_open} <- split_once(line, "\"\"\"") do
+      case split_once(after_open, "\"\"\"") do
+        {:ok, source, _after_close} ->
+          {:ok, String.trim(source), line_no, rest}
+
+        :error ->
+          case collect_triple_quoted_literal(rest, [after_open]) do
+            {:ok, source, line_end, remaining} ->
+              {:ok, String.trim(source), line_end, remaining}
+
+            :unterminated ->
+              :not_literal
+          end
+      end
+    else
+      :error -> :not_literal
+    end
+  end
+
+  defp collect_triple_quoted_literal([], _acc), do: :unterminated
+
+  defp collect_triple_quoted_literal([{line, line_no} | rest], acc) do
+    case split_once(line, "\"\"\"") do
+      {:ok, before_close, _after_close} ->
+        source =
+          [before_close | acc]
+          |> Enum.reverse()
+          |> Enum.join("\n")
+
+        {:ok, source, line_no, rest}
+
+      :error ->
+        collect_triple_quoted_literal(rest, [line | acc])
+    end
+  end
+
+  defp split_once(binary, pattern) do
+    case :binary.match(binary, pattern) do
+      {start, length} ->
+        before = binary_part(binary, 0, start)
+        after_match = binary_part(binary, start + length, byte_size(binary) - start - length)
+        {:ok, before, after_match}
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp normalize_query(query) when is_binary(query) do
+    query
+    |> String.trim()
+    |> case do
+      "" -> nil
+      query -> String.downcase(query)
+    end
+  end
+
+  defp normalize_query(_query), do: nil
+
+  defp selected_diagram(diagrams, diagram_index, nil), do: Enum.at(diagrams, diagram_index - 1)
+
+  defp selected_diagram(diagrams, diagram_index, query) do
+    select_diagram_by_query(diagrams, query) || Enum.at(diagrams, diagram_index - 1)
+  end
+
+  defp select_diagram_by_query(diagrams, query) do
+    diagrams
+    |> Enum.map(fn diagram -> {diagram, diagram_query_score(diagram, query)} end)
+    |> Enum.filter(fn {_diagram, score} -> score > 0 end)
+    |> Enum.max_by(
+      fn {diagram, score} ->
+        {score, if(diagram.renderable?, do: 1, else: 0), -diagram.index}
+      end,
+      fn -> nil end
+    )
+    |> case do
+      nil -> nil
+      {diagram, _score} -> diagram
+    end
+  end
+
+  defp diagram_query_score(diagram, query) do
+    text = diagram_search_text(diagram)
+    exact_score = if String.contains?(text, query), do: 100, else: 0
+    tokens = query_tokens(query)
+    token_score = Enum.count(tokens, &String.contains?(text, &1))
+
+    exact_score + token_score
+  end
+
+  defp mermaid_file?(path), do: Path.extname(path) in [".mmd", ".mermaid"]
+
+  defp diagram_search_text(diagram) do
+    [diagram.heading, diagram.context, diagram.source, diagram.expression]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+    |> String.downcase()
+  end
+
+  defp query_tokens(query) do
+    query
+    |> String.downcase()
+    |> String.split(~r/[^a-z0-9_]+/, trim: true)
+    |> Enum.reject(&(byte_size(&1) < 3 or &1 in @diagram_query_stopwords))
+    |> Enum.map(&singularize_token/1)
+    |> Enum.uniq()
+  end
+
+  defp singularize_token(token) do
+    if String.ends_with?(token, "s") and byte_size(token) > 3 do
+      String.slice(token, 0, byte_size(token) - 1)
+    else
+      token
+    end
+  end
+
+  defp diagram_candidate_output(diagram, include_source?, max_source_bytes, query) do
+    source = diagram.source || diagram.expression || ""
+
+    output = %{
+      index: diagram.index,
+      file_diagram_index: Map.get(diagram, :file_diagram_index),
+      path: Map.get(diagram, :path),
+      sha256: Map.get(diagram, :sha256),
+      container: diagram.container,
+      renderable?: diagram.renderable?,
+      line_start: diagram.line_start,
+      line_end: diagram.line_end,
+      heading: diagram.heading,
+      query_score: query && diagram_query_score(diagram, query),
+      source_preview: truncate_output(source, max_source_bytes),
+      source_truncated?: byte_size(source) > max_source_bytes,
+      context_preview: truncate_output(diagram.context || "", max_source_bytes)
+    }
+
+    if include_source? and diagram.renderable? do
+      Map.put(output, :source, diagram.source)
+    else
+      output
+    end
+  end
+
+  defp diagram_context(content, line_start, source) do
+    before =
+      content
+      |> String.split("\n", trim: false)
+      |> Enum.take(max(line_start - 1, 0))
+      |> Enum.take(-@diagram_context_lines)
+      |> Enum.join("\n")
+
+    [before, source]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("\n")
+    |> String.trim()
+  end
+
+  defp heading_before_line(content, line_start) do
+    content
+    |> String.split("\n", trim: false)
+    |> Enum.take(max(line_start - 1, 0))
+    |> Enum.reverse()
+    |> Enum.find(&Regex.match?(~r/^#+\s+\S/, &1))
+    |> case do
+      nil -> nil
+      heading -> Regex.replace(~r/^#+\s+/, heading, "")
+    end
+  end
+
+  defp line_number_at(content, byte_offset) do
+    byte_offset = min(byte_offset, byte_size(content))
+
+    content
+    |> binary_part(0, byte_offset)
+    |> :binary.matches("\n")
+    |> length()
+    |> Kernel.+(1)
+  end
+
+  defp content_line_count(content), do: content |> String.split("\n", trim: false) |> length()
+
+  defp render_mermaid_source(source, format, color, source_metadata) do
+    case System.find_executable("mmdflux") do
+      nil ->
+        {:ok,
+         Map.merge(source_metadata, %{
+           status: :blocked,
+           command: "mmdflux --format #{format} --color #{color}",
+           format: format,
+           color: color,
+           rendered: nil,
+           source_preview: source,
+           error: "mmdflux executable was not found on PATH"
+         })}
+
+      executable ->
+        execute_mmdflux(executable, source, format, color, source_metadata)
+    end
+  end
+
+  defp execute_mmdflux(executable, source, format, color, source_metadata) do
+    args = ["--format", format, "--color", color]
+
+    tmp_path =
+      Path.join(System.tmp_dir!(), "runic-ai-mmdflux-#{System.unique_integer([:positive])}.mmd")
+
+    try do
+      task =
+        Task.async(fn ->
+          File.write!(tmp_path, source)
+          System.cmd(executable, args ++ [tmp_path], stderr_to_stdout: true)
+        end)
+
+      case Task.yield(task, @mmdflux_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {output, exit_status}} ->
+          {:ok,
+           Map.merge(source_metadata, %{
+             status: if(exit_status == 0, do: :pass, else: :fail),
+             command: "mmdflux #{Enum.join(args, " ")}",
+             format: format,
+             color: color,
+             exit_status: exit_status,
+             rendered: truncate_output(output, @mmdflux_max_output_bytes),
+             truncated?: byte_size(output) > @mmdflux_max_output_bytes,
+             source_preview: source
+           })}
+
+        {:exit, reason} ->
+          {:error,
+           Error.from_reason(reason, source: __MODULE__, message: "mmdflux execution failed")}
+
+        nil ->
+          {:ok,
+           Map.merge(source_metadata, %{
+             status: :fail,
+             command: "mmdflux #{Enum.join(args, " ")}",
+             format: format,
+             color: color,
+             rendered: nil,
+             error: "mmdflux timed out after #{@mmdflux_timeout_ms}ms",
+             source_preview: source
+           })}
+      end
+    after
+      File.rm(tmp_path)
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, kind: :unexpected, source: __MODULE__)}
+  end
+
+  defp mmdflux_format("default"), do: {:ok, "text"}
+  defp mmdflux_format("terminal"), do: {:ok, "text"}
+  defp mmdflux_format("ansi"), do: {:ok, "text"}
+  defp mmdflux_format(format) when format in ["svg", "mmds", "mermaid"], do: {:ok, "text"}
+  defp mmdflux_format(format) when format in @mmdflux_formats, do: {:ok, format}
+
+  defp mmdflux_format(format) do
+    {:error,
+     Error.validation("unsupported mmdflux format",
+       source: __MODULE__,
+       details: %{format: format, valid_formats: @mmdflux_formats}
+     )}
+  end
+
+  defp mmdflux_color("never"), do: {:ok, "off"}
+  defp mmdflux_color("default"), do: {:ok, "auto"}
+  defp mmdflux_color(color) when color in @mmdflux_colors, do: {:ok, color}
+
+  defp mmdflux_color(color) do
+    {:error,
+     Error.validation("unsupported mmdflux color",
+       source: __MODULE__,
+       details: %{color: color, valid_colors: @mmdflux_colors}
+     )}
+  end
+
+  defp truncate_output(output, max_bytes) when byte_size(output) <= max_bytes, do: output
+
+  defp truncate_output(output, max_bytes) do
+    output
+    |> binary_part(0, max_bytes)
+    |> valid_utf8_prefix()
+  end
+
+  defp valid_utf8_prefix(output) do
+    if String.valid?(output) do
+      output
+    else
+      output
+      |> binary_part(0, byte_size(output) - 1)
+      |> valid_utf8_prefix()
+    end
+  end
+
   defp parse_rg_line(workspace, line, query) do
     case String.split(line, ":", parts: 4) do
       [path, line_no, column, text] ->
@@ -948,7 +1744,8 @@ defmodule RunicAI.Coding.Tools do
              line: line_no,
              column: column,
              match: query,
-             text: text,
+             text: line_preview(text),
+             text_truncated?: text_truncated?(text),
              before: [],
              after: []
            }}
@@ -981,7 +1778,8 @@ defmodule RunicAI.Coding.Tools do
               line: line_no,
               column: column,
               match: match,
-              text: line,
+              text: line_preview(line),
+              text_truncated?: text_truncated?(line),
               before: context(lines, line_no, -context_lines),
               after: context(lines, line_no, context_lines),
               sha256: sha256
@@ -1029,15 +1827,26 @@ defmodule RunicAI.Coding.Tools do
     lines
     |> Enum.with_index(1)
     |> Enum.filter(fn {_line, current} -> current >= line_no - count and current < line_no end)
-    |> Enum.map(fn {line, current} -> %{line: current, text: line} end)
+    |> Enum.map(fn {line, current} -> context_entry(line, current) end)
   end
 
   defp context(lines, line_no, count) do
     lines
     |> Enum.with_index(1)
     |> Enum.filter(fn {_line, current} -> current > line_no and current <= line_no + count end)
-    |> Enum.map(fn {line, current} -> %{line: current, text: line} end)
+    |> Enum.map(fn {line, current} -> context_entry(line, current) end)
   end
+
+  defp context_entry(line, line_no) do
+    %{
+      line: line_no,
+      text: line_preview(line),
+      text_truncated?: text_truncated?(line)
+    }
+  end
+
+  defp line_preview(line), do: truncate_output(line, @default_search_line_max_bytes)
+  defp text_truncated?(line), do: byte_size(line) > @default_search_line_max_bytes
 
   defp walk_files(workspace, absolute, relative, include_hidden?, ignore, query, limit) do
     do_walk_files(workspace, absolute, relative, include_hidden?, ignore, query, limit, [])

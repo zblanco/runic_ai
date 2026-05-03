@@ -156,7 +156,78 @@ defmodule RunicAI.Assistant.RLM.Agent do
 
       {:error, %Error{} = error} ->
         emit(event_sink, run_id, :execution_failed, :error, %{error: error})
-        {:error, error}
+
+        maybe_repair_runtime(
+          workspace,
+          objective,
+          blueprint,
+          opts,
+          run_id,
+          event_sink,
+          repair_history,
+          error
+        )
+    end
+  end
+
+  defp maybe_repair_runtime(
+         workspace,
+         objective,
+         blueprint,
+         opts,
+         run_id,
+         event_sink,
+         repair_history,
+         error
+       ) do
+    if runtime_repair_needed?(repair_history, opts) do
+      emit(event_sink, run_id, :repair_attempt_started, :running, %{
+        strategy: :runtime_diagnostic_repair,
+        reason: error.message,
+        error: error
+      })
+
+      case RepairLoop.runtime_repair(workspace, objective, blueprint, error, opts) do
+        {:ok, repair} ->
+          blueprint = repair.blueprint
+
+          with {:ok, report} <- BlueprintValidator.validate(blueprint, validation_opts(opts)) do
+            emit(event_sink, run_id, :repair_completed, :ok, %{
+              strategy: repair.strategy,
+              reason: repair.reason,
+              blueprint_id: blueprint.id
+            })
+
+            execute_blueprint(
+              workspace,
+              objective,
+              blueprint,
+              report,
+              Keyword.put(opts, :repair_runtime?, false),
+              run_id,
+              event_sink,
+              repair_history ++ [Map.drop(repair, [:blueprint])]
+            )
+          else
+            {:error, %Error{} = repair_error} ->
+              emit(event_sink, run_id, :repair_attempt_completed, :error, %{
+                strategy: Map.get(repair, :strategy),
+                error: repair_error
+              })
+
+              {:error, error}
+          end
+
+        {:error, %Error{} = repair_error} ->
+          emit(event_sink, run_id, :repair_attempt_completed, :error, %{
+            strategy: :runtime_diagnostic_repair,
+            error: repair_error
+          })
+
+          {:error, error}
+      end
+    else
+      {:error, error}
     end
   end
 
@@ -220,6 +291,18 @@ defmodule RunicAI.Assistant.RLM.Agent do
         Map.get(repair, :strategy) in [
           :scorecard_diagnostic_repair,
           "scorecard_diagnostic_repair"
+        ]
+      end)
+  end
+
+  defp runtime_repair_needed?(repair_history, opts) do
+    Keyword.get(opts, :repair_runtime?, true) and
+      not Enum.any?(repair_history, fn repair ->
+        Map.get(repair, :strategy) in [
+          :runtime_diagnostic_repair,
+          "runtime_diagnostic_repair",
+          :runtime_fallback_blueprint,
+          "runtime_fallback_blueprint"
         ]
       end)
   end
