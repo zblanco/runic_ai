@@ -30,6 +30,7 @@ defmodule RunicAI.Coding.PathPolicy do
 
   @enforce_keys [
     :root_jail,
+    :read_root_jail,
     :symlink_policy,
     :hidden_policy,
     :max_file_bytes,
@@ -38,6 +39,7 @@ defmodule RunicAI.Coding.PathPolicy do
     :metadata
   ]
   defstruct root_jail: true,
+            read_root_jail: true,
             symlink_policy: :reject,
             hidden_policy: :read_only,
             max_file_bytes: 1_048_576,
@@ -56,6 +58,7 @@ defmodule RunicAI.Coding.PathPolicy do
 
   @type t :: %__MODULE__{
           root_jail: boolean(),
+          read_root_jail: boolean(),
           symlink_policy: symlink_policy(),
           hidden_policy: hidden_policy(),
           max_file_bytes: pos_integer(),
@@ -67,6 +70,7 @@ defmodule RunicAI.Coding.PathPolicy do
   @spec new(keyword()) :: {:ok, t()} | {:error, Error.t()}
   def new(opts \\ []) when is_list(opts) do
     root_jail = Keyword.get(opts, :root_jail, true)
+    read_root_jail = Keyword.get(opts, :read_root_jail, root_jail)
     symlink_policy = Keyword.get(opts, :symlink_policy, :reject)
     hidden_policy = Keyword.get(opts, :hidden_policy, :read_only)
     max_file_bytes = Keyword.get(opts, :max_file_bytes, 1_048_576)
@@ -75,6 +79,7 @@ defmodule RunicAI.Coding.PathPolicy do
     metadata = Keyword.get(opts, :metadata, %{})
 
     with :ok <- validate_boolean(root_jail, :root_jail),
+         :ok <- validate_boolean(read_root_jail, :read_root_jail),
          :ok <- validate_symlink_policy(symlink_policy),
          :ok <- validate_hidden_policy(hidden_policy),
          :ok <- validate_max_file_bytes(max_file_bytes),
@@ -84,6 +89,7 @@ defmodule RunicAI.Coding.PathPolicy do
       {:ok,
        %__MODULE__{
          root_jail: root_jail,
+         read_root_jail: read_root_jail,
          symlink_policy: symlink_policy,
          hidden_policy: hidden_policy,
          max_file_bytes: max_file_bytes,
@@ -110,6 +116,7 @@ defmodule RunicAI.Coding.PathPolicy do
   def from_input(input) when is_map(input) do
     new(
       root_jail: get(input, :root_jail, true),
+      read_root_jail: get(input, :read_root_jail, get(input, :root_jail, true)),
       symlink_policy: get(input, :symlink_policy, :reject),
       hidden_policy: get(input, :hidden_policy, :read_only),
       max_file_bytes: get(input, :max_file_bytes, 1_048_576),
@@ -139,6 +146,7 @@ defmodule RunicAI.Coding.PathPolicy do
   def validate(%__MODULE__{} = policy) do
     new(
       root_jail: policy.root_jail,
+      read_root_jail: policy.read_root_jail,
       symlink_policy: policy.symlink_policy,
       hidden_policy: policy.hidden_policy,
       max_file_bytes: policy.max_file_bytes,
@@ -153,12 +161,12 @@ defmodule RunicAI.Coding.PathPolicy do
       when is_binary(root) and access in [:read, :write] do
     root = Path.expand(root)
 
-    with {:ok, relative} <- safe_relative(path, root),
-         absolute = Path.expand(relative, root),
-         :ok <- enforce_root_jail(policy, absolute, root),
+    with {:ok, %{path: absolute, relative: relative}} <-
+           expand_path(policy, root, path, access),
+         :ok <- enforce_root_jail(policy, absolute, root, access),
          :ok <- enforce_hidden_policy(policy, relative, access),
          :ok <- enforce_credential_policy(policy, relative),
-         :ok <- enforce_symlink_policy(policy, root, relative, access),
+         :ok <- enforce_symlink_policy(policy, absolute, access),
          :ok <- enforce_write_roots(policy, absolute, root, access) do
       {:ok, %{path: absolute, relative: normalize_relative(relative)}}
     end
@@ -186,26 +194,54 @@ defmodule RunicAI.Coding.PathPolicy do
     end)
   end
 
-  defp safe_relative(path, _root) when path in ["", "."], do: {:ok, "."}
+  defp expand_path(%__MODULE__{} = policy, root, path, access) when is_binary(path) do
+    cond do
+      path in ["", "."] ->
+        {:ok, %{path: root, relative: "."}}
 
-  defp safe_relative(path, root) when is_binary(path) do
-    if Path.type(path) == :relative do
-      case Path.safe_relative(path, root) do
-        {:ok, relative} -> {:ok, normalize_relative(relative)}
-        :error -> path_error(path, "path escapes the workspace root")
-      end
-    else
-      path_error(path, "path must be workspace-relative")
+      Path.type(path) == :relative ->
+        case Path.safe_relative(path, root) do
+          {:ok, relative} ->
+            relative = normalize_relative(relative)
+            {:ok, %{path: Path.expand(relative, root), relative: relative}}
+
+          :error ->
+            if access == :read and not policy.read_root_jail do
+              absolute = Path.expand(path, root)
+              {:ok, %{path: absolute, relative: absolute}}
+            else
+              path_error(path, "path escapes the workspace root")
+            end
+        end
+
+      access == :read and not policy.read_root_jail ->
+        absolute = Path.expand(path)
+        {:ok, %{path: absolute, relative: absolute}}
+
+      true ->
+        path_error(path, "path must be workspace-relative")
     end
   end
 
-  defp safe_relative(path, _root) do
+  defp expand_path(_policy, _root, path, _access) do
     path_error(path, "path must be a string")
   end
 
-  defp enforce_root_jail(%__MODULE__{root_jail: false}, _absolute, _root), do: :ok
+  defp enforce_root_jail(%__MODULE__{} = policy, absolute, root, :read) do
+    if policy.read_root_jail do
+      enforce_inside_root(absolute, root)
+    else
+      :ok
+    end
+  end
 
-  defp enforce_root_jail(%__MODULE__{root_jail: true}, absolute, root) do
+  defp enforce_root_jail(%__MODULE__{root_jail: false}, _absolute, _root, :write), do: :ok
+
+  defp enforce_root_jail(%__MODULE__{root_jail: true}, absolute, root, :write) do
+    enforce_inside_root(absolute, root)
+  end
+
+  defp enforce_inside_root(absolute, root) do
     if inside?(absolute, root) do
       :ok
     else
@@ -237,11 +273,11 @@ defmodule RunicAI.Coding.PathPolicy do
     end
   end
 
-  defp enforce_symlink_policy(%__MODULE__{symlink_policy: :allow}, _root, _relative, _access),
+  defp enforce_symlink_policy(%__MODULE__{symlink_policy: :allow}, _absolute, _access),
     do: :ok
 
-  defp enforce_symlink_policy(%__MODULE__{symlink_policy: :reject}, root, relative, access) do
-    paths = existing_component_paths(root, relative, access)
+  defp enforce_symlink_policy(%__MODULE__{symlink_policy: :reject}, absolute, access) do
+    paths = existing_component_paths(absolute, access)
 
     case Enum.find(paths, &symlink?/1) do
       nil -> :ok
@@ -259,21 +295,29 @@ defmodule RunicAI.Coding.PathPolicy do
     end
   end
 
-  defp existing_component_paths(root, relative, access) do
-    components =
-      relative
-      |> Path.split()
-      |> Enum.reject(&(&1 in [".", ""]))
-
-    paths =
-      Enum.scan(components, root, fn component, parent ->
-        Path.join(parent, component)
-      end)
+  defp existing_component_paths(absolute, access) do
+    paths = path_prefixes(Path.expand(absolute))
 
     case access do
       :read -> paths
       :write -> Enum.take_while(paths, &File.exists?/1)
     end
+  end
+
+  defp path_prefixes(absolute) do
+    absolute
+    |> Path.split()
+    |> Enum.reduce([], fn
+      "/", [] ->
+        ["/"]
+
+      component, [] ->
+        [component]
+
+      component, acc ->
+        acc ++ [Path.join(List.last(acc), component)]
+    end)
+    |> Enum.reject(&(&1 in ["", "/"]))
   end
 
   defp symlink?(path) do
@@ -284,13 +328,28 @@ defmodule RunicAI.Coding.PathPolicy do
   end
 
   defp inside_allowed_write_root?(allowed_root, absolute, root) do
-    with {:ok, relative_root} <- safe_relative(allowed_root, root) do
+    with {:ok, relative_root} <- write_root_relative(allowed_root, root) do
       allowed_absolute = Path.expand(relative_root, root)
       inside?(absolute, allowed_absolute)
     else
       _error -> false
     end
   end
+
+  defp write_root_relative(path, _root) when path in ["", "."], do: {:ok, "."}
+
+  defp write_root_relative(path, root) when is_binary(path) do
+    if Path.type(path) == :relative do
+      case Path.safe_relative(path, root) do
+        {:ok, relative} -> {:ok, normalize_relative(relative)}
+        :error -> path_error(path, "path escapes the workspace root")
+      end
+    else
+      path_error(path, "path must be workspace-relative")
+    end
+  end
+
+  defp write_root_relative(path, _root), do: path_error(path, "path must be a string")
 
   defp inside?(path, root) do
     path = Path.expand(path)

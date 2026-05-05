@@ -287,7 +287,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   defp fallback_graph(:compare_synthesize_report, sources, opts) do
     components = [
       ComponentBlueprint.new!("discover_sources", :source_discovery,
-        params: %{paths: Enum.map(sources, & &1.path)}
+        params: source_discovery_params(sources, opts)
       ),
       ComponentBlueprint.new!("compare_documents", :document_compare),
       ComponentBlueprint.new!("compose_report", :report_composer,
@@ -306,7 +306,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   defp fallback_graph(:parse_normalize_report, sources, opts) do
     components = [
       ComponentBlueprint.new!("discover_sources", :source_discovery,
-        params: %{paths: Enum.map(sources, & &1.path)}
+        params: source_discovery_params(sources, opts)
       ),
       ComponentBlueprint.new!("parse_records", :tabular_parser),
       ComponentBlueprint.new!("group_records", :record_group,
@@ -329,10 +329,27 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     {components, edges, "compose_report"}
   end
 
+  defp fallback_graph(:direct_response, _sources, opts) do
+    components = [
+      ComponentBlueprint.new!("synthesize_response", :llm_leaf,
+        params:
+          %{
+            strategy: :llm_reduce,
+            group_prompt: direct_response_group_prompt(),
+            prompt: direct_response_prompt(),
+            max_group_items: 1
+          }
+          |> maybe_put_model(opts)
+      )
+    ]
+
+    {components, [], "synthesize_response"}
+  end
+
   defp fallback_graph(_shape, sources, opts) do
     components = [
       ComponentBlueprint.new!("discover_sources", :source_discovery,
-        params: %{paths: Enum.map(sources, & &1.path)}
+        params: source_discovery_params(sources, opts)
       ),
       ComponentBlueprint.new!("split_sources", :source_splitter,
         params: %{
@@ -427,6 +444,13 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
            ] ->
         value
 
+      value when value in [:direct_response, :direct_answer] ->
+        :direct_response
+
+      value
+      when value in ["direct_response", "direct-response", "direct_answer", "direct-answer"] ->
+        :direct_response
+
       value when value in ["split_map_reduce_report", "split-map-reduce-report"] ->
         :split_map_reduce_report
 
@@ -445,6 +469,9 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     objective = String.downcase(objective || "")
 
     cond do
+      sources == [] ->
+        :direct_response
+
       String.contains?(objective, ["compare", "diff", "old", "new"]) or length(sources) >= 2 ->
         :compare_synthesize_report
 
@@ -468,6 +495,32 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   defp tabular_path?(path) do
     extension = path |> Path.extname() |> String.downcase()
     extension in [".csv", ".jsonl", ".json"]
+  end
+
+  defp direct_response_group_prompt do
+    """
+    Objective:
+    {{objective}}
+
+    Request context:
+    {{items}}
+
+    Extract the user's direct request. If no external source material is present,
+    keep only the objective and any explicit constraints.
+    """
+  end
+
+  defp direct_response_prompt do
+    """
+    Objective:
+    {{objective}}
+
+    Direct request context:
+    {{items}}
+
+    Produce the requested assistant response directly. Do not claim external
+    source evidence unless it appears in the request context.
+    """
   end
 
   defp directory_source?(workspace, %{path: path}) when is_binary(path),
@@ -505,12 +558,21 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     }
   end
 
+  defp source_discovery_params(sources, opts) do
+    %{
+      paths: Enum.map(sources, & &1.path),
+      max_depth: Keyword.get(opts, :source_discovery_max_depth, 3),
+      max_files: Keyword.get(opts, :source_discovery_max_files, 96)
+    }
+  end
+
   defp scorecard_params(opts, output_path) do
     %{
       artifact_path: output_path,
       required_sections: Keyword.get(opts, :required_sections, []),
       required_source_cues:
         Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
+      require_provenance?: Keyword.get(opts, :require_provenance?, false),
       require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
     }
   end
@@ -563,6 +625,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     {{items}}
 
     Write the requested durable report. Use clear markdown sections derived from the objective, preserve important provenance hints, and include residual uncertainty when evidence is thin.
+    The merged notes are evidence produced by local source components. If they include local paths or source provenance, do not claim you could not inspect those declared paths.
     """
   end
 end

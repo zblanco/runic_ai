@@ -36,9 +36,9 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
 
     coverage_status =
       cond do
-        source_count == 0 -> :not_required
         provenance_count > 0 -> :present
         require_provenance? -> :missing
+        source_count == 0 -> :not_required
         true -> :not_required
       end
 

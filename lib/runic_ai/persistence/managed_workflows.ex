@@ -8,6 +8,7 @@ defmodule RunicAI.Persistence.ManagedWorkflows do
   """
 
   alias RunicAI.Persistence.JSON
+  alias RunicAI.Ids
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.RunnerStore
   alias RunicAI.Persistence.SQLite
@@ -184,7 +185,7 @@ defmodule RunicAI.Persistence.ManagedWorkflows do
   end
 
   defp default_run_id(%ManagedWorkflow{} = workflow) do
-    "run:#{workflow.workflow_key}:#{System.unique_integer([:positive, :monotonic])}"
+    Ids.unique("run:#{workflow.workflow_key}")
   end
 
   defp input_blob(attrs) do

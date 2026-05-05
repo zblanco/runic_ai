@@ -11,6 +11,10 @@ defmodule RunicAI.Coding.RLM.Reducers do
   alias RunicAI.Coding.RLM.Risk
   alias RunicAI.Coding.RLM.VerificationObservation
 
+  @max_report_entries 50
+  @max_file_content_chars 4_000
+  @max_command_output_chars 6_000
+
   @spec reduce_findings([term()]) :: [Finding.t()]
   def reduce_findings(values) when is_list(values) do
     values
@@ -190,7 +194,253 @@ defmodule RunicAI.Coding.RLM.Reducers do
   defp format_value(%{output: output}), do: format_value(output)
   defp format_value(%Artifact{} = artifact), do: format_value(artifact.content)
   defp format_value(value) when is_binary(value), do: value
+
+  defp format_value(value) when is_map(value) do
+    cond do
+      is_list(field(value, :files)) ->
+        format_file_collection(value)
+
+      is_list(field(value, :entries)) ->
+        format_entry_collection(value)
+
+      is_list(field(value, :matches)) ->
+        format_match_collection(value)
+
+      file_entry?(value) ->
+        format_file_entry(value)
+
+      command_result?(value) ->
+        format_command_output(value)
+
+      true ->
+        fenced("elixir", inspect(value, pretty: true, limit: 50, printable_limit: 2_000))
+    end
+  end
+
   defp format_value(value), do: inspect(value)
+
+  defp format_file_collection(value) do
+    files = field(value, :files) || []
+    count = field(value, :count) || length(files)
+
+    header =
+      "## File output\n\n" <>
+        "#{length(files)} of #{count} files" <> truncated_suffix(value)
+
+    body =
+      files
+      |> Enum.take(@max_report_entries)
+      |> Enum.map(&format_file_collection_entry/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n\n")
+
+    [header, body, omitted_suffix(files)]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp format_file_collection_entry(entry) do
+    if file_entry_has_content?(entry) do
+      format_file_entry(entry)
+    else
+      "- `#{field(entry, :path) || field(entry, :name) || inspect(entry)}`#{file_metadata(entry)}"
+    end
+  end
+
+  defp format_entry_collection(value) do
+    entries = field(value, :entries) || []
+    count = field(value, :count) || length(entries)
+    path = field(value, :path)
+
+    header =
+      ["## Directory listing", path && "`#{path}`", "#{length(entries)} of #{count} entries"]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n\n")
+
+    body =
+      entries
+      |> Enum.take(@max_report_entries)
+      |> Enum.map(fn entry ->
+        name = field(entry, :path) || field(entry, :name) || inspect(entry)
+        type = field(entry, :type)
+        "- `#{name}`#{if type, do: " (#{type})", else: ""}#{file_metadata(entry)}"
+      end)
+      |> Enum.join("\n")
+
+    [header, body, omitted_suffix(entries)]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp format_match_collection(value) do
+    matches = field(value, :matches) || []
+    count = field(value, :count) || length(matches)
+
+    header =
+      "## Search results\n\n" <>
+        "#{length(matches)} of #{count} matches" <> truncated_suffix(value)
+
+    body =
+      matches
+      |> Enum.take(@max_report_entries)
+      |> Enum.map(&format_match_entry/1)
+      |> Enum.join("\n")
+
+    [header, body, omitted_suffix(matches)]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp format_match_entry(match) do
+    path = field(match, :path) || "unknown"
+    line = field(match, :line) || field(match, :line_number)
+    text = field(match, :text) || field(match, :match) || field(match, :line_text)
+
+    location =
+      if line do
+        "#{path}:#{line}"
+      else
+        path
+      end
+
+    "- `#{location}` #{String.trim(to_string(text || ""))}"
+  end
+
+  defp format_file_entry(entry) do
+    path = field(entry, :path) || field(entry, :name) || "file"
+
+    cond do
+      field(entry, :failure) ->
+        "### `#{path}`\n\nError: #{format_failure(field(entry, :failure))}"
+
+      truthy?(field(entry, :binary?)) ->
+        "### `#{path}`\n\nBinary file#{file_metadata(entry)}"
+
+      true ->
+        content = field(entry, :content) || field(entry, :text) || field(entry, :preview) || ""
+        language = fence_language(path)
+
+        "### `#{path}`#{file_metadata(entry)}\n\n" <>
+          fenced(language, truncate_content(content, @max_file_content_chars))
+    end
+  end
+
+  defp format_command_output(value) do
+    status = field(value, :status) || field(value, :exit_status)
+    command = field(value, :command) || field(value, :argv)
+    stdout = field(value, :stdout) || field(value, :output) || ""
+    stderr = field(value, :stderr) || ""
+
+    [
+      "## Command output",
+      command && "`#{format_command(command)}`",
+      status && "status: #{status}",
+      stdout != "" &&
+        "### stdout\n\n" <> fenced("", truncate_content(stdout, @max_command_output_chars)),
+      stderr != "" &&
+        "### stderr\n\n" <> fenced("", truncate_content(stderr, @max_command_output_chars))
+    ]
+    |> Enum.reject(&(&1 in [nil, false, ""]))
+    |> Enum.join("\n\n")
+  end
+
+  defp file_entry?(value) do
+    not is_nil(field(value, :path)) and
+      Enum.any?([:content, :preview, :text, :binary?, :failure], &(not is_nil(field(value, &1))))
+  end
+
+  defp file_entry_has_content?(value) do
+    Enum.any?([:content, :preview, :text, :binary?, :failure], &(not is_nil(field(value, &1))))
+  end
+
+  defp command_result?(value) do
+    Enum.any?([:stdout, :stderr, :exit_status, :command, :argv], &(not is_nil(field(value, &1))))
+  end
+
+  defp file_metadata(value) do
+    parts =
+      [
+        byte_size_label(field(value, :byte_size) || field(value, :bytes)),
+        truthy?(field(value, :truncated?)) && "truncated"
+      ]
+      |> Enum.reject(&(&1 in [nil, false, ""]))
+
+    if parts == [] do
+      ""
+    else
+      " (#{Enum.join(parts, ", ")})"
+    end
+  end
+
+  defp byte_size_label(nil), do: nil
+  defp byte_size_label(bytes) when is_integer(bytes), do: "#{bytes} bytes"
+  defp byte_size_label(bytes), do: "#{bytes} bytes"
+
+  defp truncated_suffix(value) do
+    if truthy?(field(value, :truncated?)), do: " (truncated)", else: ""
+  end
+
+  defp omitted_suffix(values) when length(values) > @max_report_entries do
+    "_#{length(values) - @max_report_entries} more omitted from terminal report._"
+  end
+
+  defp omitted_suffix(_values), do: nil
+
+  defp format_failure(failure) when is_map(failure) do
+    field(failure, :error) || inspect(failure, pretty: true, limit: 20)
+  end
+
+  defp format_failure(failure), do: to_string(failure)
+
+  defp truncate_content(content, max_chars) when is_binary(content) do
+    if String.length(content) > max_chars do
+      String.slice(content, 0, max_chars) <> "\n\n[truncated for terminal report]"
+    else
+      content
+    end
+  end
+
+  defp truncate_content(content, _max_chars), do: inspect(content)
+
+  defp fenced(language, content) do
+    fence = if String.contains?(content, "```"), do: "````", else: "```"
+    language = language || ""
+    "#{fence}#{language}\n#{content}\n#{fence}"
+  end
+
+  defp fence_language(path) when is_binary(path) do
+    case Path.extname(path) do
+      ".ex" -> "elixir"
+      ".exs" -> "elixir"
+      ".heex" -> "heex"
+      ".livemd" -> "markdown"
+      ".md" -> "markdown"
+      ".markdown" -> "markdown"
+      ".json" -> "json"
+      ".js" -> "javascript"
+      ".jsx" -> "javascript"
+      ".ts" -> "typescript"
+      ".tsx" -> "typescript"
+      ".py" -> "python"
+      ".sh" -> "sh"
+      ".bash" -> "sh"
+      ".zsh" -> "sh"
+      ".sql" -> "sql"
+      ".diff" -> "diff"
+      ".patch" -> "diff"
+      _other -> ""
+    end
+  end
+
+  defp fence_language(_path), do: ""
+
+  defp field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key)
+  defp field(_map, _key), do: nil
+
+  defp truthy?(value), do: value in [true, "true", 1]
 
   defp format_command(command) when is_list(command), do: Enum.join(command, " ")
   defp format_command(command) when is_binary(command), do: command

@@ -8,6 +8,7 @@ defmodule RunicAI.Terminal.RunnerTest do
   alias RunicAI.LLM.TestClient
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
+  alias RunicAI.RLM.Episode
   alias RunicAI.Terminal.AgentRunner
   alias RunicAI.Terminal.AssistantRunner
   alias RunicAI.Terminal.CliOptions
@@ -42,8 +43,11 @@ defmodule RunicAI.Terminal.RunnerTest do
   test "RLM runner renders live stage events and final artifacts from a run function" do
     root = tmp_dir()
     {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+    caller = self()
 
     run_fun = fn _cwd, _objective, opts ->
+      send(caller, {:rlm_runner_opts, opts[:session_id], opts[:run_id]})
+
       opts[:event_sink].(%{
         run_id: opts[:run_id],
         stage: :proposal_received,
@@ -57,18 +61,30 @@ defmodule RunicAI.Terminal.RunnerTest do
     assert {:ok, result} =
              RLMRunner.run("Explain Demo",
                cwd: root,
-               session_id: "terminal-rlm",
+               session_id: "terminal-rlm-session",
+               run_id: "terminal-rlm-run",
                run_fun: run_fun,
                event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
              )
 
     assert result.agent == :rlm
     assert result.status == :ok
+    assert result.session_id == "terminal-rlm-session"
+    assert result.run_id == "terminal-rlm-run"
+    assert_receive {:rlm_runner_opts, "terminal-rlm-session", "terminal-rlm-run"}
 
     emitted = Elixir.Agent.get(events, & &1)
     assert Enum.any?(emitted, &(&1.phase == :proposal_received))
     assert Enum.any?(emitted, &(&1.phase == :proposed))
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :message and &1.data["message_kind"] == "workflow_output" and
+                 &1.data["content"] == "RLM visible final output.")
+           )
+
     assert Enum.any?(emitted, &(&1.phase == :scorecard))
+    assert Enum.all?(emitted, &(event_run_id(&1) == "terminal-rlm-run"))
   end
 
   test "assistant runner renders live stage events and final artifacts from a run function" do
@@ -163,6 +179,56 @@ defmodule RunicAI.Terminal.RunnerTest do
     assert Queries.artifacts_for_run(store, result.run_id) != []
   end
 
+  test "agent runner uses default workspace SQLite persistence for local harness runs" do
+    root = tmp_dir()
+    sqlite_path = Path.join([root, ".runic_ai", "runs.db"])
+
+    run_fun = fn _cwd, _objective, opts ->
+      opts[:event_sink].(%{
+        run_id: opts[:run_id],
+        stage: :node_started,
+        status: :running,
+        data: %{
+          runnable: %{
+            id: "runnable:default",
+            node: "assistant_node_1_plan",
+            component_id: "plan",
+            component_type: "blueprint_proposer"
+          },
+          input: %{objective: "persist by default"}
+        }
+      })
+
+      {:ok, assistant_result()}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "persist by default",
+        "--agent",
+        "assistant",
+        "--cwd",
+        root
+      ])
+
+    assert options.persistence == :sqlite
+    assert options.sqlite_path == sqlite_path
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert File.exists?(sqlite_path)
+
+    {:ok, store} = SQLite.open(database: sqlite_path)
+    on_exit(fn -> SQLite.close(store) end)
+
+    assert Queries.run_timeline(store, result.run_id) != []
+    assert Queries.runnable_events(store, result.run_id) != []
+  end
+
   defp rlm_result do
     proposal =
       WorkflowProposal.new!(
@@ -182,9 +248,19 @@ defmodule RunicAI.Terminal.RunnerTest do
       validation_report: WorkflowValidationReport.accept(),
       compiled: %{workflow_id: "compiled"},
       objective_scorecard: scorecard,
-      context: %{episodes: []}
+      context: %{
+        episodes: [
+          Episode.new!(:satisfied, "RLM visible final output.",
+            id: "episode:answer",
+            parent_node_id: "answer",
+            artifacts: ["RLM visible final output."]
+          )
+        ]
+      }
     }
   end
+
+  defp event_run_id(event), do: event.data["run_id"] || event.data[:run_id]
 
   defp assistant_result do
     blueprint =

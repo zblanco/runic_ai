@@ -75,6 +75,21 @@ defmodule RunicAI.Persistence.HarnessProjection do
       }
     }
 
+    attrs =
+      case store.repo.get(AgentSession, event.session_id) do
+        nil ->
+          attrs
+
+        %AgentSession{} = session ->
+          %{
+            attrs
+            | workspace_root: attrs.workspace_root || session.workspace_root,
+              objective: attrs.objective || session.objective,
+              model: attrs.model || session.model,
+              started_at: session.started_at || attrs.started_at
+          }
+      end
+
     upsert_by_id!(store, AgentSession, event.session_id, attrs, [:metadata_json])
   end
 
@@ -118,7 +133,14 @@ defmodule RunicAI.Persistence.HarnessProjection do
 
   defp project_event_kind!(store, %TerminalEvent{kind: "message"} = event) do
     conversation = ensure_conversation!(store, event)
-    insert_message!(store, event, conversation.id, "assistant", event.phase || "message")
+
+    insert_message!(
+      store,
+      event,
+      conversation.id,
+      message_role(event, "assistant"),
+      message_kind(event, event.phase || "message")
+    )
   end
 
   defp project_event_kind!(store, %TerminalEvent{kind: "chunk"} = event) do
@@ -174,11 +196,24 @@ defmodule RunicAI.Persistence.HarnessProjection do
   defp project_event_kind!(store, %TerminalEvent{kind: "rlm_plan"} = event) do
     maybe_insert_graph_summary!(store, event)
     maybe_insert_blueprint_artifact!(store, event)
+
+    if direct_response_completed?(event) do
+      conversation = ensure_conversation!(store, event)
+      insert_message!(store, event, conversation.id, "assistant", "direct_response")
+    end
+
+    if workflow_completed?(event) do
+      conversation = ensure_conversation!(store, event)
+      insert_message!(store, event, conversation.id, "assistant", "workflow_output")
+    end
+
+    :ok
   end
 
   defp project_event_kind!(store, %TerminalEvent{kind: "rlm_node"} = event) do
     insert_runnable_event!(store, event)
     maybe_insert_artifacts!(store, event)
+    maybe_insert_workflow_output_message!(store, event)
   end
 
   defp project_event_kind!(store, %TerminalEvent{kind: "verification"} = event) do
@@ -211,6 +246,17 @@ defmodule RunicAI.Persistence.HarnessProjection do
   end
 
   defp insert_message!(%Store{} = store, %TerminalEvent{} = event, conversation_id, role, kind) do
+    insert_message!(store, event, conversation_id, role, kind, [])
+  end
+
+  defp insert_message!(
+         %Store{} = store,
+         %TerminalEvent{} = event,
+         conversation_id,
+         role,
+         kind,
+         opts
+       ) do
     attrs = %{
       id: "message:#{event.id}",
       conversation_id: conversation_id,
@@ -219,11 +265,11 @@ defmodule RunicAI.Persistence.HarnessProjection do
       message_kind: kind,
       source_step: event.phase,
       workflow_node: workflow_node(event),
-      runnable_id: runnable_id(event),
+      runnable_id: optional_string(runnable_id(event)),
       content: message_content(event),
       content_json: event.data_json,
       stream_complete: event.kind != "chunk",
-      transient: false,
+      transient: Keyword.get(opts, :transient, false),
       presentation_group_id: event.run_id,
       created_at: event.at
     }
@@ -259,19 +305,20 @@ defmodule RunicAI.Persistence.HarnessProjection do
   end
 
   defp insert_review_request!(%Store{} = store, %TerminalEvent{} = event) do
-    details = field(event.data_json, :details) || event.data_json
+    data = stage_data(event)
+    details = field(data, :details) || field(event.data_json, :details) || data
 
     attrs = %{
-      id: field(event.data_json, :id) || "review:#{event.id}",
+      id: field(data, :id) || field(event.data_json, :id) || "review:#{event.id}",
       session_id: event.session_id,
       workflow_run_id: event.run_id,
-      tool_call_id: field(event.data_json, :tool_call_id),
-      kind: field(event.data_json, :kind) || event.phase || "review",
-      checkpoint: field(event.data_json, :checkpoint),
-      resume_key: field(event.data_json, :resume_key),
+      tool_call_id: field(data, :tool_call_id) || field(event.data_json, :tool_call_id),
+      kind: field(data, :kind) || field(event.data_json, :kind) || event.phase || "review",
+      checkpoint: field(data, :checkpoint) || field(event.data_json, :checkpoint),
+      resume_key: field(data, :resume_key) || field(event.data_json, :resume_key),
       status: review_status(event),
       details_json: details,
-      decision_json: field(event.data_json, :decision) || %{}
+      decision_json: field(data, :decision) || field(event.data_json, :decision) || %{}
     }
 
     upsert_by_id!(store, ReviewRequest, attrs.id, attrs, [:details_json, :decision_json])
@@ -309,7 +356,7 @@ defmodule RunicAI.Persistence.HarnessProjection do
       attrs = %{
         run_id: event.run_id,
         sequence: event.sequence || next_sequence!(store, RunnableEvent, event.run_id),
-        runnable_id: field(runnable, :id) || field(data, :runnable_id),
+        runnable_id: optional_string(field(runnable, :id) || field(data, :runnable_id)),
         node_name: field(data, :node) || field(runnable, :node) || workflow_node(event),
         node_hash: optional_string(field(runnable, :node_hash) || field(data, :node_hash)),
         component_id: field(runnable, :component_id) || field(data, :component_id),
@@ -394,6 +441,18 @@ defmodule RunicAI.Persistence.HarnessProjection do
         insert_artifact!(store, event, %{kind: "workflow_graph", payload: graph})
         merge_run_metadata!(store, event.run_id, %{graph_summary: graph})
     end
+  end
+
+  defp maybe_insert_workflow_output_message!(%Store{} = store, %TerminalEvent{} = event) do
+    if workflow_output_text(event) do
+      conversation = ensure_conversation!(store, event)
+
+      insert_message!(store, event, conversation.id, "assistant", "workflow_output",
+        transient: true
+      )
+    end
+
+    :ok
   end
 
   defp insert_repair_attempts!(%Store{} = store, %TerminalEvent{} = event) do
@@ -603,6 +662,9 @@ defmodule RunicAI.Persistence.HarnessProjection do
       last_terminal_event_id: event.id,
       last_terminal_event_title: event.title
     }
+    |> maybe_put(:objective, data_field(event, :objective))
+    |> maybe_put(:model, data_field(event, :model))
+    |> maybe_put(:workspace, data_field(event, :workspace) || data_field(event, :cwd))
     |> maybe_put(:graph_summary, graph_summary(event))
     |> maybe_put(
       :blueprint,
@@ -624,14 +686,143 @@ defmodule RunicAI.Persistence.HarnessProjection do
     end
   end
 
+  defp error_message(%TerminalEvent{} = event) do
+    error = field(event.data_json, :error) || field(stage_data(event), :error)
+
+    error
+    |> field(:message)
+    |> case do
+      nil -> first_line(event.detail)
+      message -> first_line(message)
+    end
+  end
+
+  defp first_line(nil), do: nil
+
+  defp first_line(value) do
+    value
+    |> to_string()
+    |> String.split("\n", parts: 2)
+    |> List.first()
+    |> String.trim()
+    |> case do
+      "" -> nil
+      line -> line
+    end
+  end
+
   defp prompt_text(%TerminalEvent{} = event) do
     data_field(event, :system_prompt) || data_field(event, :prompt)
   end
 
-  defp message_content(%TerminalEvent{} = event) do
-    event.detail || data_field(event, :reply_text) || data_field(event, :final_answer) ||
-      event.title
+  defp message_content(%TerminalEvent{kind: "error"} = event) do
+    case error_message(event) do
+      nil -> event.title || "Agent error"
+      message -> "Error: #{message}"
+    end
   end
+
+  defp message_content(%TerminalEvent{} = event) do
+    completed_workflow_output_text(event) || workflow_output_text(event) ||
+      direct_response_text(event) || data_field(event, :reply_text) ||
+      data_field(event, :final_answer) || data_field(event, :content) ||
+      event.detail || event.title
+  end
+
+  defp message_role(%TerminalEvent{} = event, default) do
+    data_field(event, :role) || default
+  end
+
+  defp message_kind(%TerminalEvent{} = event, default) do
+    data_field(event, :message_kind) || default
+  end
+
+  defp direct_response_text(%TerminalEvent{} = event) do
+    if direct_response_completed?(event) do
+      data = stage_data(event)
+      output = field(data, :output) || %{}
+
+      field(data, :reply_text) || field(output, :text) || field(output, :text_preview)
+    end
+  end
+
+  defp direct_response_completed?(%TerminalEvent{kind: "rlm_plan", phase: phase})
+       when phase in ["direct_response_completed", :direct_response_completed],
+       do: true
+
+  defp direct_response_completed?(_event), do: false
+
+  defp completed_workflow_output_text(%TerminalEvent{} = event) do
+    if workflow_completed?(event) do
+      data = stage_data(event)
+
+      field(data, :output_text) ||
+        data
+        |> field(:output)
+        |> output_text()
+    end
+  end
+
+  defp workflow_completed?(%TerminalEvent{kind: "rlm_plan", phase: phase, status: status} = event)
+       when phase in ["completed", :completed] and status in ["ok", :ok] do
+    not is_nil(field(stage_data(event), :output_text))
+  end
+
+  defp workflow_completed?(_event), do: false
+
+  defp workflow_output_text(%TerminalEvent{} = event) do
+    if workflow_output_event?(event) do
+      data = stage_data(event)
+
+      data
+      |> field(:output)
+      |> output_text()
+      |> then(fn
+        nil -> policy_event_output_text(data)
+        text -> text
+      end)
+    end
+  end
+
+  defp workflow_output_event?(
+         %TerminalEvent{kind: "rlm_node", phase: phase, status: status} = event
+       )
+       when phase in ["node_completed", :node_completed] and status in ["ok", :ok] do
+    data = stage_data(event)
+    runnable = field(data, :runnable) || %{}
+
+    (field(data, :type) || field(runnable, :component_type)) in ["llm_leaf", :llm_leaf]
+  end
+
+  defp workflow_output_event?(_event), do: false
+
+  defp policy_event_output_text(data) do
+    data
+    |> field(:policy_events)
+    |> List.wrap()
+    |> Enum.find_value(fn event ->
+      event
+      |> field(:result_fact)
+      |> fact_text()
+    end)
+  end
+
+  defp fact_text(fact) do
+    fact
+    |> field(:value)
+    |> output_text()
+  end
+
+  defp output_text(%{} = output) do
+    output
+    |> field(:text)
+    |> case do
+      text when is_binary(text) and text != "" -> text
+      _other -> nil
+    end
+  end
+
+  defp output_text(_output), do: nil
 
   defp workflow_node(%TerminalEvent{} = event) do
     data = stage_data(event)
@@ -724,7 +915,8 @@ defmodule RunicAI.Persistence.HarnessProjection do
   defp blank_map?(map) when is_map(map), do: map_size(map) == 0
   defp blank_map?(_value), do: false
 
-  defp data_field(%TerminalEvent{} = event, key), do: field(event.data_json, key)
+  defp data_field(%TerminalEvent{} = event, key),
+    do: field(event.data_json, key) || field(stage_data(event), key)
 
   defp field(map, key) when is_map(map) and is_atom(key),
     do: Map.get(map, key) || Map.get(map, Atom.to_string(key))

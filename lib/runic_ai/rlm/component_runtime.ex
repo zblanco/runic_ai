@@ -27,6 +27,8 @@ defmodule RunicAI.RLM.ComponentRuntime do
   alias RunicAI.RLM.Components.SourceMaterializer
   alias RunicAI.RLM.Components.SourceSplitter
   alias RunicAI.RLM.Components.TabularParser
+  alias RunicAI.ReviewDecision
+  alias RunicAI.ReviewRequest
 
   @default_model "openai:gpt-5.4-mini"
 
@@ -287,19 +289,22 @@ defmodule RunicAI.RLM.ComponentRuntime do
 
   defp dispatch(%ComponentBlueprint{type: :artifact_writer, params: params}, input, runtime) do
     base = runtime_context(runtime)
+    opts = runtime_opts(runtime)
 
     params =
       Map.put_new(
         params,
         :write_policy,
         Keyword.get(
-          runtime_opts(runtime),
+          opts,
           :write_policy,
           get(base.policies, :write_policy, :docs_only)
         )
       )
 
-    ArtifactWriter.run(base.workspace, input, params)
+    with :ok <- maybe_review_artifact_write(base, input, params, opts) do
+      ArtifactWriter.run(base.workspace, input, params)
+    end
   end
 
   defp dispatch(%ComponentBlueprint{type: type, params: params}, input, runtime)
@@ -452,6 +457,93 @@ defmodule RunicAI.RLM.ComponentRuntime do
     :ok
   rescue
     _exception -> :ok
+  end
+
+  defp maybe_review_artifact_write(base, input, params, opts) do
+    case Keyword.get(opts, :review_decider) do
+      decider when is_function(decider, 2) ->
+        request = artifact_write_review_request(base, input, params)
+        emit_stage(base, :review_requested, :review, review_event_data(request))
+
+        case decider.(request, %{workspace: base.workspace, input: input, params: params}) do
+          {:ok, %ReviewDecision{status: :approved} = decision} ->
+            emit_stage(base, :review_completed, :ok, review_event_data(request, decision))
+            :ok
+
+          {:ok, %ReviewDecision{status: status} = decision}
+          when status in [:rejected, :cancelled, :edited] ->
+            emit_stage(base, :review_completed, :blocked, review_event_data(request, decision))
+            artifact_write_review_denied(request, decision)
+
+          {:error, %Error{} = error} ->
+            {:error, error}
+
+          {:error, reason} ->
+            {:error, Error.from_reason(reason, source: __MODULE__)}
+        end
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp artifact_write_review_request(base, input, params) do
+    path = get(params, :path, nil)
+    write_policy = get(params, :write_policy, :docs_only)
+    docs_only? = write_policy in [:docs_only, "docs_only", "docs-only"]
+
+    ReviewRequest.new!(:assistant_artifact_write,
+      checkpoint: :pre_write,
+      resume_key:
+        "review:artifact_writer:#{get_in(base.metadata, [:run_id]) || System.unique_integer([:positive])}:#{path || "unknown"}",
+      options: [:approve, :reject, :cancel],
+      subject: %{path: path, write_policy: write_policy},
+      details: %{
+        path: path,
+        write_policy: write_policy,
+        input_preview: output_summary(input)
+      },
+      metadata: %{
+        safe?: docs_only?,
+        component_type: :artifact_writer,
+        risk: if(docs_only?, do: :low, else: :medium)
+      }
+    )
+  end
+
+  defp review_event_data(%ReviewRequest{} = request) do
+    %{
+      id: request.resume_key,
+      kind: request.kind,
+      checkpoint: request.checkpoint,
+      resume_key: request.resume_key,
+      options: request.options,
+      details: request.details,
+      metadata: request.metadata
+    }
+  end
+
+  defp review_event_data(%ReviewRequest{} = request, %ReviewDecision{} = decision) do
+    request
+    |> review_event_data()
+    |> Map.put(:decision, %{
+      resume_key: decision.resume_key,
+      status: decision.status,
+      actor: decision.actor,
+      metadata: decision.metadata
+    })
+  end
+
+  defp artifact_write_review_denied(%ReviewRequest{} = request, %ReviewDecision{} = decision) do
+    {:error,
+     Error.validation("artifact write denied by review",
+       source: __MODULE__,
+       details: %{
+         path: request.details[:path],
+         resume_key: request.resume_key,
+         decision_status: decision.status
+       }
+     )}
   end
 
   defp output_summary(output) do

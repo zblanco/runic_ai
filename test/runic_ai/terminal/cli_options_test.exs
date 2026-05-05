@@ -32,6 +32,8 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.color == :auto
     assert opts.theme == :runic
     assert String.starts_with?(opts.jsonl_path, cwd)
+    assert opts.persistence == :sqlite
+    assert opts.sqlite_path == Path.join([cwd, ".runic_ai", "runs.db"])
   end
 
   test "parses presentation options" do
@@ -178,7 +180,41 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert {:ok, opts} =
              CliOptions.parse(["do work", "--cwd", cwd, "--sqlite", ".runic_ai/runs.db"])
 
+    assert opts.persistence == :sqlite
     assert opts.sqlite_path == Path.join([cwd, ".runic_ai", "runs.db"])
+  end
+
+  test "parses explicit ephemeral persistence opt outs" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse(["do work", "--cwd", cwd, "--persistence", "memory"])
+
+    assert opts.persistence == :memory
+    assert opts.sqlite_path == nil
+
+    assert {:ok, opts} =
+             CliOptions.parse(["do work", "--cwd", cwd, "--persistence", "none"])
+
+    assert opts.persistence == :none
+    assert opts.sqlite_path == nil
+  end
+
+  test "rejects sqlite path when persistence is explicitly not sqlite" do
+    cwd = tmp_dir()
+
+    assert {:error, error} =
+             CliOptions.parse([
+               "do work",
+               "--cwd",
+               cwd,
+               "--persistence",
+               "memory",
+               "--sqlite",
+               ".runic_ai/runs.db"
+             ])
+
+    assert error.message =~ "--sqlite"
   end
 
   defp tmp_dir do

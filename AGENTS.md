@@ -149,6 +149,22 @@ tool = ReqLLM.tool(
 - Module attributes for compile-time configuration
 - **One module per file** — never nest multiple modules (causes cyclic dependency / compilation errors)
 
+## Phoenix LiveView UI Preferences
+
+For future RunicAI-associated Phoenix/LiveView applications, keep Phoenix and web UI dependencies in a separate application alongside RunicAI unless explicitly asked to move them into the core library.
+
+- Default to a dark/night-mode theme derived from `.docs/DESIGN.md`.
+- Prefer the `Inter` font, backdrop blur, opacity, rounded edges, and restrained dark surfaces.
+- Tailwind CSS v4 uses `app.css` as a configuration surface. Keep that file focused on Tailwind setup, theme/design tokens, fonts, plugins, and focused CSS only when Tailwind or component composition is not enough.
+- Prefer colocated HEEx markup with Tailwind classes and reusable Phoenix components over broad custom CSS.
+- Use Phoenix's built-in Heroicons path through `<.icon>` for normal UI icons.
+- Use `mount/3` for stable defaults, empty streams, subscriptions, and assign shape.
+- Use `handle_params/3` for loading route/query-param aware data, especially database filters, selected tabs, pagination, search, and current resource selection.
+- Use `handle_event/3` for server-side actions such as starting runs, submitting prompts, approving tools, changing persisted settings, replaying workflows, or cancelling sessions.
+- Use Phoenix JS commands or hooks for purely client-side behavior such as dropdowns, disclosure state, focus management, auto-scroll, Mermaid rendering, clipboard actions, and local measurements.
+- Use MDEx for Markdown rendering and Mermaid JS for browser-side Mermaid diagrams, with dark-mode styling by default.
+- Keep LiveView pages backed by durable RunicAI query/read-model APIs where practical rather than relying on large in-memory assigns.
+
 ## Elixir Rules
 
 - Elixir lists **do not support index access** via `[]`. Use `Enum.at/2`, pattern matching, or `List` functions.

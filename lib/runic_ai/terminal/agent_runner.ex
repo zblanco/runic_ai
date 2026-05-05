@@ -12,6 +12,7 @@ defmodule RunicAI.Terminal.AgentRunner do
   alias RunicAI.ReviewRequest
   alias RunicAI.Terminal.AssistantRunner
   alias RunicAI.Terminal.CliOptions
+  alias RunicAI.Terminal.Event
   alias RunicAI.Terminal.InteractiveContext
   alias RunicAI.Terminal.JsonlSink
   alias RunicAI.Terminal.RLMRunner
@@ -62,6 +63,7 @@ defmodule RunicAI.Terminal.AgentRunner do
         :rlm -> RLMRunner.run(options.objective, runner_opts)
       end
 
+    emit_final_event(result, options, event_sink)
     render_final(result, output_fun, renderer)
     result
   end
@@ -152,6 +154,8 @@ defmodule RunicAI.Terminal.AgentRunner do
       max_turns: options.max_turns,
       max_runtime_ms: options.max_runtime_ms,
       session_id: options.session_id,
+      run_id: Keyword.get(opts, :run_id),
+      conversation_history: Keyword.get(opts, :conversation_history, []),
       mode: options.mode,
       input_paths: options.input_paths,
       output_path: options.output_path,
@@ -182,20 +186,29 @@ defmodule RunicAI.Terminal.AgentRunner do
     end
   end
 
-  defp open_persistence(%CliOptions{sqlite_path: nil}, opts) do
-    {:ok, {:external, Keyword.get(opts, :persistence)}}
-  end
-
-  defp open_persistence(%CliOptions{sqlite_path: path}, opts) do
+  defp open_persistence(%CliOptions{} = options, opts) do
     case Keyword.fetch(opts, :persistence) do
       {:ok, persistence} ->
         {:ok, {:external, persistence}}
 
       :error ->
-        case SQLite.open(database: path, migrate?: true) do
-          {:ok, store} -> {:ok, {:owned, store}}
-          {:error, _reason} = error -> error
-        end
+        open_cli_persistence(options)
+    end
+  end
+
+  defp open_cli_persistence(%CliOptions{persistence: :none}), do: {:ok, {:external, nil}}
+
+  defp open_cli_persistence(%CliOptions{persistence: :memory}) do
+    case SQLite.open(database: ":memory:", migrate?: true) do
+      {:ok, store} -> {:ok, {:owned, store}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp open_cli_persistence(%CliOptions{persistence: :sqlite, sqlite_path: path}) do
+    case SQLite.open(database: path, migrate?: true) do
+      {:ok, store} -> {:ok, {:owned, store}}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -252,6 +265,57 @@ defmodule RunicAI.Terminal.AgentRunner do
     event_sink.(event)
   end
 
+  defp emit_final_event({:ok, result}, %CliOptions{} = options, event_sink) when is_map(result) do
+    status = Map.get(result, :status, :ok)
+
+    event =
+      Event.new!(:summary,
+        session_id: Map.get(result, :session_id) || options.session_id,
+        agent: options.agent,
+        phase: :final,
+        status: terminal_status(status),
+        title: "Agent finished",
+        detail: "status: #{status}",
+        data: %{
+          run_id: Map.get(result, :run_id) || Map.get(result, :session_id) || options.session_id,
+          result_status: status,
+          objective_status: objective_status(result)
+        }
+      )
+
+    event_sink.(event)
+  end
+
+  defp emit_final_event({:error, %Error{} = error}, %CliOptions{} = options, event_sink) do
+    event =
+      Event.new!(:error,
+        session_id: options.session_id,
+        agent: options.agent,
+        phase: :final,
+        status: :error,
+        title: "Agent failed",
+        detail: error.message,
+        data: %{
+          run_id: options.session_id,
+          error: Map.take(error, [:kind, :message, :details, :source, :retryable?, :metadata])
+        }
+      )
+
+    event_sink.(event)
+  end
+
+  defp terminal_status(status) when status in [:blocked, "blocked"], do: :blocked
+  defp terminal_status(status) when status in [:error, :failed, "error", "failed"], do: :error
+  defp terminal_status(_status), do: :ok
+
+  defp objective_status(result) do
+    case Map.get(result, :scorecard, Map.get(result, :objective_scorecard, %{})) do
+      %{objective_status: status} -> status
+      %{"objective_status" => status} -> status
+      _other -> nil
+    end
+  end
+
   defp safe_review?(%ReviewRequest{} = request) do
     request.metadata[:safe?] in [true, "true"] or
       request.details[:safe?] in [true, "true"] or
@@ -279,6 +343,8 @@ defmodule RunicAI.Terminal.AgentRunner do
       approve: options.approve,
       detail: options.detail,
       jsonl_path: options.jsonl_path,
+      sqlite_path: options.sqlite_path,
+      persistence: options.persistence,
       renderer: renderer.name,
       theme: renderer.theme,
       color: renderer.color

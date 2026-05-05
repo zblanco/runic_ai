@@ -37,7 +37,7 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
       |> Enum.reject(&(&1 == ""))
       |> Enum.join(separator)
 
-    %{text: text, count: length(items), strategy: :join}
+    %{text: text, count: length(items), strategy: :join, provenance: collect_provenance(items)}
   end
 
   defp llm_reduce(items, input, params, opts) do
@@ -53,7 +53,8 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
          count: length(items),
          groups: length(chunks),
          strategy: :llm_reduce,
-         intermediate: intermediate
+         intermediate: intermediate,
+         provenance: collect_provenance(input)
        }}
     end
   end
@@ -154,6 +155,32 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
   defp item_text(%{"text" => text}) when is_binary(text), do: text
   defp item_text(value) when is_binary(value), do: value
   defp item_text(value), do: inspect(value, limit: 40, printable_limit: 2_000)
+
+  defp collect_provenance(value) when is_list(value) do
+    value
+    |> Enum.flat_map(&collect_provenance/1)
+    |> Enum.uniq()
+  end
+
+  defp collect_provenance(value) when is_map(value) do
+    own =
+      value
+      |> get(:provenance, [])
+      |> case do
+        provenance when is_list(provenance) -> provenance
+        _other -> []
+      end
+
+    nested =
+      value
+      |> Map.take([:items, "items", :records, "records", :slices, "slices", :outputs, "outputs"])
+      |> Map.values()
+      |> Enum.flat_map(&collect_provenance/1)
+
+    Enum.uniq(own ++ nested)
+  end
+
+  defp collect_provenance(_value), do: []
 
   defp render_items(items) do
     items

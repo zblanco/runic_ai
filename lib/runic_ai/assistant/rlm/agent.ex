@@ -15,6 +15,58 @@ defmodule RunicAI.Assistant.RLM.Agent do
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
 
+  @default_workflow_response_max_tokens 12_000
+  @default_blueprint_generation_timeout_ms 180_000
+  @max_conversation_history_messages 12
+  @max_conversation_history_chars 16_000
+  @workspace_reference_terms [
+    "workspace",
+    "repo",
+    "repository",
+    "codebase",
+    "files",
+    "directory",
+    "project",
+    ".docs",
+    ".runic_ai",
+    "mix.exs"
+  ]
+  @source_action_terms [
+    "find",
+    "locate",
+    "search",
+    "scan",
+    "read",
+    "open",
+    "inspect",
+    "summarize",
+    "summarise",
+    "review",
+    "grep",
+    "list",
+    "show me"
+  ]
+  @source_target_terms [
+    "file",
+    "files",
+    "folder",
+    "directory",
+    "dir",
+    "path",
+    "plan",
+    "plans",
+    "doc",
+    "docs",
+    "document",
+    "module",
+    "test",
+    "tests",
+    "migration",
+    "source"
+  ]
+  @path_reference_pattern ~r/(^|\s)(\.\.?\/|[a-z0-9_.-]+\/[a-z0-9_.\/-]*|[a-z0-9_.-]+\.(exs?|md|livemd|json|ya?ml|toml|txt|db|sqlite))(\s|$|[,.])/i
+  @explicit_path_reference_pattern ~r/(^|[\s`'"(\[])(~\/[^\s`'",;:)\]}]+|\/[A-Za-z0-9._~\/-]+|\.{1,2}\/[A-Za-z0-9._\/-]+|[A-Za-z0-9_.-]+\/[A-Za-z0-9_.\/-]*|[A-Za-z0-9_.-]+\.(?:exs?|md|livemd|json|ya?ml|toml|txt|db|sqlite))(?=$|[\s`'",;:).\]}])/i
+
   @spec run(Workspace.t() | Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(workspace_input, objective, opts \\ [])
       when is_binary(objective) and objective != "" and is_list(opts) do
@@ -22,8 +74,21 @@ defmodule RunicAI.Assistant.RLM.Agent do
     event_sink = Keyword.get(opts, :event_sink, fn _stage -> :ok end)
 
     with {:ok, workspace} <- workspace_from_input(workspace_input, opts) do
+      opts =
+        opts
+        |> maybe_put_inferred_input_paths(objective, workspace)
+        |> maybe_put_source_requirements(objective)
+
+      history = conversation_history(opts)
+
+      opts =
+        opts
+        |> Keyword.put(:conversation_history, history)
+        |> Keyword.put(:conversation_context, format_conversation_history(history))
+
       emit(event_sink, run_id, :started, :running, %{
         objective: objective,
+        conversation_history_count: length(history),
         workspace: workspace.root,
         inputs: Keyword.get(opts, :input_paths, []),
         output: Keyword.get(opts, :output_path)
@@ -33,12 +98,20 @@ defmodule RunicAI.Assistant.RLM.Agent do
         capabilities: Coordinator.capability_manifest(opts)
       })
 
-      case propose_validate_execute(workspace, objective, opts, run_id, event_sink) do
+      result = propose_validate_execute(workspace, objective, opts, run_id, event_sink)
+
+      case result do
         {:ok, result} ->
-          emit(event_sink, run_id, :completed, result_status(result.scorecard), %{
-            artifact_paths: artifact_paths(result.artifacts),
-            scorecard: result.scorecard
-          })
+          emit(
+            event_sink,
+            run_id,
+            :completed,
+            result_status(result.scorecard),
+            result
+            |> completed_data()
+            |> Map.put(:artifact_paths, artifact_paths(result.artifacts))
+            |> Map.put(:scorecard, result.scorecard)
+          )
 
           {:ok,
            result
@@ -55,7 +128,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
   end
 
   defp propose_validate_execute(workspace, objective, opts, run_id, event_sink) do
-    with {:ok, blueprint} <- Coordinator.propose(workspace, objective, opts) do
+    with {:ok, blueprint} <- generate_blueprint(workspace, objective, opts, run_id, event_sink) do
       emit(event_sink, run_id, :blueprint_proposed, :ok, %{
         blueprint_id: blueprint.id,
         component_count: length(blueprint.components),
@@ -70,6 +143,126 @@ defmodule RunicAI.Assistant.RLM.Agent do
           repair_and_execute(workspace, objective, opts, run_id, event_sink, error)
       end
     end
+  end
+
+  defp generate_blueprint(workspace, objective, opts, run_id, event_sink) do
+    with {:ok, timeout_ms} <- blueprint_generation_timeout(opts) do
+      started_at = System.monotonic_time(:millisecond)
+
+      emit(event_sink, run_id, :blueprint_generation_started, :running, %{
+        model: Keyword.get(opts, :model),
+        timeout_ms: timeout_ms,
+        proposal_generation: Keyword.get(opts, :proposal_generation, :json_text),
+        conversation_history_count: length(conversation_history(opts))
+      })
+
+      result =
+        case run_coordinator_proposal(workspace, objective, opts, timeout_ms) do
+          {:ok, blueprint} ->
+            emit(event_sink, run_id, :blueprint_generation_completed, :ok, %{
+              elapsed_ms: elapsed_ms(started_at),
+              blueprint_id: blueprint.id,
+              component_count: length(blueprint.components),
+              sources: blueprint.sources
+            })
+
+            {:ok, blueprint}
+
+          {:error, %Error{} = error} ->
+            emit(event_sink, run_id, :blueprint_generation_completed, :error, %{
+              elapsed_ms: elapsed_ms(started_at),
+              error: error
+            })
+
+            {:error, error}
+        end
+
+      result
+    end
+  end
+
+  defp run_coordinator_proposal(workspace, objective, opts, timeout_ms)
+       when timeout_ms in [nil, :infinity] do
+    safe_coordinator_proposal(workspace, objective, opts)
+  end
+
+  defp run_coordinator_proposal(workspace, objective, opts, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0 do
+    task =
+      Task.async(fn ->
+        safe_coordinator_proposal(workspace, objective, opts)
+      end)
+
+    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} ->
+        result
+
+      {:exit, reason} ->
+        {:error,
+         Error.from_reason(reason,
+           kind: :unexpected,
+           message: "assistant blueprint generation task exited",
+           source: __MODULE__,
+           metadata: %{stage: :blueprint_generation}
+         )}
+
+      nil ->
+        {:error,
+         Error.timeout("assistant blueprint generation timed out",
+           source: __MODULE__,
+           details: %{timeout_ms: timeout_ms}
+         )}
+    end
+  end
+
+  defp safe_coordinator_proposal(workspace, objective, opts) do
+    Coordinator.propose(workspace, objective, opts)
+  rescue
+    exception ->
+      {:error,
+       Error.from_exception(exception,
+         kind: :unexpected,
+         source: Coordinator,
+         metadata: %{stage: :blueprint_generation}
+       )}
+  catch
+    kind, reason ->
+      {:error,
+       Error.from_reason(reason,
+         kind: :unexpected,
+         message: "assistant blueprint generation exited",
+         source: Coordinator,
+         details: %{exit_kind: kind},
+         metadata: %{stage: :blueprint_generation}
+       )}
+  end
+
+  defp blueprint_generation_timeout(opts) do
+    case Keyword.get(
+           opts,
+           :blueprint_generation_timeout_ms,
+           @default_blueprint_generation_timeout_ms
+         ) do
+      nil ->
+        {:ok, @default_blueprint_generation_timeout_ms}
+
+      :infinity ->
+        {:ok, :infinity}
+
+      timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
+        {:ok, timeout_ms}
+
+      timeout_ms ->
+        {:error,
+         Error.validation("assistant blueprint_generation_timeout_ms must be a positive integer",
+           source: __MODULE__,
+           details: %{blueprint_generation_timeout_ms: timeout_ms}
+         )}
+    end
+  end
+
+  defp elapsed_ms(started_at) do
+    System.monotonic_time(:millisecond) - started_at
   end
 
   defp repair_and_execute(workspace, objective, opts, run_id, event_sink, error) do
@@ -122,9 +315,12 @@ defmodule RunicAI.Assistant.RLM.Agent do
       |> Keyword.put(:run_id, run_id)
       |> Keyword.put(:event_sink, event_sink)
       |> Keyword.put(:objective, objective)
+      |> put_default_execution_llm_limit()
 
-    case WorkflowCompiler.run(blueprint, workspace, %{}, run_opts) do
+    case WorkflowCompiler.run(blueprint, workspace, workflow_input(objective, opts), run_opts) do
       {:ok, result} ->
+        result = put_assistant_facing_output(result)
+
         emit(event_sink, run_id, :execution_completed, :ok, %{
           output: output_summary(result.output),
           artifacts: result.artifacts
@@ -307,6 +503,206 @@ defmodule RunicAI.Assistant.RLM.Agent do
       end)
   end
 
+  defp maybe_put_source_requirements(opts, objective) do
+    if declared_source_inputs?(opts) or workspace_grounded_objective?(String.downcase(objective)) do
+      Keyword.put_new(opts, :require_provenance?, true)
+    else
+      opts
+    end
+  end
+
+  defp declared_source_inputs?(opts) do
+    not empty_listish?(Keyword.get(opts, :input_paths, [])) or
+      not empty_listish?(Keyword.get(opts, :inputs, []))
+  end
+
+  defp maybe_put_inferred_input_paths(opts, objective, %Workspace{} = workspace) do
+    if declared_source_inputs?(opts) do
+      opts
+    else
+      case infer_existing_input_paths(objective, workspace) do
+        [] ->
+          opts
+
+        paths ->
+          opts
+          |> Keyword.put(:input_paths, paths)
+          |> Keyword.put(:inferred_input_paths, paths)
+      end
+    end
+  end
+
+  defp infer_existing_input_paths(objective, %Workspace{} = workspace) do
+    objective
+    |> path_candidates()
+    |> Enum.filter(&existing_readable_path?(workspace, &1))
+    |> Enum.uniq()
+  end
+
+  defp path_candidates(objective) do
+    @explicit_path_reference_pattern
+    |> Regex.scan(objective, capture: :all_but_first)
+    |> Enum.map(fn [_prefix, path] -> normalize_referenced_path(path) end)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_referenced_path(path) do
+    path
+    |> String.trim(~s(`'" ))
+    |> String.replace(~r/[,.!?;:)\]}]+$/, "")
+  end
+
+  defp existing_readable_path?(%Workspace{} = workspace, path) do
+    with {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read) do
+      File.exists?(resolved.path)
+    else
+      _error -> false
+    end
+  end
+
+  defp workspace_grounded_objective?(objective) do
+    contains_objective_term?(objective, @workspace_reference_terms) or
+      Regex.match?(@path_reference_pattern, objective) or
+      source_action_reference?(objective)
+  end
+
+  defp source_action_reference?(objective) do
+    contains_objective_term?(objective, @source_action_terms) and
+      contains_objective_term?(objective, @source_target_terms)
+  end
+
+  defp contains_objective_term?(objective, terms) do
+    Enum.any?(terms, &objective_term?(objective, &1))
+  end
+
+  defp objective_term?(objective, term) do
+    cond do
+      String.contains?(term, [".", "/"]) ->
+        String.contains?(objective, term)
+
+      String.contains?(term, " ") ->
+        String.contains?(objective, term)
+
+      true ->
+        Regex.match?(
+          Regex.compile!("(^|[^a-z0-9_])#{Regex.escape(term)}($|[^a-z0-9_])"),
+          objective
+        )
+    end
+  end
+
+  defp workflow_input(objective, opts) do
+    history = conversation_history(opts)
+
+    %{
+      current_request: objective,
+      conversation_history: history,
+      conversation_context: format_conversation_history(history)
+    }
+  end
+
+  defp conversation_history(opts) do
+    opts
+    |> Keyword.get(:conversation_history, [])
+    |> List.wrap()
+    |> Enum.map(&normalize_history_message/1)
+    |> Enum.reject(&(String.trim(&1.content) == ""))
+    |> Enum.take(-@max_conversation_history_messages)
+  end
+
+  defp normalize_history_message(message) when is_map(message) do
+    %{
+      role: history_field(message, :role) || "message",
+      message_kind: history_field(message, :message_kind) || history_field(message, :kind),
+      content: history_content(history_field(message, :content))
+    }
+  end
+
+  defp normalize_history_message(message) when is_binary(message) do
+    %{role: "message", message_kind: nil, content: message}
+  end
+
+  defp normalize_history_message(message) do
+    %{role: "message", message_kind: nil, content: inspect(message)}
+  end
+
+  defp history_field(message, key) when is_map(message) do
+    Map.get(message, key) || Map.get(message, Atom.to_string(key))
+  end
+
+  defp history_content(nil), do: ""
+  defp history_content(content) when is_binary(content), do: content
+  defp history_content(content), do: inspect(content)
+
+  defp format_conversation_history(history) do
+    history
+    |> Enum.map(&format_history_message/1)
+    |> Enum.join("\n\n")
+    |> truncate_history()
+  end
+
+  defp format_history_message(message) do
+    role =
+      message.role
+      |> to_string()
+      |> String.capitalize()
+
+    kind =
+      case message.message_kind do
+        nil -> ""
+        "" -> ""
+        kind -> " / #{kind}"
+      end
+
+    "[#{role}#{kind}]\n#{String.trim(message.content)}"
+  end
+
+  defp truncate_history(text) when byte_size(text) <= @max_conversation_history_chars, do: text
+
+  defp truncate_history(text) do
+    omitted = byte_size(text) - @max_conversation_history_chars
+
+    text
+    |> binary_part(omitted, @max_conversation_history_chars)
+    |> then(&("[older conversation context omitted: #{omitted} bytes]\n" <> &1))
+  end
+
+  defp put_default_execution_llm_limit(opts) do
+    llm_opts =
+      opts
+      |> Keyword.get(:llm_opts, [])
+      |> maybe_put_workflow_response_max_tokens(opts)
+
+    Keyword.put(opts, :llm_opts, llm_opts)
+  end
+
+  defp maybe_put_workflow_response_max_tokens(llm_opts, opts) do
+    if output_limit_configured?(llm_opts) do
+      llm_opts
+    else
+      Keyword.put(
+        llm_opts,
+        :max_tokens,
+        Keyword.get(
+          opts,
+          :workflow_response_max_tokens,
+          Keyword.get(opts, :direct_response_max_tokens, @default_workflow_response_max_tokens)
+        )
+      )
+    end
+  end
+
+  defp output_limit_configured?(llm_opts) do
+    Enum.any?(
+      [:max_tokens, :max_completion_tokens, :max_output_tokens],
+      &Keyword.has_key?(llm_opts, &1)
+    )
+  end
+
+  defp empty_listish?(nil), do: true
+  defp empty_listish?([]), do: true
+  defp empty_listish?(value), do: value in ["", false]
+
   defp workspace_from_input(%Workspace{} = workspace, _opts), do: Workspace.validate(workspace)
 
   defp workspace_from_input(root, opts) when is_binary(root) do
@@ -320,6 +716,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
 
   defp path_policy(:docs_only, opts) do
     PathPolicy.new!(
+      read_root_jail: Keyword.get(opts, :read_root_jail, false),
       hidden_policy: :allow,
       allowed_write_roots: [".docs"],
       max_file_bytes: Keyword.get(opts, :max_file_bytes, 5_242_880)
@@ -331,6 +728,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
 
   defp path_policy(:workspace_review, opts) do
     PathPolicy.new!(
+      read_root_jail: Keyword.get(opts, :read_root_jail, false),
       hidden_policy: :allow,
       allowed_write_roots: ["."],
       max_file_bytes: Keyword.get(opts, :max_file_bytes, 5_242_880)
@@ -342,6 +740,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
 
   defp path_policy(_policy, opts) do
     PathPolicy.new!(
+      read_root_jail: Keyword.get(opts, :read_root_jail, false),
       hidden_policy: :allow,
       allowed_write_roots: ["."],
       max_file_bytes: Keyword.get(opts, :max_file_bytes, 5_242_880)
@@ -393,6 +792,16 @@ defmodule RunicAI.Assistant.RLM.Agent do
     |> Enum.reject(&is_nil/1)
   end
 
+  defp completed_data(result) do
+    text = result |> Map.get(:output) |> output_text()
+
+    if text == "" do
+      %{}
+    else
+      %{output_text: text}
+    end
+  end
+
   defp output_summary(%{text: text}) when is_binary(text), do: %{text_preview: preview(text)}
   defp output_summary(value), do: %{preview: preview(value)}
 
@@ -400,6 +809,37 @@ defmodule RunicAI.Assistant.RLM.Agent do
   defp output_text(%{"text" => text}) when is_binary(text), do: text
   defp output_text(value) when is_binary(value), do: value
   defp output_text(_value), do: ""
+
+  defp put_assistant_facing_output(result) when is_map(result) do
+    output = Map.get(result, :output)
+
+    if scorecard_output?(output) do
+      case assistant_facing_output(result) do
+        nil -> result
+        assistant_output -> Map.put(result, :output, assistant_output)
+      end
+    else
+      result
+    end
+  end
+
+  defp assistant_facing_output(result) do
+    result
+    |> Map.get(:component_results, [])
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{type: type, output: output}
+      when type in [:llm_leaf, :report_composer, :blueprint_reduce] and not is_nil(output) ->
+        output
+
+      _other ->
+        nil
+    end)
+  end
+
+  defp scorecard_output?(%{objective_status: _status}), do: true
+  defp scorecard_output?(%{"objective_status" => _status}), do: true
+  defp scorecard_output?(_output), do: false
 
   defp emit(event_sink, run_id, stage, status, data) when is_function(event_sink, 1) do
     try do

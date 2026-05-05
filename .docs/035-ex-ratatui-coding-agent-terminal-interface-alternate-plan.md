@@ -344,18 +344,16 @@ where they clarify the data.
 
 Keyboard first:
 
-- `q` / `Ctrl+C`: quit or prompt to stop active work.
+- `Ctrl+Q` / `Ctrl+C`: quit or prompt to stop active work.
 - `Ctrl+S`: stop active session.
 - `Tab` / `Shift+Tab`: focus movement.
-- `Enter`: submit composer or activate selected row.
-- `/`: slash command mode.
-- `?`: help popup.
-- `r`: resume selected run or managed workflow when possible.
-- `e`: export selected run JSONL.
-- `f`: filter/search.
-- `v`: cycle detail visibility.
-- `g`: switch graph mode.
-- `a`, `d`, `s`, `w` in review popup: approve, deny, stop, rewrite.
+- `Up` / `Down`: move the active selection.
+- `Enter`: submit composer or slash command.
+- `Esc`: cancel slash command mode.
+- `/`: slash command mode when the composer is empty.
+- Plain printable keys always belong to the active composer or slash input.
+- Resume, export, filter/search, detail, graph, and help actions are slash
+  commands unless a future modal implements scoped, focus-local shortcuts.
 
 Slash commands:
 
@@ -382,182 +380,267 @@ Slash commands:
 
 Deliverables:
 
-- [ ] Add `{:ex_ratatui, "~> 0.8"}` on a focused branch.
-- [ ] Verify `mix deps.get` and `mix compile` download/use precompiled NIFs on
+- [x] Add `{:ex_ratatui, "~> 0.8"}` on a focused branch.
+- [x] Verify `mix deps.get` and `mix compile` download/use precompiled NIFs on
       the local platform.
-- [ ] Verify source-build fallback with `EX_RATATUI_BUILD=true` only if the
+- [x] Verify source-build fallback with `EX_RATATUI_BUILD=true` only if the
       local Rust toolchain is already available or explicitly installed.
-- [ ] Add `mix runic_ai.tui --help` with default SQLite behavior,
+- [x] Add `mix runic_ai.tui --help` with default SQLite behavior,
       `--persistence`, `--sqlite`, `--run`, and existing agent/model/approval
       options documented.
-- [ ] Add a minimal local app that starts, renders one paragraph, handles `q`,
+- [x] Add a minimal local app that starts, renders one paragraph, handles `q`,
       exits, and restores the terminal.
-- [ ] Verify running without `--sqlite` creates/migrates the default local
+- [x] Verify running without `--sqlite` creates/migrates the default local
       SQLite database.
-- [ ] Verify `--sqlite PATH` overrides the database path and explicit ephemeral
+- [x] Verify `--sqlite PATH` overrides the database path and explicit ephemeral
       storage opts out.
-- [ ] Add a headless `test_mode` test with `Runtime.inject_event/2`.
+- [x] Add a headless `test_mode` test with `Runtime.inject_event/2`.
 
 Validation:
 
-- [ ] `mix compile --warnings-as-errors`
-- [ ] focused TUI tests
-- [ ] manual TTY smoke: start without `--sqlite`, verify default SQLite is
+- [x] `mix compile --warnings-as-errors`
+- [x] focused TUI tests
+- [x] manual TTY smoke: start without `--sqlite`, verify default SQLite is
       created/migrated, resize, quit, terminal restored
 
 ### Phase 1: Query-Backed Read-Only Workbench
 
 Deliverables:
 
-- [ ] Open SQLite through `RunicAI.Persistence.SQLite` by default for local
+- [x] Open SQLite through `RunicAI.Persistence.SQLite` by default for local
       harness mode.
-- [ ] Load recent runs, selected run timeline, scorecard status, failed
+- [x] Load recent runs, selected run timeline, scorecard status, failed
       runnable, artifacts, repairs, and tool calls through query helpers.
-- [ ] Render run picker, timeline, detail pane, and status bar.
-- [ ] Implement `/search`, `/errors`, `/artifacts`, `/scorecard`, `/repairs`,
+- [x] Render run picker, timeline, detail pane, and status bar.
+- [x] Implement `/search`, `/errors`, `/artifacts`, `/scorecard`, `/repairs`,
       and `/export`.
-- [ ] Hydrate correctly from an on-disk database after a fresh BEAM start.
+- [x] Hydrate correctly from an on-disk database after a fresh BEAM start.
 
 Validation:
 
-- [ ] Headless tests for model hydration and focus.
-- [ ] Headless tests for slash commands mapped to persistence queries.
-- [ ] Manual smoke against the default database produced by `mix runic_ai.agent`
+- [x] Headless tests for model hydration and focus.
+- [x] Headless tests for slash commands mapped to persistence queries.
+- [x] Manual smoke against the default database produced by `mix runic_ai.agent`
       with no persistence flag.
-- [ ] Manual smoke against an overridden database produced with
+- [x] Manual smoke against an overridden database produced with
       `mix runic_ai.agent --sqlite PATH`.
 
 ### Phase 2: Live Standard-Agent Session
 
 Deliverables:
 
-- [ ] Submit objectives from `Textarea`/composer.
-- [ ] Run standard agent through the existing terminal runner path.
-- [ ] Write terminal events to SQLite before updating the TUI model.
-- [ ] Refresh current run panes from query results so live and postmortem paths
+- [x] Submit objectives from `Textarea`/composer.
+- [x] Run standard agent through the existing terminal runner path.
+- [x] Write terminal events to SQLite before updating the TUI model.
+- [x] Refresh current run panes from query results so live and postmortem paths
       match.
-- [ ] Keep composer/input responsive while the run is active.
-- [ ] Support stop/interruption and durable partial evidence.
+- [x] Keep composer/input responsive while the run is active.
+- [x] Support stop/interruption and durable partial evidence.
 
 Validation:
 
-- [ ] Scripted standard-agent integration test with headless events.
-- [ ] Manual read-only standard-agent smoke.
-- [ ] Event count in TUI equals SQLite timeline count.
+- [x] Scripted standard-agent integration test with headless events.
+- [x] Manual read-only standard-agent smoke.
+- [x] Event count in TUI equals SQLite timeline count.
 
 ### Phase 3: Review Queue And HITL Modal
 
 Deliverables:
 
-- [ ] Render pending `review_requests`.
-- [ ] Open focused review modal with checkpoint, resume key, tool/path/command
+- [x] Render pending `review_requests`.
+- [x] Open focused review modal with checkpoint, resume key, tool/path/command
       preview, risk, and allowed decisions.
-- [ ] Support approve, deny, stop, and rewrite.
-- [ ] Persist the decision as terminal/review events.
-- [ ] Resume a live session when the runtime handle exists.
-- [ ] Keep pending reviews inspectable after process restart.
+- [x] Support approve, deny, stop, and rewrite.
+- [x] Persist the decision as terminal/review events.
+- [x] Resume a live session when the runtime handle exists.
+- [x] Keep pending reviews inspectable after process restart.
 
 Validation:
 
-- [ ] Unit tests for review state transitions.
-- [ ] Integration test review-gated scripted session resumes after approval.
-- [ ] Manual review-gated smoke.
+- [x] Unit tests for review state transitions.
+- [x] Integration test review-gated scripted session resumes after approval.
+- [x] Manual review-gated smoke.
 
 ### Phase 4: RLM And Assistant Workflow Views
 
 Deliverables:
 
-- [ ] Render assistant/RLM phases from durable terminal events:
+- [x] Render assistant/RLM phases from durable terminal events:
       proposal, validation, compilation, runnable start/complete/failure,
       repair, scorecard, artifacts, final summary.
-- [ ] Show runnable table from `runnable_events`.
-- [ ] Show graph summary/artifact from persisted graph serializer payloads.
-- [ ] Switch between proposal graph and materialized execution graph where both
+- [x] Show runnable table from `runnable_events`.
+- [x] Show graph summary/artifact from persisted graph serializer payloads.
+- [x] Switch between proposal graph and materialized execution graph where both
       exist.
-- [ ] Show residual risks, changed files, verification observations, and
+- [x] Show residual risks, changed files, verification observations, and
       source cues.
 
 Validation:
 
-- [ ] Scripted assistant run creates workflow rows, runnable rows, scorecard,
+- [x] Scripted assistant run creates workflow rows, runnable rows, scorecard,
       artifacts, repair rows, and graph rows visible in the TUI.
-- [ ] Manual conservative assistant/RLM smoke.
+- [x] Manual conservative assistant/RLM smoke.
 
 ### Phase 5: Managed Workflows And Background Runs
 
 Deliverables:
 
-- [ ] Managed workflow table with pending, active, paused, failed, scheduled
+- [x] Managed workflow table with pending, active, paused, failed, scheduled
       filters.
-- [ ] Start command-invokable managed workflows from the TUI.
-- [ ] Resume durable workflows by delegating to caller-owned runner APIs.
-- [ ] Show background session cards with phase, elapsed time, review-needed
+- [x] Start command-invokable managed workflows from the TUI.
+- [x] Resume durable workflows by delegating to caller-owned runner APIs.
+- [x] Show background session cards with phase, elapsed time, review-needed
       state, and latest evidence.
-- [ ] Keep active-session cache as a projection only; SQLite remains the source
+- [x] Keep active-session cache as a projection only; SQLite remains the source
       of truth.
 
 Validation:
 
-- [ ] Headless tests for managed workflow filters and resume command
+- [x] Headless tests for managed workflow filters and resume command
       generation.
-- [ ] Integration test with one foreground and one background scripted run.
+- [x] Integration test with one foreground and one background scripted run.
 
 ### Phase 6: Eval, Tuning, And Hermes-Inspired Signals
 
 Deliverables:
 
-- [ ] Eval cohort panel using `RunicAI.Persistence.Evals`.
-- [ ] Compare objective status, scorecard fields, repair counts, tool failures,
+- [x] Eval cohort panel using `RunicAI.Persistence.Evals`.
+- [x] Compare objective status, scorecard fields, repair counts, tool failures,
       artifact counts, and model/workspace dimensions.
-- [ ] Add prompt/source-cue inspection for selected runs.
-- [ ] Add derived signal views for Hermes-like lifecycle concepts:
+- [x] Add prompt/source-cue inspection for selected runs.
+- [x] Add derived signal views for Hermes-like lifecycle concepts:
       prefetch candidates, session recall, sync-turn facts, delegation
       summaries, and on-session-end summaries.
-- [ ] Keep these views derived from RunicAI persisted signals, not new memory
+- [x] Keep these views derived from RunicAI persisted signals, not new memory
       files.
 
 Validation:
 
-- [ ] Headless tests for cohort grouping and selected-run detail hydration.
-- [ ] Manual smoke over a small multi-run SQLite database.
+- [x] Headless tests for cohort grouping and selected-run detail hydration.
+- [x] Manual smoke over a small multi-run SQLite database.
 
 ### Phase 7: Remote Transport Spike
 
 Deliverables:
 
-- [ ] Spike `transport: :ssh` for local development only.
-- [ ] Confirm each SSH client gets isolated TUI state but shared SQLite-backed
+- [x] Spike `transport: :ssh` for local development only.
+- [x] Confirm each SSH client gets isolated TUI state but shared SQLite-backed
       run history.
-- [ ] Decide whether remote TUI belongs in RunicAI core or an optional example.
-- [ ] Do not expose SSH by default.
+- [x] Decide whether remote TUI belongs in RunicAI core or an optional example.
+- [x] Do not expose SSH by default.
 
 Validation:
 
-- [ ] Manual local SSH smoke with generated dev host key.
-- [ ] Security note for auth, host keys, and disabled-by-default behavior.
+- [x] Manual local SSH smoke with generated dev host key.
+- [x] Security note for auth, host keys, and disabled-by-default behavior.
 
 ### Phase 8: Hardening And Accessibility
 
 Deliverables:
 
-- [ ] Terminal restore verification under normal quit, crash, startup error,
+- [x] Terminal restore verification under normal quit, crash, startup error,
       timeout, and backend error.
-- [ ] Narrow-width layouts at 80x24 and 100x30.
-- [ ] Non-color/ASCII fallback.
-- [ ] Render-loop budget checks for large timelines and cohorts.
-- [ ] NIF/platform compatibility note.
-- [ ] Internal docs explaining CLI vs Owl CLI vs ExRatatui workbench.
+- [x] Narrow-width layouts at 80x24 and 100x30.
+- [x] Non-color/ASCII fallback.
+- [x] Render-loop budget checks for large timelines and cohorts.
+- [x] NIF/platform compatibility note.
+- [x] Internal docs explaining CLI vs Owl CLI vs ExRatatui workbench.
 
 Validation:
 
-- [ ] `mix format`
-- [ ] `mix compile --warnings-as-errors`
-- [ ] `mix test test/runic_ai/terminal test/runic_ai/persistence`
-- [ ] `mix test`
-- [ ] manual TTY smoke at narrow and wide sizes
-- [ ] manual live read-only standard-agent smoke
-- [ ] manual review-gated smoke
-- [ ] manual assistant/RLM smoke
+- [x] `mix format`
+- [x] `mix compile --warnings-as-errors`
+- [x] `mix test test/runic_ai/terminal test/runic_ai/persistence`
+- [x] `mix test`
+- [x] manual TTY smoke at narrow and wide sizes
+- [x] manual live read-only standard-agent smoke
+- [x] manual review-gated smoke
+- [x] manual assistant/RLM smoke
+
+## Implementation Notes
+
+Completed on 2026-05-03.
+
+- `mix runic_ai.agent`, `mix runic_ai.runs`, and `mix runic_ai.tui` now use
+  the local harness default SQLite path unless persistence is explicitly set to
+  `memory` or `none`.
+- `mix runic_ai.tui` is an ExRatatui reducer app over the durable SQLite read
+  model. It uses bounded app state only for visible projections and reloads
+  runs, timelines, reviews, managed workflows, eval cohorts, artifacts, repairs,
+  tool calls, scorecards, graph summaries, and Hermes-like derived signals from
+  query helpers.
+- Live objective submission goes through `RunicAI.Terminal.AgentRunner` with the
+  already-open SQLite store, so event counts in the TUI and SQLite timeline stay
+  aligned.
+- The terminal runner now emits a final durable summary/error event after a run
+  returns. This keeps read models from being left `running` after process exit
+  and preserves failed/blocked/completed final state for postmortem debugging.
+- Default CLI run IDs and terminal event IDs now use globally unique IDs rather
+  than BEAM-local `System.unique_integer/1` values, which avoids collisions
+  across repeated Mix invocations writing to the same local SQLite database.
+- SSH remains a local-development spike. It is disabled by default and requires
+  `--ssh-password`; ExRatatui generates/reuses a dev host key under the RunicAI
+  priv directory when `auto_host_key: true` is used.
+- Follow-up interactive input testing found that plain printable shortcuts made
+  normal objectives and slash commands impossible to type. Plain letters now flow
+  to the active textarea, with global quit/stop shortcuts on control chords and
+  structural keys.
+- Follow-up assistant debugging found that simple no-input prompts from the TUI,
+  such as creative writing requests, were routed through an unnecessary generated
+  source workflow and blocked as `no output produced`. The assistant now uses a
+  direct single-call response lane for simple no-input/no-output requests while
+  keeping durable lifecycle events and a scorecard.
+- Follow-up conversation UX work made the local harness TUI chat-first by
+  default. The primary view now renders a normal conversation surface with user
+  turns, assistant outputs, and a compact agent activity pane for HITL, tools,
+  artifacts, scorecards, and repairs. The prior run picker, timeline, evidence,
+  graph, managed workflow, and eval panes remain available as the debug view via
+  `/debug` or `F2`.
+- TUI submissions now generate a run id before dispatch, persist the submitted
+  objective as a first-class `agent_messages` user row, and pass that id through
+  `--session-id` so the user turn, assistant output, lifecycle events, and final
+  summary share one durable transcript.
+
+Verification evidence:
+
+- `mix deps.get`
+- `EX_RATATUI_BUILD=true mix deps.compile ex_ratatui --force`
+- `mix deps.compile ex_ratatui --force`
+- `mix runic_ai.tui --help`
+- `mix runic_ai.runs --help`
+- `mix runic_ai.tui --cwd /tmp/runic-ai-tui-smoke` then `ctrl-q`; verified
+  `/tmp/runic-ai-tui-smoke/.runic_ai/runs.db` exists and terminal restored.
+- `mix runic_ai.agent "Inspect this empty workspace and report that no changes
+  are needed." --agent standard --client codex --model gpt-5.2 --mode read-only
+  --approve never --max-turns 1 --max-runtime-ms 90000 --cwd
+  /tmp/runic-ai-agent-smoke-final --renderer text --color never`; completed with
+  durable run `coding:cli:HI6UBETKIR:3:8b8c58c2`.
+- `mix runic_ai.runs --cwd /tmp/runic-ai-agent-smoke-final --limit 5`; printed
+  the completed durable run above.
+- `mix runic_ai.tui --cwd /tmp/runic-ai-agent-smoke-final` then `ctrl-q`; displayed
+  the completed run timeline and final summary from SQLite.
+- OTP SSH smoke started the ExRatatui SSH transport with `auto_host_key: true`,
+  authenticated with explicit password auth, allocated a PTY, received 3580
+  render bytes, sent `ctrl-q`, and stopped the daemon.
+- `mix runic_ai.tui --cwd /tmp/runic-ai-tui-interface-pass --persistence memory`
+  interactive PTY pass: `/help` submitted and rendered help,
+  `/search does-not-exist` stayed visible as a zero-result search, and
+  `query review errors` remained in the composer without `q`, `e`, or `r`
+  triggering global shortcuts.
+- `RunicAI.Terminal.AssistantRunner.run/2` smoke with a fake client for `Write me
+  a poem about frogs`; emitted `direct_response_started`,
+  `direct_response_completed`, and `scorecard_completed`, then returned `:ok`.
+- `mix test test/runic_ai/terminal/ex_ratatui`
+- `mix test test/runic_ai/terminal test/runic_ai/persistence`
+- SQLite-backed chat smoke through `RunicAI.Terminal.ExRatatui.Commands`:
+  persisted `{"user", "objective", "Write me a poem about frogs"}` and
+  `{"assistant", "direct_response", "Visible assistant output"}` for the same
+  `assistant:tui:*` run id.
+- `mix test test/runic_ai/terminal/ex_ratatui/workbench_test.exs
+  test/runic_ai/persistence/sqlite_test.exs`; 20 tests, 0 failures.
+- `mix test test/runic_ai/terminal test/runic_ai/persistence`; 90 tests, 0
+  failures.
+- `mix test`; 479 tests, 0 failures, 2 skipped.
 
 ## Recommendation
 

@@ -32,6 +32,24 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert Enum.all?(result.slices, &(is_list(&1.provenance) and &1.start_line <= &1.end_line))
   end
 
+  test "source splitter truncates broad source sets instead of failing the workflow" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "a.md"), "A\n")
+    File.write!(Path.join(root, "b.md"), "B\n")
+    File.write!(Path.join(root, "c.md"), "C\n")
+    workspace = Workspace.new!(root: root)
+
+    assert {:ok, result} =
+             SourceSplitter.run(workspace, ["a.md", "b.md", "c.md"], %{max_sources: 2})
+
+    assert result.truncated?
+    assert result.input_source_count == 3
+    assert result.resolved_source_count == 2
+    assert result.source_count == 2
+    assert Enum.map(result.sources, & &1.path) == ["a.md", "b.md"]
+    assert Enum.all?(result.slices, &(&1.path in ["a.md", "b.md"]))
+  end
+
   test "source discovery finds explicit files, directories, and extension-filtered sources" do
     root = tmp_dir()
     File.mkdir_p!(Path.join(root, "notes"))
@@ -49,6 +67,52 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert result.count == 2
     assert Enum.map(result.sources, & &1.path) == ["notes/a.md", "notes/b.txt"]
     assert Enum.all?(result.sources, &(is_list(&1.provenance) and &1.byte_size > 0))
+  end
+
+  test "source discovery can read explicit external directories when policy allows read escapes" do
+    root = tmp_dir()
+    external = tmp_dir()
+    File.write!(Path.join(external, "workflow.ex"), "defmodule ExternalWorkflow do\nend\n")
+
+    workspace =
+      Workspace.new!(
+        root: root,
+        path_policy: PathPolicy.new!(read_root_jail: false)
+      )
+
+    assert {:ok, result} =
+             SourceDiscovery.run(workspace, [external], %{
+               extensions: ["ex"],
+               max_files: 8
+             })
+
+    assert result.count == 1
+    assert [%{path: path, absolute_path: absolute_path, discovery: :directory}] = result.sources
+    assert path == absolute_path
+    assert path == Path.join(external, "workflow.ex")
+  end
+
+  test "source discovery skips policy-blocked files during broad directory scans" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "README.md"), "# Safe project notes\n")
+    File.mkdir_p!(Path.join(root, "config"))
+    File.write!(Path.join(root, "config/prod.secret.exs"), "import Config\n")
+    workspace = Workspace.new!(root: root)
+
+    assert {:ok, result} =
+             SourceDiscovery.run(workspace, ["."], %{
+               extensions: ["md", "exs"],
+               max_depth: 3,
+               max_files: 8
+             })
+
+    assert result.count == 1
+    assert [%{path: "README.md"}] = result.sources
+
+    assert {:error, error} =
+             SourceDiscovery.run(workspace, ["config/prod.secret.exs"], %{extensions: ["exs"]})
+
+    assert error.message == "credential-looking paths are not allowed"
   end
 
   test "source materializer enforces total byte caps" do
@@ -199,6 +263,16 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert cue_failed.objective_status == :objective_incomplete
     assert cue_failed.source_cue_status == :missing
     assert "missing cue" in cue_failed.missing_source_cues
+
+    assert {:ok, provenance_failed} =
+             ObjectiveScorecard.run(workspace, %{sources: [], artifacts: []}, report, %{
+               require_provenance?: true
+             })
+
+    assert provenance_failed.objective_status == :objective_incomplete
+    assert provenance_failed.source_coverage == :missing
+
+    assert "source/provenance coverage was required but not present" in provenance_failed.residual_risks
 
     assert {:ok, quality_failed} =
              ObjectiveScorecard.run(workspace, context, "%{a => b}\n\n%{c => d}", %{

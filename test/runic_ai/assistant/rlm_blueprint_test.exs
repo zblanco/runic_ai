@@ -238,6 +238,72 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert blueprint.metadata.proposal_kind == :validation_repair
   end
 
+  test "coordinator repair prompt accepts diagnostics containing nested errors" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+    parent = self()
+
+    client = fn _model, prompt, _opts ->
+      blueprint =
+        if prompt =~ "repairing an invalid" do
+          send(parent, {:repair_prompt, prompt})
+
+          %{
+            id: "assistant:repaired_function",
+            objective: "Pick repos",
+            components: [
+              %{
+                id: "respond",
+                type: "llm_leaf",
+                params: %{
+                  strategy: "llm_reduce",
+                  group_prompt: "Use {{input}}",
+                  prompt: "Respond from {{items}}",
+                  max_group_items: 1
+                }
+              },
+              %{id: "score", type: "objective_scorecard", params: %{}}
+            ],
+            edges: [%{from: "respond", to: "score"}],
+            stop_conditions: ["response produced"],
+            policies: %{generated_functions: %{max_tier: "tier1"}},
+            metadata: %{}
+          }
+        else
+          %{
+            id: "assistant:bad_function",
+            objective: "Pick repos",
+            components: [
+              %{
+                id: "bad_transform",
+                type: "blueprint_transform",
+                params: %{function: %{tier: "tier0"}}
+              },
+              %{id: "score", type: "objective_scorecard", params: %{}}
+            ],
+            edges: [%{from: "bad_transform", to: "score"}],
+            stop_conditions: ["response produced"],
+            policies: %{generated_functions: %{max_tier: "tier1"}},
+            metadata: %{}
+          }
+        end
+
+      {:ok, TestClient.result(Jason.encode!(blueprint))}
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Pick repos",
+               client: client,
+               model: "test:model",
+               fallback?: false
+             )
+
+    assert blueprint.id == "assistant:repaired_function"
+    assert_receive {:repair_prompt, prompt}
+    assert prompt =~ "tier0 function blueprints require a built-in operation"
+    refute prompt =~ "%RunicAI.Error{"
+  end
+
   defp tmp_dir do
     path =
       Path.join(

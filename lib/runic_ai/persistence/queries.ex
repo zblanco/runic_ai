@@ -129,6 +129,25 @@ defmodule RunicAI.Persistence.Queries do
     end)
   end
 
+  @spec messages_for_run_query(String.t()) :: Ecto.Query.t()
+  def messages_for_run_query(run_id) when is_binary(run_id) do
+    conversation_id = "conversation:#{run_id}"
+
+    from(message in AgentMessage,
+      where:
+        message.presentation_group_id == ^run_id or message.session_id == ^run_id or
+          message.conversation_id == ^conversation_id,
+      order_by: [asc: message.created_at]
+    )
+  end
+
+  @spec messages_for_run(Store.t(), String.t()) :: [AgentMessage.t()]
+  def messages_for_run(%Store{} = store, run_id) do
+    SQLite.with_repo(store, fn ->
+      store.repo.all(messages_for_run_query(run_id))
+    end)
+  end
+
   @spec artifacts_for_run_query(String.t()) :: Ecto.Query.t()
   def artifacts_for_run_query(run_id) when is_binary(run_id) do
     from(artifact in RunArtifact,

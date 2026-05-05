@@ -24,6 +24,8 @@ defmodule RunicAI.Terminal.EventPresenter do
       "  model: #{value(opts, :model, "default")}",
       "  client: #{value(opts, :client, "default")}",
       "  detail: #{value(opts, :detail, :collapsed)}",
+      "  persistence: #{value(opts, :persistence, :sqlite)}",
+      sqlite_line(opts),
       header_line("async", value(opts, :async, nil)),
       header_line("max concurrency", value(opts, :max_concurrency, nil)),
       header_line("LLM map concurrency", value(opts, :max_llm_map_concurrency, nil)),
@@ -374,6 +376,10 @@ defmodule RunicAI.Terminal.EventPresenter do
   defp jsonl_line(%{jsonl_path: nil}), do: nil
   defp jsonl_line(%{jsonl_path: path}), do: "  jsonl: #{path}"
   defp jsonl_line(_opts), do: nil
+
+  defp sqlite_line(%{sqlite_path: nil}), do: nil
+  defp sqlite_line(%{sqlite_path: path}), do: "  sqlite: #{path}"
+  defp sqlite_line(_opts), do: nil
 
   defp header_line(_label, nil), do: nil
   defp header_line(label, value), do: "  #{label}: #{value}"

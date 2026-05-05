@@ -376,9 +376,10 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     SchedulerPolicy.llm_policy() |> policy_map()
   end
 
+  defp preset_policy(:source_discovery), do: SchedulerPolicy.fast_fail() |> policy_map()
+
   defp preset_policy(type)
        when type in [
-              :source_discovery,
               :source_splitter,
               :source_materializer,
               :tabular_parser,

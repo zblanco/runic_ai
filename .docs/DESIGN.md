@@ -5,7 +5,7 @@ Status: draft
 Date: 2026-05-01
 
 Scope: terminal presentation for `mix runic_ai.agent`, the Owl/Bunt enhanced
-CLI, and the future TermUI TUI.
+CLI, and the future TermUI or ExRatatui TUI.
 
 This is an internal design guide for UX and visual decisions. It should evolve
 with implementation. Public docs should copy from this only when the behavior is
@@ -153,10 +153,23 @@ TUI:
 
 - Status bar is one row when possible.
 - Composer is always visible at the bottom unless a modal is active.
-- Timeline should be the primary left or top pane.
-- Detail/evidence pane should show selected event context.
+- The default local harness view is chat-first: user turns, assistant outputs,
+  HITL prompts, tool activity, artifacts, and final status should be visible
+  without opening a diagnostic pane.
+- Timeline, run picker, graph, scorecard, and eval panes belong to the debug
+  workbench view. They are first-class for inspection, but not the default
+  answer surface.
+- Detail/evidence pane should show selected event context in debug mode.
 - Graph pane appears for RLM and workflow-heavy runs, not every standard run.
 - Avoid nested framed panels. Split panes and top-level modals are enough.
+- Query-backed TUI workbenches should keep SQLite as the durable source of
+  truth and hold only bounded visible projections in app state.
+- For ExRatatui, prefer `WidgetList` for long timelines, `Table` for run and
+  eval cohorts, `Textarea` for the objective composer, and `Popup` only for
+  review/HITL.
+- Remote ExRatatui transport is a local-development/admin spike only. It must
+  stay opt-in, require explicit auth configuration, and keep per-client UI state
+  isolated while reading from the shared SQLite store.
 
 Padding:
 
@@ -323,6 +336,10 @@ Terminal copy should describe state and evidence, not explain how the UI works.
 | 2026-05-01 | Treat Bunt as optional semantic color support behind `RunicAI.Terminal.Theme`. |
 | 2026-05-01 | Treat TermUI as a separate TUI surface over `RunicAI.Terminal.Event`. |
 | 2026-05-01 | Treat mmdflux as optional graph rendering; do not require Rust for the base CLI. |
+| 2026-05-03 | Treat local harness commands and TUIs as SQLite-backed by default; in-memory/no-storage modes are explicit opt-outs. |
+| 2026-05-03 | Spike ExRatatui as a Rust-rendered alternate TUI over the same persistence and terminal event model. |
+| 2026-05-03 | Use globally unique durable run/event IDs for CLI harness persistence; BEAM-local counters are not acceptable for SQLite-backed local history. |
+| 2026-05-03 | Keep ExRatatui SSH disabled by default and require explicit password/auth configuration for local development. |
 
 ## Open Questions
 

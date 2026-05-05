@@ -219,7 +219,9 @@ defmodule RunicAI.Assistant.RLM.BlueprintGraph do
 
       if Multigraph.is_acyclic?(graph) do
         view = graph_view(blueprint, specs, graph)
-        root_leaf_diagnostics(view, opts) ++ isolated_component_diagnostics(view)
+
+        root_leaf_diagnostics(view, opts) ++
+          isolated_component_diagnostics(view) ++ source_materializer_parent_diagnostics(view)
       else
         []
       end
@@ -264,6 +266,34 @@ defmodule RunicAI.Assistant.RLM.BlueprintGraph do
         )
       ]
     end
+  end
+
+  defp source_materializer_parent_diagnostics(%__MODULE__{} = graph) do
+    graph.specs
+    |> Enum.filter(&(&1.type == :source_materializer))
+    |> Enum.flat_map(fn spec ->
+      parents =
+        graph.graph
+        |> Multigraph.in_edges(spec, by: :flow)
+        |> Enum.map(& &1.v1)
+
+      if Enum.any?(parents, &(&1.type == :source_splitter)) do
+        []
+      else
+        [
+          diagnostic(
+            :error,
+            :missing_source_splitter,
+            "source_materializer requires source_splitter output, not raw discovery or arbitrary transformed values",
+            %{
+              component_id: spec.id,
+              parent_component_ids: Enum.map(parents, & &1.id),
+              parent_component_types: Enum.map(parents, & &1.type)
+            }
+          )
+        ]
+      end
+    end)
   end
 
   defp build_graph(%WorkflowBlueprint{} = blueprint, specs) do

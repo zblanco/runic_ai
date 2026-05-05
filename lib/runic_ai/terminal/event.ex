@@ -9,6 +9,7 @@ defmodule RunicAI.Terminal.Event do
 
   alias RunicAI.Error
   alias RunicAI.Harness.Session
+  alias RunicAI.Ids
   alias RunicAI.ReviewRequest
   alias RunicAI.Trace.Event, as: TraceEvent
   alias RunicAI.Wait
@@ -288,6 +289,7 @@ defmodule RunicAI.Terminal.Event do
     |> maybe_append(rlm_compiled_event(result, opts))
     |> Kernel.++(rlm_episode_events(result, opts))
     |> maybe_append(rlm_repair_event(result, opts))
+    |> maybe_append(rlm_final_output_event(result, opts))
     |> maybe_append(rlm_scorecard_event(result, opts))
     |> maybe_append(rlm_persistence_event(result, opts))
   end
@@ -487,6 +489,41 @@ defmodule RunicAI.Terminal.Event do
     end
   end
 
+  defp rlm_final_output_event(result, opts) do
+    agent = Keyword.get(opts, :agent, :rlm)
+
+    if agent == :rlm do
+      result
+      |> rlm_final_output_text()
+      |> case do
+        text when is_binary(text) ->
+          text = String.trim(text)
+
+          if text != "" do
+            new!(:message,
+              session_id: Keyword.get(opts, :session_id),
+              agent: :rlm,
+              phase: :assistant,
+              status: :ok,
+              title: "RLM final output",
+              detail: preview(text),
+              data: %{
+                run_id: Keyword.get(opts, :run_id) || Keyword.get(opts, :session_id),
+                role: "assistant",
+                message_kind: "workflow_output",
+                content: text,
+                output_text: text
+              },
+              raw: result
+            )
+          end
+
+        _other ->
+          nil
+      end
+    end
+  end
+
   defp rlm_scorecard_event(result, opts) do
     case scorecard(result) do
       nil ->
@@ -605,6 +642,76 @@ defmodule RunicAI.Terminal.Event do
         nil
     end
   end
+
+  defp rlm_final_output_text(result) do
+    [
+      text_field(result, :output_text),
+      text_field(result, :final_answer),
+      text_field(result, :reply_text),
+      text_field(result, :content),
+      text_candidate(field(result, :output)),
+      episode_output_text(result),
+      text_candidate(field(result, :artifacts))
+    ]
+    |> Enum.find(&present_text?/1)
+  end
+
+  defp episode_output_text(result) do
+    result
+    |> episodes()
+    |> Enum.reverse()
+    |> Enum.find_value(fn episode ->
+      text_candidate(field(episode, :outcome)) ||
+        text_candidate(field(episode, :output)) ||
+        text_candidate(field(episode, :artifacts))
+    end)
+  end
+
+  defp text_field(map, key) do
+    case field(map, key) do
+      value when is_binary(value) -> value
+      _other -> nil
+    end
+  end
+
+  defp text_candidate(nil), do: nil
+  defp text_candidate(value) when is_binary(value), do: value
+
+  defp text_candidate(values) when is_list(values) do
+    values
+    |> Enum.reverse()
+    |> Enum.find_value(&text_candidate/1)
+  end
+
+  defp text_candidate(%{} = value) do
+    text_field(value, :output_text) ||
+      text_field(value, :final_answer) ||
+      text_field(value, :reply_text) ||
+      text_field(value, :content) ||
+      text_field(value, :text) ||
+      text_field(value, :text_preview) ||
+      text_candidate(field(value, :output)) ||
+      text_candidate(field(value, :outcome)) ||
+      text_candidate(field(value, :value)) ||
+      structured_report_candidate(value)
+  end
+
+  defp text_candidate(_value), do: nil
+
+  defp structured_report_candidate(%{} = value) do
+    if structured_report_map?(value) do
+      RunicAI.Coding.RLM.Reducers.reduce(:report, [value])
+    end
+  end
+
+  defp structured_report_map?(value) do
+    Enum.any?([:files, :entries, :matches, :path, :stdout, :stderr, :exit_status], fn key ->
+      not is_nil(field(value, key))
+    end)
+  end
+
+  defp present_text?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_text?(_value), do: false
 
   defp trace_status(%TraceEvent{kind: :review_requested}), do: :review
   defp trace_status(%TraceEvent{kind: :wait_registered}), do: :waiting
@@ -807,6 +914,8 @@ defmodule RunicAI.Terminal.Event do
        when stage in [:repair_attempt_started, :repair_attempt_completed, :repair_completed],
        do: :repair
 
+  defp rlm_kind(stage) when stage in [:review_requested, :review_completed], do: :hitl
+
   defp rlm_kind(stage) when stage in [:progress_gate_completed, :scorecard, :scorecard_completed],
     do: :summary
 
@@ -893,5 +1002,5 @@ defmodule RunicAI.Terminal.Event do
 
   defp humanize(value), do: value |> inspect() |> humanize()
 
-  defp default_id(kind), do: "terminal:#{kind}:#{System.unique_integer([:positive])}"
+  defp default_id(kind), do: Ids.unique("terminal:#{kind}")
 end

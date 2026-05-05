@@ -20,6 +20,7 @@ defmodule RunicAI.Terminal.CliOptions do
   @progress_modes [:auto, :off]
   @unicode_modes [:auto, :always, :never]
   @graph_modes [:text, :mermaid, :mmdflux]
+  @persistence_modes [:sqlite, :memory, :none]
 
   @enforce_keys [
     :agent,
@@ -33,12 +34,14 @@ defmodule RunicAI.Terminal.CliOptions do
     :theme,
     :progress,
     :unicode,
-    :graph
+    :graph,
+    :persistence
   ]
   defstruct [
     :objective,
     :jsonl_path,
     :sqlite_path,
+    :persistence,
     :model,
     :client,
     :client_label,
@@ -82,6 +85,7 @@ defmodule RunicAI.Terminal.CliOptions do
           interactive: :boolean,
           jsonl: :string,
           sqlite: :string,
+          persistence: :string,
           detail: :string,
           approve: :string,
           async: :boolean,
@@ -140,7 +144,9 @@ defmodule RunicAI.Terminal.CliOptions do
          {:ok, output_path} <- normalize_workspace_path(Keyword.get(opts, :output), cwd, :output),
          {:ok, client, client_label} <- normalize_client(Keyword.get(opts, :client)),
          {:ok, jsonl_path} <- normalize_jsonl_path(Keyword.get(opts, :jsonl), cwd),
-         {:ok, sqlite_path} <- normalize_sqlite_path(Keyword.get(opts, :sqlite), cwd),
+         {:ok, persistence} <-
+           normalize_persistence(Keyword.get(opts, :persistence), Keyword.get(opts, :sqlite)),
+         {:ok, sqlite_path} <- normalize_sqlite_path(Keyword.get(opts, :sqlite), cwd, persistence),
          {:ok, objective} <-
            normalize_objective(
              rest,
@@ -167,6 +173,7 @@ defmodule RunicAI.Terminal.CliOptions do
          interactive?: Keyword.get(opts, :interactive, false),
          jsonl_path: jsonl_path,
          sqlite_path: sqlite_path,
+         persistence: persistence,
          detail: detail,
          approve: approve,
          async?: Keyword.get(opts, :async),
@@ -217,6 +224,7 @@ defmodule RunicAI.Terminal.CliOptions do
       --graph text|mermaid|mmdflux
       --interactive
       --jsonl PATH
+      --persistence sqlite|memory|none
       --sqlite PATH
       --detail hidden|collapsed|expanded
       --approve never|safe|ask
@@ -371,9 +379,27 @@ defmodule RunicAI.Terminal.CliOptions do
      )}
   end
 
-  defp normalize_sqlite_path(nil, _cwd), do: {:ok, nil}
+  @spec default_sqlite_path(Path.t()) :: Path.t()
+  def default_sqlite_path(cwd), do: Path.join([cwd, ".runic_ai", "runs.db"])
 
-  defp normalize_sqlite_path(path, cwd) when is_binary(path) and path != "" do
+  defp normalize_persistence(nil, _sqlite_path), do: {:ok, :sqlite}
+
+  defp normalize_persistence(value, _sqlite_path) do
+    normalize_choice(value, @persistence_modes, :persistence)
+  end
+
+  defp normalize_sqlite_path(nil, cwd, :sqlite), do: {:ok, default_sqlite_path(cwd)}
+  defp normalize_sqlite_path(nil, _cwd, _persistence), do: {:ok, nil}
+
+  defp normalize_sqlite_path(path, _cwd, persistence) when persistence in [:memory, :none] do
+    {:error,
+     Error.validation("runic_ai.agent --sqlite requires --persistence sqlite",
+       source: __MODULE__,
+       details: %{sqlite: path, persistence: persistence}
+     )}
+  end
+
+  defp normalize_sqlite_path(path, cwd, :sqlite) when is_binary(path) and path != "" do
     expanded = Path.expand(path, cwd)
 
     if within?(expanded, cwd) or within?(expanded, System.tmp_dir!()) do
@@ -387,7 +413,7 @@ defmodule RunicAI.Terminal.CliOptions do
     end
   end
 
-  defp normalize_sqlite_path(path, _cwd) do
+  defp normalize_sqlite_path(path, _cwd, _persistence) do
     {:error,
      Error.validation("runic_ai.agent --sqlite must be a non-empty path",
        source: __MODULE__,

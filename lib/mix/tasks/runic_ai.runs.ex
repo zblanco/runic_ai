@@ -5,6 +5,9 @@ defmodule Mix.Tasks.RunicAi.Runs do
       mix runic_ai.runs --sqlite .runic_ai/runs.db
       mix runic_ai.runs --sqlite .runic_ai/runs.db --run assistant:cli:123
       mix runic_ai.runs --sqlite .runic_ai/runs.db --run assistant:cli:123 --export-jsonl tmp/run.jsonl
+
+  Without `--sqlite`, this task inspects the local harness default database at
+  `.runic_ai/runs.db`.
   """
 
   use Mix.Task
@@ -13,10 +16,12 @@ defmodule Mix.Tasks.RunicAi.Runs do
   alias RunicAI.Persistence.Inspection
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
+  alias RunicAI.Terminal.CliOptions
 
   @shortdoc "Inspect RunicAI SQLite run history"
 
   @switches [
+    cwd: :string,
     sqlite: :string,
     run: :string,
     limit: :integer,
@@ -47,15 +52,22 @@ defmodule Mix.Tasks.RunicAi.Runs do
       {opts, _argv, []} ->
         opts = Map.new(opts)
 
+        cwd = Map.get(opts, :cwd, File.cwd!()) |> Path.expand()
+        sqlite = Map.get(opts, :sqlite) || CliOptions.default_sqlite_path(cwd)
+
         cond do
           Map.get(opts, :help) ->
             {:help, usage()}
 
-          not is_binary(Map.get(opts, :sqlite)) ->
-            {:error, "--sqlite PATH is required"}
+          not File.dir?(cwd) ->
+            {:error, "--cwd must be an existing directory"}
 
           true ->
-            {:ok, Map.put_new(opts, :limit, 20)}
+            {:ok,
+             opts
+             |> Map.put(:cwd, cwd)
+             |> Map.put(:sqlite, Path.expand(sqlite, cwd))
+             |> Map.put_new(:limit, 20)}
         end
 
       {_opts, _argv, invalid} ->
@@ -101,7 +113,7 @@ defmodule Mix.Tasks.RunicAi.Runs do
   defp usage do
     """
     Usage:
-      mix runic_ai.runs --sqlite PATH [--limit N]
+      mix runic_ai.runs [--cwd PATH] [--sqlite PATH] [--limit N]
       mix runic_ai.runs --sqlite PATH --run RUN_ID
       mix runic_ai.runs --sqlite PATH --run RUN_ID --export-jsonl PATH
     """

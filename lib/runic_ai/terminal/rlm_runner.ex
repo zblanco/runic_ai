@@ -8,23 +8,26 @@ defmodule RunicAI.Terminal.RLMRunner do
 
   alias RunicAI.Coding.RLM.Agent
   alias RunicAI.Error
+  alias RunicAI.Ids
   alias RunicAI.Terminal.Event
 
   @spec run(String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(objective, opts \\ []) when is_binary(objective) and is_list(opts) do
     event_sink = Keyword.get(opts, :event_sink, fn _event -> :ok end)
-    session_id = Keyword.get(opts, :session_id) || "rlm:cli:#{System.unique_integer([:positive])}"
+    session_id = Keyword.get(opts, :session_id) || Ids.unique("rlm:cli")
+    run_id = Keyword.get(opts, :run_id) || session_id
     cwd = Keyword.get(opts, :cwd, File.cwd!())
     parent = self()
 
-    emit(event_sink, started_event(session_id, cwd, opts))
+    emit(event_sink, started_event(session_id, run_id, cwd, opts))
 
     rlm_opts =
       opts
       |> Keyword.drop([:event_sink, :run_fun])
-      |> Keyword.put(:run_id, session_id)
+      |> Keyword.put(:run_id, run_id)
+      |> Keyword.put(:session_id, session_id)
       |> Keyword.put(:event_sink, fn stage ->
-        send(parent, {:runic_ai_terminal_rlm_stage, session_id, stage})
+        send(parent, {:runic_ai_terminal_rlm_stage, run_id, stage})
       end)
 
     task =
@@ -33,24 +36,25 @@ defmodule RunicAI.Terminal.RLMRunner do
         run_fun.(cwd, objective, rlm_opts)
       end)
 
-    case await_task(task, session_id, event_sink, deadline(opts)) do
+    case await_task(task, session_id, run_id, event_sink, deadline(opts)) do
       {:ok, result} ->
-        Event.from_rlm_result(result, session_id: session_id)
+        Event.from_rlm_result(result, session_id: session_id, run_id: run_id)
+        |> Enum.map(&put_event_run_id(&1, run_id))
         |> Enum.each(&emit(event_sink, &1))
 
-        {:ok, final_result(result, session_id)}
+        {:ok, final_result(result, session_id, run_id)}
 
       {:error, %Error{} = error} ->
-        emit(event_sink, error_event(session_id, error))
+        emit(event_sink, error_event(session_id, run_id, error))
         {:error, error}
     end
   end
 
-  defp await_task(%Task{ref: ref} = task, session_id, event_sink, deadline_ms) do
+  defp await_task(%Task{ref: ref} = task, session_id, run_id, event_sink, deadline_ms) do
     receive do
       {^ref, result} ->
         Process.demonitor(ref, [:flush])
-        drain_stage_messages(session_id, event_sink)
+        drain_stage_messages(session_id, run_id, event_sink)
         result
 
       {:DOWN, ^ref, :process, _pid, reason} ->
@@ -60,9 +64,13 @@ defmodule RunicAI.Terminal.RLMRunner do
            message: "RLM terminal runner task exited"
          )}
 
-      {:runic_ai_terminal_rlm_stage, ^session_id, stage} ->
-        emit(event_sink, Event.from_rlm_stage(stage, session_id: session_id))
-        await_task(task, session_id, event_sink, deadline_ms)
+      {:runic_ai_terminal_rlm_stage, ^run_id, stage} ->
+        stage
+        |> Event.from_rlm_stage(session_id: session_id, run_id: run_id)
+        |> put_event_run_id(run_id)
+        |> then(&emit(event_sink, &1))
+
+        await_task(task, session_id, run_id, event_sink, deadline_ms)
     after
       25 ->
         if expired?(deadline_ms) do
@@ -71,32 +79,36 @@ defmodule RunicAI.Terminal.RLMRunner do
           {:error,
            Error.timeout("RLM terminal runner timed out",
              source: __MODULE__,
-             details: %{session_id: session_id}
+             details: %{session_id: session_id, run_id: run_id}
            )}
         else
-          await_task(task, session_id, event_sink, deadline_ms)
+          await_task(task, session_id, run_id, event_sink, deadline_ms)
         end
     end
   end
 
-  defp drain_stage_messages(session_id, event_sink) do
+  defp drain_stage_messages(session_id, run_id, event_sink) do
     receive do
-      {:runic_ai_terminal_rlm_stage, ^session_id, stage} ->
-        emit(event_sink, Event.from_rlm_stage(stage, session_id: session_id))
-        drain_stage_messages(session_id, event_sink)
+      {:runic_ai_terminal_rlm_stage, ^run_id, stage} ->
+        stage
+        |> Event.from_rlm_stage(session_id: session_id, run_id: run_id)
+        |> put_event_run_id(run_id)
+        |> then(&emit(event_sink, &1))
+
+        drain_stage_messages(session_id, run_id, event_sink)
     after
       0 -> :ok
     end
   end
 
-  defp final_result(result, session_id) do
+  defp final_result(result, session_id, run_id) do
     scorecard = scorecard(result)
 
     %{
       agent: :rlm,
       status: final_status(scorecard),
       session_id: session_id,
-      run_id: session_id,
+      run_id: run_id,
       result: result,
       scorecard: scorecard,
       persistence_ref: field(result, :persistence_ref)
@@ -130,7 +142,7 @@ defmodule RunicAI.Terminal.RLMRunner do
     end
   end
 
-  defp started_event(session_id, cwd, opts) do
+  defp started_event(session_id, run_id, cwd, opts) do
     Event.new!(:status,
       session_id: session_id,
       agent: :rlm,
@@ -138,11 +150,16 @@ defmodule RunicAI.Terminal.RLMRunner do
       status: :running,
       title: "RLM agent started",
       detail: cwd,
-      data: %{cwd: cwd, model: Keyword.get(opts, :model), client: Keyword.get(opts, :client)}
+      data: %{
+        run_id: run_id,
+        cwd: cwd,
+        model: Keyword.get(opts, :model),
+        client: Keyword.get(opts, :client)
+      }
     )
   end
 
-  defp error_event(session_id, %Error{} = error) do
+  defp error_event(session_id, run_id, %Error{} = error) do
     Event.new!(:error,
       session_id: session_id,
       agent: :rlm,
@@ -150,9 +167,13 @@ defmodule RunicAI.Terminal.RLMRunner do
       status: :error,
       title: "RLM agent failed",
       detail: error.message,
-      data: %{error: error},
+      data: %{run_id: run_id, error: error},
       raw: error
     )
+  end
+
+  defp put_event_run_id(%Event{} = event, run_id) do
+    %{event | data: Map.put_new(event.data || %{}, :run_id, run_id)}
   end
 
   defp deadline(opts) do

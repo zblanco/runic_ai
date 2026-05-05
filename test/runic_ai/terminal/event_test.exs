@@ -6,6 +6,7 @@ defmodule RunicAI.Terminal.EventTest do
   alias RunicAI.Coding.RLM.WorkflowScorecard
   alias RunicAI.Coding.RLM.WorkflowValidationReport
   alias RunicAI.ReviewRequest
+  alias RunicAI.RLM.Episode
   alias RunicAI.Terminal.Event
   alias RunicAI.Trace.Event, as: TraceEvent
 
@@ -86,6 +87,55 @@ defmodule RunicAI.Terminal.EventTest do
     assert Enum.any?(events, &(&1.phase == :proposed))
     assert Enum.any?(events, &(&1.phase == :validated))
     assert Enum.any?(events, &(&1.phase == :scorecard and &1.status == :ok))
+  end
+
+  test "normalizes coding RLM final output as a chat-visible assistant message" do
+    episode =
+      Episode.new!(:satisfied, "Final repo summary for the conversation pane.",
+        id: "episode:answer",
+        parent_node_id: "answer",
+        artifacts: ["Final repo summary for the conversation pane."]
+      )
+
+    events =
+      Event.from_rlm_result(
+        %{
+          context: %{episodes: [episode]},
+          objective_scorecard: WorkflowScorecard.new!(objective_status: :objective_satisfied)
+        },
+        session_id: "session:rlm",
+        run_id: "run:rlm"
+      )
+
+    assert %Event{kind: :message, phase: :assistant, status: :ok, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["run_id"] == "run:rlm"
+    assert data["role"] == "assistant"
+    assert data["message_kind"] == "workflow_output"
+    assert data["content"] == "Final repo summary for the conversation pane."
+  end
+
+  test "normalizes structured coding RLM final output as markdown content" do
+    episode =
+      Episode.new!(:satisfied, %{files: [%{path: "README.md", content: "# Demo\n\nhello"}]},
+        id: "episode:answer",
+        parent_node_id: "answer",
+        artifacts: [%{files: [%{path: "README.md", content: "# Demo\n\nhello"}]}]
+      )
+
+    events =
+      Event.from_rlm_result(%{context: %{episodes: [episode]}},
+        session_id: "session:rlm",
+        run_id: "run:rlm"
+      )
+
+    assert %Event{kind: :message, data: data} = Enum.find(events, &(&1.kind == :message))
+
+    assert data["content"] =~ "## File output"
+    assert data["content"] =~ "```markdown\n# Demo\n\nhello\n```"
+    refute data["content"] =~ "%{"
+    refute data["content"] =~ "\\n"
   end
 
   test "normalizes Runic runnable lifecycle stages into JSON-safe trace events" do

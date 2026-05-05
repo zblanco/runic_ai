@@ -25,7 +25,8 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
          path: resolved.relative,
          absolute_path: resolved.path,
          bytes: byte_size(content),
-         write_policy: write_policy
+         write_policy: write_policy,
+         provenance: collect_provenance(input)
        }}
     else
       {:error, %Error{} = error} -> {:error, error}
@@ -58,6 +59,41 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
   defp fallback_content(%{"content" => content}) when is_binary(content), do: content
   defp fallback_content(value) when is_binary(value), do: value
   defp fallback_content(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+
+  defp collect_provenance(value) when is_list(value) do
+    value
+    |> Enum.flat_map(&collect_provenance/1)
+    |> Enum.uniq()
+  end
+
+  defp collect_provenance(value) when is_map(value) do
+    own =
+      value
+      |> get(:provenance, [])
+      |> case do
+        provenance when is_list(provenance) -> provenance
+        _other -> []
+      end
+
+    nested =
+      value
+      |> Map.take([
+        :items,
+        "items",
+        :records,
+        "records",
+        :slices,
+        "slices",
+        :outputs,
+        "outputs"
+      ])
+      |> Map.values()
+      |> Enum.flat_map(&collect_provenance/1)
+
+    Enum.uniq(own ++ nested)
+  end
+
+  defp collect_provenance(_value), do: []
 
   defp validate_path(path) when is_binary(path) and path != "", do: :ok
 

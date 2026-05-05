@@ -13,6 +13,8 @@ defmodule RunicAI.Persistence.SQLiteTest do
   alias RunicAI.Persistence.Schemas.TerminalEvent
   alias RunicAI.Persistence.Schemas.ToolCall
   alias RunicAI.Persistence.Schemas.WorkflowRun
+  alias RunicAI.RLM.Episode
+  alias RunicAI.Terminal.Event
 
   setup do
     {:ok, store} = SQLite.open(":memory:")
@@ -296,6 +298,289 @@ defmodule RunicAI.Persistence.SQLiteTest do
     exported = Export.terminal_jsonl(store, "session:projection")
     assert exported |> String.split("\n", trim: true) |> length() == 6
     assert exported =~ "source-cue-2"
+  end
+
+  test "assistant direct response stages project first-class message rows", %{store: store} do
+    at = ~U[2026-05-03 12:10:00Z]
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:direct-response",
+               session_id: "assistant:direct",
+               run_id: "assistant:direct",
+               agent: :assistant,
+               kind: :rlm_plan,
+               phase: :direct_response_completed,
+               status: :ok,
+               title: "Assistant RLM Direct response completed ok",
+               detail: "preview only",
+               data_json: %{
+                 stage: :direct_response_completed,
+                 status: :ok,
+                 data: %{
+                   reply_text: "Frogs hum softly beside the moonlit reeds.",
+                   output: %{text_preview: "Frogs hum softly beside the moonlit reeds."}
+                 }
+               },
+               at: at
+             })
+
+    rows =
+      SQLite.with_repo(store, fn ->
+        %{
+          messages: store.repo.all(AgentMessage),
+          sessions: store.repo.all(AgentSession),
+          runs: store.repo.all(WorkflowRun)
+        }
+      end)
+
+    assert [
+             %AgentMessage{
+               role: "assistant",
+               message_kind: "direct_response",
+               content: "Frogs hum softly beside the moonlit reeds."
+             }
+           ] = rows.messages
+
+    assert [%AgentSession{status: "running"}] = rows.sessions
+    assert [%WorkflowRun{status: "running"}] = rows.runs
+    assert [%AgentMessage{}] = Queries.messages_for_run(store, "assistant:direct")
+  end
+
+  test "assistant error events project concise chat messages", %{store: store} do
+    at = ~U[2026-05-03 12:12:00Z]
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:assistant-error",
+               session_id: "assistant:error",
+               run_id: "assistant:error",
+               agent: :assistant,
+               kind: :error,
+               phase: :run,
+               status: :error,
+               title: "Assistant RLM agent failed",
+               detail:
+                 "protocol Jason.Encoder not implemented for RunicAI.Error (a struct)\n\nIf you own the struct, derive Jason.Encoder.",
+               data_json: %{
+                 error: %{
+                   kind: :unexpected,
+                   message:
+                     "protocol Jason.Encoder not implemented for RunicAI.Error (a struct)\n\nIf you own the struct, derive Jason.Encoder."
+                 }
+               },
+               at: at
+             })
+
+    assert [
+             %AgentMessage{
+               role: "assistant",
+               message_kind: "error",
+               content:
+                 "Error: protocol Jason.Encoder not implemented for RunicAI.Error (a struct)"
+             }
+           ] = Queries.messages_for_run(store, "assistant:error")
+  end
+
+  test "assistant workflow llm_leaf completions project first-class message rows", %{store: store} do
+    at = ~U[2026-05-03 12:15:00Z]
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:workflow-output",
+               session_id: "assistant:workflow",
+               run_id: "assistant:workflow",
+               agent: :assistant,
+               kind: :rlm_node,
+               phase: :node_completed,
+               status: :ok,
+               title: "Assistant RLM Node completed ok",
+               detail: "synthesis complete",
+               data_json: %{
+                 stage: :node_completed,
+                 status: :ok,
+                 data: %{
+                   runnable: %{
+                     id: 123,
+                     node: "assistant_node_1_synthesize_response",
+                     component_id: "synthesize_response",
+                     component_type: "llm_leaf"
+                   },
+                   output: %{count: 1, strategy: :llm_reduce},
+                   policy_events: [
+                     %{
+                       result_fact: %{
+                         value: %{
+                           text:
+                             "Workflow graphs compose durable, inspectable execution from named nodes and facts."
+                         }
+                       }
+                     }
+                   ]
+                 }
+               },
+               at: at
+             })
+
+    assert [
+             %AgentMessage{
+               role: "assistant",
+               message_kind: "workflow_output",
+               content:
+                 "Workflow graphs compose durable, inspectable execution from named nodes and facts.",
+               transient: true
+             }
+           ] = Queries.messages_for_run(store, "assistant:workflow")
+  end
+
+  test "assistant completed workflow stage projects the final non-transient chat output", %{
+    store: store
+  } do
+    at = ~U[2026-05-03 12:16:00Z]
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:workflow-intermediate-output",
+               session_id: "assistant:workflow-final",
+               run_id: "assistant:workflow-final",
+               agent: :assistant,
+               kind: :rlm_node,
+               phase: :node_completed,
+               status: :ok,
+               title: "Assistant RLM Node completed ok",
+               detail: "synthesis complete",
+               data_json: %{
+                 stage: :node_completed,
+                 status: :ok,
+                 data: %{
+                   node_id: "synthesize",
+                   type: "llm_leaf",
+                   output: %{text: "Intermediate answer before scorecard repair."}
+                 }
+               },
+               at: at
+             })
+
+    assert {:ok, %TerminalEvent{sequence: 2}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:workflow-final-output",
+               session_id: "assistant:workflow-final",
+               run_id: "assistant:workflow-final",
+               agent: :assistant,
+               kind: :rlm_plan,
+               phase: :completed,
+               status: :ok,
+               title: "Assistant RLM Completed ok",
+               detail: "completed",
+               data_json: %{
+                 stage: :completed,
+                 status: :ok,
+                 data: %{
+                   output_text: "Final repaired answer with provenance-backed summary."
+                 }
+               },
+               at: DateTime.add(at, 1, :second)
+             })
+
+    assert [
+             %AgentMessage{
+               content: "Intermediate answer before scorecard repair.",
+               transient: true
+             },
+             %AgentMessage{
+               content: "Final repaired answer with provenance-backed summary.",
+               transient: false
+             }
+           ] = Queries.messages_for_run(store, "assistant:workflow-final")
+  end
+
+  test "coding RLM final result events project non-transient workflow output messages", %{
+    store: store
+  } do
+    episode =
+      Episode.new!(:satisfied, "Repo A handles UI, Repo B handles data, Repo C handles docs.",
+        id: "episode:answer",
+        parent_node_id: "answer",
+        artifacts: ["Repo A handles UI, Repo B handles data, Repo C handles docs."]
+      )
+
+    final_event =
+      %{context: %{episodes: [episode]}}
+      |> Event.from_rlm_result(session_id: "session:rlm-chat", run_id: "run:rlm-chat")
+      |> Enum.find(&(&1.kind == :message))
+
+    assert {:ok, %TerminalEvent{run_id: "run:rlm-chat", sequence: 1}} =
+             SQLite.record_terminal_event(store, final_event)
+
+    assert [
+             %AgentMessage{
+               role: "assistant",
+               message_kind: "workflow_output",
+               content: "Repo A handles UI, Repo B handles data, Repo C handles docs.",
+               transient: false,
+               presentation_group_id: "run:rlm-chat"
+             }
+           ] = Queries.messages_for_run(store, "run:rlm-chat")
+  end
+
+  test "assistant review stages project nested HITL review requests", %{store: store} do
+    at = ~U[2026-05-03 12:20:00Z]
+
+    review_data = %{
+      id: "review:artifact:1",
+      kind: :assistant_artifact_write,
+      checkpoint: :pre_write,
+      resume_key: "review:artifact:1",
+      options: [:approve, :reject, :cancel],
+      details: %{path: ".docs/report.md", write_policy: :docs_only},
+      metadata: %{safe?: true}
+    }
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:assistant-review-requested",
+               session_id: "assistant:review",
+               run_id: "assistant:review",
+               agent: :assistant,
+               kind: :hitl,
+               phase: :review_requested,
+               status: :review,
+               title: "Assistant RLM Review requested review",
+               detail: "write .docs/report.md",
+               data_json: %{stage: :review_requested, status: :review, data: review_data},
+               at: at
+             })
+
+    assert {:ok, %TerminalEvent{sequence: 2}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:assistant-review-completed",
+               session_id: "assistant:review",
+               run_id: "assistant:review",
+               agent: :assistant,
+               kind: :hitl,
+               phase: :review_completed,
+               status: :ok,
+               title: "Assistant RLM Review completed ok",
+               detail: "approved",
+               data_json: %{
+                 stage: :review_completed,
+                 status: :ok,
+                 data: Map.put(review_data, :decision, %{status: :approved})
+               },
+               at: DateTime.add(at, 1)
+             })
+
+    rows = SQLite.with_repo(store, fn -> store.repo.all(ReviewRequest) end)
+
+    assert [
+             %ReviewRequest{
+               id: "review:artifact:1",
+               kind: "assistant_artifact_write",
+               checkpoint: "pre_write",
+               resume_key: "review:artifact:1",
+               status: "approved"
+             }
+           ] = rows
   end
 
   defp insert_session(store, id) do

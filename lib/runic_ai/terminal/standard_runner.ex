@@ -13,6 +13,7 @@ defmodule RunicAI.Terminal.StandardRunner do
   alias RunicAI.Harness.Policy
   alias RunicAI.Harness.Session
   alias RunicAI.Integrated.Emission
+  alias RunicAI.Ids
   alias RunicAI.ReviewRequest
   alias RunicAI.Runtime
   alias RunicAI.Terminal.Event
@@ -25,7 +26,7 @@ defmodule RunicAI.Terminal.StandardRunner do
     review_decider = Keyword.get(opts, :review_decider, &default_review_decider/2)
 
     session_id =
-      Keyword.get(opts, :session_id) || "coding:cli:#{System.unique_integer([:positive])}"
+      Keyword.get(opts, :session_id) || Ids.unique("coding:cli")
 
     cwd = Keyword.get(opts, :cwd, File.cwd!())
     policy = policy(opts)

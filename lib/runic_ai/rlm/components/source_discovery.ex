@@ -121,39 +121,34 @@ defmodule RunicAI.RLM.Components.SourceDiscovery do
       resolved.path
       |> walk_files(max_depth, include_hidden?(params))
       |> Enum.reduce_while({:ok, []}, fn absolute, {:ok, acc} ->
-        with {:ok, relative_path} <- Workspace.relative_path(workspace, absolute),
-             {:ok, file_resolved} <- Workspace.resolve_path(workspace, relative_path, :read) do
-          if include_file?(relative_path, params) do
-            entry_id = "#{id}:#{length(acc) + 1}"
-            {:cont, {:ok, acc ++ source_entry(file_resolved, entry_id, metadata, :directory)}}
-          else
-            {:cont, {:ok, acc}}
-          end
-        else
-          {:error, %Error{} = error} -> {:halt, {:error, error}}
+        entry_id = "#{id}:#{length(acc) + 1}"
+
+        case discovered_source_entry(workspace, absolute, entry_id, metadata, :directory, params) do
+          {:ok, entry} -> {:cont, {:ok, acc ++ entry}}
+          :skip -> {:cont, {:ok, acc}}
         end
       end)
     end
   end
 
   defp discover_glob(workspace, pattern, id, metadata, params) do
-    absolute_pattern = Path.join(workspace.root, pattern)
+    absolute_pattern =
+      if Path.type(pattern) == :absolute do
+        pattern
+      else
+        Path.join(workspace.root, pattern)
+      end
 
     absolute_pattern
     |> Path.wildcard(match_dot: include_hidden?(params))
     |> Enum.filter(&File.regular?/1)
     |> Enum.sort()
     |> Enum.reduce_while({:ok, []}, fn absolute, {:ok, acc} ->
-      with {:ok, relative_path} <- Workspace.relative_path(workspace, absolute),
-           {:ok, resolved} <- Workspace.resolve_path(workspace, relative_path, :read) do
-        if include_file?(relative_path, params) do
-          entry_id = "#{id}:#{length(acc) + 1}"
-          {:cont, {:ok, acc ++ source_entry(resolved, entry_id, metadata, :glob)}}
-        else
-          {:cont, {:ok, acc}}
-        end
-      else
-        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      entry_id = "#{id}:#{length(acc) + 1}"
+
+      case discovered_source_entry(workspace, absolute, entry_id, metadata, :glob, params) do
+        {:ok, entry} -> {:cont, {:ok, acc ++ entry}}
+        :skip -> {:cont, {:ok, acc}}
       end
     end)
   end
@@ -173,16 +168,50 @@ defmodule RunicAI.RLM.Components.SourceDiscovery do
         []
 
       File.dir?(path) ->
-        path
-        |> File.ls!()
-        |> Enum.reject(&(not include_hidden? and String.starts_with?(&1, ".")))
-        |> Enum.flat_map(fn name ->
-          Path.join(path, name)
-          |> do_walk_files(depth + 1, max_depth, include_hidden?)
-        end)
+        case File.ls(path) do
+          {:ok, names} ->
+            names
+            |> Enum.reject(&(not include_hidden? and String.starts_with?(&1, ".")))
+            |> Enum.flat_map(fn name ->
+              path
+              |> Path.join(name)
+              |> do_walk_files(depth + 1, max_depth, include_hidden?)
+            end)
+
+          {:error, _reason} ->
+            []
+        end
 
       true ->
         []
+    end
+  end
+
+  defp discovered_source_entry(workspace, absolute, id, metadata, discovery, params) do
+    with {:ok, relative_path} <- Workspace.relative_path(workspace, absolute),
+         true <- include_file?(relative_path, params),
+         {:ok, resolved} <- Workspace.resolve_path(workspace, relative_path, :read),
+         {:ok, stat} <- File.stat(resolved.path) do
+      extension = resolved.relative |> Path.extname() |> String.downcase()
+
+      {:ok,
+       [
+         %{
+           id: id,
+           path: resolved.relative,
+           absolute_path: resolved.path,
+           kind: :file,
+           discovery: discovery,
+           extension: extension,
+           byte_size: stat.size,
+           metadata: metadata,
+           provenance: [%{path: resolved.relative, discovery: discovery}]
+         }
+       ]}
+    else
+      false -> :skip
+      {:error, %Error{}} -> :skip
+      {:error, _reason} -> :skip
     end
   end
 

@@ -780,6 +780,29 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert [%RunicAI.Coding.RLM.RepairNeed{}] = Reducers.repair_needs(observations)
   end
 
+  test "report reducer formats file tool outputs as markdown instead of inspected maps" do
+    report =
+      Reducers.reduce(:report, [
+        %{
+          count: 1,
+          files: [
+            %{
+              path: "README.md",
+              byte_size: 14,
+              truncated?: false,
+              content: "# Demo\n\nhello"
+            }
+          ]
+        }
+      ])
+
+    assert report =~ "## File output"
+    assert report =~ "### `README.md`"
+    assert report =~ "```markdown\n# Demo\n\nhello\n```"
+    refute report =~ "%{"
+    refute report =~ "\\n"
+  end
+
   test "codex JSONL events normalize into coding RLM artifacts" do
     jsonl = ~s({"type":"message","content":"working"}\n{"type":"result","message":"done"}\n)
 

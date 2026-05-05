@@ -29,7 +29,9 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
   def run(%Workspace{} = workspace, sources, opts) when is_list(sources) do
     opts = opts_map(opts)
 
-    with {:ok, resolved_sources} <- resolve_sources(workspace, sources, opts) do
+    with {:ok, resolved} <- resolve_sources(workspace, sources, opts) do
+      resolved_sources = resolved.sources
+
       slices =
         resolved_sources
         |> Enum.flat_map(&split_source(&1, opts))
@@ -43,6 +45,10 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
          slices: slices,
          count: length(slices),
          sources: Enum.map(resolved_sources, &Map.drop(&1, [:text])),
+         source_count: length(resolved_sources),
+         input_source_count: resolved.input_source_count,
+         resolved_source_count: resolved.resolved_source_count,
+         truncated?: resolved.truncated?,
          strategy: strategy(opts)
        }}
     end
@@ -68,28 +74,40 @@ defmodule RunicAI.RLM.Components.SourceSplitter do
   defp resolve_sources(workspace, sources, opts) do
     max_sources = integer_opt(opts, :max_sources, @default_max_sources)
 
+    initial = %{
+      sources: [],
+      input_source_count: length(sources),
+      resolved_source_count: 0,
+      truncated?: false
+    }
+
     sources
     |> Enum.with_index(1)
-    |> Enum.reduce_while({:ok, []}, fn {source, index}, {:ok, acc} ->
-      case resolve_source(workspace, source, index, opts) do
-        {:ok, source_entries} ->
-          next = acc ++ source_entries
+    |> Enum.reduce_while({:ok, initial}, fn {source, index}, {:ok, acc} ->
+      if length(acc.sources) >= max_sources do
+        {:halt, {:ok, %{acc | truncated?: true}}}
+      else
+        case resolve_source(workspace, source, index, opts) do
+          {:ok, source_entries} ->
+            {:cont, {:ok, append_sources(acc, source_entries, max_sources)}}
 
-          if length(next) > max_sources do
-            {:halt,
-             {:error,
-              Error.validation("source splitter source budget exceeded",
-                source: __MODULE__,
-                details: %{max_sources: max_sources}
-              )}}
-          else
-            {:cont, {:ok, next}}
-          end
-
-        {:error, %Error{} = error} ->
-          {:halt, {:error, error}}
+          {:error, %Error{} = error} ->
+            {:halt, {:error, error}}
+        end
       end
     end)
+  end
+
+  defp append_sources(acc, source_entries, max_sources) do
+    remaining = max_sources - length(acc.sources)
+    selected = Enum.take(source_entries, remaining)
+
+    %{
+      acc
+      | sources: acc.sources ++ selected,
+        resolved_source_count: acc.resolved_source_count + length(source_entries),
+        truncated?: acc.truncated? or length(source_entries) > remaining
+    }
   end
 
   defp resolve_source(workspace, path, index, opts) when is_binary(path) do

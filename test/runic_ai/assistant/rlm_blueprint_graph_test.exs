@@ -5,6 +5,7 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
   alias Runic.Workflow
   alias RunicAI.Assistant.RLM.BlueprintGraph
   alias RunicAI.Assistant.RLM.BlueprintProposalPrompt
+  alias RunicAI.Assistant.RLM.BlueprintValidator
   alias RunicAI.Assistant.RLM.ComponentBlueprint
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Assistant.RLM.WorkflowCompiler
@@ -135,6 +136,31 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
       )
 
     assert Enum.any?(BlueprintGraph.diagnostics(cycle), &(&1.code == :cycle))
+  end
+
+  test "blueprint graph rejects materialization without source splitter output" do
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Read repository sources",
+        [
+          ComponentBlueprint.new!("discover", :source_discovery),
+          ComponentBlueprint.new!("pick", :blueprint_transform,
+            params: %{function: %{tier: :tier0, op: :identity}}
+          ),
+          ComponentBlueprint.new!("materialize", :source_materializer)
+        ],
+        edges: [%{from: "discover", to: "pick"}, %{from: "pick", to: "materialize"}],
+        stop_conditions: ["done"]
+      )
+
+    diagnostics = BlueprintGraph.diagnostics(blueprint)
+
+    assert Enum.any?(diagnostics, &(&1.code == :missing_source_splitter))
+
+    assert %{status: :rejected, diagnostics: diagnostics} =
+             BlueprintValidator.report(blueprint)
+
+    assert Enum.any?(diagnostics, &(&1.code == :missing_source_splitter))
   end
 
   test "blueprint graph reports root leaf and isolated component diagnostics" do

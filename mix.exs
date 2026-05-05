@@ -34,6 +34,8 @@ defmodule RunicAI.MixProject do
       {:req_llm, "~> 1.9"},
       {:ecto_sql, "~> 3.13"},
       {:ecto_sqlite3, "~> 0.22"},
+      {:ex_ratatui, "~> 0.8"},
+      {:rustler, "~> 0.37.3", runtime: false},
       {:owl, "~> 0.13"},
       {:bunt, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},

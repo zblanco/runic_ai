@@ -96,36 +96,49 @@ defmodule RunicAI.Coding.Workspace do
   @spec resolve_path(t(), Path.t(), PathPolicy.access()) ::
           {:ok, PathPolicy.resolved_path()} | {:error, Error.t()}
   def resolve_path(%__MODULE__{} = workspace, path, access \\ :read) do
-    with {:ok, path} <- normalize_tool_path(workspace, path) do
+    with {:ok, path} <- normalize_tool_path(workspace, path, access) do
       PathPolicy.resolve(workspace.path_policy, workspace.root, path, access)
     end
   end
 
   @spec relative_path(t(), Path.t()) :: {:ok, Path.t()} | {:error, Error.t()}
-  def relative_path(%__MODULE__{root: root}, absolute_path) when is_binary(absolute_path) do
+  def relative_path(%__MODULE__{} = workspace, absolute_path) when is_binary(absolute_path) do
     absolute_path = Path.expand(absolute_path)
-    root = Path.expand(root)
+    root = Path.expand(workspace.root)
 
-    if absolute_path == root or List.starts_with?(Path.split(absolute_path), Path.split(root)) do
-      {:ok, Path.relative_to(absolute_path, root)}
-    else
-      {:error,
-       Error.validation("absolute path is outside workspace root",
-         source: __MODULE__,
-         details: %{path: absolute_path, root: root}
-       )}
+    cond do
+      inside?(absolute_path, root) ->
+        {:ok, Path.relative_to(absolute_path, root)}
+
+      not workspace.path_policy.read_root_jail ->
+        {:ok, absolute_path}
+
+      true ->
+        {:error,
+         Error.validation("absolute path is outside workspace root",
+           source: __MODULE__,
+           details: %{path: absolute_path, root: root}
+         )}
     end
   end
 
-  defp normalize_tool_path(%__MODULE__{} = workspace, path) when is_binary(path) do
+  defp normalize_tool_path(%__MODULE__{} = workspace, path, access) when is_binary(path) do
     if Path.type(path) == :absolute do
-      relative_path(workspace, path)
+      normalize_absolute_tool_path(workspace, path, access)
     else
       {:ok, path}
     end
   end
 
-  defp normalize_tool_path(_workspace, path), do: {:ok, path}
+  defp normalize_tool_path(_workspace, path, _access), do: {:ok, path}
+
+  defp normalize_absolute_tool_path(%__MODULE__{} = workspace, path, :read) do
+    relative_path(workspace, path)
+  end
+
+  defp normalize_absolute_tool_path(%__MODULE__{} = workspace, path, :write) do
+    relative_path(workspace, path)
+  end
 
   defp normalize_root(root) when is_binary(root) and root != "" do
     root = Path.expand(root)
@@ -160,6 +173,13 @@ defmodule RunicAI.Coding.Workspace do
 
   defp normalize_profile(nil, root), do: Profile.detect(root)
   defp normalize_profile(profile, _root), do: Profile.from_input(profile)
+
+  defp inside?(path, root) do
+    path = Path.expand(path)
+    root = Path.expand(root)
+
+    path == root or List.starts_with?(Path.split(path), Path.split(root))
+  end
 
   defp validate_metadata(metadata) when is_map(metadata), do: :ok
 

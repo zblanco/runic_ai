@@ -46,6 +46,32 @@ defmodule RunicAI.Coding.WorkspaceTest do
     assert error.message =~ "outside workspace root"
   end
 
+  test "can allow read-only paths outside the workspace root without allowing writes" do
+    root = tmp_dir()
+    outside = tmp_dir()
+    File.write!(Path.join(outside, "notes.md"), "# Notes\n")
+
+    workspace =
+      Workspace.new!(
+        root: root,
+        path_policy: PathPolicy.new!(read_root_jail: false)
+      )
+
+    outside_file = Path.join(outside, "notes.md")
+
+    assert {:ok, resolved} = Workspace.resolve_path(workspace, outside_file, :read)
+    assert resolved.path == outside_file
+    assert resolved.relative == outside_file
+
+    assert {:ok, relative_resolved} =
+             Workspace.resolve_path(workspace, Path.relative_to(outside_file, root), :read)
+
+    assert relative_resolved.path == outside_file
+
+    assert {:error, error} = Workspace.resolve_path(workspace, outside_file, :write)
+    assert error.message =~ "workspace-relative"
+  end
+
   test "allows hidden reads by default but rejects hidden writes" do
     root = tmp_dir()
     File.write!(Path.join(root, ".formatter.exs"), "[]\n")
