@@ -112,6 +112,34 @@ defmodule RunicAI.Terminal.CliOptionsTest do
            ]
   end
 
+  test "preserves repeated assistant input paths" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "--agent",
+               "assistant",
+               "--cwd",
+               cwd,
+               "--input",
+               "tmp/old.md",
+               "--input=tmp/new.md",
+               "compare policies"
+             ])
+
+    assert opts.input_paths == ["tmp/old.md", "tmp/new.md"]
+  end
+
+  test "normalizes codex client alias to the callable client module" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse(["summarize repo", "--cwd", cwd, "--client", "codex"])
+
+    assert opts.client == RunicAI.Coding.Codex.Client
+    assert opts.client_label == "codex"
+  end
+
   test "parses explicit concurrency options" do
     cwd = tmp_dir()
 

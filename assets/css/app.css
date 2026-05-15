@@ -1,0 +1,335 @@
+/* Tailwind CSS v4 uses this file as the app's configuration surface. */
+
+@import "tailwindcss" source(none);
+@source "../css";
+@source "../js";
+@source "../../lib/runic_ai_web";
+
+@plugin "../vendor/heroicons";
+
+:root {
+  --rune-bg: oklch(11% 0.026 282);
+  --rune-bg-deep: oklch(7% 0.018 282);
+  --rune-surface: oklch(16% 0.026 282);
+  --rune-surface-2: oklch(20% 0.03 282);
+  --rune-surface-3: oklch(25% 0.034 282);
+  --rune-text: oklch(91% 0.025 82);
+  --rune-text-soft: oklch(73% 0.03 82);
+  --rune-muted: oklch(56% 0.035 78);
+  --rune-border: oklch(42% 0.065 65);
+  --rune-border-soft: oklch(28% 0.04 67);
+  --rune-primary: oklch(72% 0.14 164);
+  --rune-primary-soft: oklch(83% 0.095 166);
+  --rune-gold: oklch(77% 0.13 78);
+  --rune-bronze: oklch(58% 0.12 68);
+  --rune-purple: oklch(64% 0.14 304);
+  --rune-magenta: oklch(70% 0.18 333);
+  --rune-success: oklch(72% 0.14 150);
+  --rune-warning: oklch(78% 0.15 74);
+  --rune-error: oklch(68% 0.17 24);
+  --rune-info: oklch(72% 0.12 235);
+  --rune-glass-line: rgba(255, 244, 211, 0.07);
+  --rune-shadow: 0 30px 110px rgba(0, 0, 0, 0.46);
+  --rune-shadow-soft: 0 18px 58px rgba(0, 0, 0, 0.26);
+}
+
+[data-contrast="high"] {
+  --rune-bg: oklch(7% 0.018 282);
+  --rune-bg-deep: oklch(4% 0.012 282);
+  --rune-surface: oklch(13% 0.022 282);
+  --rune-surface-2: oklch(18% 0.028 282);
+  --rune-text: oklch(97% 0.018 82);
+  --rune-text-soft: oklch(86% 0.024 82);
+  --rune-muted: oklch(71% 0.035 78);
+  --rune-border: oklch(62% 0.105 70);
+  --rune-primary: oklch(84% 0.14 164);
+  --rune-gold: oklch(86% 0.14 78);
+}
+
+[data-motion="reduced"],
+[data-motion="reduced"] * {
+  scroll-behavior: auto !important;
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+}
+
+@theme {
+  --font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-display: "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-rune-bg: var(--rune-bg);
+  --color-rune-bg-deep: var(--rune-bg-deep);
+  --color-rune-surface: var(--rune-surface);
+  --color-rune-surface-elevated: var(--rune-surface-2);
+  --color-rune-surface-high: var(--rune-surface-3);
+  --color-rune-border: var(--rune-border);
+  --color-rune-border-soft: var(--rune-border-soft);
+  --color-rune-text: var(--rune-text);
+  --color-rune-text-soft: var(--rune-text-soft);
+  --color-rune-muted: var(--rune-muted);
+  --color-rune-primary: var(--rune-primary);
+  --color-rune-primary-soft: var(--rune-primary-soft);
+  --color-rune-gold: var(--rune-gold);
+  --color-rune-bronze: var(--rune-bronze);
+  --color-rune-purple: var(--rune-purple);
+  --color-rune-magenta: var(--rune-magenta);
+  --color-rune-success: var(--rune-success);
+  --color-rune-warning: var(--rune-warning);
+  --color-rune-error: var(--rune-error);
+  --color-rune-info: var(--rune-info);
+}
+
+@custom-variant phx-click-loading (.phx-click-loading&, .phx-click-loading &);
+@custom-variant phx-submit-loading (.phx-submit-loading&, .phx-submit-loading &);
+@custom-variant phx-change-loading (.phx-change-loading&, .phx-change-loading &);
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+[data-phx-session],
+[data-phx-teleported-src] {
+  display: contents;
+}
+
+html,
+body {
+  min-height: 100%;
+  background: var(--rune-bg-deep);
+  color: var(--rune-text);
+  letter-spacing: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--rune-primary);
+  outline-offset: 2px;
+}
+
+.runic-workbench {
+  position: relative;
+  background:
+    linear-gradient(90deg, rgba(222, 166, 81, 0.024) 1px, transparent 1px) 0 0 / 86px 86px,
+    linear-gradient(0deg, rgba(222, 166, 81, 0.02) 1px, transparent 1px) 0 0 / 86px 86px,
+    radial-gradient(circle at 48% -18%, rgba(122, 225, 180, 0.12), transparent 34%),
+    radial-gradient(circle at 94% 28%, rgba(128, 77, 166, 0.14), transparent 28%),
+    radial-gradient(circle at 8% 82%, rgba(222, 166, 81, 0.08), transparent 30%),
+    var(--rune-bg);
+}
+
+.runic-workbench::before {
+  position: fixed;
+  left: 318px;
+  right: 420px;
+  top: 74px;
+  z-index: 0;
+  color: rgba(232, 192, 116, 0.035);
+  font-family: var(--font-display);
+  font-size: clamp(82px, 11vw, 178px);
+  letter-spacing: 0.24em;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.runic-frost {
+  backdrop-filter: blur(26px) saturate(142%);
+  -webkit-backdrop-filter: blur(26px) saturate(142%);
+}
+
+.runic-shadow {
+  box-shadow: var(--rune-shadow);
+}
+
+.runic-shadow-soft {
+  box-shadow: var(--rune-shadow-soft);
+}
+
+.runic-sidebar-panel,
+.runic-inspector-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 244, 211, 0.034), rgba(255, 244, 211, 0.008)),
+    rgba(13, 10, 19, 0.64);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 244, 211, 0.045),
+    var(--rune-shadow-soft);
+}
+
+.runic-chat-panel {
+  border: 1px solid rgba(255, 244, 211, 0.075);
+  background:
+    linear-gradient(180deg, rgba(255, 244, 211, 0.028), rgba(255, 244, 211, 0.006)),
+    rgba(4, 3, 8, 0.44);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 244, 211, 0.035),
+    0 18px 56px rgba(0, 0, 0, 0.2);
+}
+
+.runic-composer-shell {
+  border: 1px solid rgba(222, 166, 81, 0.32);
+  background:
+    linear-gradient(180deg, rgba(255, 244, 211, 0.04), rgba(255, 244, 211, 0.012)),
+    rgba(4, 3, 8, 0.56);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 244, 211, 0.05),
+    0 18px 52px rgba(0, 0, 0, 0.3),
+    0 0 38px rgba(222, 166, 81, 0.07),
+    0 0 34px rgba(122, 225, 180, 0.045);
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+
+.runic-composer-shell:focus-within {
+  border-color: rgba(244, 197, 111, 0.78);
+  background:
+    linear-gradient(180deg, rgba(255, 244, 211, 0.055), rgba(255, 244, 211, 0.014)),
+    rgba(4, 3, 8, 0.62);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 244, 211, 0.08),
+    0 18px 52px rgba(0, 0, 0, 0.32),
+    0 0 0 1px rgba(244, 197, 111, 0.16),
+    0 0 34px rgba(222, 166, 81, 0.18),
+    0 0 76px rgba(222, 166, 81, 0.12);
+}
+
+.runic-review-card {
+  border: 1px solid rgba(222, 166, 81, 0.12);
+  background:
+    radial-gradient(circle at 9% 0%, rgba(222, 166, 81, 0.11), transparent 34%),
+    rgba(0, 0, 0, 0.24);
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklch, var(--rune-warning) 18%, transparent),
+    0 16px 44px rgba(0, 0, 0, 0.2);
+}
+
+.runic-scrollbar {
+  scrollbar-color: color-mix(in oklch, var(--rune-border) 58%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.runic-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.runic-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.runic-scrollbar::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--rune-border) 58%, transparent);
+  background-clip: padding-box;
+}
+
+.runic-markdown > :first-child {
+  margin-top: 0;
+}
+
+.runic-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.runic-markdown p,
+.runic-markdown ul,
+.runic-markdown ol,
+.runic-markdown pre,
+.runic-markdown table,
+.runic-markdown blockquote {
+  margin-bottom: 0.7rem;
+}
+
+.runic-markdown ul,
+.runic-markdown ol {
+  padding-left: 1.25rem;
+}
+
+.runic-markdown ul {
+  list-style: disc;
+}
+
+.runic-markdown ol {
+  list-style: decimal;
+}
+
+.runic-markdown code {
+  border-radius: 0.32rem;
+  background: color-mix(in oklch, var(--rune-bg) 86%, var(--rune-border));
+  padding: 0.1rem 0.25rem;
+  color: var(--color-rune-primary-soft);
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+
+.runic-markdown pre {
+  overflow-x: auto;
+  border-radius: 0.75rem;
+  border: 1px solid color-mix(in oklch, var(--rune-border) 72%, transparent);
+  background: color-mix(in oklch, var(--rune-bg-deep) 82%, black);
+  padding: 0.85rem;
+}
+
+.runic-markdown pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.runic-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.runic-markdown th,
+.runic-markdown td {
+  border: 1px solid color-mix(in oklch, var(--rune-border) 70%, transparent);
+  padding: 0.35rem 0.5rem;
+}
+
+.runic-markdown th {
+  background: var(--color-rune-surface);
+  color: var(--color-rune-gold);
+}
+
+.runic-markdown a {
+  color: var(--color-rune-info);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.runic-markdown blockquote {
+  border-left: 3px solid var(--color-rune-bronze);
+  padding-left: 0.85rem;
+  color: var(--color-rune-text-soft);
+}
+
+.runic-command-palette {
+  color-scheme: dark;
+}
+
+.runic-diff-panel {
+  tab-size: 2;
+}
+
+@media (max-width: 880px) {
+  body {
+    overflow: auto;
+  }
+
+  .runic-workbench::before {
+    display: none;
+  }
+}

@@ -8,14 +8,26 @@ defmodule RunicAI.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      RunicAIWeb.Telemetry,
+      {DNSCluster, query: Application.get_env(:runic_ai, :dns_cluster_query) || :ignore},
+      {Phoenix.PubSub, name: RunicAI.PubSub},
+      {RunicAI.Workbench.StoreServer, Application.get_env(:runic_ai, :workbench, [])},
+      {Task.Supervisor, name: RunicAI.Workbench.TaskSupervisor},
       {RunicAI.Runtime.Registry, []},
       {RunicAI.Runtime.SessionSupervisor, []},
-      {Runic.Runner, name: RunicAI.Runtime.Runner}
+      {Runic.Runner, name: RunicAI.Runtime.Runner},
+      RunicAIWeb.Endpoint
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: RunicAI.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  @impl true
+  def config_change(changed, _new, removed) do
+    RunicAIWeb.Endpoint.config_change(changed, removed)
+    :ok
   end
 end

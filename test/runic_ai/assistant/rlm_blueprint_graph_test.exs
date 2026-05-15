@@ -217,6 +217,44 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
     assert Enum.any?(compiled.scheduler_policies, &match?({:default, %{timeout_ms: 1_000}}, &1))
   end
 
+  test "reviewed artifact writers get a human-review scheduler window" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Reviewed artifact write",
+        [
+          ComponentBlueprint.new!("compose", :report_composer),
+          ComponentBlueprint.new!("write", :artifact_writer,
+            params: %{path: ".docs/out.md"},
+            policy: %{timeout_ms: 10_000, max_retries: 2}
+          )
+        ],
+        edges: [%{from: "compose", to: "write"}],
+        stop_conditions: ["done"]
+      )
+
+    assert {:ok, compiled} =
+             WorkflowCompiler.compile(blueprint, workspace,
+               review_decider: fn _request, _context -> :ok end,
+               max_runtime_ms: 120_000
+             )
+
+    write_policy =
+      Enum.find_value(compiled.scheduler_policies, fn
+        {{:name, regex}, policy} ->
+          if Regex.match?(regex, compiled.node_names["write"]), do: policy
+
+        _other ->
+          nil
+      end)
+
+    assert write_policy.timeout_ms == 125_000
+    assert write_policy.max_retries == 0
+    assert write_policy.backoff == :none
+  end
+
   test "workflow compiler rejects incompatible Runic port contracts" do
     root = tmp_dir()
     workspace = Workspace.new!(root: root)

@@ -64,16 +64,176 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              )
 
     assert error.message =~ "artifact write denied by review"
+    assert error.details.artifact_outcome.status == "artifact_not_written"
+    assert error.details.artifact_outcome.reason == "denied"
+    assert error.details.artifact_outcome.path == ".docs/report.md"
     refute File.exists?(Path.join(root, ".docs/report.md"))
 
     assert_receive {:artifact_write_review, request, %{workspace: ^workspace}}
     assert request.kind == :assistant_artifact_write
     assert request.checkpoint == :pre_write
     assert request.details.path == ".docs/report.md"
+    assert request.details.input_preview.text_preview =~ "High Level Overview"
 
     emitted = Elixir.Agent.get(events, & &1)
     assert Enum.any?(emitted, &(&1.stage == :review_requested and &1.status == :review))
     assert Enum.any?(emitted, &(&1.stage == :review_completed and &1.status == :blocked))
+  end
+
+  test "assistant workflow artifact review rewrite writes edited artifact content" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "chapter.md"), "Ada arrived.\n\nBea found the key.\n")
+
+    workspace =
+      Workspace.new!(
+        root: root,
+        path_policy: PathPolicy.new!(hidden_policy: :allow, allowed_write_roots: [".docs"])
+      )
+
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    review_decider = fn request, _context ->
+      {:ok, Review.rewrite(request, "# Edited report\n\nApproved browser rewrite.")}
+    end
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(report_blueprint(".docs/report.md"), workspace, %{},
+               client: scripted_client(),
+               model: "test:model",
+               write_policy: :docs_only,
+               run_id: "assistant-review-rewrite-test",
+               review_decider: review_decider,
+               event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
+             )
+
+    assert result.intermediate_outputs["write"].status == :written
+    assert File.read!(Path.join(root, ".docs/report.md")) =~ "Approved browser rewrite."
+
+    emitted = Elixir.Agent.get(events, & &1)
+    assert Enum.any?(emitted, &(&1.stage == :review_requested and &1.status == :review))
+
+    assert Enum.any?(
+             emitted,
+             &(&1.stage == :review_completed and &1.status == :ok and
+                 get_in(&1, [:data, :decision, :status]) == :edited)
+           )
+  end
+
+  test "artifact writer policy errors carry artifact-not-written outcome suggestions" do
+    root = tmp_dir()
+
+    workspace =
+      Workspace.new!(
+        root: root,
+        path_policy: PathPolicy.new!(hidden_policy: :allow, allowed_write_roots: [".docs"])
+      )
+
+    assert {:error, error} =
+             RunicAI.RLM.Components.ArtifactWriter.run(workspace, %{text: "Report"},
+               path: "tmp/report.md",
+               write_policy: :docs_only
+             )
+
+    assert error.details.artifact_outcome.status == "artifact_not_written"
+    assert error.details.artifact_outcome.reason == "policy_blocked"
+    assert error.details.artifact_outcome.suggested_paths == [".docs/report.md"]
+    refute File.exists?(Path.join(root, "tmp/report.md"))
+  end
+
+  test "assistant artifact prompts keep approval requests out of written content" do
+    root = tmp_dir()
+
+    File.write!(
+      Path.join(root, "meeting.md"),
+      "Decision: keep docs-only writes.\nAction: publish the report.\n"
+    )
+
+    parent = self()
+
+    client = fn _model, prompt, _opts ->
+      cond do
+        prompt =~ "Merged notes:" ->
+          send(parent, {:final_prompt, prompt})
+
+          {:ok,
+           TestClient.result("""
+           ## Decisions
+
+           - Keep docs-only writes.
+
+           ## Actions
+
+           - Publish the report.
+           """)}
+
+        prompt =~ "Partial notes group" ->
+          {:ok, TestClient.result("Decision: keep docs-only writes. Action: publish the report.")}
+
+        true ->
+          {:ok, TestClient.result("Meeting notes extracted.")}
+      end
+    end
+
+    review_decider = fn request, _context ->
+      send(parent, {:artifact_review_requested, request})
+      {:ok, Review.allow(request, reason: "approved in test")}
+    end
+
+    objective =
+      "Write a Markdown report to .docs/meeting-report.md summarizing meeting.md. Wait for approval before writing."
+
+    assert {:ok, result} =
+             Agent.run(root, objective,
+               input_paths: ["meeting.md"],
+               output_path: ".docs/meeting-report.md",
+               proposal_strategy: :fallback,
+               client: client,
+               model: "test:model",
+               write_policy: :docs_only,
+               review_decider: review_decider
+             )
+
+    assert result.status == :ok
+    assert_receive {:final_prompt, final_prompt}
+    assert final_prompt =~ "Do not ask the user for approval in the artifact content"
+    refute final_prompt =~ "Wait for approval before writing."
+    assert_receive {:artifact_review_requested, request}
+    assert request.details.path == ".docs/meeting-report.md"
+
+    content = File.read!(Path.join(root, ".docs/meeting-report.md"))
+    assert content =~ "## Decisions"
+    refute content =~ "Reply with"
+    refute content =~ "approval before writing"
+  end
+
+  test "assistant workflow validates artifact write policy before requesting review" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "chapter.md"), "Ada arrived.\n\nBea found the key.\n")
+
+    workspace =
+      Workspace.new!(
+        root: root,
+        path_policy: PathPolicy.new!(hidden_policy: :allow, allowed_write_roots: [".docs"])
+      )
+
+    parent = self()
+
+    review_decider = fn request, context ->
+      send(parent, {:unexpected_artifact_write_review, request, context})
+      {:ok, Review.allow(request, reason: "should not be called")}
+    end
+
+    assert {:error, error} =
+             WorkflowCompiler.run(report_blueprint("tmp/report.md"), workspace, %{},
+               client: scripted_client(),
+               model: "test:model",
+               write_policy: :docs_only,
+               review_decider: review_decider
+             )
+
+    assert error.message =~ "write policy"
+    assert error.details.suggested_paths == [".docs/report.md"]
+    refute_receive {:unexpected_artifact_write_review, _request, _context}
   end
 
   test "assistant agent builds the generic fallback workflow and emits stages" do

@@ -189,6 +189,33 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
            ]
   end
 
+  test "coordinator prefers curated ticket clustering recipe for common tabular tasks" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "tickets.jsonl"), ~s({"ticket":"T1","theme":"login"}\n))
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      flunk("curated recipe should not call the blueprint generation client")
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Cluster support tickets by theme",
+               input_paths: ["tickets.jsonl"],
+               output_path: ".docs/tickets.md",
+               client: client,
+               model: "test:model"
+             )
+
+    assert blueprint.metadata.proposal_kind == :curated_recipe
+    assert blueprint.metadata.recipe == :parse_normalize_report
+
+    assert %{type: :record_group, params: params} =
+             Enum.find(blueprint.components, &(&1.type == :record_group))
+
+    assert params.group_by == "theme"
+    assert params.dedupe_by == ["ticket_id", "ticket", "id"]
+  end
+
   test "coordinator repairs invalid generated blueprint diagnostics" do
     root = tmp_dir()
     File.write!(Path.join(root, "input.md"), "hello\n")

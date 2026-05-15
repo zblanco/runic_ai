@@ -19,8 +19,14 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 runic_ai-*.tar
 
+# Ignore generated Phoenix asset output.
+/priv/static/assets/
+/priv/static/cache_manifest.json
+
 # Temporary files, for example, from tests.
 /tmp/
 
-# Planning documents
+# Local RunicAI workbench data.
+/.runic_ai/
 
+# Planning documents

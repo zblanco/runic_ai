@@ -162,7 +162,9 @@ defmodule RunicAI.Terminal.AgentRunner do
       max_generated_function_tier: max_generated_function_tier(options.allow_generated_functions),
       write_policy: options.write_policy,
       event_sink: event_sink,
-      review_decider: review_decider(options, input_fun, output_fun, renderer, event_sink),
+      review_decider:
+        Keyword.get(opts, :review_decider) ||
+          review_decider(options, input_fun, output_fun, renderer, event_sink),
       run_fun: Keyword.get(opts, :run_fun)
     ]
     |> Keyword.merge(CliOptions.concurrency_opts(options))
@@ -220,7 +222,10 @@ defmodule RunicAI.Terminal.AgentRunner do
   defp close_persistence(_persistence), do: :ok
 
   defp write_persistence_event(%RunicAI.Persistence.SQLite.Store{} = store, event) do
-    SQLite.record_terminal_event(store, event)
+    with {:ok, persisted} <- SQLite.record_terminal_event(store, event) do
+      RunicAI.Workbench.broadcast_terminal_event(persisted)
+      {:ok, persisted}
+    end
   end
 
   defp write_persistence_event(_persistence, _event), do: :ok
@@ -287,6 +292,8 @@ defmodule RunicAI.Terminal.AgentRunner do
   end
 
   defp emit_final_event({:error, %Error{} = error}, %CliOptions{} = options, event_sink) do
+    artifact_outcome = Event.artifact_outcome_from_error(error)
+
     event =
       Event.new!(:error,
         session_id: options.session_id,
@@ -295,14 +302,25 @@ defmodule RunicAI.Terminal.AgentRunner do
         status: :error,
         title: "Agent failed",
         detail: error.message,
-        data: %{
-          run_id: options.session_id,
-          error: Map.take(error, [:kind, :message, :details, :source, :retryable?, :metadata])
-        }
+        data:
+          %{
+            run_id: options.session_id,
+            error: Map.take(error, [:kind, :message, :details, :source, :retryable?, :metadata])
+          }
+          |> maybe_put(:artifact_outcome, artifact_outcome)
+          |> maybe_put(:suggested_paths, suggested_paths(artifact_outcome))
       )
 
     event_sink.(event)
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp suggested_paths(nil), do: nil
+  defp suggested_paths(%{suggested_paths: paths}) when is_list(paths), do: paths
+  defp suggested_paths(%{"suggested_paths" => paths}) when is_list(paths), do: paths
+  defp suggested_paths(_outcome), do: nil
 
   defp terminal_status(status) when status in [:blocked, "blocked"], do: :blocked
   defp terminal_status(status) when status in [:error, :failed, "error", "failed"], do: :error

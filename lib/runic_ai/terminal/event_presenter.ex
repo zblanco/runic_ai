@@ -201,15 +201,15 @@ defmodule RunicAI.Terminal.EventPresenter do
 
   defp render_rlm_final_report(result) do
     scorecard = Map.get(result, :scorecard) || Map.get(result, "scorecard") || %{}
-    changed = scorecard[:changed_files] || scorecard["changed_files"] || []
-    risks = scorecard[:residual_risks] || scorecard["residual_risks"] || []
+    changed = field(scorecard, :changed_files) || []
+    risks = field(scorecard, :residual_risks) || []
 
     [
       "",
       "Final report",
       "  status: #{Map.get(result, :status)}",
       "  run: #{Map.get(result, :session_id) || Map.get(result, :run_id)}",
-      maybe_line("  objective", scorecard[:objective_status] || scorecard["objective_status"]),
+      maybe_line("  objective", field(scorecard, :objective_status)),
       maybe_list("  changed files", changed),
       maybe_list("  risks", risks),
       maybe_line("  persistence", Map.get(result, :persistence_ref))
@@ -221,14 +221,14 @@ defmodule RunicAI.Terminal.EventPresenter do
   defp render_assistant_final_report(result) do
     scorecard = Map.get(result, :scorecard) || Map.get(result, "scorecard") || %{}
     artifacts = Map.get(result, :artifacts) || Map.get(result, "artifacts") || []
-    risks = scorecard[:residual_risks] || scorecard["residual_risks"] || []
+    risks = field(scorecard, :residual_risks) || []
 
     [
       "",
       "Final report",
       "  status: #{Map.get(result, :status)}",
       "  run: #{Map.get(result, :session_id) || Map.get(result, :run_id)}",
-      maybe_line("  objective", scorecard[:objective_status] || scorecard["objective_status"]),
+      maybe_line("  objective", field(scorecard, :objective_status)),
       maybe_list("  artifacts", artifact_paths(artifacts)),
       maybe_list("  risks", risks)
     ]

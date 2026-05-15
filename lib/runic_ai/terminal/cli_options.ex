@@ -75,6 +75,8 @@ defmodule RunicAI.Terminal.CliOptions do
 
   @spec parse([String.t()]) :: {:ok, t()} | {:error, Error.t()}
   def parse(args) when is_list(args) do
+    input_values = repeated_option_values(args, "input")
+
     {opts, rest, invalid} =
       OptionParser.parse(args,
         strict: [
@@ -140,7 +142,7 @@ defmodule RunicAI.Terminal.CliOptions do
          {:ok, unicode} <-
            normalize_choice(Keyword.get(opts, :unicode, "auto"), @unicode_modes, :unicode),
          {:ok, graph} <- normalize_choice(Keyword.get(opts, :graph, "text"), @graph_modes, :graph),
-         {:ok, input_paths} <- normalize_input_paths(Keyword.get_values(opts, :input), cwd),
+         {:ok, input_paths} <- normalize_input_paths(input_values, cwd),
          {:ok, output_path} <- normalize_workspace_path(Keyword.get(opts, :output), cwd, :output),
          {:ok, client, client_label} <- normalize_client(Keyword.get(opts, :client)),
          {:ok, jsonl_path} <- normalize_jsonl_path(Keyword.get(opts, :jsonl), cwd),
@@ -345,7 +347,7 @@ defmodule RunicAI.Terminal.CliOptions do
   defp normalize_client(""), do: {:ok, nil, "default"}
   defp normalize_client("default"), do: {:ok, nil, "default"}
   defp normalize_client("req_llm"), do: {:ok, nil, "default"}
-  defp normalize_client("codex"), do: {:ok, :codex, "codex"}
+  defp normalize_client("codex"), do: {:ok, RunicAI.Coding.Codex.Client, "codex"}
 
   defp normalize_client(client) do
     {:error,
@@ -353,6 +355,28 @@ defmodule RunicAI.Terminal.CliOptions do
        source: __MODULE__,
        details: %{client: client, valid: ["default", "req_llm", "codex"]}
      )}
+  end
+
+  defp repeated_option_values(args, option_name) do
+    long = "--#{option_name}"
+    prefix = long <> "="
+
+    args
+    |> Enum.reduce({[], false}, fn
+      arg, {values, true} ->
+        {values ++ [arg], false}
+
+      ^long, {values, false} ->
+        {values, true}
+
+      arg, {values, false} when is_binary(arg) ->
+        if String.starts_with?(arg, prefix) do
+          {values ++ [String.replace_prefix(arg, prefix, "")], false}
+        else
+          {values, false}
+        end
+    end)
+    |> elem(0)
   end
 
   defp normalize_jsonl_path(nil, _cwd), do: {:ok, nil}

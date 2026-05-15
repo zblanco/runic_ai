@@ -23,6 +23,7 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
 
     require_provenance? = truthy?(get(params, :require_provenance?, false))
     require_artifact_quality? = truthy?(get(params, :require_artifact_quality?, false))
+    comparison_required? = truthy?(get(params, :comparison_required?, false))
 
     text = output_text(input) || artifact_text(workspace, artifact_path) || ""
     artifact_status = artifact_status(workspace, artifact_path)
@@ -33,6 +34,7 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
     source_count = source_count(context)
     provenance_count = provenance_count(input) + provenance_count(context)
     artifact_bytes = artifact_bytes(workspace, artifact_path)
+    comparison_count = comparison_count(input)
 
     coverage_status =
       cond do
@@ -58,7 +60,9 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
         text,
         missing_source_cues,
         artifact_quality,
-        require_artifact_quality?
+        require_artifact_quality?,
+        comparison_required?,
+        comparison_count
       )
 
     objective_status =
@@ -86,6 +90,8 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
        source_count: source_count,
        source_coverage: coverage_status,
        provenance_count: provenance_count,
+       comparison_required?: comparison_required?,
+       comparison_count: comparison_count,
        budget_summary: BudgetLedger.summary(get(context, :budget_ledger, nil)),
        residual_risks: residual_risks
      }}
@@ -271,14 +277,76 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
 
     nested =
       value
-      |> Map.take([:items, "items", :records, "records", :slices, "slices", :outputs, "outputs"])
+      |> Map.take([
+        :items,
+        "items",
+        :records,
+        "records",
+        :groups,
+        "groups",
+        :comparisons,
+        "comparisons",
+        :sources,
+        "sources",
+        :slices,
+        "slices",
+        :outputs,
+        "outputs",
+        :artifacts,
+        "artifacts",
+        :output,
+        "output",
+        :value,
+        "value"
+      ])
       |> Map.values()
       |> Enum.reduce(0, &(&2 + provenance_count(&1)))
 
-    own + nested
+    own + source_reference_count(value) + nested
   end
 
   defp provenance_count(_value), do: 0
+
+  defp comparison_count(value) when is_map(value) do
+    cond do
+      is_integer(get(value, :comparison_count, nil)) ->
+        get(value, :comparison_count, nil)
+
+      is_integer(get(value, :count, nil)) and has_comparison_shape?(value) ->
+        get(value, :count, nil)
+
+      is_list(get(value, :comparisons, nil)) ->
+        length(get(value, :comparisons, nil))
+
+      true ->
+        value
+        |> Map.take([:output, "output", :value, "value"])
+        |> Map.values()
+        |> Enum.reduce(0, &max(&2, comparison_count(&1)))
+    end
+  end
+
+  defp comparison_count(value) when is_list(value),
+    do: Enum.reduce(value, 0, &(&2 + comparison_count(&1)))
+
+  defp comparison_count(_value), do: 0
+
+  defp has_comparison_shape?(value) when is_map(value) do
+    Map.has_key?(value, :comparisons) or Map.has_key?(value, "comparisons")
+  end
+
+  defp source_reference_count(value) when is_map(value) do
+    cond do
+      present_path?(get(value, :path, nil)) -> 1
+      present_path?(get(value, :source_path, nil)) -> 1
+      present_path?(get(value, :absolute_path, nil)) -> 1
+      present_path?(get(value, :left, nil)) and present_path?(get(value, :right, nil)) -> 1
+      true -> 0
+    end
+  end
+
+  defp present_path?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_path?(_value), do: false
 
   defp residual_risks(
          :missing,
@@ -288,7 +356,9 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
          _text,
          _cues,
          _quality,
-         _required?
+         _required?,
+         _comparison_required?,
+         _comparison_count
        ),
        do: ["required artifact was not written"]
 
@@ -300,7 +370,9 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
          text,
          missing_source_cues,
          artifact_quality,
-         require_artifact_quality?
+         require_artifact_quality?,
+         comparison_required?,
+         comparison_count
        ) do
     []
     |> maybe_risk(String.trim(text || "") == "", "final output was empty")
@@ -323,6 +395,10 @@ defmodule RunicAI.RLM.Components.ObjectiveScorecard do
     |> maybe_risk(
       require_artifact_quality? and artifact_quality.status != :acceptable,
       "artifact quality issues: #{Enum.join(artifact_quality.issues, "; ")}"
+    )
+    |> maybe_risk(
+      comparison_required? and comparison_count == 0,
+      "comparison was required but fewer than two comparable sources were available"
     )
   end
 

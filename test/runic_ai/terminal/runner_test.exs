@@ -5,6 +5,7 @@ defmodule RunicAI.Terminal.RunnerTest do
   alias RunicAI.Coding.RLM.WorkflowProposal
   alias RunicAI.Coding.RLM.WorkflowScorecard
   alias RunicAI.Coding.RLM.WorkflowValidationReport
+  alias RunicAI.Error
   alias RunicAI.LLM.TestClient
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
@@ -85,6 +86,43 @@ defmodule RunicAI.Terminal.RunnerTest do
 
     assert Enum.any?(emitted, &(&1.phase == :scorecard))
     assert Enum.all?(emitted, &(event_run_id(&1) == "terminal-rlm-run"))
+  end
+
+  test "agent runner renders RLM final report with WorkflowScorecard structs" do
+    root = tmp_dir()
+    output = []
+
+    run_fun = fn _cwd, _objective, _opts -> {:ok, rlm_result()} end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Explain Demo",
+        "--agent",
+        "rlm",
+        "--cwd",
+        root,
+        "--persistence",
+        "none"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn line ->
+                 Process.put(:rlm_report_output, [line | Process.get(:rlm_report_output, output)])
+               end
+             )
+
+    assert result.status == :ok
+
+    rendered =
+      :rlm_report_output
+      |> Process.get([])
+      |> Enum.reverse()
+      |> Enum.join("\n")
+
+    assert rendered =~ "Final report"
+    assert rendered =~ "objective_satisfied"
   end
 
   test "assistant runner renders live stage events and final artifacts from a run function" do
@@ -227,6 +265,57 @@ defmodule RunicAI.Terminal.RunnerTest do
 
     assert Queries.run_timeline(store, result.run_id) != []
     assert Queries.runnable_events(store, result.run_id) != []
+  end
+
+  test "agent runner persists artifact-not-written outcomes on failed assistant runs" do
+    root = tmp_dir()
+    sqlite_path = Path.join(root, "runs.db")
+    session_id = "terminal-artifact-denied"
+
+    run_fun = fn _cwd, _objective, _opts ->
+      {:error,
+       Error.validation("artifact write denied by review",
+         details: %{
+           artifact_outcome: %{
+             status: "artifact_not_written",
+             reason: "denied",
+             path: ".docs/report.md",
+             suggested_paths: [".docs/report.md"]
+           }
+         }
+       )}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "write a report",
+        "--agent",
+        "assistant",
+        "--cwd",
+        root,
+        "--session-id",
+        session_id,
+        "--sqlite",
+        sqlite_path
+      ])
+
+    assert {:error, _error} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    {:ok, store} = SQLite.open(database: sqlite_path)
+    on_exit(fn -> SQLite.close(store) end)
+
+    messages = Queries.messages_for_session(store, session_id)
+
+    assert Enum.any?(
+             messages,
+             &(&1.content =~ "artifact_not_written: denied" and
+                 get_in(&1.content_json, ["artifact_outcome", "status"]) ==
+                   "artifact_not_written")
+           )
   end
 
   defp rlm_result do

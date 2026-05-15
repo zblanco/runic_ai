@@ -15,14 +15,18 @@ defmodule RunicAI.MixProject do
       package: package(),
       docs: docs(),
       deps: deps(),
-      aliases: aliases()
+      escript: [main_module: RunicAI.Server, name: "runic_ai"],
+      releases: releases(),
+      aliases: aliases(),
+      compilers: [:phoenix_live_view] ++ Mix.compilers(),
+      listeners: [Phoenix.CodeReloader]
     ]
   end
 
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :runtime_tools],
       mod: {RunicAI.Application, []}
     ]
   end
@@ -34,21 +38,46 @@ defmodule RunicAI.MixProject do
       {:req_llm, "~> 1.9"},
       {:ecto_sql, "~> 3.13"},
       {:ecto_sqlite3, "~> 0.22"},
+      {:phoenix, "~> 1.8.6"},
+      {:phoenix_html, "~> 4.1"},
+      {:phoenix_live_reload, "~> 1.2", only: :dev},
+      {:phoenix_live_view, "~> 1.1"},
+      {:lazy_html, ">= 0.1.0", only: :test},
+      {:mdex, "~> 0.12.2"},
+      {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.3", runtime: Mix.env() == :dev},
+      {:heroicons,
+       github: "tailwindlabs/heroicons",
+       tag: "v2.2.0",
+       sparse: "optimized",
+       app: false,
+       compile: false,
+       depth: 1},
+      {:telemetry_metrics, "~> 1.0"},
+      {:telemetry_poller, "~> 1.0"},
+      {:jason, "~> 1.2"},
+      {:dns_cluster, "~> 0.2"},
+      {:bandit, "~> 1.5"},
       {:ex_ratatui, "~> 0.8"},
       {:rustler, "~> 0.37.3", runtime: false},
       {:owl, "~> 0.13"},
       {:bunt, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:just_bash, "~> 0.3", only: [:dev, :test], optional: true},
-      {:tidewave, "~> 0.4", only: :dev},
-      {:bandit, "~> 1.0", only: :dev}
+      {:tidewave, "~> 0.5", only: :dev}
     ]
   end
 
   defp aliases do
     [
-      tidewave:
-        "run --no-halt -e 'Agent.start(fn -> Bandit.start_link(plug: Tidewave, port: 4000) end)'"
+      setup: ["deps.get", "assets.setup", "assets.build"],
+      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.build": ["compile", "tailwind runic_ai", "esbuild runic_ai"],
+      "assets.deploy": [
+        "tailwind runic_ai --minify",
+        "esbuild runic_ai --minify",
+        "phx.digest"
+      ]
     ]
   end
 
@@ -58,12 +87,22 @@ defmodule RunicAI.MixProject do
 
   defp package do
     [
-      files: ~w(lib mix.exs README.md CHANGELOG.md SECURITY.md guides livebooks .formatter.exs),
+      files:
+        ~w(lib config priv/static mix.exs README.md CHANGELOG.md SECURITY.md guides livebooks .formatter.exs),
       links: %{
         "GitHub" => @source_url,
         "Runic" => "https://hex.pm/packages/runic",
         "ReqLLM" => "https://hex.pm/packages/req_llm"
       }
+    ]
+  end
+
+  defp releases do
+    [
+      runic_ai: [
+        include_executables_for: [:unix],
+        applications: [runtime_tools: :permanent]
+      ]
     ]
   end
 

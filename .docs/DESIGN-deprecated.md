@@ -1,6 +1,6 @@
 # RunicAI Terminal Design Guide
 
-Status: draft
+Status: DEPRECATED
 
 Date: 2026-05-01
 

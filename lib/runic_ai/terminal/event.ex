@@ -294,6 +294,19 @@ defmodule RunicAI.Terminal.Event do
     |> maybe_append(rlm_persistence_event(result, opts))
   end
 
+  @spec artifact_outcome_from_error(Error.t() | map() | nil) :: map() | nil
+  def artifact_outcome_from_error(%Error{} = error) do
+    artifact_outcome_from_error(Map.from_struct(error))
+  end
+
+  def artifact_outcome_from_error(error) when is_map(error) do
+    normalize_artifact_outcome(field(error, :artifact_outcome)) ||
+      error |> field(:details) |> artifact_outcome_from_details() ||
+      error |> field(:metadata) |> artifact_outcome_from_details()
+  end
+
+  def artifact_outcome_from_error(_error), do: nil
+
   @spec to_json_map(t(), keyword()) :: map()
   def to_json_map(%__MODULE__{} = event, opts \\ []) do
     include_raw? = Keyword.get(opts, :include_raw?, false)
@@ -492,7 +505,7 @@ defmodule RunicAI.Terminal.Event do
   defp rlm_final_output_event(result, opts) do
     agent = Keyword.get(opts, :agent, :rlm)
 
-    if agent == :rlm do
+    if agent in [:rlm, :assistant] do
       result
       |> rlm_final_output_text()
       |> case do
@@ -500,20 +513,29 @@ defmodule RunicAI.Terminal.Event do
           text = String.trim(text)
 
           if text != "" do
+            status = final_output_status(result)
+            artifact_paths = artifact_paths(result)
+            artifact_outcome = artifact_outcome(result, artifact_paths)
+
             new!(:message,
               session_id: Keyword.get(opts, :session_id),
-              agent: :rlm,
+              agent: agent,
               phase: :assistant,
-              status: :ok,
-              title: "RLM final output",
+              status: status,
+              title: "#{rlm_label(agent)} final output",
               detail: preview(text),
-              data: %{
-                run_id: Keyword.get(opts, :run_id) || Keyword.get(opts, :session_id),
-                role: "assistant",
-                message_kind: "workflow_output",
-                content: text,
-                output_text: text
-              },
+              data:
+                %{
+                  run_id: Keyword.get(opts, :run_id) || Keyword.get(opts, :session_id),
+                  role: "assistant",
+                  message_kind: "workflow_output",
+                  content: text,
+                  output_text: text,
+                  blocked?: status == :blocked,
+                  blocking_reason: blocking_reason(result),
+                  artifact_paths: artifact_paths
+                }
+                |> maybe_put(:artifact_outcome, artifact_outcome),
               raw: result
             )
           end
@@ -521,6 +543,39 @@ defmodule RunicAI.Terminal.Event do
         _other ->
           nil
       end
+    end
+  end
+
+  defp final_output_status(result) do
+    case scorecard(result) do
+      nil ->
+        :ok
+
+      scorecard ->
+        if field(scorecard, :objective_status) in [:objective_incomplete, "objective_incomplete"] do
+          :blocked
+        else
+          :ok
+        end
+    end
+  end
+
+  defp blocking_reason(result) do
+    case scorecard(result) do
+      nil ->
+        nil
+
+      scorecard ->
+        scorecard
+        |> field(:residual_risks)
+        |> List.wrap()
+        |> Enum.reject(&is_nil/1)
+        |> Enum.map(&to_string/1)
+        |> Enum.join("; ")
+        |> case do
+          "" -> nil
+          reason -> reason
+        end
     end
   end
 
@@ -651,6 +706,8 @@ defmodule RunicAI.Terminal.Event do
       text_field(result, :content),
       text_candidate(field(result, :output)),
       episode_output_text(result),
+      text_candidate(field(result, :repair_history)),
+      text_candidate(field(result, :repair_attempts)),
       text_candidate(field(result, :artifacts))
     ]
     |> Enum.find(&present_text?/1)
@@ -712,6 +769,81 @@ defmodule RunicAI.Terminal.Event do
 
   defp present_text?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_text?(_value), do: false
+
+  defp artifact_paths(result) do
+    result
+    |> field(:artifacts)
+    |> List.wrap()
+    |> Enum.map(fn artifact -> field(artifact, :path) || field(artifact, :absolute_path) end)
+    |> Enum.filter(&present_text?/1)
+    |> Enum.uniq()
+  end
+
+  defp artifact_outcome(result, paths) do
+    explicit =
+      normalize_artifact_outcome(field(result, :artifact_outcome)) ||
+        result |> field(:metadata) |> artifact_outcome_from_details()
+
+    cond do
+      not is_nil(explicit) -> explicit
+      paths == [] -> nil
+      true -> %{status: "artifact_written", paths: paths}
+    end
+  end
+
+  defp artifact_outcome_from_details(details) when is_map(details) do
+    normalize_artifact_outcome(field(details, :artifact_outcome))
+  end
+
+  defp artifact_outcome_from_details(_details), do: nil
+
+  defp normalize_artifact_outcome(nil), do: nil
+
+  defp normalize_artifact_outcome(outcome) when is_map(outcome) do
+    status = field(outcome, :status)
+    reason = field(outcome, :reason)
+    paths = outcome |> field(:paths) |> List.wrap() |> Enum.filter(&present_text?/1)
+
+    suggested_paths =
+      outcome |> field(:suggested_paths) |> List.wrap() |> Enum.filter(&present_text?/1)
+
+    base =
+      cond do
+        status in [:artifact_written, "artifact_written"] ->
+          %{status: "artifact_written"}
+
+        status in [:artifact_not_written, "artifact_not_written", :not_written, "not_written"] ->
+          %{status: "artifact_not_written"}
+
+        present_text?(reason) ->
+          %{status: "artifact_not_written"}
+
+        true ->
+          nil
+      end
+
+    if is_nil(base) do
+      nil
+    else
+      base
+      |> maybe_put(:reason, normalize_outcome_reason(reason))
+      |> maybe_put(:path, field(outcome, :path))
+      |> maybe_put(:paths, non_empty(paths))
+      |> maybe_put(:suggested_paths, non_empty(suggested_paths))
+      |> maybe_put(:decision_status, field(outcome, :decision_status))
+      |> maybe_put(:policy, field(outcome, :policy))
+    end
+  end
+
+  defp normalize_artifact_outcome(_outcome), do: nil
+
+  defp normalize_outcome_reason(nil), do: nil
+  defp normalize_outcome_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp normalize_outcome_reason(reason) when is_binary(reason), do: reason
+  defp normalize_outcome_reason(reason), do: inspect(reason)
+
+  defp non_empty([]), do: nil
+  defp non_empty(values), do: values
 
   defp trace_status(%TraceEvent{kind: :review_requested}), do: :review
   defp trace_status(%TraceEvent{kind: :wait_registered}), do: :waiting
@@ -895,6 +1027,9 @@ defmodule RunicAI.Terminal.Event do
 
   defp maybe_put_raw(map, raw, true), do: Map.put(map, :raw, json_safe(raw))
   defp maybe_put_raw(map, _raw, false), do: map
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_append(events, nil), do: events
   defp maybe_append(events, event), do: events ++ [event]

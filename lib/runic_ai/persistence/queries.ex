@@ -8,6 +8,7 @@ defmodule RunicAI.Persistence.Queries do
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.SQLite.Store
   alias RunicAI.Persistence.Schemas.AgentMessage
+  alias RunicAI.Persistence.Schemas.AgentSession
   alias RunicAI.Persistence.Schemas.ManagedWorkflow
   alias RunicAI.Persistence.Schemas.RepairAttempt
   alias RunicAI.Persistence.Schemas.ReviewRequest
@@ -19,6 +20,88 @@ defmodule RunicAI.Persistence.Queries do
   alias RunicAI.Persistence.Schemas.WorkflowEvent
   alias RunicAI.Persistence.Schemas.WorkflowFact
   alias RunicAI.Persistence.Schemas.WorkflowRun
+
+  @spec recent_sessions_query(keyword()) :: Ecto.Query.t()
+  def recent_sessions_query(opts \\ []) do
+    limit = Keyword.get(opts, :limit, 30)
+
+    from(session in AgentSession,
+      order_by: [
+        asc:
+          fragment(
+            "CASE ? WHEN 'running' THEN 0 WHEN 'review' THEN 1 WHEN 'waiting' THEN 2 WHEN 'failed' THEN 3 ELSE 4 END",
+            session.status
+          ),
+        desc: session.started_at,
+        desc: session.inserted_at
+      ],
+      limit: ^limit
+    )
+  end
+
+  @spec recent_sessions(Store.t(), keyword()) :: [AgentSession.t()]
+  def recent_sessions(%Store{} = store, opts \\ []) do
+    SQLite.with_repo(store, fn -> store.repo.all(recent_sessions_query(opts)) end)
+  end
+
+  @spec get_session(Store.t(), String.t()) :: AgentSession.t() | nil
+  def get_session(%Store{} = store, session_id) when is_binary(session_id) do
+    SQLite.with_repo(store, fn -> store.repo.get(AgentSession, session_id) end)
+  end
+
+  @spec messages_for_session_query(String.t()) :: Ecto.Query.t()
+  def messages_for_session_query(session_id) when is_binary(session_id) do
+    from(message in AgentMessage,
+      where: message.session_id == ^session_id,
+      order_by: [asc: message.created_at]
+    )
+  end
+
+  @spec messages_for_session(Store.t(), String.t()) :: [AgentMessage.t()]
+  def messages_for_session(%Store{} = store, session_id) do
+    SQLite.with_repo(store, fn -> store.repo.all(messages_for_session_query(session_id)) end)
+  end
+
+  @spec terminal_events_for_session_query(String.t()) :: Ecto.Query.t()
+  def terminal_events_for_session_query(session_id) when is_binary(session_id) do
+    from(event in TerminalEvent,
+      where: event.session_id == ^session_id or event.run_id == ^session_id,
+      order_by: [asc: event.sequence, asc: event.at]
+    )
+  end
+
+  @spec terminal_events_for_session(Store.t(), String.t()) :: [TerminalEvent.t()]
+  def terminal_events_for_session(%Store{} = store, session_id) do
+    SQLite.with_repo(store, fn ->
+      store.repo.all(terminal_events_for_session_query(session_id))
+    end)
+  end
+
+  @spec workflow_runs_for_session_query(String.t()) :: Ecto.Query.t()
+  def workflow_runs_for_session_query(session_id) when is_binary(session_id) do
+    from(run in WorkflowRun,
+      where: run.session_id == ^session_id or run.id == ^session_id,
+      order_by: [desc: run.started_at, desc: run.inserted_at]
+    )
+  end
+
+  @spec workflow_runs_for_session(Store.t(), String.t()) :: [WorkflowRun.t()]
+  def workflow_runs_for_session(%Store{} = store, session_id) do
+    SQLite.with_repo(store, fn -> store.repo.all(workflow_runs_for_session_query(session_id)) end)
+  end
+
+  @spec tool_calls_for_session_query(String.t()) :: Ecto.Query.t()
+  def tool_calls_for_session_query(session_id) when is_binary(session_id) do
+    from(call in ToolCall,
+      where: call.session_id == ^session_id or call.workflow_run_id == ^session_id,
+      order_by: [asc: call.requested_at, asc: call.started_at, asc: call.completed_at]
+    )
+  end
+
+  @spec tool_calls_for_session(Store.t(), String.t()) :: [ToolCall.t()]
+  def tool_calls_for_session(%Store{} = store, session_id) do
+    SQLite.with_repo(store, fn -> store.repo.all(tool_calls_for_session_query(session_id)) end)
+  end
 
   @spec recent_runs_query(keyword()) :: Ecto.Query.t()
   def recent_runs_query(opts \\ []) do
@@ -205,7 +288,7 @@ defmodule RunicAI.Persistence.Queries do
   @spec review_requests_query(String.t()) :: Ecto.Query.t()
   def review_requests_query(run_id) when is_binary(run_id) do
     from(request in ReviewRequest,
-      where: request.workflow_run_id == ^run_id,
+      where: request.workflow_run_id == ^run_id or request.session_id == ^run_id,
       order_by: [asc: request.inserted_at]
     )
   end

@@ -7,14 +7,23 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
   alias RunicAI.Error
   alias RunicAI.RLM.Components.BlueprintTransform
 
+  @spec validate_target(term(), term()) :: :ok | {:error, Error.t()}
+  def validate_target(path, write_policy) do
+    write_policy = write_policy(write_policy)
+
+    with :ok <- validate_path(path),
+         :ok <- enforce_write_policy(path, write_policy) do
+      :ok
+    end
+  end
+
   @spec run(Workspace.t(), term(), map() | keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(%Workspace{} = workspace, input, params \\ %{}) do
     params = opts_map(params)
     path = get(params, :path, nil)
     write_policy = write_policy(get(params, :write_policy, :docs_only))
 
-    with :ok <- validate_path(path),
-         :ok <- enforce_write_policy(path, write_policy),
+    with :ok <- validate_target(path, write_policy),
          {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
          content <- content(input, params),
          :ok <- File.mkdir_p(Path.dirname(resolved.path)),
@@ -101,7 +110,16 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
     {:error,
      Error.validation("artifact writer requires a non-empty path",
        source: __MODULE__,
-       details: %{path: path}
+       details: %{
+         path: path,
+         suggested_paths: suggested_paths(:docs_only, path),
+         artifact_outcome:
+           artifact_not_written_outcome(
+             :repair_answer_only,
+             path,
+             suggested_paths(:docs_only, path)
+           )
+       }
      )}
   end
 
@@ -120,12 +138,36 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
   end
 
   defp policy_error(policy, path \\ nil) do
+    suggested_paths = suggested_paths(policy, path)
+
     {:error,
      Error.validation("artifact write blocked by assistant write policy",
        source: __MODULE__,
-       details: %{policy: policy, path: path}
+       details: %{
+         policy: policy,
+         path: path,
+         suggested_paths: suggested_paths,
+         artifact_outcome: artifact_not_written_outcome(:policy_blocked, path, suggested_paths)
+       }
      )}
   end
+
+  defp artifact_not_written_outcome(reason, path, suggested_paths) do
+    %{
+      status: "artifact_not_written",
+      reason: to_string(reason),
+      path: path,
+      suggested_paths: suggested_paths
+    }
+  end
+
+  defp suggested_paths(:docs_only, path) when is_binary(path) and path != "" do
+    basename = Path.basename(path)
+    [Path.join(".docs", basename)]
+  end
+
+  defp suggested_paths(:docs_only, _path), do: [".docs/report.md"]
+  defp suggested_paths(_policy, _path), do: []
 
   defp write_policy(value) when value in [:none, :docs_only, :workspace_review], do: value
   defp write_policy("none"), do: :none

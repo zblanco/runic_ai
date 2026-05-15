@@ -1,0 +1,1690 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RunicAI Workbench</title>
+  <style>
+    :root {
+      --bg: oklch(11% 0.026 282);
+      --bg-deep: oklch(7% 0.018 282);
+      --surface: oklch(16% 0.026 282);
+      --surface-2: oklch(20% 0.03 282);
+      --surface-3: oklch(25% 0.034 282);
+      --fg: oklch(91% 0.025 82);
+      --soft: oklch(73% 0.03 82);
+      --muted: oklch(56% 0.035 78);
+      --border: oklch(42% 0.065 65);
+      --border-soft: oklch(28% 0.04 67);
+      --accent: oklch(72% 0.14 164);
+      --gold: oklch(77% 0.13 78);
+      --violet: oklch(64% 0.14 304);
+      --danger: oklch(68% 0.17 24);
+      --warn: oklch(78% 0.15 74);
+      --ok: oklch(72% 0.14 150);
+      --glass: color-mix(in oklch, var(--surface) 54%, transparent);
+      --glass-strong: color-mix(in oklch, var(--surface-2) 68%, transparent);
+      --glass-soft: color-mix(in oklch, var(--surface) 34%, transparent);
+      --glass-line: rgba(255, 244, 211, 0.07);
+      --shadow: 0 30px 110px rgba(0, 0, 0, 0.46);
+      --shadow-soft: 0 18px 58px rgba(0, 0, 0, 0.26);
+      --frost: blur(26px) saturate(142%);
+      --font-display: "Iowan Old Style", "Charter", "Palatino Linotype", Georgia, serif;
+      --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      min-height: 100%;
+      margin: 0;
+      background: var(--bg-deep);
+      color: var(--fg);
+      font-family: var(--font-body);
+      letter-spacing: 0;
+    }
+
+    body {
+      overflow: hidden;
+    }
+
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      cursor: pointer;
+    }
+
+    .workbench {
+      position: relative;
+      display: grid;
+      grid-template-columns: 304px minmax(680px, 1fr) 410px;
+      gap: 18px;
+      height: 100vh;
+      padding: 18px;
+      background:
+        linear-gradient(90deg, rgba(222, 166, 81, 0.024) 1px, transparent 1px) 0 0 / 86px 86px,
+        linear-gradient(0deg, rgba(222, 166, 81, 0.02) 1px, transparent 1px) 0 0 / 86px 86px,
+        radial-gradient(circle at 48% -18%, rgba(122, 225, 180, 0.12), transparent 34%),
+        radial-gradient(circle at 94% 28%, rgba(128, 77, 166, 0.14), transparent 28%),
+        radial-gradient(circle at 8% 82%, rgba(222, 166, 81, 0.08), transparent 30%),
+        var(--bg);
+      transition: grid-template-columns 220ms ease;
+    }
+
+    .workbench.inspector-collapsed {
+      grid-template-columns: 304px minmax(680px, 1fr) 54px;
+    }
+
+    .workbench::before {
+      content: "ᚱ ᚢ ᚾ ᛁ ᚳ";
+      position: fixed;
+      left: 318px;
+      right: 420px;
+      top: 74px;
+      z-index: 0;
+      color: rgba(232, 192, 116, 0.035);
+      font-family: var(--font-display);
+      font-size: clamp(82px, 11vw, 178px);
+      letter-spacing: 0.24em;
+      filter: blur(0.4px);
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    .sidebar,
+    .main,
+    .inspector {
+      position: relative;
+      z-index: 1;
+      min-height: 0;
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: var(--frost);
+      -webkit-backdrop-filter: var(--frost);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.032), rgba(255, 244, 211, 0.008)),
+        rgba(12, 9, 18, 0.66);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.045),
+        var(--shadow-soft);
+    }
+
+    .brand {
+      display: grid;
+      grid-template-columns: 46px 1fr;
+      gap: 12px;
+      align-items: center;
+      padding: 22px 22px 18px;
+    }
+
+    .sigil {
+      display: grid;
+      place-items: center;
+      width: 46px;
+      height: 46px;
+      border-radius: 14px;
+      background:
+        linear-gradient(135deg, rgba(222, 166, 81, 0.2), rgba(92, 64, 132, 0.18)),
+        rgba(255, 255, 255, 0.04);
+      color: var(--gold);
+      font-family: var(--font-display);
+      font-size: 25px;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.14),
+        0 18px 34px rgba(0, 0, 0, 0.28);
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 600;
+      line-height: 1;
+    }
+
+    .brand p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+
+    .sidebar-scroll {
+      min-height: 0;
+      padding: 16px 14px 22px;
+      overflow: auto;
+    }
+
+    .section-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 20px 10px 10px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+
+    .count {
+      color: var(--gold);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .nav-item,
+    .session {
+      width: 100%;
+      color: inherit;
+      text-align: left;
+      background: transparent;
+    }
+
+    .nav-item {
+      position: relative;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      width: calc(100% + 28px);
+      margin: 0 -14px;
+      padding: 11px 26px;
+      border-radius: 0;
+      color: var(--soft);
+      font-size: 13px;
+      isolation: isolate;
+    }
+
+    .nav-item:hover {
+      background: rgba(255, 244, 211, 0.032);
+      color: var(--fg);
+      backdrop-filter: blur(14px) saturate(122%);
+      -webkit-backdrop-filter: blur(14px) saturate(122%);
+    }
+
+    .nav-item.active {
+      background:
+        linear-gradient(90deg, rgba(222, 166, 81, 0.09), rgba(255, 244, 211, 0.028) 44%, transparent),
+        rgba(0, 0, 0, 0.14);
+      color: var(--fg);
+      backdrop-filter: blur(22px) saturate(138%);
+      -webkit-backdrop-filter: blur(22px) saturate(138%);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+    }
+
+    .nav-item.active::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: var(--gold);
+      box-shadow: 0 0 18px color-mix(in oklch, var(--gold) 50%, transparent);
+    }
+
+    .nav-icon {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      color: var(--gold);
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    .session {
+      position: relative;
+      display: grid;
+      grid-template-columns: 12px 1fr auto;
+      gap: 12px;
+      align-items: start;
+      width: calc(100% + 28px);
+      margin: 6px -14px;
+      padding: 14px 26px;
+      border-radius: 0;
+      isolation: isolate;
+    }
+
+    .session.active {
+      padding: 15px 26px;
+      background:
+        linear-gradient(90deg, rgba(122, 225, 180, 0.105), rgba(255, 244, 211, 0.026) 48%, transparent),
+        rgba(0, 0, 0, 0.18);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.042),
+        0 0 32px rgba(122, 225, 180, 0.052),
+        0 16px 36px rgba(0, 0, 0, 0.16);
+      backdrop-filter: blur(20px) saturate(132%);
+      -webkit-backdrop-filter: blur(20px) saturate(132%);
+    }
+
+    .session.active::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: var(--accent);
+      box-shadow:
+        0 0 18px color-mix(in oklch, var(--accent) 44%, transparent),
+        0 0 34px color-mix(in oklch, var(--gold) 16%, transparent);
+    }
+
+    .session:hover {
+      background:
+        linear-gradient(90deg, rgba(255, 244, 211, 0.035), rgba(255, 244, 211, 0.014) 52%, transparent),
+        rgba(0, 0, 0, 0.08);
+      backdrop-filter: blur(14px) saturate(116%);
+      -webkit-backdrop-filter: blur(14px) saturate(116%);
+    }
+
+    .session.active:hover {
+      background:
+        linear-gradient(90deg, rgba(122, 225, 180, 0.13), rgba(255, 244, 211, 0.032) 48%, transparent),
+        rgba(0, 0, 0, 0.2);
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      margin-top: 4px;
+      border-radius: 999px;
+      background: var(--muted);
+      box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.035);
+    }
+
+    .dot.running {
+      background: var(--accent);
+      box-shadow: 0 0 20px color-mix(in oklch, var(--accent) 58%, transparent);
+    }
+
+    .dot.waiting {
+      background: var(--warn);
+    }
+
+    .dot.failed {
+      background: var(--danger);
+    }
+
+    .session-title {
+      margin: 0;
+      color: var(--fg);
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.25;
+    }
+
+    .session-meta {
+      display: flex;
+      gap: 8px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      white-space: nowrap;
+    }
+
+    .session-time {
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10px;
+    }
+
+    .sidebar-footer {
+      display: grid;
+      gap: 10px;
+      padding: 16px 22px 22px;
+      background: rgba(0, 0, 0, 0.11);
+    }
+
+    .health-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    .health-row strong {
+      color: var(--ok);
+      font-weight: 650;
+    }
+
+    .main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-width: 0;
+      border-radius: 18px;
+      background: transparent;
+      box-shadow: none;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: center;
+      margin: 2px 0 18px;
+      padding: 14px 4px 8px;
+      background: transparent;
+    }
+
+    .crumbs {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 4px;
+      color: var(--accent);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .topbar h2 {
+      margin: 0;
+      overflow: hidden;
+      color: var(--fg);
+      font-family: var(--font-display);
+      font-size: 25px;
+      font-weight: 600;
+      line-height: 1.08;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .topbar-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      display: inline-flex;
+      gap: 7px;
+      align-items: center;
+      min-height: 30px;
+      padding: 6px 10px;
+      border: 1px solid rgba(255, 244, 211, 0.045);
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.2);
+      color: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .pill.accent {
+      background: color-mix(in oklch, var(--accent) 14%, transparent);
+      color: var(--accent);
+    }
+
+    .pill.gold {
+      background: color-mix(in oklch, var(--gold) 13%, transparent);
+      color: var(--gold);
+    }
+
+    .content {
+      min-height: 0;
+      overflow: auto;
+      padding: 0 2px 20px;
+    }
+
+    .workspace-view {
+      display: grid;
+      gap: 12px;
+    }
+
+    .workspace-tabs {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      width: max-content;
+      max-width: 100%;
+      padding: 4px;
+      border: 1px solid rgba(255, 244, 211, 0.055);
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.18);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+      backdrop-filter: blur(18px) saturate(128%);
+      -webkit-backdrop-filter: blur(18px) saturate(128%);
+      overflow-x: auto;
+    }
+
+    .workspace-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .workspace-tab.active {
+      background: rgba(255, 244, 211, 0.075);
+      color: var(--fg);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.07);
+    }
+
+    .workspace-tab-icon {
+      color: var(--gold);
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .workspace-tab-meta {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      padding: 3px 7px;
+      border: 1px solid rgba(255, 244, 211, 0.045);
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.24);
+      color: var(--muted);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .workspace-tab.active .workspace-tab-meta {
+      color: var(--accent);
+    }
+
+    .workspace-panel {
+      display: none;
+      min-width: 0;
+    }
+
+    .workspace-panel.active {
+      display: block;
+    }
+
+    .run-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 0;
+    }
+
+    .run-step {
+      position: relative;
+      min-height: 88px;
+      padding: 15px 16px 14px;
+      border: 1px solid rgba(255, 244, 211, 0.065);
+      border-radius: 16px;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.035), rgba(255, 244, 211, 0.012)),
+        rgba(4, 3, 8, 0.36);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.035),
+        0 12px 34px rgba(0, 0, 0, 0.18);
+      backdrop-filter: blur(20px) saturate(130%);
+      -webkit-backdrop-filter: blur(20px) saturate(130%);
+    }
+
+    .run-step::before {
+      content: "";
+      position: absolute;
+      top: 18px;
+      bottom: 18px;
+      left: 0;
+      width: 3px;
+      border-radius: 999px;
+      background: var(--muted);
+    }
+
+    .run-step.done::before {
+      background: var(--ok);
+    }
+
+    .run-step.live::before {
+      background: var(--accent);
+      box-shadow: 0 0 18px color-mix(in oklch, var(--accent) 58%, transparent);
+    }
+
+    .run-step.wait::before {
+      background: var(--warn);
+    }
+
+    .run-step span {
+      display: block;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      text-transform: uppercase;
+    }
+
+    .run-step strong {
+      display: block;
+      margin-top: 7px;
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .run-step em {
+      display: block;
+      margin-top: 7px;
+      color: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-style: normal;
+    }
+
+    .chat {
+      display: block;
+      width: 100%;
+      margin: 0;
+      border: 1px solid rgba(255, 244, 211, 0.075);
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.028), rgba(255, 244, 211, 0.006)),
+        rgba(4, 3, 8, 0.44);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.035),
+        0 18px 56px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+      backdrop-filter: blur(24px) saturate(132%);
+      -webkit-backdrop-filter: blur(24px) saturate(132%);
+    }
+
+    .message {
+      display: block;
+      width: 100%;
+    }
+
+    .message + .message {
+      border-top: 1px solid rgba(255, 244, 211, 0.07);
+    }
+
+    .sender {
+      display: inline-flex;
+      gap: 9px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .avatar-mark {
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      background: rgba(255, 244, 211, 0.075);
+      color: var(--gold);
+      font-family: var(--font-display);
+      font-size: 14px;
+      line-height: 1;
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.075);
+    }
+
+    .bubble {
+      background: transparent;
+      overflow: hidden;
+    }
+
+    .bubble-head {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 18px 2px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    .bubble-head strong {
+      color: var(--soft);
+      font-weight: 700;
+    }
+
+    .bubble-body {
+      padding: 11px 18px 20px;
+      color: var(--soft);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .bubble-body p {
+      margin: 0 0 10px;
+    }
+
+    .bubble-body p:last-child {
+      margin-bottom: 0;
+    }
+
+    .objective {
+      color: var(--fg);
+      font-size: 16px;
+    }
+
+    .activity-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .activity {
+      min-height: 104px;
+      padding: 14px;
+      border: 1px solid rgba(255, 244, 211, 0.055);
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.22);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+    }
+
+    .activity span {
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      text-transform: uppercase;
+    }
+
+    .activity strong {
+      display: block;
+      margin-top: 7px;
+      color: var(--fg);
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .activity code,
+    .code {
+      color: var(--gold);
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    .review {
+      margin-top: 18px;
+      border: 1px solid rgba(222, 166, 81, 0.12);
+      border-radius: 16px;
+      background:
+        radial-gradient(circle at 9% 0%, rgba(222, 166, 81, 0.11), transparent 34%),
+        rgba(0, 0, 0, 0.24);
+      box-shadow:
+        inset 0 1px 0 color-mix(in oklch, var(--warn) 18%, transparent),
+        0 16px 44px rgba(0, 0, 0, 0.2);
+    }
+
+    .review h3 {
+      margin: 0;
+      padding: 16px 18px 0;
+      color: var(--fg);
+      font-size: 15px;
+    }
+
+    .review p {
+      margin: 8px 18px 0;
+      color: var(--soft);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .review-actions {
+      display: flex;
+      gap: 8px;
+      padding: 16px 18px 18px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      min-height: 34px;
+      padding: 8px 12px;
+      border: 1px solid rgba(255, 244, 211, 0.05);
+      border-radius: 11px;
+      background: rgba(0, 0, 0, 0.24);
+      color: var(--fg);
+      font-size: 12px;
+      font-weight: 650;
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+    }
+
+    .btn.primary {
+      background: color-mix(in oklch, var(--accent) 22%, var(--surface-2));
+      color: oklch(96% 0.024 160);
+    }
+
+    .btn.warn {
+      color: var(--warn);
+    }
+
+    .artifact-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      margin-top: 12px;
+      padding: 14px 15px;
+      border: 1px solid rgba(255, 244, 211, 0.055);
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.22);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+    }
+
+    .artifact-row strong {
+      display: block;
+      color: var(--fg);
+      font-size: 13px;
+    }
+
+    .artifact-row span {
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+    }
+
+    .composer {
+      padding: 2px 2px 2px;
+      background: linear-gradient(0deg, rgba(10, 7, 14, 0.56), transparent);
+      backdrop-filter: var(--frost);
+      -webkit-backdrop-filter: var(--frost);
+    }
+
+    .composer-shell {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      width: 100%;
+      margin: 0;
+      padding: 12px;
+      border: 1px solid rgba(222, 166, 81, 0.32);
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.04), rgba(255, 244, 211, 0.012)),
+        rgba(4, 3, 8, 0.56);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.05),
+        0 18px 52px rgba(0, 0, 0, 0.3),
+        0 0 38px rgba(222, 166, 81, 0.07),
+        0 0 34px rgba(122, 225, 180, 0.045);
+      backdrop-filter: blur(24px) saturate(145%);
+      -webkit-backdrop-filter: blur(24px) saturate(145%);
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+
+    .composer-shell:focus-within {
+      border-color: rgba(244, 197, 111, 0.78);
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.055), rgba(255, 244, 211, 0.014)),
+        rgba(4, 3, 8, 0.62);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.08),
+        0 18px 52px rgba(0, 0, 0, 0.32),
+        0 0 0 1px rgba(244, 197, 111, 0.16),
+        0 0 34px rgba(222, 166, 81, 0.18),
+        0 0 76px rgba(222, 166, 81, 0.12);
+    }
+
+    .composer textarea {
+      width: 100%;
+      min-height: 62px;
+      max-height: 130px;
+      resize: vertical;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--fg);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .composer textarea::placeholder {
+      color: var(--muted);
+    }
+
+    .composer-side {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      justify-content: space-between;
+      min-width: 156px;
+    }
+
+    .selectish {
+      min-height: 31px;
+      padding: 7px 10px;
+      border: 1px solid rgba(255, 244, 211, 0.045);
+      border-radius: 11px;
+      background: rgba(0, 0, 0, 0.22);
+      color: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .send-button {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      border-color: rgba(222, 166, 81, 0.22);
+      background:
+        linear-gradient(180deg, rgba(64, 43, 116, 0.34), rgba(17, 11, 38, 0.78)),
+        rgba(9, 6, 22, 0.66);
+      color: var(--gold);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.08),
+        0 14px 34px rgba(8, 4, 24, 0.46),
+        0 0 20px rgba(222, 166, 81, 0.06);
+      backdrop-filter: blur(18px) saturate(142%);
+      -webkit-backdrop-filter: blur(18px) saturate(142%);
+    }
+
+    .send-button:hover,
+    .send-button:focus-visible {
+      border-color: rgba(244, 197, 111, 0.48);
+      background:
+        linear-gradient(180deg, rgba(75, 50, 134, 0.44), rgba(22, 14, 49, 0.84)),
+        rgba(11, 7, 28, 0.72);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.12),
+        0 14px 34px rgba(8, 4, 24, 0.5),
+        0 0 30px rgba(222, 166, 81, 0.14);
+    }
+
+    .send-icon {
+      color: color-mix(in oklch, var(--gold) 88%, white 12%);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .inspector {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      min-width: 0;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.034), rgba(255, 244, 211, 0.008)),
+        rgba(13, 10, 19, 0.64);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 244, 211, 0.045),
+        var(--shadow-soft);
+      transition: opacity 180ms ease, transform 220ms ease;
+    }
+
+    .inspector-head {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: start;
+      padding: 22px 22px 12px;
+    }
+
+    .inspector-title {
+      min-width: 0;
+    }
+
+    .inspector-head h2 {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 22px;
+      font-weight: 600;
+    }
+
+    .inspector-head p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    .inspector-toggle,
+    .collapsed-rail {
+      display: grid;
+      place-items: center;
+      border-radius: 12px;
+      background: rgba(255, 244, 211, 0.065);
+      color: var(--soft);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.075);
+    }
+
+    .inspector-toggle {
+      width: 34px;
+      height: 34px;
+      font-family: var(--font-mono);
+      font-size: 15px;
+    }
+
+    .inspector-toggle:hover,
+    .collapsed-rail:hover {
+      background: rgba(255, 244, 211, 0.1);
+      color: var(--fg);
+    }
+
+    .collapsed-rail {
+      position: relative;
+      z-index: 1;
+      display: none;
+      width: 54px;
+      min-height: 100%;
+      border-radius: 24px;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.034), rgba(255, 244, 211, 0.008)),
+        rgba(13, 10, 19, 0.64);
+      color: var(--gold);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      letter-spacing: 0;
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      box-shadow:
+        inset 0 1px 0 var(--glass-line),
+        var(--shadow-soft);
+      backdrop-filter: var(--frost);
+      -webkit-backdrop-filter: var(--frost);
+    }
+
+    .workbench.inspector-collapsed .inspector {
+      display: none;
+    }
+
+    .workbench.inspector-collapsed .collapsed-rail {
+      display: grid;
+    }
+
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin: 2px 14px 16px;
+      padding: 4px;
+      border: 1px solid rgba(255, 244, 211, 0.05);
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.22);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.035);
+      backdrop-filter: blur(18px) saturate(128%);
+      -webkit-backdrop-filter: blur(18px) saturate(128%);
+    }
+
+    .tab {
+      display: inline-flex;
+      flex: 1 1 0;
+      gap: 7px;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 7px 8px;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .tab.active {
+      background: rgba(255, 244, 211, 0.075);
+      color: var(--fg);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.07);
+    }
+
+    .tab-icon {
+      color: var(--gold);
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .panel {
+      display: none;
+      min-height: 0;
+      padding: 4px 18px 18px;
+      overflow: auto;
+    }
+
+    .panel.active {
+      display: block;
+    }
+
+    .trace-panel {
+      padding-right: 0;
+      padding-left: 0;
+    }
+
+    .trace-list {
+      display: block;
+      width: 100%;
+      overflow: hidden;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.03), rgba(255, 244, 211, 0.006)),
+        rgba(0, 0, 0, 0.12);
+      backdrop-filter: blur(20px) saturate(124%);
+      -webkit-backdrop-filter: blur(20px) saturate(124%);
+    }
+
+    .trace-list .record {
+      margin: 0;
+      padding: 17px 22px 18px;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .trace-list .record + .record {
+      border-top: 1px solid rgba(255, 244, 211, 0.055);
+    }
+
+    .record {
+      margin-bottom: 14px;
+      padding: 15px;
+      border-radius: 17px;
+      background:
+        linear-gradient(180deg, rgba(255, 244, 211, 0.048), rgba(255, 244, 211, 0.016)),
+        rgba(0, 0, 0, 0.11);
+      box-shadow: inset 0 1px 0 rgba(255, 244, 211, 0.06);
+    }
+
+    .record-head {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+    }
+
+    .record-title {
+      margin: 0;
+      color: var(--fg);
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+
+    .record p {
+      margin: 7px 0 0;
+      color: var(--soft);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 118px 1fr;
+      gap: 7px 12px;
+      margin-top: 10px;
+      color: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+    }
+
+    .kv span:nth-child(odd) {
+      color: var(--muted);
+    }
+
+    .log-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+    }
+
+    .log-table th,
+    .log-table td {
+      padding: 10px 7px;
+      border-bottom: 1px solid rgba(255, 244, 211, 0.045);
+      color: var(--soft);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .log-table th {
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 4px 8px;
+      border: 1px solid rgba(255, 244, 211, 0.045);
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.22);
+      color: var(--soft);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .status.ok {
+      background: color-mix(in oklch, var(--ok) 14%, transparent);
+      color: var(--ok);
+    }
+
+    .status.warn {
+      background: color-mix(in oklch, var(--warn) 14%, transparent);
+      color: var(--warn);
+    }
+
+    .status.violet {
+      background: color-mix(in oklch, var(--violet) 14%, transparent);
+      color: var(--violet);
+    }
+
+    .mini-rune {
+      color: var(--gold);
+      font-family: var(--font-display);
+      font-size: 18px;
+      line-height: 0;
+    }
+
+    @media (max-width: 1240px) {
+      .workbench {
+        grid-template-columns: 264px minmax(520px, 1fr);
+      }
+
+      .workbench.inspector-collapsed {
+        grid-template-columns: 264px minmax(520px, 1fr) 54px;
+      }
+
+      .inspector {
+        position: fixed;
+        top: 18px;
+        right: 18px;
+        bottom: 18px;
+        width: min(390px, 92vw);
+        transform: translateX(0);
+        box-shadow: var(--shadow);
+      }
+
+      .workbench.inspector-collapsed .inspector {
+        display: none;
+      }
+
+      .run-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 880px) {
+      body {
+        overflow: auto;
+      }
+
+      .workbench {
+        display: block;
+        height: auto;
+        min-height: 100vh;
+        padding: 14px;
+      }
+
+      .sidebar,
+      .inspector,
+      .collapsed-rail {
+        display: none;
+      }
+
+      .workbench.inspector-collapsed .collapsed-rail {
+        display: none;
+      }
+
+      .main {
+        min-height: 100vh;
+      }
+
+      .topbar,
+      .composer-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .run-strip,
+      .activity-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="workbench" data-od-id="runicai-workbench">
+    <aside class="sidebar" data-od-id="session-navigator">
+      <div class="brand">
+        <div class="sigil" aria-hidden="true">ᚱ</div>
+        <div>
+          <h1>RunicAI</h1>
+          <p>local agent workbench</p>
+        </div>
+      </div>
+
+      <div class="sidebar-scroll">
+        <div class="section-label">Workspace <span class="count">~/wrk/runic_ai</span></div>
+        <button class="nav-item active"><span class="nav-icon">⌘</span>Session Workbench</button>
+        <button class="nav-item"><span class="nav-icon">◆</span>Runs & Artifacts</button>
+        <button class="nav-item"><span class="nav-icon">λ</span>Agents</button>
+        <button class="nav-item"><span class="nav-icon">☷</span>Logs & Traces</button>
+        <button class="nav-item"><span class="nav-icon">⚙</span>Local Settings</button>
+
+        <div class="section-label">Recent Sessions <span class="count">12</span></div>
+        <button class="session active" data-session="phase3">
+          <span class="dot running"></span>
+          <span>
+            <span class="session-title">Implement Phase 3 review cards</span>
+            <span class="session-meta"><span>assistant</span><span>4 tools</span><span>waiting</span></span>
+          </span>
+          <span class="session-time">now</span>
+        </button>
+        <button class="session" data-session="sqlite">
+          <span class="dot waiting"></span>
+          <span>
+            <span class="session-title">Confirm SQLite projection restart</span>
+            <span class="session-meta"><span>standard</span><span>2 runs</span><span>review</span></span>
+          </span>
+          <span class="session-time">18m</span>
+        </button>
+        <button class="session" data-session="rlm">
+          <span class="dot"></span>
+          <span>
+            <span class="session-title">RLM smoke matrix source cues</span>
+            <span class="session-meta"><span>rlm</span><span>scorecard</span><span>done</span></span>
+          </span>
+          <span class="session-time">1h</span>
+        </button>
+        <button class="session" data-session="failure">
+          <span class="dot failed"></span>
+          <span>
+            <span class="session-title">Artifact writer repair loop</span>
+            <span class="session-meta"><span>assistant</span><span>failed</span><span>1 repair</span></span>
+          </span>
+          <span class="session-time">3h</span>
+        </button>
+
+        <div class="section-label">Saved Views</div>
+        <button class="nav-item"><span class="nav-icon">!</span>Needs Review</button>
+        <button class="nav-item"><span class="nav-icon">✦</span>Recent Artifacts</button>
+        <button class="nav-item"><span class="nav-icon">×</span>Failed Checks</button>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="health-row"><span>runtime</span><strong>online</strong></div>
+        <div class="health-row"><span>sqlite</span><strong>wal synced</strong></div>
+        <div class="health-row"><span>local bind</span><strong>127.0.0.1</strong></div>
+      </div>
+    </aside>
+
+    <main class="main" data-od-id="chat-workbench">
+      <header class="topbar">
+        <div class="crumbs">
+          <p class="eyebrow">Session 01JDX-7K9 · approval required</p>
+          <h2>Implement Phoenix LiveView HITL review cards</h2>
+        </div>
+        <div class="topbar-actions">
+          <span class="pill accent">assistant · running</span>
+          <span class="pill">model gpt-5.4-mini</span>
+          <span class="pill gold">sqlite source of truth</span>
+          <span class="pill">compact debug</span>
+        </div>
+      </header>
+
+      <section class="content">
+        <div class="workspace-view" data-od-id="session-mode-tabs">
+          <div class="workspace-tabs" role="tablist" aria-label="Session content">
+            <button class="workspace-tab active" type="button" data-workspace-tab="chat" aria-selected="true">
+              <span class="workspace-tab-icon">☷</span>
+              <span>Chat</span>
+              <span class="workspace-tab-meta" data-chat-count>4 messages</span>
+            </button>
+            <button class="workspace-tab" type="button" data-workspace-tab="plan" aria-selected="false">
+              <span class="workspace-tab-icon">ᚱ</span>
+              <span>Plan</span>
+              <span class="workspace-tab-meta">waiting review</span>
+            </button>
+          </div>
+
+          <section class="workspace-panel active" data-workspace-panel="chat" role="tabpanel">
+            <div class="chat">
+          <article class="message user">
+            <div class="bubble">
+              <div class="bubble-head">
+                <span class="sender"><span class="avatar-mark">D</span><strong>doops</strong></span>
+                <span>09:41 · objective</span>
+              </div>
+              <div class="bubble-body">
+                <p class="objective">Implement the first useful HITL review card flow for the local RunicAI workbench. Keep it backed by persisted session events, not LiveView-only state.</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="message">
+            <div class="bubble">
+              <div class="bubble-head">
+                <span class="sender"><span class="avatar-mark">ᚱ</span><strong>RunicAI assistant</strong></span>
+                <span>09:42 · plan</span>
+              </div>
+              <div class="bubble-body">
+                <p>I found the existing session projection and will add the review card at the chat presentation layer. The browser should show the pending command, policy reason, workspace path, and the exact resume action that will be persisted before runtime continuation.</p>
+                <div class="activity-grid" data-od-id="tool-activity">
+                  <div class="activity">
+                    <span>read</span>
+                    <strong>session projection and grouped chat entries</strong>
+                    <code>RunicAI.Persistence.HarnessProjection</code>
+                  </div>
+                  <div class="activity">
+                    <span>trace</span>
+                    <strong>policy gate raised review_required</strong>
+                    <code>terminal_event:hitl_prompt</code>
+                  </div>
+                  <div class="activity">
+                    <span>next</span>
+                    <strong>write LiveView component and focused tests</strong>
+                    <code>RunicAIWeb.SessionLive</code>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="message">
+            <div class="bubble">
+              <div class="bubble-head">
+                <span class="sender"><span class="avatar-mark">ᚱ</span><strong>RunicAI assistant</strong></span>
+                <span>09:44 · review gate</span>
+              </div>
+              <div class="bubble-body">
+                <p>The agent is ready to edit files under <span class="code">lib/runic_ai_web/</span>. The policy requires explicit approval because the change adds write-capable review handlers and a persisted decision event.</p>
+                <div class="review" data-od-id="hitl-review-card">
+                  <h3>Approve write operation?</h3>
+                  <p><strong>Command preview:</strong> apply patch to add review card component, event handlers, and test coverage for approve / deny / rewrite actions.</p>
+                  <p><strong>Risk:</strong> browser controls can resume a runtime session; decision must be written to SQLite before continuation.</p>
+                  <div class="review-actions">
+                    <button class="btn primary">Approve once</button>
+                    <button class="btn">Rewrite instruction</button>
+                    <button class="btn warn">Deny</button>
+                    <button class="btn">Stop session</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="message">
+            <div class="bubble">
+              <div class="bubble-head">
+                <span class="sender"><span class="avatar-mark">ᚱ</span><strong>RunicAI assistant</strong></span>
+                <span>09:45 · artifacts</span>
+              </div>
+              <div class="bubble-body">
+                <p>Draft outputs are staged as artifacts until the approval decision lands. Each artifact keeps provenance back to the run, tool call, and workflow phase.</p>
+                <div class="artifact-row">
+                  <div>
+                    <strong>review-card-component.patch</strong>
+                    <span>pending · 3 files · +186 / -12</span>
+                  </div>
+                  <span class="status warn">needs approval</span>
+                </div>
+                <div class="artifact-row">
+                  <div>
+                    <strong>hitl-flow-test-output.txt</strong>
+                    <span>captured · focused LiveView test command</span>
+                  </div>
+                  <span class="status ok">passed</span>
+                </div>
+              </div>
+            </div>
+          </article>
+            </div>
+          </section>
+
+          <section class="workspace-panel" data-workspace-panel="plan" role="tabpanel">
+            <div class="run-strip" data-od-id="run-history">
+              <div class="run-step done">
+                <span>01 objective</span>
+                <strong>Build review affordances in the browser workbench.</strong>
+                <em>accepted · 09:41:12</em>
+              </div>
+              <div class="run-step done">
+                <span>02 context</span>
+                <strong>Loaded plan, persistence projection, and LiveView shell.</strong>
+                <em>6 files · 2,804 tokens</em>
+              </div>
+              <div class="run-step live">
+                <span>03 execution</span>
+                <strong>Rendering tool preview and durable decision controls.</strong>
+                <em>streaming terminal events</em>
+              </div>
+              <div class="run-step wait">
+                <span>04 review</span>
+                <strong>Awaiting approval before writing web module changes.</strong>
+                <em>policy: ask before write</em>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <footer class="composer" data-od-id="composer">
+        <div class="composer-shell">
+          <textarea aria-label="Prompt composer" placeholder="Ask RunicAI to continue, inspect an event, approve with constraints, or launch a new local objective..."></textarea>
+          <div class="composer-side">
+            <div class="selectish">assistant · local</div>
+            <div class="selectish">approval: ask before write</div>
+            <button class="btn send-button"><span class="send-icon" aria-hidden="true">↵</span><span>Send</span></button>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="inspector" data-od-id="trace-inspector">
+      <div class="inspector-head">
+        <div class="inspector-title">
+          <h2>Inspector</h2>
+          <p>selected: review gate · session 01JDX-7K9</p>
+        </div>
+        <button class="inspector-toggle" type="button" aria-label="Collapse inspector" aria-expanded="true" data-inspector-toggle>›</button>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-panel="trace"><span class="tab-icon">☷</span><span>Trace</span></button>
+        <button class="tab" data-panel="logs"><span class="tab-icon">▤</span><span>Logs</span></button>
+        <button class="tab" data-panel="artifacts"><span class="tab-icon">◆</span><span>Artifacts</span></button>
+        <button class="tab" data-panel="details"><span class="tab-icon">ᛞ</span><span>Details</span></button>
+      </div>
+
+      <section class="panel trace-panel active" data-panel-id="trace">
+        <div class="trace-list">
+          <div class="record">
+            <div class="record-head"><span>09:44:03.118</span><span class="status warn">review</span></div>
+            <h3 class="record-title">Policy gate requested human approval</h3>
+            <p>Write-capable operation under the workbench web namespace. Runtime is paused until a persisted decision is recorded.</p>
+            <div class="kv">
+              <span>component</span><span>approval_policy</span>
+              <span>phase</span><span>before_tool_call</span>
+              <span>tool</span><span>patch_writer</span>
+              <span>resume key</span><span>rvw_4f31a</span>
+            </div>
+          </div>
+          <div class="record">
+            <div class="record-head"><span>09:43:51.664</span><span class="status violet">workflow</span></div>
+            <h3 class="record-title">Execution node entered materialize_changes</h3>
+            <p>The Runic workflow moved from context gathering to patch planning with compact debug mode enabled.</p>
+          </div>
+          <div class="record">
+            <div class="record-head"><span>09:42:19.220</span><span class="status ok">evidence</span></div>
+            <h3 class="record-title">Projection hydrated from SQLite</h3>
+            <p>Messages, artifacts, tool calls, and terminal events were loaded from persisted rows before stream updates attached.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" data-panel-id="logs">
+        <table class="log-table">
+          <thead>
+            <tr><th>time</th><th>kind</th><th>message</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>09:44</td><td>policy</td><td>review_required path=lib/runic_ai_web</td></tr>
+            <tr><td>09:43</td><td>tool</td><td>read grouped presentation entries</td></tr>
+            <tr><td>09:42</td><td>runtime</td><td>session subscribed to terminal events</td></tr>
+            <tr><td>09:41</td><td>store</td><td>sqlite projection loaded 37 rows</td></tr>
+            <tr><td>09:41</td><td>agent</td><td>assistant runner started objective</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" data-panel-id="artifacts">
+        <div class="record">
+          <div class="record-head"><span>patch</span><span class="status warn">pending</span></div>
+          <h3 class="record-title">review-card-component.patch</h3>
+          <p>Adds a compact review card, approval buttons, durable decision events, and focused tests.</p>
+          <div class="kv">
+            <span>changes</span><span>+186 / -12</span>
+            <span>source</span><span>tool_call_92df</span>
+            <span>node</span><span>materialize_changes</span>
+          </div>
+        </div>
+        <div class="record">
+          <div class="record-head"><span>verification</span><span class="status ok">passed</span></div>
+          <h3 class="record-title">hitl-flow-test-output.txt</h3>
+          <p>Focused LiveView flow passed for approve, deny, rewrite, and persisted history rendering.</p>
+        </div>
+        <div class="record">
+          <div class="record-head"><span>report</span><span class="status violet">draft</span></div>
+          <h3 class="record-title">phase-3-review-flow-notes.md</h3>
+          <p>Residual risk summary and next browser checks for streaming focus behavior.</p>
+        </div>
+      </section>
+
+      <section class="panel" data-panel-id="details">
+        <div class="record">
+          <div class="record-head"><span class="mini-rune">ᛞ</span><span class="status ok">local</span></div>
+          <h3 class="record-title">Session details</h3>
+          <div class="kv">
+            <span>workspace</span><span>~/wrk/runic_ai</span>
+            <span>agent</span><span>assistant</span>
+            <span>model</span><span>gpt-5.4-mini</span>
+            <span>approval</span><span>ask before write</span>
+            <span>database</span><span>.runic_ai/runs.db</span>
+            <span>provider</span><span>ready</span>
+          </div>
+        </div>
+        <div class="record">
+          <div class="record-head"><span>run memory</span><span class="status violet">compact</span></div>
+          <h3 class="record-title">Visible source cues</h3>
+          <p>Plan document, persistence projection, terminal event boundary, and current LiveView shell state.</p>
+        </div>
+      </section>
+    </aside>
+    <button class="collapsed-rail" type="button" aria-label="Open inspector" data-inspector-rail>Inspector</button>
+  </div>
+
+  <script>
+    const runicWorkbench = {
+      initWorkspaceTabs() {
+        const tabs = document.querySelectorAll("[data-workspace-tab]");
+        const panels = document.querySelectorAll("[data-workspace-panel]");
+        const chatCount = document.querySelector("[data-chat-count]");
+        const messageCount = document.querySelectorAll(".chat .message").length;
+        const saved = localStorage.getItem("runicai.sessionView") || "chat";
+        const initial = Array.from(tabs).some((tab) => tab.dataset.workspaceTab === saved) ? saved : "chat";
+
+        if (chatCount) {
+          chatCount.textContent = `${messageCount} ${messageCount === 1 ? "message" : "messages"}`;
+        }
+
+        this.activateWorkspaceTab(initial, tabs, panels);
+        tabs.forEach((tab) => {
+          tab.addEventListener("click", () => {
+            const target = tab.dataset.workspaceTab;
+            localStorage.setItem("runicai.sessionView", target);
+            this.activateWorkspaceTab(target, tabs, panels);
+          });
+        });
+      },
+      activateWorkspaceTab(target, tabs, panels) {
+        tabs.forEach((tab) => {
+          const active = tab.dataset.workspaceTab === target;
+          tab.classList.toggle("active", active);
+          tab.setAttribute("aria-selected", String(active));
+        });
+        panels.forEach((panel) => panel.classList.toggle("active", panel.dataset.workspacePanel === target));
+      },
+      initTabs() {
+        const tabs = document.querySelectorAll(".tab");
+        const panels = document.querySelectorAll(".panel");
+        const saved = localStorage.getItem("runicai.inspectorTab");
+        if (saved) {
+          this.activateTab(saved, tabs, panels);
+        }
+        tabs.forEach((tab) => {
+          tab.addEventListener("click", () => {
+            const target = tab.dataset.panel;
+            localStorage.setItem("runicai.inspectorTab", target);
+            this.activateTab(target, tabs, panels);
+          });
+        });
+      },
+      activateTab(target, tabs, panels) {
+        tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.panel === target));
+        panels.forEach((panel) => panel.classList.toggle("active", panel.dataset.panelId === target));
+      },
+      initSessions() {
+        const sessions = document.querySelectorAll(".session");
+        sessions.forEach((session) => {
+          session.addEventListener("click", () => {
+            sessions.forEach((item) => item.classList.remove("active"));
+            session.classList.add("active");
+          });
+        });
+      },
+      initInspectorCollapse() {
+        const root = document.querySelector(".workbench");
+        const toggle = document.querySelector("[data-inspector-toggle]");
+        const rail = document.querySelector("[data-inspector-rail]");
+        const saved = localStorage.getItem("runicai.inspectorCollapsed") === "true";
+
+        const setCollapsed = (collapsed) => {
+          root.classList.toggle("inspector-collapsed", collapsed);
+          toggle.setAttribute("aria-expanded", String(!collapsed));
+          toggle.textContent = collapsed ? "‹" : "›";
+          localStorage.setItem("runicai.inspectorCollapsed", String(collapsed));
+        };
+
+        setCollapsed(saved);
+        toggle.addEventListener("click", () => setCollapsed(!root.classList.contains("inspector-collapsed")));
+        rail.addEventListener("click", () => setCollapsed(false));
+      },
+      init() {
+        this.initWorkspaceTabs();
+        this.initTabs();
+        this.initSessions();
+        this.initInspectorCollapse();
+      }
+    };
+
+    runicWorkbench.init();
+  </script>
+</body>
+</html>

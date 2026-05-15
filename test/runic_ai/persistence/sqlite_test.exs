@@ -523,6 +523,37 @@ defmodule RunicAI.Persistence.SQLiteTest do
            ] = Queries.messages_for_run(store, "run:rlm-chat")
   end
 
+  test "assistant blocked final result events project best output as non-transient draft", %{
+    store: store
+  } do
+    final_event =
+      %{
+        output: %{text: "Best repaired comparison draft."},
+        objective_scorecard: %{
+          objective_status: :objective_incomplete,
+          residual_risks: ["source/provenance coverage was required but not present"]
+        }
+      }
+      |> Event.from_rlm_result(
+        agent: :assistant,
+        session_id: "session:assistant-blocked",
+        run_id: "run:assistant-blocked"
+      )
+      |> Enum.find(&(&1.kind == :message))
+
+    assert {:ok, %TerminalEvent{run_id: "run:assistant-blocked", sequence: 1}} =
+             SQLite.record_terminal_event(store, final_event)
+
+    assert [
+             %AgentMessage{
+               role: "assistant",
+               message_kind: "workflow_output",
+               content: "Best repaired comparison draft.",
+               transient: false
+             }
+           ] = Queries.messages_for_run(store, "run:assistant-blocked")
+  end
+
   test "assistant review stages project nested HITL review requests", %{store: store} do
     at = ~U[2026-05-03 12:20:00Z]
 

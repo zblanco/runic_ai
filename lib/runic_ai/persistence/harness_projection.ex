@@ -71,7 +71,10 @@ defmodule RunicAI.Persistence.HarnessProjection do
         last_event_kind: event.kind,
         last_event_phase: event.phase,
         last_event_title: event.title,
-        run_id: event.run_id
+        run_id: event.run_id,
+        approval: data_field(event, :approve),
+        mode: data_field(event, :mode),
+        client: data_field(event, :client)
       }
     }
 
@@ -86,7 +89,8 @@ defmodule RunicAI.Persistence.HarnessProjection do
             | workspace_root: attrs.workspace_root || session.workspace_root,
               objective: attrs.objective || session.objective,
               model: attrs.model || session.model,
-              started_at: session.started_at || attrs.started_at
+              started_at: session.started_at || attrs.started_at,
+              metadata_json: Map.merge(session.metadata_json || %{}, attrs.metadata_json)
           }
       end
 
@@ -629,9 +633,36 @@ defmodule RunicAI.Persistence.HarnessProjection do
   defp tool_status(%TerminalEvent{status: "blocked"}), do: "denied"
   defp tool_status(%TerminalEvent{}), do: "running"
 
-  defp review_status(%TerminalEvent{status: "blocked"}), do: "denied"
-  defp review_status(%TerminalEvent{status: "ok"}), do: "approved"
-  defp review_status(%TerminalEvent{}), do: "pending"
+  defp review_status(%TerminalEvent{} = event) do
+    data = stage_data(event)
+
+    case field(data, :decision) || field(event.data_json, :decision) do
+      decision when is_map(decision) ->
+        case field(decision, :status) || field(decision, :decision) do
+          status when status in ["approved", :approved, "approve", :approve] ->
+            "approved"
+
+          status when status in ["edited", :edited, "rewrite", :rewrite] ->
+            "approved"
+
+          status when status in ["cancelled", :cancelled, "stop", :stop] ->
+            "cancelled"
+
+          status when status in ["denied", :denied, "rejected", :rejected, "deny", :deny] ->
+            "denied"
+
+          _other ->
+            review_status_from_event(event)
+        end
+
+      _other ->
+        review_status_from_event(event)
+    end
+  end
+
+  defp review_status_from_event(%TerminalEvent{status: "blocked"}), do: "denied"
+  defp review_status_from_event(%TerminalEvent{status: "ok"}), do: "approved"
+  defp review_status_from_event(%TerminalEvent{}), do: "pending"
 
   defp subagent_status(%TerminalEvent{status: "error"}), do: "failed"
   defp subagent_status(%TerminalEvent{status: "ok"}), do: "completed"
@@ -697,6 +728,59 @@ defmodule RunicAI.Persistence.HarnessProjection do
     end
   end
 
+  defp artifact_outcome_message(%TerminalEvent{} = event) do
+    case artifact_outcome(event) do
+      outcome when is_map(outcome) ->
+        case {field(outcome, :status), field(outcome, :reason)} do
+          {status, reason}
+          when status in ["artifact_not_written", :artifact_not_written] and not is_nil(reason) ->
+            "artifact_not_written: #{reason}"
+
+          {status, _reason} when status in ["artifact_not_written", :artifact_not_written] ->
+            "artifact_not_written"
+
+          _other ->
+            nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp suggested_paths_message(%TerminalEvent{} = event) do
+    paths =
+      event
+      |> suggested_paths()
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&to_string/1)
+      |> Enum.reject(&(String.trim(&1) == ""))
+      |> Enum.uniq()
+
+    case paths do
+      [] -> nil
+      [path] -> "Suggested path: #{path}"
+      paths -> "Suggested paths: #{Enum.join(paths, ", ")}"
+    end
+  end
+
+  defp artifact_outcome(%TerminalEvent{} = event) do
+    error = field(event.data_json, :error) || field(stage_data(event), :error)
+    error_details = field(error, :details) || %{}
+
+    data_field(event, :artifact_outcome) || field(error_details, :artifact_outcome)
+  end
+
+  defp suggested_paths(%TerminalEvent{} = event) do
+    outcome = artifact_outcome(event) || %{}
+    error = field(event.data_json, :error) || field(stage_data(event), :error)
+    error_details = field(error, :details) || %{}
+
+    List.wrap(data_field(event, :suggested_paths)) ++
+      List.wrap(field(outcome, :suggested_paths)) ++
+      List.wrap(field(error_details, :suggested_paths))
+  end
+
   defp first_line(nil), do: nil
 
   defp first_line(value) do
@@ -716,10 +800,15 @@ defmodule RunicAI.Persistence.HarnessProjection do
   end
 
   defp message_content(%TerminalEvent{kind: "error"} = event) do
-    case error_message(event) do
-      nil -> event.title || "Agent error"
-      message -> "Error: #{message}"
-    end
+    base =
+      case error_message(event) do
+        nil -> event.title || "Agent error"
+        message -> "Error: #{message}"
+      end
+
+    [base, artifact_outcome_message(event), suggested_paths_message(event)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
   end
 
   defp message_content(%TerminalEvent{} = event) do

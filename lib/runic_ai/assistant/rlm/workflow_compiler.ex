@@ -59,7 +59,7 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
 
           workflow =
             workflow
-            |> attach_scheduler_policies(blueprint_graph, node_names, blueprint)
+            |> attach_scheduler_policies(blueprint_graph, node_names, blueprint, opts)
             |> Workflow.put_run_context(
               runtime_context(base_context, blueprint_graph, node_names, opts)
             )
@@ -328,13 +328,14 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
          %Workflow{} = workflow,
          %BlueprintGraph{} = blueprint_graph,
          node_names,
-         %WorkflowBlueprint{} = blueprint
+         %WorkflowBlueprint{} = blueprint,
+         opts
        ) do
     workflow
     |> attach_budget_policy(blueprint)
     |> then(fn workflow ->
       Enum.reduce(blueprint_graph.ordered_specs, workflow, fn spec, workflow ->
-        case scheduler_policy(spec) do
+        case scheduler_policy(spec, opts) do
           nil ->
             workflow
 
@@ -362,11 +363,12 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     end
   end
 
-  defp scheduler_policy(%ComponentSpec{} = spec) do
+  defp scheduler_policy(%ComponentSpec{} = spec, opts \\ []) do
     spec.type
     |> preset_policy()
     |> Map.merge(native_execution_policy(spec))
     |> Map.merge(policy_overrides(spec.policy))
+    |> Map.merge(review_gate_policy(spec, opts))
     |> reject_empty_policy()
   end
 
@@ -426,6 +428,27 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
   end
 
   defp native_execution_policy(_spec), do: %{}
+
+  defp review_gate_policy(%ComponentSpec{type: :artifact_writer}, opts) do
+    if is_function(Keyword.get(opts, :review_decider), 2) do
+      %{
+        timeout_ms: review_gate_timeout_ms(opts),
+        max_retries: 0,
+        backoff: :none
+      }
+    else
+      %{}
+    end
+  end
+
+  defp review_gate_policy(%ComponentSpec{}, _opts), do: %{}
+
+  defp review_gate_timeout_ms(opts) do
+    case positive_integer(Keyword.get(opts, :max_runtime_ms)) do
+      nil -> 305_000
+      timeout_ms -> timeout_ms + 5_000
+    end
+  end
 
   defp component_policies_by_id(%BlueprintGraph{} = blueprint_graph) do
     blueprint_graph.ordered_specs

@@ -199,6 +199,37 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert Enum.find(grouped.groups, &(&1.key == "login")).count == 2
   end
 
+  test "record group preserves ticket_id records with fallback identity keys" do
+    input = """
+    {"ticket_id":"T1","theme":"login","severity":"high"}
+    {"ticket_id":"T2","theme":"billing","severity":"medium"}
+    {"ticket_id":"T3","theme":"login","severity":"high"}
+    """
+
+    assert {:ok, parsed} = TabularParser.run(input, %{format: :jsonl})
+
+    assert {:ok, grouped} =
+             RecordGroup.run(parsed, %{
+               group_by: "theme",
+               dedupe_by: ["ticket_id", "ticket", "id"]
+             })
+
+    assert grouped.count == 3
+    assert grouped.record_ids == ["T1", "T2", "T3"]
+    assert grouped.dropped_record_ids == []
+    assert Enum.find(grouped.groups, &(&1.key == "login")).count == 2
+    assert Enum.find(grouped.groups, &(&1.key == "billing")).count == 1
+  end
+
+  test "record group does not collapse records when configured identity keys are missing" do
+    records = [%{name: "Ada"}, %{name: "Bea"}]
+
+    assert {:ok, grouped} = RecordGroup.run(records, %{dedupe_by: ["ticket_id"]})
+
+    assert grouped.count == 2
+    assert grouped.dedupe.missing_identity_key_count == 2
+  end
+
   test "document compare emits added and removed candidates" do
     input = %{
       sources: [
@@ -211,6 +242,29 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert [%{added: added, removed: removed}] = result.comparisons
     assert "D" in added
     assert "B" in removed
+  end
+
+  test "comparison-required scorecard fails when no comparable pair exists" do
+    workspace = Workspace.new!(root: tmp_dir())
+
+    assert {:ok, compared} =
+             DocumentCompare.run(%{
+               sources: [%{id: "old", path: "old.md", text: "Response target is two days."}]
+             })
+
+    assert compared.count == 0
+
+    assert {:ok, report} = ReportComposer.run(compared, %{title: "Comparison Report"})
+
+    assert {:ok, scorecard} =
+             ObjectiveScorecard.run(workspace, %{sources: compared.sources}, report, %{
+               comparison_required?: true,
+               require_provenance?: true
+             })
+
+    assert scorecard.objective_status == :objective_incomplete
+
+    assert "comparison was required but fewer than two comparable sources were available" in scorecard.residual_risks
   end
 
   test "report composer and objective scorecard verify required sections" do
@@ -281,6 +335,36 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
 
     assert quality_failed.objective_status == :objective_incomplete
     assert quality_failed.artifact_quality.status == :questionable
+  end
+
+  test "objective scorecard accepts structured provenance from assistant components" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    comparison = %{
+      comparisons: [
+        %{
+          left: "old.md",
+          right: "new.md",
+          added: ["Response target is one business day."],
+          removed: ["Response target is two business days."],
+          provenance: [%{left: "old.md", right: "new.md"}]
+        }
+      ],
+      sources: [%{path: "old.md"}, %{path: "new.md"}]
+    }
+
+    assert {:ok, report} = ReportComposer.run(comparison, %{title: "Comparison Report"})
+    assert report.provenance == [%{left: "old.md", right: "new.md"}]
+
+    assert {:ok, scorecard} =
+             ObjectiveScorecard.run(workspace, %{sources: comparison.sources}, report, %{
+               require_provenance?: true
+             })
+
+    assert scorecard.objective_status == :objective_satisfied
+    assert scorecard.source_coverage == :present
+    assert scorecard.provenance_count > 0
   end
 
   test "budget ledger records component metrics and reports budget errors" do

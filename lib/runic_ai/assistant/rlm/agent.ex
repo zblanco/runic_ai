@@ -77,6 +77,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
       opts =
         opts
         |> maybe_put_inferred_input_paths(objective, workspace)
+        |> maybe_put_inferred_output_path(objective)
         |> maybe_put_source_requirements(objective)
 
       history = conversation_history(opts)
@@ -102,6 +103,8 @@ defmodule RunicAI.Assistant.RLM.Agent do
 
       case result do
         {:ok, result} ->
+          artifact_outcome = artifact_outcome(result.artifacts, opts)
+
           emit(
             event_sink,
             run_id,
@@ -110,6 +113,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
             result
             |> completed_data()
             |> Map.put(:artifact_paths, artifact_paths(result.artifacts))
+            |> Map.put(:artifact_outcome, artifact_outcome)
             |> Map.put(:scorecard, result.scorecard)
           )
 
@@ -118,6 +122,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
            |> Map.put(:agent, :assistant)
            |> Map.put(:run_id, run_id)
            |> Map.put(:session_id, run_id)
+           |> Map.put(:artifact_outcome, artifact_outcome)
            |> Map.put(:status, result_status(result.scorecard))}
 
         {:error, %Error{} = error} ->
@@ -504,11 +509,31 @@ defmodule RunicAI.Assistant.RLM.Agent do
   end
 
   defp maybe_put_source_requirements(opts, objective) do
-    if declared_source_inputs?(opts) or workspace_grounded_objective?(String.downcase(objective)) do
-      Keyword.put_new(opts, :require_provenance?, true)
-    else
-      opts
+    objective = String.downcase(objective || "")
+
+    cond do
+      no_source_requested?(objective) ->
+        Keyword.delete(opts, :require_provenance?)
+
+      declared_source_inputs?(opts) or workspace_grounded_objective?(objective) ->
+        Keyword.put_new(opts, :require_provenance?, true)
+
+      true ->
+        opts
     end
+  end
+
+  defp no_source_requested?(objective) do
+    String.contains?(objective, [
+      "do not inspect files",
+      "don't inspect files",
+      "do not read files",
+      "don't read files",
+      "do not inspect the repo",
+      "don't inspect the repo",
+      "without source",
+      "no source inspection"
+    ])
   end
 
   defp declared_source_inputs?(opts) do
@@ -522,7 +547,12 @@ defmodule RunicAI.Assistant.RLM.Agent do
     else
       case infer_existing_input_paths(objective, workspace) do
         [] ->
-          opts
+          if workspace_grounded_objective?(String.downcase(objective || "")) and
+               not no_source_requested?(String.downcase(objective || "")) do
+            Keyword.put(opts, :input_paths, ["."])
+          else
+            opts
+          end
 
         paths ->
           opts
@@ -531,6 +561,30 @@ defmodule RunicAI.Assistant.RLM.Agent do
       end
     end
   end
+
+  defp maybe_put_inferred_output_path(opts, objective) do
+    if Keyword.get(opts, :output_path) in [nil, ""] do
+      case infer_output_path(objective) do
+        nil -> opts
+        path -> Keyword.put(opts, :output_path, path)
+      end
+    else
+      opts
+    end
+  end
+
+  defp infer_output_path(objective) when is_binary(objective) do
+    Regex.scan(
+      ~r/\b(?:write|save|create|persist|output|report)\b.{0,120}?\b(?:to|at|as|in)\s+(`[^`]+`|"[^"]+"|'[^']+'|[A-Za-z0-9_.\/-]+\.(?:md|txt|json|jsonl|csv|exs?|livemd))/i,
+      objective,
+      capture: :all_but_first
+    )
+    |> Enum.map(fn [path] -> normalize_referenced_path(path) end)
+    |> Enum.reject(&(&1 == ""))
+    |> List.first()
+  end
+
+  defp infer_output_path(_objective), do: nil
 
   defp infer_existing_input_paths(objective, %Workspace{} = workspace) do
     objective
@@ -790,6 +844,31 @@ defmodule RunicAI.Assistant.RLM.Agent do
     |> List.wrap()
     |> Enum.map(&(Map.get(&1, :path) || Map.get(&1, "path")))
     |> Enum.reject(&is_nil/1)
+  end
+
+  defp artifact_outcome(artifacts, opts) do
+    paths = artifact_paths(artifacts)
+
+    cond do
+      paths != [] ->
+        %{status: "artifact_written", paths: paths}
+
+      output_path = requested_output_path(opts) ->
+        %{status: "artifact_not_written", reason: "repair_answer_only", path: output_path}
+
+      true ->
+        nil
+    end
+  end
+
+  defp requested_output_path(opts) do
+    case Keyword.get(opts, :output_path) do
+      path when is_binary(path) ->
+        if String.trim(path) == "", do: nil, else: path
+
+      path ->
+        path
+    end
   end
 
   defp completed_data(result) do

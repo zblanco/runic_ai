@@ -12,18 +12,23 @@ defmodule RunicAI.RLM.Components.RecordGroup do
     records = records(input)
 
     with {:ok, transformed} <- maybe_apply_function(records, params, opts) do
-      deduped = dedupe(transformed, params)
+      {deduped, dedupe_diagnostics} = dedupe(transformed, params)
       sorted = sort_records(deduped, params)
       groups = group_records(sorted, params)
       limit = integer_opt(params, :limit, length(sorted))
+      visible_records = Enum.take(sorted, limit)
 
       {:ok,
        %{
-         records: Enum.take(sorted, limit),
+         records: visible_records,
          groups: groups,
          count: min(length(sorted), limit),
          input_count: length(records),
+         output_count: length(visible_records),
          group_count: length(groups),
+         record_ids: record_ids(visible_records),
+         dropped_record_ids: dropped_record_ids(records, visible_records),
+         dedupe: dedupe_diagnostics,
          truncated?: length(sorted) > limit
        }}
     end
@@ -48,10 +53,41 @@ defmodule RunicAI.RLM.Components.RecordGroup do
     keys = path_list(get(params, :dedupe_by, []))
 
     if keys == [] do
-      records
+      {records, %{dedupe_keys: [], input_count: length(records), output_count: length(records)}}
     else
-      Enum.uniq_by(records, fn record -> Enum.map(keys, &get_path(record_data(record), &1)) end)
+      deduped =
+        records
+        |> Enum.with_index()
+        |> Enum.uniq_by(fn {record, index} -> identity_key(record, keys, index) end)
+        |> Enum.map(fn {record, _index} -> record end)
+
+      {deduped,
+       %{
+         dedupe_keys: Enum.map(keys, &Enum.join(&1, ".")),
+         input_count: length(records),
+         output_count: length(deduped),
+         dropped_count: max(length(records) - length(deduped), 0),
+         missing_identity_key_count: missing_identity_key_count(records, keys)
+       }}
     end
+  end
+
+  defp identity_key(record, keys, index) do
+    values = Enum.map(keys, &get_path(record_data(record), &1))
+
+    if Enum.all?(values, &blank?/1) do
+      {:missing_identity, index}
+    else
+      {:identity, values}
+    end
+  end
+
+  defp missing_identity_key_count(records, keys) do
+    Enum.count(records, fn record ->
+      keys
+      |> Enum.map(&get_path(record_data(record), &1))
+      |> Enum.all?(&blank?/1)
+    end)
   end
 
   defp sort_records(records, params) do
@@ -86,6 +122,27 @@ defmodule RunicAI.RLM.Components.RecordGroup do
   defp records(values) when is_list(values), do: values
   defp records(value), do: List.wrap(value)
 
+  defp record_ids(records) do
+    records
+    |> Enum.map(&record_id/1)
+    |> Enum.reject(&blank?/1)
+  end
+
+  defp dropped_record_ids(input_records, output_records) do
+    input_ids = record_ids(input_records)
+    output_ids = MapSet.new(record_ids(output_records))
+
+    Enum.reject(input_ids, &MapSet.member?(output_ids, &1))
+  end
+
+  defp record_id(record) do
+    data = record_data(record)
+
+    get(data, :ticket_id, nil) ||
+      get(data, :ticket, nil) ||
+      get(data, :id, nil)
+  end
+
   defp record_data(%{data: data}) when is_map(data), do: data
   defp record_data(%{"data" => data}) when is_map(data), do: data
   defp record_data(record) when is_map(record), do: record
@@ -114,6 +171,11 @@ defmodule RunicAI.RLM.Components.RecordGroup do
 
   defp group_key(nil), do: "nil"
   defp group_key(value), do: to_string(value)
+
+  defp blank?(nil), do: true
+  defp blank?(""), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   defp integer_opt(opts, key, default) do
     case get(opts, key, default) do

@@ -153,6 +153,8 @@ defmodule RunicAI.Terminal.AssistantRunner do
   end
 
   defp error_event(session_id, run_id, %Error{} = error) do
+    artifact_outcome = Event.artifact_outcome_from_error(error)
+
     Event.new!(:error,
       session_id: session_id,
       agent: :assistant,
@@ -160,10 +162,21 @@ defmodule RunicAI.Terminal.AssistantRunner do
       status: :error,
       title: "Assistant RLM agent failed",
       detail: error.message,
-      data: %{run_id: run_id, error: error},
+      data:
+        %{run_id: run_id, error: error}
+        |> maybe_put(:artifact_outcome, artifact_outcome)
+        |> maybe_put(:suggested_paths, suggested_paths(artifact_outcome)),
       raw: error
     )
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp suggested_paths(nil), do: nil
+  defp suggested_paths(%{suggested_paths: paths}) when is_list(paths), do: paths
+  defp suggested_paths(%{"suggested_paths" => paths}) when is_list(paths), do: paths
+  defp suggested_paths(_outcome), do: nil
 
   defp put_event_run_id(%Event{} = event, run_id) do
     %{event | data: Map.put_new(event.data || %{}, :run_id, run_id)}

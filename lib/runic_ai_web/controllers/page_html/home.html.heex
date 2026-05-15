@@ -1,0 +1,71 @@
+<Layouts.flash_group flash={@flash} />
+
+<main class="min-h-screen bg-rune-bg text-rune-text">
+  <div class="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-6 py-8">
+    <header class="flex items-center justify-between border-b border-rune-border/60 pb-5">
+      <div>
+        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-rune-primary">
+          RunicAI Web
+        </p>
+        <h1 class="mt-2 text-2xl font-semibold tracking-tight text-rune-text">
+          Local agent workbench
+        </h1>
+      </div>
+      <div class="rounded-lg border border-rune-border/70 bg-rune-surface px-3 py-2 text-right text-xs text-rune-muted shadow-sm">
+        <div>localhost:4000</div>
+        <div class="mt-1 text-rune-success">endpoint online</div>
+      </div>
+    </header>
+
+    <section class="grid flex-1 items-center gap-8 py-12 lg:grid-cols-[1.15fr_0.85fr]">
+      <div>
+        <div class="max-w-2xl">
+          <p class="text-sm leading-6 text-rune-text-soft">
+            Phoenix LiveView is now grafted into the RunicAI application. This page is the first
+            browser surface over the existing runtime, persistence, terminal, and workflow modules.
+          </p>
+
+          <div class="mt-8 grid gap-3 sm:grid-cols-3">
+            <div class="rounded-lg border border-rune-border/60 bg-rune-surface/80 p-4 backdrop-blur">
+              <div class="text-xs uppercase tracking-[0.16em] text-rune-muted">OTP app</div>
+              <div class="mt-2 font-mono text-sm text-rune-primary">:runic_ai</div>
+            </div>
+            <div class="rounded-lg border border-rune-border/60 bg-rune-surface/80 p-4 backdrop-blur">
+              <div class="text-xs uppercase tracking-[0.16em] text-rune-muted">Runtime</div>
+              <div class="mt-2 font-mono text-sm text-rune-success">{@runtime_status}</div>
+            </div>
+            <div class="rounded-lg border border-rune-border/60 bg-rune-surface/80 p-4 backdrop-blur">
+              <div class="text-xs uppercase tracking-[0.16em] text-rune-muted">Version</div>
+              <div class="mt-2 font-mono text-sm text-rune-text-soft">{@app_version}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="rounded-lg border border-rune-border/70 bg-rune-surface-elevated/90 p-5 shadow-xl shadow-black/20 backdrop-blur">
+        <div class="flex items-center justify-between gap-4">
+          <h2 class="text-sm font-semibold uppercase tracking-[0.16em] text-rune-gold">
+            Graft status
+          </h2>
+          <span class="rounded-full bg-rune-success/15 px-2.5 py-1 text-xs font-medium text-rune-success">
+            running
+          </span>
+        </div>
+        <dl class="mt-5 space-y-4 text-sm">
+          <div class="flex items-center justify-between gap-4">
+            <dt class="text-rune-muted">Endpoint</dt>
+            <dd class="font-mono text-rune-text-soft">RunicAIWeb.Endpoint</dd>
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <dt class="text-rune-muted">PubSub</dt>
+            <dd class="font-mono text-rune-text-soft">RunicAI.PubSub</dd>
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <dt class="text-rune-muted">Router</dt>
+            <dd class="font-mono text-rune-text-soft">RunicAIWeb.Router</dd>
+          </div>
+        </dl>
+      </aside>
+    </section>
+  </div>
+</main>

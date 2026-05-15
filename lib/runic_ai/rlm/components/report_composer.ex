@@ -25,7 +25,15 @@ defmodule RunicAI.RLM.Components.ReportComposer do
       |> Enum.join("\n\n")
 
     {:ok,
-     %{text: text, sections: section_titles(rendered_sections), count: length(rendered_sections)}}
+     %{
+       text: text,
+       sections: section_titles(rendered_sections),
+       count: length(rendered_sections),
+       comparison_count: comparison_count(input),
+       record_ids: record_ids(input),
+       dropped_record_ids: dropped_record_ids(input),
+       provenance: collect_provenance(input)
+     }}
   rescue
     exception ->
       {:error, Error.from_exception(exception, source: __MODULE__)}
@@ -108,6 +116,16 @@ defmodule RunicAI.RLM.Components.ReportComposer do
   defp comparisons(%{"comparisons" => comparisons}) when is_list(comparisons), do: comparisons
   defp comparisons(_input), do: []
 
+  defp comparison_count(input), do: length(comparisons(input))
+
+  defp record_ids(%{record_ids: ids}) when is_list(ids), do: ids
+  defp record_ids(%{"record_ids" => ids}) when is_list(ids), do: ids
+  defp record_ids(_input), do: []
+
+  defp dropped_record_ids(%{dropped_record_ids: ids}) when is_list(ids), do: ids
+  defp dropped_record_ids(%{"dropped_record_ids" => ids}) when is_list(ids), do: ids
+  defp dropped_record_ids(_input), do: []
+
   defp render_items(items) do
     items
     |> Enum.map(fn
@@ -142,6 +160,47 @@ defmodule RunicAI.RLM.Components.ReportComposer do
 
   defp render_value(value) when is_map(value), do: render_map(value)
   defp render_value(value), do: inspect(value, limit: 10, printable_limit: 500)
+
+  defp collect_provenance(value) when is_list(value) do
+    value
+    |> Enum.flat_map(&collect_provenance/1)
+    |> Enum.uniq()
+  end
+
+  defp collect_provenance(value) when is_map(value) do
+    own =
+      value
+      |> get(:provenance, [])
+      |> case do
+        provenance when is_list(provenance) -> provenance
+        _other -> []
+      end
+
+    nested =
+      value
+      |> Map.take([
+        :items,
+        "items",
+        :records,
+        "records",
+        :groups,
+        "groups",
+        :comparisons,
+        "comparisons",
+        :sources,
+        "sources",
+        :slices,
+        "slices",
+        :outputs,
+        "outputs"
+      ])
+      |> Map.values()
+      |> Enum.flat_map(&collect_provenance/1)
+
+    Enum.uniq(own ++ nested)
+  end
+
+  defp collect_provenance(_value), do: []
 
   defp humanize_key(key) do
     key

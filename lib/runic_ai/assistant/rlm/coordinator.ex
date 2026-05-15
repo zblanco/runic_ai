@@ -32,6 +32,13 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       fallback_strategy?(opts) ->
         fallback_blueprint(workspace, objective, opts)
 
+      match?({:ok, _shape}, curated_recipe_shape(workspace, objective, opts)) ->
+        {:ok, shape} = curated_recipe_shape(workspace, objective, opts)
+
+        workspace
+        |> fallback_blueprint(objective, Keyword.put(opts, :fallback_shape, shape))
+        |> tag_curated_recipe(shape)
+
       true ->
         case generated_blueprint(workspace, objective, opts) do
           {:ok, blueprint} -> {:ok, blueprint}
@@ -46,9 +53,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     sources = normalize_sources(Keyword.get(opts, :input_paths, Keyword.get(opts, :inputs, [])))
     output_path = Keyword.get(opts, :output_path)
     write_policy = Keyword.get(opts, :write_policy, :docs_only)
-    scorecard_params = scorecard_params(opts, output_path)
     id = Keyword.get(opts, :blueprint_id) || "assistant:generic_report"
     shape = fallback_shape(workspace, objective, sources, opts)
+    opts = maybe_put_recipe_defaults(shape, objective, opts)
+    opts = Keyword.put(opts, :comparison_required?, shape == :compare_synthesize_report)
+    scorecard_params = scorecard_params(opts, output_path)
 
     {components, edges, terminal_node} = fallback_graph(shape, sources, opts)
 
@@ -251,6 +260,51 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     Keyword.get(opts, :proposal_strategy) in [:fallback, "fallback"] or
       Keyword.get(opts, :dynamic_blueprint?, true) in [false, "false"]
   end
+
+  defp curated_recipe_shape(_workspace, objective, opts) do
+    if Keyword.get(opts, :curated_recipes?, true) do
+      sources = normalize_sources(Keyword.get(opts, :input_paths, Keyword.get(opts, :inputs, [])))
+      objective_text = String.downcase(objective || "")
+
+      cond do
+        sources == [] ->
+          :none
+
+        String.contains?(objective_text, ["compare", "diff", "old", "new"]) ->
+          {:ok, :compare_synthesize_report}
+
+        Enum.any?(sources, &tabular_source?/1) and
+            String.contains?(objective_text, [
+              "cluster",
+              "group",
+              "tickets",
+              "ticket",
+              "csv",
+              "jsonl",
+              "records"
+            ]) ->
+          {:ok, :parse_normalize_report}
+
+        true ->
+          :none
+      end
+    else
+      :none
+    end
+  end
+
+  defp tag_curated_recipe({:ok, %WorkflowBlueprint{} = blueprint}, shape) do
+    {:ok,
+     %{
+       blueprint
+       | metadata:
+           (blueprint.metadata || %{})
+           |> Map.put(:proposal_kind, :curated_recipe)
+           |> Map.put(:recipe, shape)
+     }}
+  end
+
+  defp tag_curated_recipe(error, _shape), do: error
 
   defp llm_opts(opts) do
     opts
@@ -487,6 +541,27 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     end
   end
 
+  defp maybe_put_recipe_defaults(:parse_normalize_report, objective, opts) do
+    objective = String.downcase(objective || "")
+
+    opts =
+      if Keyword.get(opts, :group_by) in [nil, ""] and
+           String.contains?(objective, ["ticket", "tickets", "cluster", "group"]) do
+        Keyword.put(opts, :group_by, "theme")
+      else
+        opts
+      end
+
+    if Keyword.get(opts, :dedupe_by) in [nil, []] and
+         String.contains?(objective, ["ticket", "tickets"]) do
+      Keyword.put(opts, :dedupe_by, ["ticket_id", "ticket", "id"])
+    else
+      opts
+    end
+  end
+
+  defp maybe_put_recipe_defaults(_shape, _objective, opts), do: opts
+
   defp tabular_source?(%{path: path}) when is_binary(path), do: tabular_path?(path)
   defp tabular_source?(%{"path" => path}) when is_binary(path), do: tabular_path?(path)
   defp tabular_source?(path) when is_binary(path), do: tabular_path?(path)
@@ -573,7 +648,8 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       required_source_cues:
         Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
       require_provenance?: Keyword.get(opts, :require_provenance?, false),
-      require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
+      require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false),
+      comparison_required?: Keyword.get(opts, :comparison_required?, false)
     }
   end
 
@@ -626,6 +702,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
 
     Write the requested durable report. Use clear markdown sections derived from the objective, preserve important provenance hints, and include residual uncertainty when evidence is thin.
     The merged notes are evidence produced by local source components. If they include local paths or source provenance, do not claim you could not inspect those declared paths.
+    If the objective says to wait for approval before writing, treat that as a runtime control already handled by RunicAI review. Do not ask the user for approval in the artifact content. Produce the artifact body that should be reviewed and written after approval.
     """
   end
 end

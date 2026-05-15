@@ -302,8 +302,13 @@ defmodule RunicAI.RLM.ComponentRuntime do
         )
       )
 
-    with :ok <- maybe_review_artifact_write(base, input, params, opts) do
-      ArtifactWriter.run(base.workspace, input, params)
+    with :ok <-
+           ArtifactWriter.validate_target(
+             get(params, :path, nil),
+             get(params, :write_policy, :docs_only)
+           ),
+         {:ok, reviewed_params} <- maybe_review_artifact_write(base, input, params, opts) do
+      ArtifactWriter.run(base.workspace, input, reviewed_params)
     end
   end
 
@@ -428,12 +433,44 @@ defmodule RunicAI.RLM.ComponentRuntime do
 
   defp llm_component_opts(base, opts) do
     opts
-    |> Keyword.put(:objective, base.objective)
+    |> Keyword.put(:objective, llm_objective(base, opts))
     |> Keyword.put(
       :model,
       Keyword.get(opts, :model) || get(base.metadata, :model, nil) || @default_model
     )
   end
+
+  defp llm_objective(base, opts) do
+    objective = to_string(base.objective || "")
+
+    if reviewed_artifact_write?(opts) do
+      strip_runtime_review_instructions(objective)
+    else
+      objective
+    end
+  end
+
+  defp reviewed_artifact_write?(opts) do
+    is_function(Keyword.get(opts, :review_decider), 2) and
+      present?(Keyword.get(opts, :output_path))
+  end
+
+  defp strip_runtime_review_instructions(objective) do
+    objective
+    |> String.replace(
+      ~r/\s*(?:wait|pause)\s+for\s+(?:browser\s+)?approval\s+before\s+writing[.!]?/i,
+      ""
+    )
+    |> String.replace(
+      ~r/\s*(?:continue|write|persist|save)\s+only\s+after\s+(?:browser\s+)?approval[.!]?/i,
+      ""
+    )
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present?(value), do: not is_nil(value)
 
   defp max_function_tier(base, opts) do
     Keyword.get(opts, :max_generated_function_tier) ||
@@ -468,10 +505,14 @@ defmodule RunicAI.RLM.ComponentRuntime do
         case decider.(request, %{workspace: base.workspace, input: input, params: params}) do
           {:ok, %ReviewDecision{status: :approved} = decision} ->
             emit_stage(base, :review_completed, :ok, review_event_data(request, decision))
-            :ok
+            {:ok, params}
+
+          {:ok, %ReviewDecision{status: :edited} = decision} ->
+            emit_stage(base, :review_completed, :ok, review_event_data(request, decision))
+            {:ok, apply_artifact_write_edit(params, decision)}
 
           {:ok, %ReviewDecision{status: status} = decision}
-          when status in [:rejected, :cancelled, :edited] ->
+          when status in [:rejected, :cancelled] ->
             emit_stage(base, :review_completed, :blocked, review_event_data(request, decision))
             artifact_write_review_denied(request, decision)
 
@@ -483,7 +524,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
         end
 
       _other ->
-        :ok
+        {:ok, params}
     end
   end
 
@@ -501,6 +542,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
       details: %{
         path: path,
         write_policy: write_policy,
+        suggested_paths: suggested_write_paths(write_policy, path),
         input_preview: output_summary(input)
       },
       metadata: %{
@@ -510,6 +552,19 @@ defmodule RunicAI.RLM.ComponentRuntime do
       }
     )
   end
+
+  defp suggested_write_paths(write_policy, path)
+       when write_policy in [:docs_only, "docs_only", "docs-only"] do
+    basename =
+      case path do
+        path when is_binary(path) and path != "" -> Path.basename(path)
+        _other -> "assistant-report.md"
+      end
+
+    [Path.join(".docs", basename)]
+  end
+
+  defp suggested_write_paths(_write_policy, _path), do: []
 
   defp review_event_data(%ReviewRequest{} = request) do
     %{
@@ -530,20 +585,58 @@ defmodule RunicAI.RLM.ComponentRuntime do
       resume_key: decision.resume_key,
       status: decision.status,
       actor: decision.actor,
-      metadata: decision.metadata
+      metadata: decision.metadata,
+      edited_value: decision.edited_value
     })
   end
 
   defp artifact_write_review_denied(%ReviewRequest{} = request, %ReviewDecision{} = decision) do
+    reason = artifact_not_written_reason(decision.status)
+    outcome = artifact_not_written_outcome(reason, request.details)
+
     {:error,
-     Error.validation("artifact write denied by review",
+     Error.validation(artifact_write_review_message(reason),
        source: __MODULE__,
        details: %{
          path: request.details[:path],
          resume_key: request.resume_key,
-         decision_status: decision.status
+         decision_status: decision.status,
+         suggested_paths: request.details[:suggested_paths] || [],
+         artifact_outcome: outcome
        }
      )}
+  end
+
+  defp apply_artifact_write_edit(params, %ReviewDecision{edited_value: edited})
+       when is_binary(edited) do
+    if String.trim(edited) == "" do
+      params
+    else
+      Map.put(params, :content, edited)
+    end
+  end
+
+  defp apply_artifact_write_edit(params, %ReviewDecision{edited_value: edited})
+       when is_map(edited) do
+    Map.merge(params, edited)
+  end
+
+  defp apply_artifact_write_edit(params, _decision), do: params
+
+  defp artifact_not_written_reason(:rejected), do: "denied"
+  defp artifact_not_written_reason(:cancelled), do: "cancelled"
+  defp artifact_not_written_reason(status), do: to_string(status)
+
+  defp artifact_write_review_message("cancelled"), do: "artifact write cancelled by review"
+  defp artifact_write_review_message(_reason), do: "artifact write denied by review"
+
+  defp artifact_not_written_outcome(reason, details) do
+    %{
+      status: "artifact_not_written",
+      reason: reason,
+      path: details[:path],
+      suggested_paths: details[:suggested_paths] || []
+    }
   end
 
   defp output_summary(output) do
@@ -551,11 +644,11 @@ defmodule RunicAI.RLM.ComponentRuntime do
       is_map(output) and Map.has_key?(output, :path) ->
         Map.take(output, [:status, :path, :bytes])
 
-      is_map(output) and Map.has_key?(output, :count) ->
-        Map.take(output, [:count, :strategy, :truncated?])
-
       is_map(output) and Map.has_key?(output, :text) ->
         %{text_preview: preview(output.text)}
+
+      is_map(output) and Map.has_key?(output, :count) ->
+        Map.take(output, [:count, :strategy, :truncated?])
 
       true ->
         %{preview: preview(output)}

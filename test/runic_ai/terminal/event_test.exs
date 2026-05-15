@@ -5,6 +5,7 @@ defmodule RunicAI.Terminal.EventTest do
   alias RunicAI.Coding.RLM.WorkflowProposal
   alias RunicAI.Coding.RLM.WorkflowScorecard
   alias RunicAI.Coding.RLM.WorkflowValidationReport
+  alias RunicAI.Error
   alias RunicAI.ReviewRequest
   alias RunicAI.RLM.Episode
   alias RunicAI.Terminal.Event
@@ -116,6 +117,71 @@ defmodule RunicAI.Terminal.EventTest do
     assert data["content"] == "Final repo summary for the conversation pane."
   end
 
+  test "normalizes assistant artifact outcomes on final chat messages" do
+    events =
+      Event.from_rlm_result(
+        %{
+          output_text: "# Report",
+          artifacts: [%{path: ".docs/report.md"}],
+          objective_scorecard: WorkflowScorecard.new!(objective_status: :objective_satisfied)
+        },
+        agent: :assistant,
+        session_id: "session:assistant",
+        run_id: "run:assistant"
+      )
+
+    assert %Event{kind: :message, data: data} = Enum.find(events, &(&1.kind == :message))
+    assert data["artifact_paths"] == [".docs/report.md"]
+    assert data["artifact_outcome"]["status"] == "artifact_written"
+    assert data["artifact_outcome"]["paths"] == [".docs/report.md"]
+  end
+
+  test "normalizes assistant artifact-not-written outcomes on final chat messages" do
+    events =
+      Event.from_rlm_result(
+        %{
+          output_text: "Prepared the answer in chat because the artifact was not written.",
+          artifacts: [],
+          artifact_outcome: %{
+            status: "artifact_not_written",
+            reason: "repair_answer_only",
+            path: ".docs/report.md"
+          },
+          objective_scorecard: WorkflowScorecard.new!(objective_status: :objective_satisfied)
+        },
+        agent: :assistant,
+        session_id: "session:assistant",
+        run_id: "run:assistant"
+      )
+
+    assert %Event{kind: :message, data: data} = Enum.find(events, &(&1.kind == :message))
+    assert data["artifact_paths"] == []
+    assert data["artifact_outcome"]["status"] == "artifact_not_written"
+    assert data["artifact_outcome"]["reason"] == "repair_answer_only"
+    assert data["artifact_outcome"]["path"] == ".docs/report.md"
+  end
+
+  test "extracts artifact-not-written outcomes from normalized errors" do
+    error =
+      Error.validation("artifact write denied by review",
+        details: %{
+          artifact_outcome: %{
+            status: "artifact_not_written",
+            reason: "denied",
+            path: ".docs/report.md",
+            suggested_paths: [".docs/report.md"]
+          }
+        }
+      )
+
+    assert %{
+             status: "artifact_not_written",
+             reason: "denied",
+             path: ".docs/report.md",
+             suggested_paths: [".docs/report.md"]
+           } = Event.artifact_outcome_from_error(error)
+  end
+
   test "normalizes structured coding RLM final output as markdown content" do
     episode =
       Episode.new!(:satisfied, %{files: [%{path: "README.md", content: "# Demo\n\nhello"}]},
@@ -136,6 +202,30 @@ defmodule RunicAI.Terminal.EventTest do
     assert data["content"] =~ "```markdown\n# Demo\n\nhello\n```"
     refute data["content"] =~ "%{"
     refute data["content"] =~ "\\n"
+  end
+
+  test "normalizes assistant blocked final output as a visible draft message" do
+    events =
+      Event.from_rlm_result(
+        %{
+          output: %{text: "Useful answer that still needs provenance formatting."},
+          objective_scorecard: %{
+            objective_status: :objective_incomplete,
+            residual_risks: ["source/provenance coverage was required but not present"]
+          }
+        },
+        agent: :assistant,
+        session_id: "session:assistant",
+        run_id: "run:assistant"
+      )
+
+    assert %Event{kind: :message, agent: :assistant, status: :blocked, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["message_kind"] == "workflow_output"
+    assert data["content"] == "Useful answer that still needs provenance formatting."
+    assert data["blocked?"] == true
+    assert data["blocking_reason"] =~ "source/provenance"
   end
 
   test "normalizes Runic runnable lifecycle stages into JSON-safe trace events" do

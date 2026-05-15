@@ -151,7 +151,7 @@ tool = ReqLLM.tool(
 
 ## Phoenix LiveView UI Preferences
 
-For future RunicAI-associated Phoenix/LiveView applications, keep Phoenix and web UI dependencies in a separate application alongside RunicAI unless explicitly asked to move them into the core library.
+For future RunicAI-associated Phoenix/LiveView work, an in-repo Phoenix graft is acceptable: Phoenix and web dependencies may live in this app when the goal is a single local RunicAI product. A separate sibling `runic_ai_web` path-dependency app is also acceptable for early isolation. Do not default to an umbrella unless separate release composition becomes a real requirement.
 
 - Default to a dark/night-mode theme derived from `.docs/DESIGN.md`.
 - Prefer the `Inter` font, backdrop blur, opacity, rounded edges, and restrained dark surfaces.
