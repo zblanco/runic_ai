@@ -19,6 +19,7 @@ defmodule RunicAI.Workbench do
   alias RunicAI.Persistence.Schemas.ToolCall
   alias RunicAI.Persistence.Schemas.WorkflowRun
   alias RunicAI.Persistence.SQLite.Store
+  alias RunicAI.Event, as: CoreEvent
   alias RunicAI.ReviewDecision
   alias RunicAI.ReviewRequest, as: RuntimeReviewRequest
   alias RunicAI.Terminal.AgentRunner
@@ -33,6 +34,13 @@ defmodule RunicAI.Workbench do
   @approval_choices %{"safe" => :safe, "never" => :never, "ask" => :ask}
   @mode_choices %{"verify" => :verify, "patch" => :patch, "read_only" => :read_only}
   @review_wait_poll_interval_ms 250
+  @rlm_workspace_cues ~w(
+    api app branch bug code codebase command compile compiler component config
+    dependency deps diff docs ecto elixir endpoint error exception failing failure
+    file files fix function git issue lib liveview log logs migration mix module
+    patch phoenix pr repo repository route runic runicai schema sqlite stacktrace
+    test tests tui warning warnings workspace
+  )
   @param_atoms %{
     "action" => :action,
     "agent" => :agent,
@@ -44,6 +52,7 @@ defmodule RunicAI.Workbench do
     "model" => :model,
     "objective" => :objective,
     "rewrite" => :rewrite,
+    "run_id" => :run_id,
     "session_id" => :session_id
   }
 
@@ -69,6 +78,8 @@ defmodule RunicAI.Workbench do
 
   @spec broadcast_terminal_event(TerminalEvent.t()) :: :ok
   def broadcast_terminal_event(%TerminalEvent{} = event) do
+    :ok = event |> core_event_from_persisted() |> broadcast_event()
+
     Phoenix.PubSub.broadcast(RunicAI.PubSub, @topic, {:workbench, :terminal_event, event})
 
     if is_binary(event.session_id) do
@@ -82,15 +93,34 @@ defmodule RunicAI.Workbench do
     :ok
   end
 
-  @spec record_terminal_event(map() | RunicAI.Terminal.Event.t()) ::
+  @spec broadcast_event(CoreEvent.t()) :: :ok
+  def broadcast_event(%CoreEvent{} = event) do
+    Phoenix.PubSub.broadcast(RunicAI.PubSub, @topic, {:workbench, :event, event})
+
+    if is_binary(event.session_id) do
+      Phoenix.PubSub.broadcast(
+        RunicAI.PubSub,
+        session_topic(event.session_id),
+        {:workbench, :event, event}
+      )
+    end
+
+    :ok
+  end
+
+  @spec record_event(map() | CoreEvent.t() | RunicAI.Terminal.Event.t()) ::
           {:ok, TerminalEvent.t()} | {:error, term()}
-  def record_terminal_event(event) do
+  def record_event(event) do
     with {:ok, %Store{} = store} <- store(),
          {:ok, %TerminalEvent{} = persisted} <- SQLite.record_terminal_event(store, event) do
       broadcast_terminal_event(persisted)
       {:ok, persisted}
     end
   end
+
+  @spec record_terminal_event(map() | CoreEvent.t() | RunicAI.Terminal.Event.t()) ::
+          {:ok, TerminalEvent.t()} | {:error, term()}
+  def record_terminal_event(event), do: record_event(event)
 
   @spec recent_sessions(keyword()) :: [map()]
   def recent_sessions(opts \\ []) do
@@ -156,10 +186,14 @@ defmodule RunicAI.Workbench do
 
   @spec start_agent_run(map()) :: {:ok, map()} | {:error, term()}
   def start_agent_run(params) when is_map(params) do
-    with {:ok, launch} <- normalize_launch(params),
-         {:ok, %TerminalEvent{}} <- record_terminal_event(launch_event(launch)),
-         {:ok, pid} <- start_agent_task(launch) do
-      {:ok, %{session_id: launch.session_id, pid: pid}}
+    with {:ok, launch} <- normalize_launch(params) do
+      launch = Map.put(launch, :conversation_history, conversation_history(launch))
+
+      with {:ok, %TerminalEvent{}} <- record_terminal_event(user_message_event(launch)),
+           {:ok, %TerminalEvent{}} <- record_terminal_event(launch_event(launch)),
+           {:ok, pid} <- start_agent_task(launch) do
+        {:ok, %{session_id: launch.session_id, run_id: launch.run_id, pid: pid}}
+      end
     end
   end
 
@@ -202,13 +236,17 @@ defmodule RunicAI.Workbench do
            normalize_max_runtime(
              value(params, "max_runtime_ms") || Keyword.get(cfg, :max_runtime_ms, 300_000)
            ) do
+      {agent, agent_route} = route_agent(agent, objective)
       session_id = value(params, "session_id") || Ids.unique("web-session")
+      run_id = value(params, "run_id") || Ids.unique("#{agent}:web")
 
       {:ok,
        %{
          session_id: session_id,
+         run_id: run_id,
          objective: objective,
          agent: agent,
+         agent_route: agent_route,
          cwd: cwd,
          model: blank_to_nil(value(params, "model") || Keyword.get(cfg, :default_model)),
          client: blank_to_nil(value(params, "client") || Keyword.get(cfg, :default_client)),
@@ -218,6 +256,29 @@ defmodule RunicAI.Workbench do
          max_runtime_ms: max_runtime_ms
        }}
     end
+  end
+
+  defp route_agent(:rlm, objective) do
+    if workspace_objective?(objective) do
+      {:rlm, nil}
+    else
+      {:assistant,
+       %{
+         requested_agent: :rlm,
+         routed_agent: :assistant,
+         route_reason: :non_workspace_rlm_objective
+       }}
+    end
+  end
+
+  defp route_agent(agent, _objective), do: {agent, nil}
+
+  defp workspace_objective?(objective) when is_binary(objective) do
+    objective = String.downcase(objective)
+
+    Enum.any?(@rlm_workspace_cues, fn cue ->
+      Regex.match?(~r/(^|[^a-z0-9_])#{Regex.escape(cue)}([^a-z0-9_]|$)/, objective)
+    end)
   end
 
   defp start_agent_task(launch) do
@@ -239,8 +300,8 @@ defmodule RunicAI.Workbench do
           persistence: store,
           output_fun: fn _line -> :ok end,
           input_fun: fn _prompt -> "d\n" end,
-          run_id: launch.session_id,
-          conversation_history: conversation_history(launch.session_id)
+          run_id: launch.run_id,
+          conversation_history: Map.get(launch, :conversation_history, [])
         ]
         |> maybe_put(:run_fun, launch.run_fun)
         |> maybe_put(:review_decider, browser_review_decider(launch))
@@ -345,7 +406,7 @@ defmodule RunicAI.Workbench do
       |> Event.from_review_request(session_id: launch.session_id, agent: launch.agent)
       |> Map.update!(:data, fn data ->
         Map.merge(data, %{
-          run_id: launch.session_id,
+          run_id: launch.run_id,
           id: request.resume_key,
           status: :review,
           data: %{
@@ -521,31 +582,66 @@ defmodule RunicAI.Workbench do
     |> Kernel.++([launch.objective])
   end
 
+  defp user_message_event(launch) do
+    %{
+      id: Ids.unique("terminal_event"),
+      session_id: launch.session_id,
+      run_id: launch.run_id,
+      agent: launch.agent,
+      kind: :message,
+      phase: :user,
+      status: :ok,
+      title: "User request",
+      detail: launch.objective,
+      data_json:
+        %{
+          run_id: launch.run_id,
+          role: "user",
+          message_kind: "objective",
+          content: launch.objective,
+          objective: launch.objective,
+          conversation_id: "conversation:#{launch.session_id}",
+          presentation_group_id: launch.run_id,
+          cwd: launch.cwd,
+          model: launch.model
+        }
+        |> put_agent_route(launch),
+      at: DateTime.utc_now()
+    }
+  end
+
   defp launch_event(launch) do
     %{
       id: Ids.unique("terminal_event"),
       session_id: launch.session_id,
-      run_id: launch.session_id,
+      run_id: launch.run_id,
       agent: launch.agent,
       kind: :status,
       phase: :session,
       status: :running,
       title: "Workbench run queued",
       detail: launch.objective,
-      data_json: %{
-        run_id: launch.session_id,
-        cwd: launch.cwd,
-        objective: launch.objective,
-        model: launch.model,
-        client: launch.client,
-        approve: launch.approve,
-        mode: launch.mode,
-        max_runtime_ms: launch.max_runtime_ms,
-        trigger: "browser"
-      },
+      data_json:
+        %{
+          run_id: launch.run_id,
+          session_id: launch.session_id,
+          cwd: launch.cwd,
+          objective: launch.objective,
+          model: launch.model,
+          client: launch.client,
+          approve: launch.approve,
+          mode: launch.mode,
+          max_runtime_ms: launch.max_runtime_ms,
+          trigger: "browser"
+        }
+        |> put_agent_route(launch),
       at: DateTime.utc_now()
     }
   end
+
+  defp put_agent_route(data, %{agent_route: nil}), do: data
+  defp put_agent_route(data, %{agent_route: route}) when is_map(route), do: Map.merge(data, route)
+  defp put_agent_route(data, _launch), do: data
 
   defp session_view(%AgentSession{} = session) do
     %{
@@ -615,6 +711,21 @@ defmodule RunicAI.Workbench do
     do: true
 
   defp assistant_summary_message?(%AgentMessage{}), do: false
+
+  defp core_event_from_persisted(%TerminalEvent{} = event) do
+    CoreEvent.new!(event.kind,
+      id: event.id,
+      at: event.at,
+      session_id: event.session_id,
+      run_id: event.run_id,
+      agent: event.agent,
+      phase: event.phase,
+      status: event.status,
+      title: event.title,
+      detail: event.detail,
+      data: event.data_json || %{}
+    )
+  end
 
   defp event_view(%TerminalEvent{} = event) do
     %{
@@ -720,12 +831,13 @@ defmodule RunicAI.Workbench do
     }
   end
 
-  defp conversation_history(session_id) when is_binary(session_id) do
+  defp conversation_history(%{session_id: session_id, agent_route: agent_route}) do
     store = store!()
 
     store
     |> Queries.messages_for_session(session_id)
     |> visible_chat_messages()
+    |> filter_routed_conversation_history(agent_route)
     |> Enum.map(fn message ->
       %{
         role: message.role,
@@ -736,6 +848,17 @@ defmodule RunicAI.Workbench do
   rescue
     _exception -> []
   end
+
+  defp filter_routed_conversation_history(messages, %{
+         route_reason: :non_workspace_rlm_objective
+       }) do
+    Enum.reject(messages, fn message ->
+      message.role == "assistant" and
+        String.starts_with?(message.presentation_group_id || "", "rlm:web")
+    end)
+  end
+
+  defp filter_routed_conversation_history(messages, _agent_route), do: messages
 
   defp inferred_output_path(objective) when is_binary(objective) do
     objective

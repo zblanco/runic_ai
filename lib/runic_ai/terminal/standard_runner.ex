@@ -28,7 +28,9 @@ defmodule RunicAI.Terminal.StandardRunner do
     session_id =
       Keyword.get(opts, :session_id) || Ids.unique("coding:cli")
 
+    run_id = Keyword.get(opts, :run_id) || session_id
     cwd = Keyword.get(opts, :cwd, File.cwd!())
+    opts = Keyword.put(opts, :run_id, run_id)
     policy = policy(opts)
 
     spec_opts =
@@ -47,7 +49,7 @@ defmodule RunicAI.Terminal.StandardRunner do
 
     with {:ok, handle} <- Runtime.start_session(spec),
          :ok <- Runtime.subscribe(handle) do
-      emit(event_sink, started_event(session_id, cwd, opts))
+      emit(event_sink, started_event(session_id, run_id, cwd, opts))
 
       try do
         do_run(handle, objective, session_id, opts, event_sink, review_decider, 0)
@@ -270,7 +272,7 @@ defmodule RunicAI.Terminal.StandardRunner do
 
   defp halt_emission_reason(_emission), do: nil
 
-  defp started_event(session_id, cwd, opts) do
+  defp started_event(session_id, run_id, cwd, opts) do
     Event.new!(:status,
       session_id: session_id,
       agent: :standard,
@@ -279,6 +281,7 @@ defmodule RunicAI.Terminal.StandardRunner do
       title: "Standard agent started",
       detail: cwd,
       data: %{
+        run_id: run_id,
         cwd: cwd,
         mode: Keyword.get(opts, :mode, :verify),
         model: Keyword.get(opts, :model),
@@ -292,7 +295,13 @@ defmodule RunicAI.Terminal.StandardRunner do
       max_turns: Keyword.get(opts, :max_turns),
       max_wall_time_ms: Keyword.get(opts, :max_runtime_ms),
       stop_on: [:review, :wait, :error],
-      capture_policy: [mode: :summary]
+      capture_policy: [mode: :summary],
+      run_context: %{
+        event_sink: Keyword.get(opts, :event_sink),
+        run_id: Keyword.get(opts, :run_id),
+        session_id: Keyword.get(opts, :session_id) || Keyword.get(opts, :run_id),
+        agent: :standard
+      }
     )
   end
 

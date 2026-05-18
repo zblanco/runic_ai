@@ -1,6 +1,7 @@
 defmodule RunicAI.WorkbenchTest do
   use ExUnit.Case, async: false
 
+  alias RunicAI.Event
   alias RunicAI.Workbench
   alias RunicAI.Persistence.SQLite
   alias RunicAI.ReviewRequest
@@ -54,6 +55,31 @@ defmodule RunicAI.WorkbenchTest do
     assert [%{content: content}] = snapshot.messages
     assert content =~ "durable"
     assert snapshot.metrics.events == 2
+  end
+
+  test "records core events without requiring the web layer to consume terminal events" do
+    session_id = unique_session_id("core-event")
+    :ok = Workbench.subscribe_session(session_id)
+
+    event =
+      Event.workflow_effect!(:analysis,
+        id: unique_event_id("core-analysis"),
+        session_id: session_id,
+        run_id: session_id,
+        agent: :assistant,
+        source_step: :analysis,
+        content: "Core analysis progress"
+      )
+
+    assert {:ok, _event} = Workbench.record_event(event)
+    assert_receive {:workbench, :event, %Event{session_id: ^session_id, kind: :message}}
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+
+    assert [%{kind: "analysis", transient: true, content: "Core analysis progress"}] =
+             snapshot.messages
+
+    assert snapshot.metrics.events == 1
   end
 
   test "session snapshot keeps transient workflow outputs and assistant summaries out of chat" do
@@ -212,7 +238,7 @@ defmodule RunicAI.WorkbenchTest do
 
     session_id = unique_session_id("launch")
 
-    assert {:ok, %{session_id: ^session_id}} =
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
              Workbench.start_agent_run(%{
                "session_id" => session_id,
                "objective" => "Reply from the browser",
@@ -223,12 +249,194 @@ defmodule RunicAI.WorkbenchTest do
                "max_runtime_ms" => "123456"
              })
 
+    assert run_id != session_id
+
     eventually(fn ->
       snapshot = Workbench.session_snapshot(session_id)
 
+      assert Enum.any?(
+               snapshot.messages,
+               &(&1.role == "user" and &1.content == "Reply from the browser")
+             )
+
       assert Enum.any?(snapshot.messages, &String.contains?(&1.content, "Browser run complete"))
       assert Enum.any?(snapshot.events, &(&1.phase == "direct_response_completed"))
-      assert Enum.any?(snapshot.events, &(get_in(&1.data, ["max_runtime_ms"]) == 123_456))
+
+      assert Enum.any?(
+               snapshot.events,
+               &(&1.run_id == run_id and get_in(&1.data, ["max_runtime_ms"]) == 123_456)
+             )
+
+      assert Enum.any?(snapshot.runs, &(&1.id == run_id))
+    end)
+  end
+
+  test "browser follow-up messages stay in the session with distinct turn runs" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, &__MODULE__.fake_assistant_run/3)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("follow-up")
+
+    assert {:ok, %{session_id: ^session_id, run_id: first_run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "First browser request",
+               "agent" => "assistant",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "verify"
+             })
+
+    eventually(fn ->
+      assert Workbench.session_snapshot(session_id).messages
+             |> Enum.any?(&String.contains?(&1.content, "First browser request"))
+    end)
+
+    assert {:ok, %{session_id: ^session_id, run_id: second_run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Second browser request",
+               "agent" => "assistant",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "verify"
+             })
+
+    assert first_run_id != second_run_id
+    assert first_run_id != session_id
+    assert second_run_id != session_id
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      user_messages =
+        snapshot.messages
+        |> Enum.filter(&(&1.role == "user"))
+        |> Enum.map(& &1.content)
+
+      assert "First browser request" in user_messages
+      assert "Second browser request" in user_messages
+
+      run_ids = Enum.map(snapshot.runs, & &1.id)
+      assert first_run_id in run_ids
+      assert second_run_id in run_ids
+    end)
+  end
+
+  test "browser repo RLM requests without workspace cues route to assistant" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+    caller = self()
+
+    run_fun = fn cwd, objective, opts ->
+      send(caller, {:conversation_history, opts[:conversation_history]})
+      fake_assistant_run(cwd, objective, opts)
+    end
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, run_fun)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("rlm-route")
+
+    objective =
+      "Build a graph memory system for a Wandering Inn text adventure game."
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("prior-rlm-output"),
+               session_id: session_id,
+               run_id: "rlm:web:prior",
+               agent: :rlm,
+               kind: :message,
+               phase: :assistant,
+               status: :ok,
+               title: "RLM final output",
+               detail: "## File output\n\nAGENTS.md",
+               data_json: %{
+                 run_id: "rlm:web:prior",
+                 role: "assistant",
+                 message_kind: "workflow_output",
+                 content: "## File output\n\nAGENTS.md",
+                 presentation_group_id: "rlm:web:prior"
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => objective,
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "verify"
+             })
+
+    assert String.starts_with?(run_id, "assistant:web")
+    assert_receive {:conversation_history, history}
+    refute Enum.any?(history, &String.contains?(&1.content, "AGENTS.md"))
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      assert snapshot.session.agent == "assistant"
+      assert Enum.any?(snapshot.messages, &(&1.role == "user" and &1.content == objective))
+      assert Enum.any?(snapshot.messages, &String.contains?(&1.content, "Browser run complete"))
+
+      assert Enum.any?(snapshot.events, fn event ->
+               event.agent == "assistant" and
+                 get_in(event.data, ["requested_agent"]) == "rlm" and
+                 get_in(event.data, ["routed_agent"]) == "assistant" and
+                 get_in(event.data, ["route_reason"]) == "non_workspace_rlm_objective"
+             end)
+    end)
+  end
+
+  test "browser repo RLM requests with workspace cues stay on the RLM runner" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, &__MODULE__.fake_assistant_run/3)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("rlm-route-code")
+
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Inspect the RunicAI repo tests for failures",
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "verify"
+             })
+
+    assert String.starts_with?(run_id, "rlm:web")
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      assert snapshot.session.agent == "rlm"
+
+      refute Enum.any?(
+               snapshot.events,
+               &(get_in(&1.data, ["route_reason"]) == "non_workspace_rlm_objective")
+             )
     end)
   end
 

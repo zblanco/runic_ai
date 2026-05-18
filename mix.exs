@@ -34,7 +34,7 @@ defmodule RunicAI.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:runic, "~> 0.1.0-alpha.7"},
+      {:runic, "~> 0.1.0-alpha.8"},
       {:req_llm, "~> 1.9"},
       {:ecto_sql, "~> 3.13"},
       {:ecto_sqlite3, "~> 0.22"},

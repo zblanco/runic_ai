@@ -49,6 +49,18 @@ defmodule RunicAI.Terminal.RunnerTest do
     run_fun = fn _cwd, _objective, opts ->
       send(caller, {:rlm_runner_opts, opts[:session_id], opts[:run_id]})
 
+      opts[:event_sink].(
+        RunicAI.Event.new!(:rlm_node,
+          session_id: opts[:session_id],
+          run_id: opts[:session_id],
+          agent: :rlm,
+          phase: :legacy_stage,
+          status: :running,
+          title: "Legacy stage",
+          data: %{"run_id" => opts[:session_id], run_id: opts[:session_id]}
+        )
+      )
+
       opts[:event_sink].(%{
         run_id: opts[:run_id],
         stage: :proposal_received,
@@ -130,6 +142,18 @@ defmodule RunicAI.Terminal.RunnerTest do
     {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
 
     run_fun = fn _cwd, _objective, opts ->
+      opts[:event_sink].(
+        RunicAI.Event.new!(:rlm_node,
+          session_id: opts[:session_id],
+          run_id: opts[:session_id],
+          agent: :assistant,
+          phase: :legacy_stage,
+          status: :running,
+          title: "Legacy assistant stage",
+          data: %{"run_id" => opts[:session_id], run_id: opts[:session_id]}
+        )
+      )
+
       opts[:event_sink].(%{
         run_id: opts[:run_id],
         stage: :blueprint_proposed,
@@ -144,6 +168,7 @@ defmodule RunicAI.Terminal.RunnerTest do
              AssistantRunner.run("Summarize chapter",
                cwd: root,
                session_id: "terminal-assistant",
+               run_id: "terminal-assistant-run",
                input_paths: ["chapter.md"],
                output_path: ".docs/chapter.md",
                run_fun: run_fun,
@@ -157,6 +182,7 @@ defmodule RunicAI.Terminal.RunnerTest do
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :blueprint_proposed))
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :proposed))
     assert Enum.any?(emitted, &(&1.agent == :assistant and &1.phase == :scorecard))
+    assert Enum.all?(emitted, &(event_run_id(&1) == "terminal-assistant-run"))
   end
 
   test "agent runner writes matching live JSONL and SQLite terminal event counts" do

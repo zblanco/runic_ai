@@ -179,7 +179,14 @@ defmodule RunicAI.Terminal.AssistantRunner do
   defp suggested_paths(_outcome), do: nil
 
   defp put_event_run_id(%Event{} = event, run_id) do
-    %{event | data: Map.put_new(event.data || %{}, :run_id, run_id)}
+    %{event | data: put_run_id(event.data, run_id)}
+  end
+
+  defp put_run_id(data, run_id) do
+    data
+    |> Kernel.||(%{})
+    |> Map.put(:run_id, run_id)
+    |> Map.put("run_id", run_id)
   end
 
   defp deadline(opts) do

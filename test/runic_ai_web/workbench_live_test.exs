@@ -21,6 +21,18 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert html =~ "RunicAI home"
   end
 
+  test "renders immediate user conversation context when run metadata is sparse", %{conn: conn} do
+    session_id = unique_session_id()
+
+    seed_sparse_user_session(session_id, "Sparse metadata session", "Visible follow-up user turn")
+
+    {:ok, _view, html} = live(conn, ~p"/sessions/#{session_id}")
+
+    assert html =~ "Sparse metadata session"
+    assert html =~ "Visible follow-up user turn"
+    assert html =~ "doops"
+  end
+
   test "root route renders the chat input landing page", %{conn: conn} do
     session_id = unique_session_id()
     seed_session(session_id, "Show recent session")
@@ -267,6 +279,54 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
           }
         },
         at: DateTime.utc_now()
+      })
+  end
+
+  defp seed_sparse_user_session(session_id, title, user_content) do
+    SQLite.migrate!(Workbench.store!())
+
+    now = DateTime.utc_now()
+
+    {:ok, _event} =
+      Workbench.record_terminal_event(%{
+        id: unique_event_id("sparse-start"),
+        session_id: session_id,
+        run_id: session_id,
+        agent: :assistant,
+        kind: :status,
+        phase: :session,
+        status: :running,
+        title: "Workbench run queued",
+        detail: title,
+        data_json: %{
+          run_id: session_id,
+          cwd: File.cwd!(),
+          objective: title,
+          model: nil,
+          approval: nil,
+          mode: nil
+        },
+        at: now
+      })
+
+    {:ok, _event} =
+      Workbench.record_terminal_event(%{
+        id: unique_event_id("sparse-user"),
+        session_id: session_id,
+        run_id: session_id,
+        agent: :assistant,
+        kind: :message,
+        phase: :user,
+        status: :ok,
+        title: "User follow-up",
+        detail: user_content,
+        data_json: %{
+          role: "user",
+          content: user_content,
+          message_kind: "followup",
+          presentation_group_id: session_id
+        },
+        at: DateTime.add(now, 1)
       })
   end
 

@@ -4,11 +4,23 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
   """
 
   alias RunicAI.Error
-  alias RunicAI.LLM
   alias RunicAI.LLM.Result
+  alias RunicAI.LLM.Streaming
   alias RunicAI.RLM.Components.BlueprintTransform
 
   @default_model "openai:gpt-5.4-mini"
+  @stream_opt_keys [
+    :stream?,
+    :stream_sink,
+    :run_id,
+    :session_id,
+    :agent,
+    :component_id,
+    :component_type,
+    :presentation_group_id,
+    :request_context_id,
+    :stream_chunk_size
+  ]
 
   @spec run(term(), map() | keyword(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(input, params \\ %{}, opts \\ []) when is_list(opts) do
@@ -75,7 +87,7 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
           }
         )
 
-      case LLM.generate_text(model, prompt, llm_opts) do
+      case Streaming.generate_text(model, prompt, stream_opts(llm_opts, "group", index)) do
         {:ok, %Result{} = result} -> {:cont, {:ok, [Result.text(result) | acc]}}
         {:retry, %Error{} = error} -> {:halt, {:error, error}}
         {:error, %Error{} = error} -> {:halt, {:error, error}}
@@ -98,7 +110,7 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
         }
       )
 
-    case LLM.generate_text(model, prompt, llm_opts) do
+    case Streaming.generate_text(model, prompt, stream_opts(llm_opts, "final", 1)) do
       {:ok, %Result{} = result} -> {:ok, Result.text(result)}
       {:retry, %Error{} = error} -> {:error, error}
       {:error, %Error{} = error} -> {:error, error}
@@ -202,8 +214,28 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
   defp llm_opts(opts) do
     []
     |> maybe_put(:client, Keyword.get(opts, :client))
+    |> Keyword.merge(Keyword.take(opts, @stream_opt_keys))
     |> Keyword.merge(Keyword.get(opts, :llm_opts, []))
   end
+
+  defp stream_opts(opts, kind, index) do
+    run_id = Keyword.get(opts, :run_id)
+    component_id = Keyword.get(opts, :component_id, "llm_leaf")
+    stream_id = stream_id(run_id, component_id, kind, index)
+
+    opts
+    |> Keyword.put(:stream_id, stream_id)
+    |> Keyword.put(:message_id, "stream:#{stream_id}")
+    |> Keyword.put_new(:message_kind, "analysis")
+    |> Keyword.put_new(:source_step, "llm_reduce")
+    |> Keyword.put_new(:workflow_node, component_id)
+    |> Keyword.put_new(:transient, true)
+  end
+
+  defp stream_id(nil, component_id, kind, index), do: "assistant:#{component_id}:#{kind}:#{index}"
+
+  defp stream_id(run_id, component_id, kind, index),
+    do: "assistant:#{run_id}:#{component_id}:#{kind}:#{index}"
 
   defp maybe_put(keyword, _key, nil), do: keyword
   defp maybe_put(keyword, key, value), do: Keyword.put(keyword, key, value)

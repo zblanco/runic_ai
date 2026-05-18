@@ -3,6 +3,7 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   use RunicAIWeb, :live_view
 
+  alias RunicAI.Event
   alias RunicAI.Workbench
   alias RunicAIWeb.Markdown
 
@@ -234,21 +235,12 @@ defmodule RunicAIWeb.WorkbenchLive do
   end
 
   @impl true
-  def handle_info({:workbench, :terminal_event, event}, socket) do
-    if socket.assigns.live_action == :index do
-      {:noreply, socket}
-    else
-      selected_session_id = socket.assigns[:selected_session_id]
+  def handle_info({:workbench, :event, %Event{} = event}, socket) do
+    handle_workbench_event(socket, event.session_id)
+  end
 
-      socket =
-        if is_nil(selected_session_id) or event.session_id == selected_session_id do
-          request_workbench_refresh(socket, selected_session_id || event.session_id)
-        else
-          request_workbench_refresh(socket, selected_session_id)
-        end
-
-      {:noreply, socket}
-    end
+  def handle_info({:workbench, :terminal_event, _event}, socket) do
+    {:noreply, socket}
   end
 
   def handle_info(:refresh_workbench, socket) do
@@ -262,6 +254,23 @@ defmodule RunicAIWeb.WorkbenchLive do
       end
 
     {:noreply, socket}
+  end
+
+  defp handle_workbench_event(socket, event_session_id) do
+    if socket.assigns.live_action == :index do
+      {:noreply, socket}
+    else
+      selected_session_id = socket.assigns[:selected_session_id]
+
+      socket =
+        if is_nil(selected_session_id) or event_session_id == selected_session_id do
+          request_workbench_refresh(socket, selected_session_id || event_session_id)
+        else
+          request_workbench_refresh(socket, selected_session_id)
+        end
+
+      {:noreply, socket}
+    end
   end
 
   @impl true
@@ -405,7 +414,11 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp decorate_snapshot(snapshot) do
     messages =
       Enum.map(snapshot.messages, fn message ->
-        Map.put(message, :html, Markdown.to_html(message.content))
+        content = message.content || ""
+
+        message
+        |> Map.put(:content, content)
+        |> Map.put(:html, Markdown.to_html(content))
       end)
 
     %{snapshot | messages: messages}
@@ -925,7 +938,7 @@ defmodule RunicAIWeb.WorkbenchLive do
                       value="rlm"
                       selected={Phoenix.HTML.Form.input_value(@new_run_form, :agent) == "rlm"}
                     >
-                      rlm
+                      repo rlm
                     </option>
                   </select>
                   <select
@@ -987,7 +1000,7 @@ defmodule RunicAIWeb.WorkbenchLive do
                       <strong class="text-rune-text">standard</strong>: direct conversational/local runs
                     </p>
                     <p>
-                      <strong class="text-rune-text">rlm</strong>: coding/RLM scorecard workflows
+                      <strong class="text-rune-text">repo rlm</strong>: coding/RLM scorecard workflows
                     </p>
                     <p>
                       <strong class="text-rune-text">verify</strong>: inspect/analyze, <strong class="text-rune-text">patch</strong>: may propose file changes, <strong class="text-rune-text">read only</strong>: no writes expected

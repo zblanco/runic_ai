@@ -8,6 +8,7 @@ defmodule RunicAI.Terminal.Event do
   """
 
   alias RunicAI.Error
+  alias RunicAI.Event, as: CoreEvent
   alias RunicAI.Harness.Session
   alias RunicAI.Ids
   alias RunicAI.ReviewRequest
@@ -261,23 +262,55 @@ defmodule RunicAI.Terminal.Event do
   end
 
   @spec from_rlm_stage(term(), keyword()) :: t()
-  def from_rlm_stage(stage, opts \\ []) do
-    stage_name = field(stage, :stage) || field(stage, :phase) || :stage
-    status = normalize_source_status(field(stage, :status) || :running)
-    data = field(stage, :data) || stage
-    agent = Keyword.get(opts, :agent, :rlm)
+  def from_rlm_stage(stage, opts \\ [])
 
-    new!(rlm_kind(stage_name),
-      id: field(stage, :id) || default_id(:rlm_plan),
-      at: field(stage, :at) || DateTime.utc_now(),
-      session_id: Keyword.get(opts, :session_id) || field(stage, :run_id),
-      agent: agent,
-      phase: normalize_phase(stage_name),
-      status: status,
-      title: rlm_stage_title(stage_name, status, rlm_label(agent)),
-      detail: preview(data),
-      data: %{stage: stage_name, status: status, data: data},
-      raw: stage
+  def from_rlm_stage(%__MODULE__{} = event, _opts), do: event
+
+  def from_rlm_stage(%CoreEvent{} = event, _opts), do: from_core(event)
+
+  def from_rlm_stage(stage, opts), do: stage |> CoreEvent.from_rlm_stage(opts) |> from_core()
+
+  @spec from_stream_stage(term(), keyword()) :: t()
+  def from_stream_stage(stage, opts \\ [])
+
+  def from_stream_stage(%__MODULE__{} = event, _opts), do: event
+  def from_stream_stage(%CoreEvent{} = event, _opts), do: from_core(event)
+
+  def from_stream_stage(stage, opts),
+    do: stage |> CoreEvent.from_stream_stage(opts) |> from_core()
+
+  @spec from_core(CoreEvent.t()) :: t()
+  def from_core(%CoreEvent{} = event) do
+    data = put_data_run_id(event.data, event.run_id)
+
+    new!(event.kind,
+      id: event.id,
+      at: event.at,
+      session_id: event.session_id,
+      agent: event.agent,
+      phase: event.phase,
+      status: event.status,
+      title: event.title,
+      detail: event.detail,
+      data: data,
+      raw: event.raw
+    )
+  end
+
+  @spec to_core(t()) :: CoreEvent.t()
+  def to_core(%__MODULE__{} = event) do
+    CoreEvent.new!(event.kind,
+      id: event.id,
+      at: event.at,
+      session_id: event.session_id,
+      run_id: field(event.data, :run_id),
+      agent: event.agent,
+      phase: event.phase,
+      status: event.status,
+      title: event.title,
+      detail: event.detail,
+      data: event.data,
+      raw: event.raw
     )
   end
 
@@ -1031,39 +1064,20 @@ defmodule RunicAI.Terminal.Event do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
+  defp put_data_run_id(data, nil), do: data || %{}
+
+  defp put_data_run_id(data, run_id) do
+    data
+    |> Kernel.||(%{})
+    |> Map.put("run_id", run_id)
+    |> Map.put(:run_id, run_id)
+  end
+
   defp maybe_append(events, nil), do: events
   defp maybe_append(events, event), do: events ++ [event]
 
-  defp rlm_kind(stage)
-       when stage in [
-              :episode_completed,
-              :node_started,
-              :node_completed,
-              :node_failed,
-              :execution_started,
-              :execution_completed
-            ],
-       do: :rlm_node
-
-  defp rlm_kind(stage)
-       when stage in [:repair_attempt_started, :repair_attempt_completed, :repair_completed],
-       do: :repair
-
-  defp rlm_kind(stage) when stage in [:review_requested, :review_completed], do: :hitl
-
-  defp rlm_kind(stage) when stage in [:progress_gate_completed, :scorecard, :scorecard_completed],
-    do: :summary
-
-  defp rlm_kind(_stage), do: :rlm_plan
-
-  defp normalize_phase(value) when is_atom(value), do: value
-  defp normalize_phase(value) when is_binary(value), do: String.replace(value, "-", "_")
-  defp normalize_phase(_value), do: :stage
-
   defp rlm_label(:assistant), do: "Assistant RLM"
   defp rlm_label(_agent), do: "RLM"
-
-  defp rlm_stage_title(stage, status, label), do: "#{label} #{humanize(stage)} #{status}"
 
   defp validation_detail(report) do
     errors = report |> field(:errors) |> List.wrap() |> length()

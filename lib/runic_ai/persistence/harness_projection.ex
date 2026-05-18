@@ -149,13 +149,21 @@ defmodule RunicAI.Persistence.HarnessProjection do
 
   defp project_event_kind!(store, %TerminalEvent{kind: "chunk"} = event) do
     conversation = ensure_conversation!(store, event)
-    message = insert_message!(store, event, conversation.id, "assistant", "stream")
+
+    message =
+      upsert_stream_message!(
+        store,
+        event,
+        conversation.id,
+        message_role(event, "assistant"),
+        message_kind(event, "stream")
+      )
 
     attrs = %{
       message_id: message.id,
-      sequence: event.sequence || 1,
-      chunk_kind: event.phase || "chunk",
-      content: event.detail,
+      sequence: stream_chunk_sequence(event),
+      chunk_kind: stream_chunk_kind(event),
+      content: stream_chunk_content(event),
       payload_json: event.data_json,
       created_at: event.at
     }
@@ -253,6 +261,54 @@ defmodule RunicAI.Persistence.HarnessProjection do
     insert_message!(store, event, conversation_id, role, kind, [])
   end
 
+  defp upsert_stream_message!(
+         %Store{} = store,
+         %TerminalEvent{} = event,
+         conversation_id,
+         role,
+         kind
+       ) do
+    id = agent_message_id(event)
+    chunk = stream_chunk_content(event)
+
+    attrs = %{
+      id: id,
+      conversation_id: conversation_id,
+      session_id: event.session_id || event.run_id,
+      role: role,
+      message_kind: kind,
+      source_step: data_field(event, :source_step) || event.phase,
+      workflow_node: workflow_node(event),
+      runnable_id: optional_string(runnable_id(event)),
+      content: chunk,
+      content_json: event.data_json,
+      stream_complete: false,
+      transient: stream_transient?(event),
+      supersedes_message_id: data_field(event, :supersedes_message_id),
+      presentation_group_id: presentation_group_id(event),
+      created_at: event.at
+    }
+
+    case store.repo.get(AgentMessage, id) do
+      nil ->
+        %AgentMessage{}
+        |> AgentMessage.changeset(attrs)
+        |> store.repo.insert!()
+
+      %AgentMessage{} = existing ->
+        attrs = %{
+          attrs
+          | content: append_stream_content(existing.content, chunk),
+            content_json: Map.merge(existing.content_json || %{}, attrs.content_json || %{}),
+            created_at: existing.created_at || attrs.created_at
+        }
+
+        existing
+        |> AgentMessage.changeset(attrs)
+        |> store.repo.update!()
+    end
+  end
+
   defp insert_message!(
          %Store{} = store,
          %TerminalEvent{} = event,
@@ -262,19 +318,20 @@ defmodule RunicAI.Persistence.HarnessProjection do
          opts
        ) do
     attrs = %{
-      id: "message:#{event.id}",
+      id: agent_message_id(event),
       conversation_id: conversation_id,
       session_id: event.session_id || event.run_id,
       role: role,
       message_kind: kind,
-      source_step: event.phase,
+      source_step: data_field(event, :source_step) || event.phase,
       workflow_node: workflow_node(event),
       runnable_id: optional_string(runnable_id(event)),
       content: message_content(event),
       content_json: event.data_json,
       stream_complete: event.kind != "chunk",
-      transient: Keyword.get(opts, :transient, false),
-      presentation_group_id: event.run_id,
+      transient: Keyword.get(opts, :transient, stream_transient?(event)),
+      supersedes_message_id: data_field(event, :supersedes_message_id),
+      presentation_group_id: presentation_group_id(event),
       created_at: event.at
     }
 
@@ -816,6 +873,59 @@ defmodule RunicAI.Persistence.HarnessProjection do
       direct_response_text(event) || data_field(event, :reply_text) ||
       data_field(event, :final_answer) || data_field(event, :content) ||
       event.detail || event.title
+  end
+
+  defp agent_message_id(%TerminalEvent{} = event) do
+    data_field(event, :message_id) ||
+      data_field(event, :stream_message_id) ||
+      stream_message_id(data_field(event, :stream_id)) ||
+      "message:#{event.id}"
+  end
+
+  defp stream_message_id(nil), do: nil
+  defp stream_message_id(""), do: nil
+  defp stream_message_id(stream_id) when is_binary(stream_id), do: "stream:#{stream_id}"
+  defp stream_message_id(stream_id), do: "stream:#{stream_id}"
+
+  defp stream_chunk_content(%TerminalEvent{} = event) do
+    data_field(event, :chunk) || data_field(event, :content) || event.detail || ""
+  end
+
+  defp stream_chunk_sequence(%TerminalEvent{} = event) do
+    case data_field(event, :sequence) do
+      sequence when is_integer(sequence) and sequence > 0 -> sequence
+      sequence when is_binary(sequence) -> parse_positive_integer(sequence) || event.sequence || 1
+      _other -> event.sequence || 1
+    end
+  end
+
+  defp stream_chunk_kind(%TerminalEvent{} = event) do
+    data_field(event, :channel) || event.phase || "chunk"
+  end
+
+  defp append_stream_content(nil, chunk), do: chunk || ""
+  defp append_stream_content(content, nil), do: content || ""
+  defp append_stream_content(content, ""), do: content || ""
+  defp append_stream_content(content, chunk), do: (content || "") <> chunk
+
+  defp presentation_group_id(%TerminalEvent{} = event) do
+    data_field(event, :presentation_group_id) || event.run_id
+  end
+
+  defp stream_transient?(%TerminalEvent{} = event) do
+    case data_field(event, :transient) do
+      value when value in [true, false] -> value
+      value when value in ["true", "1"] -> true
+      value when value in ["false", "0"] -> false
+      _other -> false
+    end
+  end
+
+  defp parse_positive_integer(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer > 0 -> integer
+      _other -> nil
+    end
   end
 
   defp message_role(%TerminalEvent{} = event, default) do

@@ -104,7 +104,11 @@ defmodule RunicAI.RLM.ComponentRuntime do
     component = native_component!(envelope, runtime)
     base = runtime_context(runtime)
     params = component.params || %{}
-    opts = llm_component_opts(base, runtime_opts(runtime))
+
+    opts =
+      base
+      |> llm_component_opts(runtime_opts(runtime))
+      |> component_llm_opts(component)
 
     result =
       case component.type do
@@ -225,9 +229,15 @@ defmodule RunicAI.RLM.ComponentRuntime do
     TabularParser.run(input, params, workspace: runtime_context(runtime).workspace)
   end
 
-  defp dispatch(%ComponentBlueprint{type: :llm_map, params: params}, input, runtime) do
+  defp dispatch(%ComponentBlueprint{type: :llm_map, params: params} = component, input, runtime) do
     base = runtime_context(runtime)
-    LLMMap.run(input, params, llm_component_opts(base, runtime_opts(runtime)))
+
+    opts =
+      base
+      |> llm_component_opts(runtime_opts(runtime))
+      |> component_llm_opts(component)
+
+    LLMMap.run(input, params, opts)
   end
 
   defp dispatch(%ComponentBlueprint{type: :record_map, params: params}, input, runtime) do
@@ -250,13 +260,15 @@ defmodule RunicAI.RLM.ComponentRuntime do
     DocumentCompare.run(input, params, workspace: runtime_context(runtime).workspace)
   end
 
-  defp dispatch(%ComponentBlueprint{type: :llm_leaf, params: params}, input, runtime) do
+  defp dispatch(%ComponentBlueprint{type: :llm_leaf, params: params} = component, input, runtime) do
     base = runtime_context(runtime)
 
     HierarchicalReduce.run(
       input,
       Map.put(params, :strategy, :llm_reduce),
-      llm_component_opts(base, runtime_opts(runtime))
+      base
+      |> llm_component_opts(runtime_opts(runtime))
+      |> component_llm_opts(component)
     )
   end
 
@@ -432,13 +444,40 @@ defmodule RunicAI.RLM.ComponentRuntime do
   defp runtime_opts(runtime), do: runtime |> get(:opts, []) |> List.wrap()
 
   defp llm_component_opts(base, opts) do
+    run_id = get(base.metadata, :run_id, nil) || Keyword.get(opts, :run_id)
+    session_id = Keyword.get(opts, :session_id) || run_id
+
     opts
     |> Keyword.put(:objective, llm_objective(base, opts))
     |> Keyword.put(
       :model,
       Keyword.get(opts, :model) || get(base.metadata, :model, nil) || @default_model
     )
+    |> maybe_put(:stream_sink, llm_stream_sink(base))
+    |> maybe_put(:run_id, run_id)
+    |> maybe_put(:session_id, session_id)
+    |> Keyword.put_new(:agent, Keyword.get(opts, :agent, :assistant))
+    |> maybe_put(:presentation_group_id, run_id || session_id)
   end
+
+  defp component_llm_opts(opts, %ComponentBlueprint{} = component) do
+    opts
+    |> Keyword.put(:component_id, component.id)
+    |> Keyword.put(:component_type, component.type)
+    |> Keyword.put_new(:workflow_node, component.id)
+    |> Keyword.put_new(:source_step, component.type)
+  end
+
+  defp llm_stream_sink(base) do
+    sink = get(base, :event_sink, nil)
+
+    if is_function(sink, 1) do
+      fn stage -> sink.(stage) end
+    end
+  end
+
+  defp maybe_put(keyword, _key, nil), do: keyword
+  defp maybe_put(keyword, key, value), do: Keyword.put(keyword, key, value)
 
   defp llm_objective(base, opts) do
     objective = to_string(base.objective || "")

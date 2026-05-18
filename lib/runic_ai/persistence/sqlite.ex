@@ -221,8 +221,12 @@ defmodule RunicAI.Persistence.SQLite do
     end
   end
 
-  @spec record_terminal_event(Store.t(), RunicAI.Terminal.Event.t() | map()) ::
+  @spec record_terminal_event(Store.t(), RunicAI.Event.t() | RunicAI.Terminal.Event.t() | map()) ::
           {:ok, TerminalEvent.t()} | {:error, term()}
+  def record_terminal_event(%Store{} = store, %RunicAI.Event{} = event) do
+    record_terminal_event(store, RunicAI.Event.to_json_map(event))
+  end
+
   def record_terminal_event(%Store{} = store, %RunicAI.Terminal.Event{} = event) do
     record_terminal_event(store, RunicAI.Terminal.Event.to_json_map(event))
   end

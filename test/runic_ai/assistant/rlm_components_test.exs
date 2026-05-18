@@ -3,6 +3,8 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
 
   alias RunicAI.Coding.PathPolicy
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Event
+  alias RunicAI.LLM.TestClient
   alias RunicAI.RLM.Components.ArtifactWriter
   alias RunicAI.RLM.Components.BlueprintTransform
   alias RunicAI.RLM.Components.BudgetLedger
@@ -151,6 +153,78 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert_receive {:mapped, _prompt}
     assert_receive {:mapped, _prompt}
     refute_receive {:mapped, _prompt}
+  end
+
+  test "LLM map emits transient stream stages for mapped items" do
+    parent = self()
+    sink = fn stage -> send(parent, {:llm_stream, stage}) end
+
+    input = %{slices: [%{id: "a", text: "A"}]}
+
+    assert {:ok, item} =
+             LLMMap.map_item(hd(input.slices), 1, input, %{},
+               client: TestClient,
+               model: "test:model",
+               stream_sink: sink,
+               run_id: "run:map",
+               component_id: "map_facts",
+               presentation_group_id: "run:map",
+               stream_chunk_size: 99
+             )
+
+    assert item.id == "a"
+    assert item.text =~ "I received:"
+
+    assert_receive {:llm_stream,
+                    %Event{
+                      kind: :chunk,
+                      run_id: "run:map",
+                      data: %{
+                        "message_id" => "stream:assistant:run:map:map_facts:item:1",
+                        "message_kind" => "analysis",
+                        "workflow_node" => "map_facts",
+                        "transient" => true
+                      }
+                    }}
+
+    assert_receive {:llm_stream,
+                    %Event{
+                      kind: :message,
+                      data: %{
+                        "message_id" => "stream:assistant:run:map:map_facts:item:1",
+                        "stream_complete" => true
+                      }
+                    }}
+  end
+
+  test "LLM map keeps concurrent item streams attached to stable message ids" do
+    parent = self()
+    sink = fn stage -> send(parent, {:llm_stream, stage}) end
+
+    input = %{slices: [%{id: "a", text: "A"}, %{id: "b", text: "B"}]}
+
+    assert {:ok, result} =
+             LLMMap.run(input, %{limit: 2, max_concurrency: 2},
+               client: TestClient,
+               model: "test:model",
+               stream_sink: sink,
+               run_id: "run:parallel-map",
+               component_id: "map_parallel",
+               stream_chunk_size: 10_000
+             )
+
+    assert result.count == 2
+
+    events = collect_stream_events(4)
+    completed_ids = events |> completed_stream_ids() |> Enum.sort()
+    chunk_ids = events |> chunk_stream_ids() |> Enum.sort()
+
+    assert completed_ids == [
+             "stream:assistant:run:parallel-map:map_parallel:item:1",
+             "stream:assistant:run:parallel-map:map_parallel:item:2"
+           ]
+
+    assert chunk_ids == completed_ids
   end
 
   test "LLM map exposes structured records as prompt text when no text field exists" do
@@ -449,5 +523,24 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     File.mkdir_p!(path)
     on_exit(fn -> File.rm_rf!(path) end)
     path
+  end
+
+  defp collect_stream_events(count, acc \\ [])
+  defp collect_stream_events(0, acc), do: Enum.reverse(acc)
+
+  defp collect_stream_events(count, acc) do
+    receive do
+      {:llm_stream, stage} -> collect_stream_events(count - 1, [stage | acc])
+    after
+      1_000 -> flunk("expected #{count} more stream event(s)")
+    end
+  end
+
+  defp completed_stream_ids(events) do
+    for %Event{kind: :message, data: %{"message_id" => id}} <- events, do: id
+  end
+
+  defp chunk_stream_ids(events) do
+    for %Event{kind: :chunk, data: %{"message_id" => id}} <- events, do: id
   end
 end

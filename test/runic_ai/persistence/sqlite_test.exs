@@ -6,6 +6,7 @@ defmodule RunicAI.Persistence.SQLiteTest do
   alias RunicAI.Persistence.Export
   alias RunicAI.Persistence.Inspection
   alias RunicAI.Persistence.Schemas.AgentMessage
+  alias RunicAI.Persistence.Schemas.AgentMessageChunk
   alias RunicAI.Persistence.Schemas.AgentSession
   alias RunicAI.Persistence.Schemas.ReviewRequest
   alias RunicAI.Persistence.Schemas.RunArtifact
@@ -83,6 +84,113 @@ defmodule RunicAI.Persistence.SQLiteTest do
     assert event.id == "event:1"
     assert [%TerminalEvent{id: "event:1"}] = Queries.run_timeline(store, "run:1")
     assert [%TerminalEvent{id: "event:1"}] = Queries.search_events(store, "salience")
+  end
+
+  test "stream chunks project into one accumulating message row", %{store: store} do
+    at = ~U[2026-05-03 12:09:00Z]
+
+    assert {:ok, %TerminalEvent{sequence: 1}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:stream:1",
+               session_id: "session:stream",
+               run_id: "run:stream",
+               agent: :assistant,
+               kind: :chunk,
+               phase: :assistant_chunk,
+               status: :running,
+               title: "Assistant stream chunk",
+               detail: "Hello ",
+               data_json: %{
+                 run_id: "run:stream",
+                 stream_id: "assistant:run:stream:final",
+                 message_id: "stream:assistant:run:stream:final",
+                 role: "assistant",
+                 message_kind: "stream",
+                 channel: "content",
+                 chunk: "Hello ",
+                 content: "Hello ",
+                 sequence: 1,
+                 source_step: "generate_turn"
+               },
+               at: at
+             })
+
+    assert {:ok, %TerminalEvent{sequence: 2}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:stream:2",
+               session_id: "session:stream",
+               run_id: "run:stream",
+               agent: :assistant,
+               kind: :chunk,
+               phase: :assistant_chunk,
+               status: :running,
+               title: "Assistant stream chunk",
+               detail: "world",
+               data_json: %{
+                 run_id: "run:stream",
+                 stream_id: "assistant:run:stream:final",
+                 message_id: "stream:assistant:run:stream:final",
+                 role: "assistant",
+                 message_kind: "stream",
+                 channel: "content",
+                 chunk: "world",
+                 content: "world",
+                 sequence: 2,
+                 source_step: "generate_turn"
+               },
+               at: DateTime.add(at, 1, :second)
+             })
+
+    assert [
+             %AgentMessage{
+               id: "stream:assistant:run:stream:final",
+               role: "assistant",
+               message_kind: "stream",
+               content: "Hello world",
+               stream_complete: false,
+               presentation_group_id: "run:stream"
+             }
+           ] = Queries.messages_for_run(store, "run:stream")
+
+    chunks =
+      SQLite.with_repo(store, fn ->
+        store.repo.all(AgentMessageChunk)
+      end)
+      |> Enum.sort_by(& &1.sequence)
+
+    assert Enum.map(chunks, & &1.content) == ["Hello ", "world"]
+    assert Enum.map(chunks, & &1.chunk_kind) == ["content", "content"]
+
+    assert {:ok, %TerminalEvent{sequence: 3}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:stream:3",
+               session_id: "session:stream",
+               run_id: "run:stream",
+               agent: :assistant,
+               kind: :message,
+               phase: :assistant,
+               status: :ok,
+               title: "Assistant response",
+               detail: "Hello world",
+               data_json: %{
+                 run_id: "run:stream",
+                 message_id: "stream:assistant:run:stream:final",
+                 role: "assistant",
+                 message_kind: "stream",
+                 content: "Hello world",
+                 stream_complete: true,
+                 source_step: "generate_turn"
+               },
+               at: DateTime.add(at, 2, :second)
+             })
+
+    assert [
+             %AgentMessage{
+               id: "stream:assistant:run:stream:final",
+               content: "Hello world",
+               stream_complete: true
+             }
+           ] = Queries.messages_for_run(store, "run:stream")
   end
 
   test "schema changesets reject invalid statuses and missing identity fields" do

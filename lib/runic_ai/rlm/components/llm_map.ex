@@ -4,11 +4,23 @@ defmodule RunicAI.RLM.Components.LLMMap do
   """
 
   alias RunicAI.Error
-  alias RunicAI.LLM
   alias RunicAI.LLM.Result
+  alias RunicAI.LLM.Streaming
   alias RunicAI.RLM.Components.BlueprintTransform
 
   @default_model "openai:gpt-5.4-mini"
+  @stream_opt_keys [
+    :stream?,
+    :stream_sink,
+    :run_id,
+    :session_id,
+    :agent,
+    :component_id,
+    :component_type,
+    :presentation_group_id,
+    :request_context_id,
+    :stream_chunk_size
+  ]
 
   @spec run(term(), map() | keyword(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def run(input, params \\ %{}, opts \\ []) when is_list(opts) do
@@ -81,7 +93,7 @@ defmodule RunicAI.RLM.Components.LLMMap do
   defp map_one(record, index, input, params, opts, model, llm_opts) do
     prompt = prompt_for(record, index, input, params, opts)
 
-    case LLM.generate_text(model, prompt, llm_opts) do
+    case Streaming.generate_text(model, prompt, stream_opts(llm_opts, index)) do
       {:ok, %Result{} = result} ->
         {:ok,
          %{
@@ -177,8 +189,28 @@ defmodule RunicAI.RLM.Components.LLMMap do
   defp llm_opts(opts) do
     []
     |> maybe_put(:client, Keyword.get(opts, :client))
+    |> Keyword.merge(Keyword.take(opts, @stream_opt_keys))
     |> Keyword.merge(Keyword.get(opts, :llm_opts, []))
   end
+
+  defp stream_opts(opts, index) do
+    run_id = Keyword.get(opts, :run_id)
+    component_id = Keyword.get(opts, :component_id, "llm_map")
+    stream_id = stream_id(run_id, component_id, "item", index)
+
+    opts
+    |> Keyword.put(:stream_id, stream_id)
+    |> Keyword.put(:message_id, "stream:#{stream_id}")
+    |> Keyword.put_new(:message_kind, "analysis")
+    |> Keyword.put_new(:source_step, "llm_map")
+    |> Keyword.put_new(:workflow_node, component_id)
+    |> Keyword.put_new(:transient, true)
+  end
+
+  defp stream_id(nil, component_id, kind, index), do: "assistant:#{component_id}:#{kind}:#{index}"
+
+  defp stream_id(run_id, component_id, kind, index),
+    do: "assistant:#{run_id}:#{component_id}:#{kind}:#{index}"
 
   defp maybe_put(keyword, _key, nil), do: keyword
   defp maybe_put(keyword, key, value), do: Keyword.put(keyword, key, value)

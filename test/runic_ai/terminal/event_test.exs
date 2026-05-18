@@ -31,6 +31,27 @@ defmodule RunicAI.Terminal.EventTest do
     refute Map.has_key?(json, :raw)
   end
 
+  test "constructs JSON-safe terminal events with tuple-keyed nested data" do
+    event =
+      Event.new!(:rlm_node,
+        agent: :assistant,
+        phase: :node_completed,
+        status: :ok,
+        title: "Tuple keyed payload",
+        data: %{
+          usage: %{
+            {252_900_930, 3_074_849_482} => %{tokens: 42}
+          }
+        }
+      )
+
+    assert event.data["usage"]["{252900930, 3074849482}"]["tokens"] == 42
+
+    json = Event.to_json_map(event)
+
+    assert json.data["usage"]["{252900930, 3074849482}"]["tokens"] == 42
+  end
+
   test "normalizes coding trace events to tool events" do
     trace =
       TraceEvent.new!(:coding_tool_call,
@@ -260,5 +281,52 @@ defmodule RunicAI.Terminal.EventTest do
     assert json.data["data"]["runnable"]["component_id"] == "map"
     assert json.data["data"]["runnable"]["component_type"] == "record_map"
     assert json.data["data"]["runnable"]["policy"]["executor_opts"]["max_concurrency"] == 1
+  end
+
+  test "normalizes LLM stream stages into chunk and message events" do
+    chunk =
+      Event.from_rlm_stage(
+        %{
+          run_id: "run:stream",
+          stage: :llm_stream_chunk,
+          status: :running,
+          data: %{
+            run_id: "run:stream",
+            agent: :assistant,
+            message_id: "stream:assistant:run:stream:final",
+            content: "Hello ",
+            chunk: "Hello ",
+            sequence: 1,
+            stream_complete: false
+          }
+        },
+        agent: :assistant
+      )
+
+    assert chunk.kind == :chunk
+    assert chunk.phase == :assistant_chunk
+    assert chunk.status == :running
+    assert chunk.detail == "Hello "
+    assert chunk.data["message_id"] == "stream:assistant:run:stream:final"
+
+    completed =
+      Event.from_stream_stage(%{
+        run_id: "run:stream",
+        stage: :llm_stream_completed,
+        status: :ok,
+        data: %{
+          run_id: "run:stream",
+          agent: :assistant,
+          message_id: "stream:assistant:run:stream:final",
+          content: "Hello world",
+          stream_complete: true
+        }
+      })
+
+    assert completed.kind == :message
+    assert completed.phase == :assistant
+    assert completed.status == :ok
+    assert completed.detail == "Hello world"
+    assert completed.data["stream_complete"] == true
   end
 end
