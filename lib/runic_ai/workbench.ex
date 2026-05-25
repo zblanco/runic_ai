@@ -7,7 +7,9 @@ defmodule RunicAI.Workbench do
   """
 
   alias RunicAI.Ids
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.Coding.Review
+  alias RunicAI.LLM.ModelCatalog
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.Schemas.AgentMessage
@@ -25,6 +27,8 @@ defmodule RunicAI.Workbench do
   alias RunicAI.Terminal.AgentRunner
   alias RunicAI.Terminal.CliOptions
   alias RunicAI.Terminal.Event
+  alias RunicAI.Terminal.GraphPresenter
+  alias RunicAI.Terminal.RLMRunner
   alias RunicAI.Workbench.StoreServer
 
   @topic "runic_ai:workbench"
@@ -33,6 +37,13 @@ defmodule RunicAI.Workbench do
   @agent_choices %{"assistant" => :assistant, "standard" => :standard, "rlm" => :rlm}
   @approval_choices %{"safe" => :safe, "never" => :never, "ask" => :ask}
   @mode_choices %{"verify" => :verify, "patch" => :patch, "read_only" => :read_only}
+  @write_policy_choices %{
+    "docs_only" => :docs_only,
+    "docs-only" => :docs_only,
+    "workspace_review" => :workspace_review,
+    "workspace-review" => :workspace_review,
+    "none" => :none
+  }
   @review_wait_poll_interval_ms 250
   @rlm_workspace_cues ~w(
     api app branch bug code codebase command compile compiler component config
@@ -50,10 +61,18 @@ defmodule RunicAI.Workbench do
     "max_runtime_ms" => :max_runtime_ms,
     "mode" => :mode,
     "model" => :model,
+    "model_id" => :model_id,
+    "model_provider" => :model_provider,
+    "max_objective_iterations" => :max_objective_iterations,
     "objective" => :objective,
+    "profile" => :profile,
     "rewrite" => :rewrite,
     "run_id" => :run_id,
-    "session_id" => :session_id
+    "session_id" => :session_id,
+    "tool_config" => :tool_config,
+    "toolsets" => :toolsets,
+    "disabled_tools" => :disabled_tools,
+    "write_policy" => :write_policy
   }
 
   @spec store() :: {:ok, Store.t()} | {:error, term()}
@@ -145,16 +164,27 @@ defmodule RunicAI.Workbench do
       reviews = Queries.review_requests(store, session_id)
       artifacts = Queries.artifacts_for_run(store, session_id)
       scorecards = Queries.scorecards_for_run(store, session_id)
+      objective_loop = Queries.latest_objective_loop_state(store, session_id)
+      event_views = Enum.map(events, &event_view/1)
+      scorecard_views = Enum.map(scorecards, &scorecard_view/1)
+      objective_contract = objective_contract_view(events, messages, scorecard_views)
+      blocked_evidence = blocked_evidence_view(session, events, messages, scorecard_views)
 
       %{
         session: session_view(session),
+        capability_profile: capability_profile_view(session, runs, events),
         messages: Enum.map(messages, &message_view/1),
-        events: Enum.map(events, &event_view/1),
+        events: event_views,
         tool_calls: Enum.map(tools, &tool_call_view/1),
         runs: Enum.map(runs, &run_view/1),
         review_requests: Enum.map(reviews, &review_request_view/1),
         artifacts: Enum.map(artifacts, &artifact_view/1),
-        scorecards: Enum.map(scorecards, &scorecard_view/1),
+        scorecards: scorecard_views,
+        objective_loop: objective_loop,
+        objective_contract: objective_contract,
+        blocked_evidence: blocked_evidence,
+        plan_workflow_graph: plan_workflow_graph_view(event_views),
+        progress_summary: progress_summary_view(event_views, blocked_evidence),
         metrics: %{
           messages: length(messages),
           events: length(events),
@@ -166,6 +196,12 @@ defmodule RunicAI.Workbench do
         }
       }
     end
+  end
+
+  @spec latest_objective_session(String.t()) :: RunicAI.Coding.RLM.ObjectiveSession.t() | nil
+  def latest_objective_session(session_id) when is_binary(session_id) do
+    store!()
+    |> Queries.latest_objective_session(session_id)
   end
 
   @spec first_pending_review_session_id(keyword()) :: String.t() | nil
@@ -191,6 +227,7 @@ defmodule RunicAI.Workbench do
 
       with {:ok, %TerminalEvent{}} <- record_terminal_event(user_message_event(launch)),
            {:ok, %TerminalEvent{}} <- record_terminal_event(launch_event(launch)),
+           {:ok, %TerminalEvent{}} <- record_terminal_event(capability_profile_event(launch)),
            {:ok, pid} <- start_agent_task(launch) do
         {:ok, %{session_id: launch.session_id, run_id: launch.run_id, pid: pid}}
       end
@@ -202,10 +239,21 @@ defmodule RunicAI.Workbench do
   def record_review_decision(session_id, review_id, params)
       when is_binary(session_id) and is_binary(review_id) and is_map(params) do
     with {:ok, %ReviewRequest{} = review} <- get_review_request(session_id, review_id),
+         :ok <- require_pending_review_decision(review),
          {:ok, decision} <- normalize_review_decision(params) do
-      record_terminal_event(review_decision_event(session_id, review, decision))
+      with {:ok, %TerminalEvent{} = event} <-
+             record_terminal_event(review_decision_event(session_id, review, decision)) do
+        maybe_start_objective_operator_resume(session_id, review, decision)
+        {:ok, event}
+      end
     end
   end
+
+  defp require_pending_review_decision(%ReviewRequest{status: status})
+       when status in ["pending", "waiting", "review"],
+       do: :ok
+
+  defp require_pending_review_decision(%ReviewRequest{}), do: {:error, :review_already_decided}
 
   defp normalize_launch(params) do
     cfg = config()
@@ -231,14 +279,45 @@ defmodule RunicAI.Workbench do
            ),
          {:ok, mode} <-
            choice(value(params, "mode"), @mode_choices, Keyword.get(cfg, :default_mode, :verify)),
+         {:ok, write_policy} <-
+           choice(
+             value(params, "write_policy"),
+             @write_policy_choices,
+             Keyword.get(cfg, :default_write_policy, default_write_policy(mode))
+           ),
          {:ok, cwd} <- normalize_cwd(value(params, "cwd") || File.cwd!()),
+         {:ok, {agent, agent_route}} <- {:ok, route_agent(agent, objective, mode)},
+         {:ok, profile} <-
+           normalize_profile(
+             value(params, "profile") || Keyword.get(cfg, :default_profile, :local_workbench)
+           ),
+         {:ok, toolsets} <- normalize_list(value(params, "toolsets")),
+         {:ok, disabled_tools} <- normalize_list(value(params, "disabled_tools")),
+         {:ok, tool_config} <- normalize_tool_config(value(params, "tool_config")),
+         {:ok, capability_resolution} <-
+           CapabilityResolver.resolve(cwd,
+             agent: agent,
+             mode: mode,
+             profile: profile,
+             toolsets: toolsets,
+             disabled_tools: disabled_tools,
+             tool_config: tool_config,
+             approval: approve,
+             write_policy: write_policy
+           ),
          {:ok, max_runtime_ms} <-
            normalize_max_runtime(
              value(params, "max_runtime_ms") || Keyword.get(cfg, :max_runtime_ms, 300_000)
+           ),
+         {:ok, max_objective_iterations} <-
+           normalize_max_objective_iterations(
+             value(params, "max_objective_iterations") ||
+               Keyword.get(cfg, :max_objective_iterations, 3)
            ) do
-      {agent, agent_route} = route_agent(agent, objective)
       session_id = value(params, "session_id") || Ids.unique("web-session")
       run_id = value(params, "run_id") || Ids.unique("#{agent}:web")
+      capability_profile = capability_resolution.metadata
+      model = normalize_model_selection(params, cfg)
 
       {:ok,
        %{
@@ -248,17 +327,26 @@ defmodule RunicAI.Workbench do
          agent: agent,
          agent_route: agent_route,
          cwd: cwd,
-         model: blank_to_nil(value(params, "model") || Keyword.get(cfg, :default_model)),
+         model: model,
          client: blank_to_nil(value(params, "client") || Keyword.get(cfg, :default_client)),
          approve: approve,
          mode: mode,
+         write_policy: write_policy,
+         profile: profile,
+         toolsets: toolsets,
+         disabled_tools: disabled_tools,
+         tool_config: tool_config,
+         capability_profile: capability_profile,
          run_fun: Keyword.get(cfg, :run_fun),
-         max_runtime_ms: max_runtime_ms
+         max_runtime_ms: max_runtime_ms,
+         max_objective_iterations: max_objective_iterations
        }}
     end
   end
 
-  defp route_agent(:rlm, objective) do
+  defp route_agent(:rlm, _objective, :patch), do: {:rlm, nil}
+
+  defp route_agent(:rlm, objective, _mode) do
     if workspace_objective?(objective) do
       {:rlm, nil}
     else
@@ -271,7 +359,30 @@ defmodule RunicAI.Workbench do
     end
   end
 
-  defp route_agent(agent, _objective), do: {agent, nil}
+  defp route_agent(:assistant, objective, _mode) do
+    if local_command_objective?(objective) do
+      {:standard,
+       %{
+         requested_agent: :assistant,
+         routed_agent: :standard,
+         route_reason: :local_command_objective
+       }}
+    else
+      {:assistant, nil}
+    end
+  end
+
+  defp route_agent(agent, _objective, _mode), do: {agent, nil}
+
+  defp local_command_objective?(objective) when is_binary(objective) do
+    objective = String.downcase(objective)
+
+    (String.contains?(objective, "command") or
+       String.contains?(objective, "terminal") or
+       String.contains?(objective, "shell") or
+       String.contains?(objective, "cli")) and
+      Regex.match?(~r/(^|[^a-z0-9_])(run|execute|invoke|call)([^a-z0-9_]|$)/, objective)
+  end
 
   defp workspace_objective?(objective) when is_binary(objective) do
     objective = String.downcase(objective)
@@ -310,22 +421,167 @@ defmodule RunicAI.Workbench do
     end
   end
 
-  defp browser_review_decider(%{approve: :ask} = launch) do
-    fn %RuntimeReviewRequest{} = request, context ->
-      request = ensure_review_id(request)
-      :ok = subscribe_session(launch.session_id)
-      _ = ensure_browser_review_request(launch, request, context)
+  defp maybe_start_objective_operator_resume(session_id, %ReviewRequest{} = review, decision) do
+    with %RunicAI.Coding.RLM.ObjectiveSession{} = session <- latest_objective_session(session_id),
+         {:ok, resume_kind} <- objective_resume_kind(session, review),
+         {:ok, %ReviewDecision{} = review_decision} <-
+           objective_operator_decision(review, decision, resume_kind),
+         {:ok, pid} <-
+           start_objective_resume_task(session_id, review, session, review_decision, resume_kind) do
+      {:ok, pid}
+    else
+      _other -> :ok
+    end
+  end
 
-      wait_for_browser_review_decision(
-        launch.session_id,
-        request,
-        launch.max_runtime_ms,
-        System.monotonic_time(:millisecond)
+  defp objective_resume_kind(
+         %RunicAI.Coding.RLM.ObjectiveSession{} = session,
+         %ReviewRequest{} = review
+       ) do
+    cond do
+      objective_review_request?(session, review) -> {:ok, :review}
+      objective_budget_request?(session, review) -> {:ok, :budget}
+      true -> {:error, :not_objective_resume}
+    end
+  end
+
+  defp objective_review_request?(
+         %RunicAI.Coding.RLM.ObjectiveSession{} = session,
+         %ReviewRequest{} = review
+       ) do
+    session.status == :needs_review_approval and
+      Enum.any?(session.review_requests, fn request ->
+        field(request, :resume_key) in [review.resume_key, review.id]
+      end)
+  end
+
+  defp objective_budget_request?(
+         %RunicAI.Coding.RLM.ObjectiveSession{} = session,
+         %ReviewRequest{} = review
+       ) do
+    session.status == :needs_budget_approval and
+      Enum.any?(session.budget_requests, fn request ->
+        key = field(request, :resume_key) || field(request, :id)
+        key in [review.resume_key, review.id]
+      end)
+  end
+
+  defp objective_operator_decision(%ReviewRequest{} = review, decision, resume_kind) do
+    status =
+      case Map.get(decision, :decision_status) || Map.get(decision, "decision_status") do
+        status when status in [:approved, "approved"] -> :approved
+        status when status in [:edited, "edited"] -> :edited
+        status when status in [:denied, "denied", :rejected, "rejected"] -> :rejected
+        status when status in [:cancelled, "cancelled"] -> :cancelled
+        _other -> nil
+      end
+
+    if status do
+      ReviewDecision.new(review.resume_key || review.id, status,
+        edited_value: Map.get(decision, :edited_value) || Map.get(decision, "edited_value"),
+        actor: :workbench,
+        metadata:
+          %{
+            source: :objective_loop_operator_decision,
+            resume_kind: resume_kind,
+            additional_iterations:
+              Map.get(decision, :additional_iterations) ||
+                Map.get(decision, "additional_iterations"),
+            additional_runtime_ms:
+              Map.get(decision, :additional_runtime_ms) ||
+                Map.get(decision, "additional_runtime_ms"),
+            approved_runtime_ms:
+              Map.get(decision, :approved_runtime_ms) ||
+                Map.get(decision, "approved_runtime_ms"),
+            max_runtime_ms:
+              Map.get(decision, :max_runtime_ms) ||
+                Map.get(decision, "max_runtime_ms")
+          }
+          |> compact_map()
       )
+    else
+      {:error, :unsupported_objective_review_decision}
+    end
+  end
+
+  defp start_objective_resume_task(
+         session_id,
+         %ReviewRequest{} = review,
+         %RunicAI.Coding.RLM.ObjectiveSession{} = session,
+         %ReviewDecision{} = decision,
+         resume_kind
+       ) do
+    fun = fn ->
+      resume_objective_after_operator_decision(session_id, review, session, decision, resume_kind)
+    end
+
+    case Process.whereis(@task_supervisor) do
+      nil -> Task.start(fun)
+      _pid -> Task.Supervisor.start_child(@task_supervisor, fun)
+    end
+  end
+
+  defp resume_objective_after_operator_decision(
+         session_id,
+         %ReviewRequest{} = review,
+         session,
+         decision,
+         resume_kind
+       ) do
+    cfg = config()
+    cwd = objective_resume_cwd(session_id)
+
+    opts = [
+      cwd: cwd,
+      session_id: session_id,
+      run_id: review.workflow_run_id || session.id,
+      run_fun: Keyword.get(cfg, :run_fun),
+      max_runtime_ms: Keyword.get(cfg, :max_runtime_ms, 300_000),
+      event_sink: fn event ->
+        _ = record_terminal_event(event)
+        :ok
+      end
+    ]
+
+    case resume_kind do
+      :budget -> RLMRunner.resume_after_budget(session, decision, opts)
+      :review -> RLMRunner.resume_after_review(session, decision, opts)
+    end
+  end
+
+  defp objective_resume_cwd(session_id) do
+    case Queries.get_session(store!(), session_id) do
+      %AgentSession{workspace_root: cwd} when is_binary(cwd) and cwd != "" -> cwd
+      _other -> File.cwd!()
+    end
+  end
+
+  defp browser_review_decider(%{approve: approve} = launch) when approve in [:ask, :safe] do
+    fn %RuntimeReviewRequest{} = request, context ->
+      if approve == :safe and safe_review?(request) do
+        {:ok, Review.allow(request, reason: "review approved by browser safe policy")}
+      else
+        request = ensure_review_id(request)
+        :ok = subscribe_session(launch.session_id)
+        _ = ensure_browser_review_request(launch, request, context)
+
+        wait_for_browser_review_decision(
+          launch.session_id,
+          request,
+          launch.max_runtime_ms,
+          System.monotonic_time(:millisecond)
+        )
+      end
     end
   end
 
   defp browser_review_decider(_launch), do: nil
+
+  defp safe_review?(%RuntimeReviewRequest{} = request) do
+    request.metadata[:safe?] in [true, "true"] or
+      request.details[:safe?] in [true, "true"] or
+      request.details[:risk] in [:low, "low"]
+  end
 
   defp wait_for_browser_review_decision(
          session_id,
@@ -445,26 +701,39 @@ defmodule RunicAI.Workbench do
   defp browser_review_decision(_event, _request), do: :ignore
 
   defp decision_from_event(%RuntimeReviewRequest{} = request, decision) do
+    metadata = browser_review_decision_metadata(decision)
+
     case field(decision, :decision) || field(decision, :status) do
       action when action in ["approve", :approve, "approved", :approved] ->
-        {:ok, Review.allow(request, reason: "approved in browser")}
+        {:ok, Review.allow(request, reason: "approved in browser", metadata: metadata)}
 
       action
       when action in ["deny", :deny, "denied", :denied, "reject", :reject, "rejected", :rejected] ->
-        {:ok, Review.deny(request, reason: "denied in browser")}
+        {:ok, Review.deny(request, reason: "denied in browser", metadata: metadata)}
 
       action when action in ["stop", :stop, "cancelled", :cancelled, "cancel", :cancel] ->
-        {:ok, Review.final_stop(request, reason: "stopped in browser")}
+        {:ok, Review.final_stop(request, reason: "stopped in browser", metadata: metadata)}
 
       action when action in ["rewrite", :rewrite, "edited", :edited] ->
         {:ok,
          Review.rewrite(request, field(decision, :edited_value) || "",
-           reason: "rewritten in browser"
+           reason: "rewritten in browser",
+           metadata: metadata
          )}
 
       _other ->
         :ignore
     end
+  end
+
+  defp browser_review_decision_metadata(decision) do
+    [:additional_iterations, :additional_runtime_ms, :approved_runtime_ms, :max_runtime_ms]
+    |> Enum.reduce(%{}, fn key, metadata ->
+      case field(decision, key) do
+        value when value in [nil, ""] -> metadata
+        value -> Map.put(metadata, key, value)
+      end
+    end)
   end
 
   defp get_review_request(session_id, review_id) do
@@ -488,10 +757,19 @@ defmodule RunicAI.Workbench do
   defp normalize_review_decision(params) do
     action = params |> value("action") |> to_string()
     rewrite = params |> value("rewrite") |> to_string() |> String.trim()
+    budget_metadata = review_budget_metadata(params)
 
     case action do
       "approve" ->
-        {:ok, %{action: "approve", status: :ok, decision_status: "approved"}}
+        {:ok,
+         Map.merge(
+           %{
+             action: "approve",
+             status: :ok,
+             decision_status: "approved"
+           },
+           budget_metadata
+         )}
 
       "deny" ->
         {:ok, %{action: "deny", status: :blocked, decision_status: "denied"}}
@@ -501,12 +779,15 @@ defmodule RunicAI.Workbench do
 
       "rewrite" when rewrite != "" ->
         {:ok,
-         %{
-           action: "rewrite",
-           status: :ok,
-           decision_status: "edited",
-           edited_value: rewrite
-         }}
+         Map.merge(
+           %{
+             action: "rewrite",
+             status: :ok,
+             decision_status: "edited",
+             edited_value: rewrite
+           },
+           budget_metadata
+         )}
 
       "rewrite" ->
         {:error, :empty_rewrite}
@@ -514,6 +795,16 @@ defmodule RunicAI.Workbench do
       _other ->
         {:error, :invalid_review_decision}
     end
+  end
+
+  defp review_budget_metadata(params) do
+    %{
+      additional_iterations: value(params, "additional_iterations"),
+      additional_runtime_ms: value(params, "additional_runtime_ms"),
+      approved_runtime_ms: value(params, "approved_runtime_ms"),
+      max_runtime_ms: value(params, "max_runtime_ms")
+    }
+    |> compact_map()
   end
 
   defp review_decision_event(session_id, %ReviewRequest{} = review, decision) do
@@ -535,12 +826,18 @@ defmodule RunicAI.Workbench do
         kind: review.kind,
         checkpoint: review.checkpoint,
         resume_key: review.resume_key,
-        decision: %{
-          decision: decision.action,
-          status: decision.decision_status,
-          edited_value: Map.get(decision, :edited_value),
-          decided_at: decided_at
-        }
+        decision:
+          %{
+            decision: decision.action,
+            status: decision.decision_status,
+            edited_value: Map.get(decision, :edited_value),
+            additional_iterations: Map.get(decision, :additional_iterations),
+            additional_runtime_ms: Map.get(decision, :additional_runtime_ms),
+            approved_runtime_ms: Map.get(decision, :approved_runtime_ms),
+            max_runtime_ms: Map.get(decision, :max_runtime_ms),
+            decided_at: decided_at
+          }
+          |> compact_map()
       },
       at: decided_at
     }
@@ -561,8 +858,12 @@ defmodule RunicAI.Workbench do
       launch.cwd,
       "--mode",
       mode_arg(launch.mode),
+      "--profile",
+      to_string(launch.profile),
       "--approve",
       Atom.to_string(launch.approve),
+      "--write-policy",
+      write_policy_arg(launch.write_policy),
       "--session-id",
       launch.session_id,
       "--renderer",
@@ -576,6 +877,10 @@ defmodule RunicAI.Workbench do
       "--max-runtime-ms",
       Integer.to_string(launch.max_runtime_ms)
     ]
+    |> append_objective_loop_args(launch)
+    |> maybe_append_list("--toolsets", launch.toolsets)
+    |> append_repeated("--disable-tool", launch.disabled_tools)
+    |> append_tool_config(launch.tool_config)
     |> maybe_append("--model", launch.model)
     |> maybe_append("--client", launch.client)
     |> maybe_append("--output", inferred_output_path(launch.objective))
@@ -631,10 +936,41 @@ defmodule RunicAI.Workbench do
           client: launch.client,
           approve: launch.approve,
           mode: launch.mode,
+          write_policy: launch.write_policy,
+          profile: launch.profile,
+          toolsets: launch.toolsets,
+          disabled_tools: launch.disabled_tools,
+          tool_config: launch.tool_config,
+          capability_profile: launch.capability_profile,
           max_runtime_ms: launch.max_runtime_ms,
+          max_objective_iterations: launch.max_objective_iterations,
           trigger: "browser"
         }
         |> put_agent_route(launch),
+      at: DateTime.utc_now()
+    }
+  end
+
+  defp capability_profile_event(launch) do
+    %{
+      id: Ids.unique("terminal_event"),
+      session_id: launch.session_id,
+      run_id: launch.run_id,
+      agent: launch.agent,
+      kind: :status,
+      phase: :capability_profile_updated,
+      status: :ok,
+      title: "Capability profile resolved",
+      detail: to_string(launch.profile),
+      data_json: %{
+        run_id: launch.run_id,
+        session_id: launch.session_id,
+        profile: launch.profile,
+        toolsets: launch.toolsets,
+        disabled_tools: launch.disabled_tools,
+        capability_profile: launch.capability_profile,
+        trigger: "browser"
+      },
       at: DateTime.utc_now()
     }
   end
@@ -644,6 +980,8 @@ defmodule RunicAI.Workbench do
   defp put_agent_route(data, _launch), do: data
 
   defp session_view(%AgentSession{} = session) do
+    metadata = session.metadata_json || %{}
+
     %{
       id: session.id,
       title: first_present(session.objective, session.id),
@@ -655,9 +993,18 @@ defmodule RunicAI.Workbench do
       started_at: session.started_at,
       completed_at: session.completed_at,
       failed_at: session.failed_at,
-      metadata: session.metadata_json || %{},
+      metadata: metadata,
+      capability_profile: field(metadata, :capability_profile),
       short_id: short_id(session.id)
     }
+  end
+
+  defp capability_profile_view(%AgentSession{} = session, runs, events) do
+    metadata = session.metadata_json || %{}
+
+    field(metadata, :capability_profile) ||
+      Enum.find_value(runs, fn run -> field(run.metadata_json || %{}, :capability_profile) end) ||
+      Enum.find_value(events, fn event -> field(event.data_json || %{}, :capability_profile) end)
   end
 
   defp message_view(%AgentMessage{} = message) do
@@ -742,6 +1089,282 @@ defmodule RunicAI.Workbench do
       detail: event.detail,
       data: event.data_json || %{}
     }
+  end
+
+  defp event_view(_event), do: nil
+
+  defp plan_workflow_graph_view(events) do
+    events
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reverse()
+    |> Enum.find_value(fn event ->
+      case compile_event_graph_summary(event) do
+        nil -> nil
+        graph -> workflow_graph_view(event, graph)
+      end
+    end)
+  end
+
+  defp compile_event_graph_summary(event) do
+    phase = event |> field(:phase) |> to_string()
+
+    if phase in ["compile_completed", "compiled"] do
+      data = field(event, :data) || %{}
+      compiled = field(data, :compiled) || field(field(data, :data) || %{}, :compiled) || %{}
+
+      field(data, :graph_summary) ||
+        field(compiled, :graph_summary) ||
+        field(field(compiled, :runic) || %{}, :graph_summary)
+    end
+  end
+
+  defp workflow_graph_view(event, graph) when is_map(graph) do
+    mermaid = graph_mermaid(graph) || GraphPresenter.to_mermaid(graph)
+
+    %{
+      title: "Compiled workflow graph",
+      mermaid: mermaid,
+      fallback: GraphPresenter.adjacency_text(graph),
+      metadata: %{
+        run_id: field(event, :run_id),
+        phase: field(event, :phase),
+        sequence: field(event, :sequence)
+      },
+      nodes: graph_nodes(graph),
+      edges: graph_edges(graph),
+      source_hash: hash_source(mermaid || inspect(graph))
+    }
+  end
+
+  defp workflow_graph_view(_event, _graph), do: nil
+
+  defp graph_mermaid(graph) do
+    graph
+    |> field(:runic)
+    |> field(:serializers)
+    |> field(:mermaid)
+    |> case do
+      source when is_binary(source) and source != "" -> source
+      _other -> nil
+    end
+  end
+
+  defp graph_nodes(graph) do
+    runic = field(graph, :runic) || %{}
+
+    (field(graph, :nodes) || field(graph, :components) || field(runic, :native_nodes) || [])
+    |> List.wrap()
+    |> Enum.with_index(1)
+    |> Enum.map(fn {node, index} -> graph_node(node, index) end)
+  end
+
+  defp graph_node(node, index) when is_map(node) do
+    id = field(node, :name) || field(node, :id) || "node_#{index}"
+
+    %{
+      id: to_string(id),
+      label: to_string(field(node, :label) || field(node, :title) || field(node, :name) || id),
+      kind: stringify(field(node, :kind) || field(node, :type)),
+      status: stringify(field(node, :status))
+    }
+  end
+
+  defp graph_node(node, index) do
+    id = stringify(node) || "node_#{index}"
+    %{id: id, label: id, kind: nil, status: nil}
+  end
+
+  defp graph_edges(graph) do
+    runic = field(graph, :runic) || %{}
+
+    (field(graph, :edges) || field(runic, :edgelist) || [])
+    |> List.wrap()
+    |> Enum.map(&graph_edge/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp graph_edge(edge) when is_map(edge) do
+    from = field(edge, :from) || field(edge, :source)
+    to = field(edge, :to) || field(edge, :target)
+
+    if is_nil(from) or is_nil(to) do
+      nil
+    else
+      %{from: to_string(from), to: to_string(to), label: stringify(field(edge, :label))}
+    end
+  end
+
+  defp graph_edge(_edge), do: nil
+
+  defp progress_summary_view(events, blocked_evidence) do
+    events = Enum.reject(events, &is_nil/1)
+    latest = latest_progress_event(events)
+    latest_node = latest_progress_field_event(events, [:node_id, :node, :current_node])
+
+    latest_child =
+      latest_progress_field_event(events, [:child_id, :child_agent_id, :current_child])
+
+    latest_objective =
+      latest_progress_field_event(events, [
+        :objective_session_id,
+        :objective,
+        :current_iteration,
+        :iteration_count,
+        :objective_iteration_count,
+        :objective_session,
+        :objective_session_state,
+        :objective_decision
+      ])
+
+    latest_elapsed = latest_progress_field_event(events, [:elapsed_ms])
+    latest_max_runtime = latest_progress_field_event(events, [:max_runtime_ms])
+    latest_remaining = latest_progress_field_event(events, [:remaining_ms, :remaining_runtime_ms])
+    latest_deadline = latest_progress_field_event(events, [:run_deadline_ms])
+    latest_timeout = latest_progress_field_event(events, [:selected_timeout_ms])
+
+    %{
+      event_count: length(events),
+      latest_event: latest,
+      current_node:
+        field(blocked_evidence || %{}, :current_node) ||
+          progress_event_field(latest_node, :node_id) ||
+          progress_event_field(latest_node, :node) ||
+          progress_event_field(latest_node, :current_node),
+      current_child:
+        field(blocked_evidence || %{}, :current_child) ||
+          progress_event_field(latest_child, :child_id) ||
+          progress_event_field(latest_child, :child_agent_id) ||
+          progress_event_field(latest_child, :current_child),
+      objective:
+        progress_event_field(latest_objective, :objective) ||
+          objective_session_field(latest_objective, :objective),
+      objective_status:
+        objective_session_field(latest_objective, :status) ||
+          progress_event_field(latest_objective, :status),
+      objective_action:
+        objective_decision_field(latest_objective, :action) ||
+          progress_event_field(latest_objective, :action),
+      objective_iteration:
+        progress_event_field(latest_objective, :current_iteration) ||
+          progress_event_field(latest_objective, :iteration_count) ||
+          progress_event_field(latest_objective, :objective_iteration_count) ||
+          objective_session_field(latest_objective, :iteration_count),
+      objective_max_iterations:
+        progress_event_field(latest_objective, :max_iterations) ||
+          objective_session_field(latest_objective, :max_iterations),
+      objective_open_task_count: progress_task_count(latest_objective, :open_tasks),
+      objective_completed_task_count: progress_task_count(latest_objective, :completed_tasks),
+      objective_error_kind: objective_error_field(latest_objective, :kind),
+      objective_error_message: objective_error_field(latest_objective, :message),
+      objective_error_reason:
+        objective_error_field(latest_objective, :reason_message) ||
+          objective_error_field(latest_objective, :reason),
+      elapsed_ms:
+        field(blocked_evidence || %{}, :elapsed_ms) ||
+          progress_event_field(latest_elapsed, :elapsed_ms),
+      max_runtime_ms:
+        field(blocked_evidence || %{}, :max_runtime_ms) ||
+          progress_event_field(latest_max_runtime, :max_runtime_ms),
+      remaining_ms:
+        field(blocked_evidence || %{}, :remaining_ms) ||
+          progress_event_field(latest_remaining, :remaining_ms) ||
+          progress_event_field(latest_remaining, :remaining_runtime_ms),
+      run_deadline_ms: progress_event_field(latest_deadline, :run_deadline_ms),
+      selected_timeout_ms: progress_event_field(latest_timeout, :selected_timeout_ms),
+      event_trail: "#{length(events)} persisted events"
+    }
+    |> compact_map()
+  end
+
+  defp latest_progress_event(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find(&progress_event?/1) ||
+      List.last(events)
+  end
+
+  defp progress_event?(event) do
+    kind = event |> field(:kind) |> to_string()
+    phase = event |> field(:phase) |> to_string()
+
+    kind in ["rlm_plan", "rlm_node", "repair", "summary", "hitl", "status"] or
+      String.contains?(kind, "coding_command") or
+      String.contains?(kind, "coding_process") or
+      String.contains?(phase, "proposal") or
+      String.contains?(phase, "node") or
+      String.contains?(phase, "child") or
+      String.contains?(phase, "budget") or
+      String.contains?(phase, "objective_loop") or
+      String.contains?(phase, "repair") or
+      String.contains?(phase, "scorecard")
+  end
+
+  defp latest_progress_field_event(events, keys) do
+    events
+    |> Enum.reverse()
+    |> Enum.find(fn event ->
+      Enum.any?(keys, &(not is_nil(progress_event_field(event, &1))))
+    end)
+  end
+
+  defp progress_event_field(nil, _key), do: nil
+
+  defp progress_event_field(event, key) do
+    data = field(event, :data) || %{}
+    nested = field(data, :data) || %{}
+
+    field(nested, key) || field(data, key) || field(event, key)
+  end
+
+  defp objective_session_field(nil, _key), do: nil
+
+  defp objective_session_field(event, key) do
+    event
+    |> progress_event_field(:objective_session)
+    |> field(key)
+  end
+
+  defp objective_decision_field(nil, _key), do: nil
+
+  defp objective_decision_field(event, key) do
+    session_decision =
+      event
+      |> progress_event_field(:objective_session)
+      |> field(:decision)
+
+    top_level_decision = progress_event_field(event, :objective_decision)
+
+    field(session_decision, key) || field(top_level_decision, key)
+  end
+
+  defp objective_error_field(nil, _key), do: nil
+
+  defp objective_error_field(event, key) do
+    summary_error =
+      event
+      |> progress_event_field(:objective_session)
+      |> field(:latest_error)
+
+    state_error =
+      event
+      |> progress_event_field(:objective_session_state)
+      |> field(:latest_error)
+
+    direct_error = progress_event_field(event, :latest_error)
+
+    field(summary_error, key) ||
+      field(state_error, key) ||
+      field(direct_error, key) ||
+      objective_session_field(event, :"latest_error_#{key}")
+  end
+
+  defp progress_task_count(nil, _key), do: nil
+
+  defp progress_task_count(event, key) do
+    case progress_event_field(event, key) do
+      tasks when is_list(tasks) -> length(tasks)
+      _other -> nil
+    end
   end
 
   defp tool_call_view(%ToolCall{} = call) do
@@ -831,6 +1454,78 @@ defmodule RunicAI.Workbench do
     }
   end
 
+  defp objective_contract_view(events, messages, scorecards) do
+    latest_from_events =
+      events
+      |> Enum.reverse()
+      |> Enum.find_value(fn event ->
+        data = event.data_json || %{}
+
+        field(data, :objective_contract) ||
+          data |> field(:blocked_evidence) |> field(:objective_contract)
+      end)
+
+    latest_from_messages =
+      messages
+      |> Enum.reverse()
+      |> Enum.find_value(fn message ->
+        data = message.content_json || %{}
+
+        field(data, :objective_contract) ||
+          data |> field(:blocked_evidence) |> field(:objective_contract)
+      end)
+
+    latest_from_scorecards =
+      scorecards
+      |> Enum.reverse()
+      |> Enum.find_value(fn scorecard ->
+        scorecard
+        |> field(:data)
+        |> field(:metadata)
+        |> field(:objective_contract)
+      end)
+
+    latest_from_events || latest_from_messages || latest_from_scorecards
+  end
+
+  defp blocked_evidence_view(%AgentSession{} = session, events, messages, scorecards) do
+    explicit =
+      events
+      |> Enum.reverse()
+      |> Enum.find_value(fn event -> event.data_json |> field(:blocked_evidence) end) ||
+        messages
+        |> Enum.reverse()
+        |> Enum.find_value(fn message -> message.content_json |> field(:blocked_evidence) end)
+
+    explicit || derived_blocked_evidence(session, events, scorecards)
+  end
+
+  defp derived_blocked_evidence(%AgentSession{status: status}, _events, _scorecards)
+       when status not in ["blocked", "failed"],
+       do: nil
+
+  defp derived_blocked_evidence(%AgentSession{} = session, events, scorecards) do
+    latest_scorecard = List.last(scorecards)
+    latest_event = List.last(events)
+
+    %{
+      status: session.status,
+      objective_status: field(latest_scorecard || %{}, :objective_status),
+      residual_risks: field(latest_scorecard || %{}, :residual_risks) || [],
+      unsatisfied_acceptance:
+        latest_scorecard
+        |> field(:acceptance_results)
+        |> List.wrap()
+        |> Enum.filter(&(field(&1, :status) in ["fail", :fail, "blocked", :blocked])),
+      latest_event: event_view(latest_event),
+      next_actions: [
+        "Inspect the latest blocked event and unsatisfied acceptance checks.",
+        "Continue with a targeted repair or rerun with a larger budget when the evidence is budget-related."
+      ]
+    }
+    |> compact_map()
+  end
+
   defp conversation_history(%{session_id: session_id, agent_route: agent_route}) do
     store = store!()
 
@@ -891,6 +1586,27 @@ defmodule RunicAI.Workbench do
   defp field(map, key) when is_map(map), do: Map.get(map, key)
   defp field(_map, _key), do: nil
 
+  defp stringify(nil), do: nil
+  defp stringify(value), do: to_string(value)
+
+  defp hash_source(source) do
+    :crypto.hash(:sha256, source)
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 16)
+  end
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> blank_value?(value) end)
+    |> Map.new()
+  end
+
+  defp blank_value?(nil), do: true
+  defp blank_value?(""), do: true
+  defp blank_value?([]), do: true
+  defp blank_value?(map) when is_map(map), do: map_size(map) == 0
+  defp blank_value?(_value), do: false
+
   defp require_objective(""), do: {:error, :empty_objective}
   defp require_objective(_objective), do: :ok
 
@@ -937,6 +1653,128 @@ defmodule RunicAI.Workbench do
 
   defp normalize_max_runtime(value), do: {:error, {:invalid_max_runtime_ms, value}}
 
+  defp normalize_max_objective_iterations(value) when is_integer(value) and value > 0,
+    do: {:ok, value}
+
+  defp normalize_max_objective_iterations(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> Integer.parse()
+    |> case do
+      {iterations, ""} when iterations > 0 -> {:ok, iterations}
+      _other -> {:error, {:invalid_max_objective_iterations, value}}
+    end
+  end
+
+  defp normalize_max_objective_iterations(value),
+    do: {:error, {:invalid_max_objective_iterations, value}}
+
+  defp normalize_model_selection(params, cfg) do
+    direct_model = blank_to_nil(value(params, "model"))
+    provider = blank_to_nil(value(params, "model_provider"))
+    model_id = blank_to_nil(value(params, "model_id"))
+    configured_default = blank_to_nil(Keyword.get(cfg, :default_model))
+
+    cond do
+      is_binary(provider) and is_binary(model_id) ->
+        "#{provider}:#{model_id}"
+
+      is_binary(direct_model) ->
+        direct_model
+
+      is_binary(configured_default) ->
+        configured_default
+
+      true ->
+        ModelCatalog.default_model_spec()
+    end
+  end
+
+  defp normalize_profile(nil), do: {:ok, "local-workbench"}
+
+  defp normalize_profile(profile) when is_atom(profile),
+    do: {:ok, profile |> Atom.to_string() |> String.replace("_", "-")}
+
+  defp normalize_profile(profile) when is_binary(profile) do
+    profile =
+      profile
+      |> String.trim()
+      |> String.replace("_", "-")
+
+    if profile == "", do: {:ok, "local-workbench"}, else: {:ok, profile}
+  end
+
+  defp normalize_profile(profile), do: {:ok, to_string(profile)}
+
+  defp normalize_list(nil), do: {:ok, []}
+  defp normalize_list(""), do: {:ok, []}
+
+  defp normalize_list(value) when is_binary(value) do
+    {:ok,
+     value
+     |> String.split([",", "\n"], trim: true)
+     |> Enum.map(&String.trim/1)
+     |> Enum.reject(&(&1 == ""))
+     |> Enum.uniq()}
+  end
+
+  defp normalize_list(values) when is_list(values) do
+    {:ok,
+     values
+     |> Enum.flat_map(fn
+       value when is_binary(value) -> String.split(value, [",", "\n"], trim: true)
+       value -> [to_string(value)]
+     end)
+     |> Enum.map(&String.trim/1)
+     |> Enum.reject(&(&1 == ""))
+     |> Enum.uniq()}
+  end
+
+  defp normalize_list(value), do: normalize_list(to_string(value))
+
+  defp normalize_tool_config(nil), do: {:ok, %{}}
+  defp normalize_tool_config(""), do: {:ok, %{}}
+
+  defp normalize_tool_config(config) when is_map(config), do: {:ok, config}
+
+  defp normalize_tool_config(config) when is_binary(config) do
+    config
+    |> String.split([",", "\n"], trim: true)
+    |> Enum.reduce_while({:ok, %{}}, fn entry, {:ok, acc} ->
+      case String.split(entry, "=", parts: 2) do
+        [key, value] ->
+          path = key |> String.trim() |> String.split(".", trim: true)
+
+          if path == [] do
+            {:halt, {:error, {:invalid_tool_config, entry}}}
+          else
+            {:cont, {:ok, put_nested_config(acc, path, parse_config_value(String.trim(value)))}}
+          end
+
+        _other ->
+          {:halt, {:error, {:invalid_tool_config, entry}}}
+      end
+    end)
+  end
+
+  defp parse_config_value("true"), do: true
+  defp parse_config_value("false"), do: false
+
+  defp parse_config_value(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _other -> value
+    end
+  end
+
+  defp put_nested_config(config, [key], value), do: Map.put(config, key, value)
+
+  defp put_nested_config(config, [key | rest], value) do
+    Map.update(config, key, put_nested_config(%{}, rest, value), fn nested ->
+      put_nested_config(Map.new(nested || %{}), rest, value)
+    end)
+  end
+
   defp value(map, key) when is_map(map) and is_atom(key) do
     Map.get(map, key) || Map.get(map, Atom.to_string(key))
   end
@@ -973,9 +1811,56 @@ defmodule RunicAI.Workbench do
   defp mode_arg(:read_only), do: "read-only"
   defp mode_arg(mode), do: Atom.to_string(mode)
 
+  defp write_policy_arg(:docs_only), do: "docs-only"
+  defp write_policy_arg(:workspace_review), do: "workspace-review"
+  defp write_policy_arg(:none), do: "none"
+  defp write_policy_arg(policy), do: to_string(policy)
+
+  defp default_write_policy(:patch), do: :workspace_review
+  defp default_write_policy(_mode), do: :docs_only
+
   defp maybe_append(args, _flag, nil), do: args
   defp maybe_append(args, _flag, ""), do: args
   defp maybe_append(args, flag, value), do: args ++ [flag, to_string(value)]
+
+  defp append_objective_loop_args(args, %{agent: :rlm, max_objective_iterations: iterations}) do
+    args ++ ["--objective-loop", "--max-objective-iterations", Integer.to_string(iterations)]
+  end
+
+  defp append_objective_loop_args(args, _launch), do: args
+
+  defp maybe_append_list(args, _flag, []), do: args
+  defp maybe_append_list(args, _flag, nil), do: args
+
+  defp maybe_append_list(args, flag, values),
+    do: args ++ [flag, Enum.join(List.wrap(values), ",")]
+
+  defp append_repeated(args, _flag, []), do: args
+  defp append_repeated(args, _flag, nil), do: args
+
+  defp append_repeated(args, flag, values) do
+    Enum.reduce(List.wrap(values), args, fn value, acc -> acc ++ [flag, to_string(value)] end)
+  end
+
+  defp append_tool_config(args, config) when config in [nil, %{}], do: args
+
+  defp append_tool_config(args, config) when is_map(config) do
+    config
+    |> flatten_tool_config()
+    |> Enum.reduce(args, fn {key, value}, acc -> acc ++ ["--tool-config", "#{key}=#{value}"] end)
+  end
+
+  defp flatten_tool_config(config, prefix \\ nil) do
+    Enum.flat_map(config, fn {key, value} ->
+      key = if prefix, do: "#{prefix}.#{key}", else: to_string(key)
+
+      if is_map(value) do
+        flatten_tool_config(value, key)
+      else
+        [{key, value}]
+      end
+    end)
+  end
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)

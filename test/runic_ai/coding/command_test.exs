@@ -27,6 +27,70 @@ defmodule RunicAI.Coding.CommandTest do
     assert result.metadata.mutates?
   end
 
+  test "streams command progress events while command output is still arriving" do
+    workspace = Workspace.new!(root: tmp_dir())
+    policy = CommandPolicy.new!(allowed_commands: ["elixir"], timeout_ms: 5_000)
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    assert {:ok, result} =
+             CommandRunner.run(
+               workspace,
+               %{
+                 argv: [
+                   "elixir",
+                   "-e",
+                   ~S|IO.puts("phase one"); Process.sleep(80); IO.puts("phase two")|
+                 ]
+               },
+               policy: policy,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    started_index = Enum.find_index(emitted, &(&1.kind == :coding_command_started))
+    progress_index = Enum.find_index(emitted, &(&1.kind == :coding_command_progress))
+    completed_index = Enum.find_index(emitted, &(&1.kind == :coding_command_completed))
+
+    assert result.status == :pass
+    assert is_integer(started_index)
+    assert is_integer(progress_index)
+    assert is_integer(completed_index)
+    assert started_index < progress_index
+    assert progress_index < completed_index
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :coding_command_progress and
+                 String.contains?(&1.output.output_preview, "phase"))
+           )
+  end
+
+  test "streaming command timeout preserves partial output as a command result" do
+    workspace = Workspace.new!(root: tmp_dir())
+    policy = CommandPolicy.new!(allowed_commands: ["sh"], timeout_ms: 2_000)
+
+    assert {:ok, result} =
+             CommandRunner.run(
+               workspace,
+               %{
+                 argv: [
+                   "sh",
+                   "-c",
+                   ~S|printf "waiting for input"; sleep 10|
+                 ]
+               },
+               policy: policy,
+               event_sink: fn _event -> :ok end
+             )
+
+    assert result.status == :timeout
+    assert result.output =~ "waiting for input"
+    assert result.output_bytes > 0
+    assert result.metadata.partial_output?
+    assert hd(result.diagnostics).details.timeout_ms == 2_000
+  end
+
   test "classifies read-only commands in result metadata" do
     workspace = Workspace.new!(root: tmp_dir())
     policy = CommandPolicy.new!(allowed_commands: ["echo"])
@@ -38,6 +102,52 @@ defmodule RunicAI.Coding.CommandTest do
     assert result.metadata.classification == :read_only
     refute result.metadata.network?
     refute result.metadata.mutates?
+  end
+
+  test "HITL approval bypasses only the command-name allowlist" do
+    workspace = Workspace.new!(root: tmp_dir())
+    policy = CommandPolicy.new!(allowed_commands: ["git"])
+
+    assert {:ok, blocked} =
+             CommandRunner.run(workspace, %{argv: ["printf", "approved"]}, policy: policy)
+
+    assert blocked.status == :blocked
+    assert hd(blocked.diagnostics).message =~ "allowlist"
+
+    assert {:ok, result} =
+             CommandRunner.run(
+               workspace,
+               %{
+                 argv: ["printf", "approved"],
+                 metadata: %{hitl_approved?: true, review_resume_key: "review:1"}
+               },
+               policy: policy
+             )
+
+    assert result.status == :pass
+    assert result.output == "approved"
+    assert result.metadata.hitl_approved?
+    assert result.metadata.review_resume_key == "review:1"
+  end
+
+  test "project_command preserves HITL approval metadata for generic commands" do
+    workspace = Workspace.new!(root: tmp_dir())
+    policy = CommandPolicy.new!(allowed_commands: ["git"])
+
+    assert {:ok, result} =
+             Tools.project_command(
+               workspace,
+               %{
+                 command: "printf approved",
+                 metadata: %{hitl_approved?: true, review_resume_key: "review:project"}
+               },
+               policy
+             )
+
+    assert result.status == :pass
+    assert result.output == "approved"
+    assert result.metadata.hitl_approved?
+    assert result.metadata.review_resume_key == "review:project"
   end
 
   test "normalizes command failures without making them tool errors" do

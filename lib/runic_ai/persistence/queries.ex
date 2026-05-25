@@ -5,6 +5,7 @@ defmodule RunicAI.Persistence.Queries do
 
   import Ecto.Query
 
+  alias RunicAI.Coding.RLM.ObjectiveSession
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.SQLite.Store
   alias RunicAI.Persistence.Schemas.AgentMessage
@@ -143,6 +144,45 @@ defmodule RunicAI.Persistence.Queries do
   @spec run_timeline(Store.t(), String.t()) :: [TerminalEvent.t()]
   def run_timeline(%Store{} = store, run_id) do
     SQLite.with_repo(store, fn -> store.repo.all(run_timeline_query(run_id)) end)
+  end
+
+  @spec objective_loop_events_query(String.t()) :: Ecto.Query.t()
+  def objective_loop_events_query(session_or_run_id) when is_binary(session_or_run_id) do
+    from(event in TerminalEvent,
+      where:
+        (event.run_id == ^session_or_run_id or event.session_id == ^session_or_run_id) and
+          event.agent == "rlm" and
+          (event.phase == "objective_loop" or
+             event.phase == "objective_loop_progress" or
+             (event.phase == "objective_loop_resume" and
+                event.title == "Objective auto-resume limit reached")),
+      order_by: [asc: event.sequence, asc: event.at]
+    )
+  end
+
+  @spec objective_loop_events(Store.t(), String.t()) :: [TerminalEvent.t()]
+  def objective_loop_events(%Store{} = store, session_or_run_id) do
+    SQLite.with_repo(store, fn ->
+      store.repo.all(objective_loop_events_query(session_or_run_id))
+    end)
+  end
+
+  @spec latest_objective_loop_state(Store.t(), String.t()) :: map() | nil
+  def latest_objective_loop_state(%Store{} = store, session_or_run_id)
+      when is_binary(session_or_run_id) do
+    store
+    |> objective_loop_events(session_or_run_id)
+    |> List.last()
+    |> objective_loop_state()
+  end
+
+  @spec latest_objective_session(Store.t(), String.t()) :: ObjectiveSession.t() | nil
+  def latest_objective_session(%Store{} = store, session_or_run_id)
+      when is_binary(session_or_run_id) do
+    store
+    |> objective_loop_events(session_or_run_id)
+    |> List.last()
+    |> objective_session_from_event()
   end
 
   @spec workflow_events_query(String.t()) :: Ecto.Query.t()
@@ -345,6 +385,128 @@ defmodule RunicAI.Persistence.Queries do
       ~s("#{String.replace(term, ~s("), ~s(""))}")
     end
   end
+
+  defp objective_loop_state(nil), do: nil
+
+  defp objective_loop_state(%TerminalEvent{} = event) do
+    data = event.data_json || %{}
+    session = field(data, :objective_session) || %{}
+    state = field(data, :objective_session_state) || %{}
+
+    decision =
+      field(data, :objective_decision) ||
+        field(session, :decision) ||
+        %{
+          action: field(data, :action),
+          status: field(data, :status) || field(session, :status) || field(state, :status)
+        }
+
+    review_requests =
+      field(data, :review_requests) || field(session, :review_requests) ||
+        field(state, :review_requests) || []
+
+    budget_requests =
+      field(data, :budget_requests) || field(session, :budget_requests) ||
+        field(state, :budget_requests) || []
+
+    latest_error =
+      field(session, :latest_error) ||
+        field(state, :latest_error)
+
+    %{
+      event_id: event.id,
+      session_id: event.session_id,
+      run_id: event.run_id,
+      sequence: event.sequence,
+      at: event.at,
+      status: field(session, :status) || field(state, :status) || event.status,
+      action:
+        field(decision, :action) || field(data, :action) ||
+          objective_action_from_status(field(decision, :status)),
+      objective: field(session, :objective) || field(state, :objective),
+      iteration_count:
+        field(data, :objective_iteration_count) ||
+          field(data, :iteration_count) ||
+          field(data, :current_iteration) ||
+          field(session, :iteration_count) ||
+          length(field(state, :iterations) || []),
+      max_iterations:
+        field(session, :max_iterations) || field(data, :max_iterations) ||
+          field(state, :max_iterations),
+      latest_error: latest_error,
+      latest_error_kind: field(latest_error, :kind) || field(session, :latest_error_kind),
+      latest_error_message:
+        field(latest_error, :message) || field(session, :latest_error_message),
+      open_tasks:
+        field(data, :open_tasks) || field(session, :open_tasks) || field(state, :open_tasks) ||
+          [],
+      completed_tasks:
+        field(data, :completed_tasks) || field(session, :completed_tasks) ||
+          field(state, :completed_tasks) || [],
+      review_requests: review_requests,
+      pending_review_requests: Enum.filter(review_requests, &pending_review_request?/1),
+      latest_review_request:
+        field(data, :latest_review_request) || field(session, :latest_review_request) ||
+          List.last(review_requests),
+      budget_requests: budget_requests,
+      pending_budget_requests: Enum.filter(budget_requests, &pending_budget_request?/1),
+      decision: decision,
+      summary: session,
+      title: event.title,
+      detail: event.detail
+    }
+    |> reject_nil_values()
+  end
+
+  defp objective_session_from_event(nil), do: nil
+
+  defp objective_session_from_event(%TerminalEvent{} = event) do
+    data = event.data_json || %{}
+
+    data
+    |> field(:objective_session_state)
+    |> case do
+      state when is_map(state) ->
+        case ObjectiveSession.from_map(state) do
+          {:ok, session} -> session
+          {:error, _error} -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp reject_nil_values(map) do
+    Map.reject(map, fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp objective_action_from_status(status)
+       when status in [:needs_review_approval, "needs_review_approval"],
+       do: "request_review_approval"
+
+  defp objective_action_from_status(status)
+       when status in [:needs_budget_approval, "needs_budget_approval"],
+       do: "request_budget_approval"
+
+  defp objective_action_from_status(_status), do: nil
+
+  defp field(map, key) when is_map(map),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(_map, _key), do: nil
+
+  defp pending_review_request?(request) when is_map(request) do
+    field(request, :status) in [nil, :pending, "pending", :waiting, "waiting"]
+  end
+
+  defp pending_review_request?(_request), do: false
+
+  defp pending_budget_request?(request) when is_map(request) do
+    field(request, :status) in [nil, :pending, "pending", :waiting, "waiting"]
+  end
+
+  defp pending_budget_request?(_request), do: false
 
   @spec managed_workflows_query(keyword()) :: Ecto.Query.t()
   def managed_workflows_query(opts \\ []) do

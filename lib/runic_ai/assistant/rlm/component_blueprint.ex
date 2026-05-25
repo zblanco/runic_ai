@@ -28,6 +28,13 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
           | :record_map
           | :record_group
           | :document_compare
+          | :collection_compute
+          | :string_compute
+          | :json_compute
+          | :artifact_compute
+          | :time_compute
+          | :score_compute
+          | :tool_leaf
           | :llm_leaf
           | :report_composer
           | :blueprint_transform

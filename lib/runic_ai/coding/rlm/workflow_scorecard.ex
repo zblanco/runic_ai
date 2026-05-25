@@ -113,10 +113,6 @@ defmodule RunicAI.Coding.RLM.WorkflowScorecard do
     blocking_acceptance_results = blocking_acceptance_results(current_acceptance_results)
 
     cond do
-      current_acceptance_results != [] and
-          blocking_acceptance_results == [] ->
-        :objective_satisfied
-
       any_child_status?(child_results, [:failed]) ->
         :failed
 
@@ -125,6 +121,10 @@ defmodule RunicAI.Coding.RLM.WorkflowScorecard do
 
       any_child_status?(child_results, [:blocked, :needs_review]) ->
         :blocked
+
+      current_acceptance_results != [] and
+          blocking_acceptance_results == [] ->
+        :objective_satisfied
 
       any_child_status?(child_results, [:partial]) ->
         :objective_incomplete

@@ -18,7 +18,9 @@ defmodule RunicAI.Terminal.ExRatatui.Views.Activity do
     [
       run_lines(model),
       "",
-      hitl_lines(model.review_requests),
+      objective_lines(model),
+      "",
+      hitl_lines(model),
       "",
       tool_lines(model.tool_calls),
       "",
@@ -33,6 +35,54 @@ defmodule RunicAI.Terminal.ExRatatui.Views.Activity do
     |> Enum.join("\n")
   end
 
+  defp objective_lines(%Model{} = model) do
+    status =
+      objective_field(model.progress_summary, :objective_status) ||
+        objective_field(model.objective_loop, :status)
+
+    action =
+      objective_field(model.progress_summary, :objective_action) ||
+        objective_field(model.objective_loop, :action)
+
+    if status || action do
+      [
+        "Objective: #{status || "unknown"}",
+        "  Action: #{action || "-"}",
+        "  Iteration: #{objective_iteration(model) || "-"}",
+        "  Tasks: open=#{objective_field(model.progress_summary, :objective_open_task_count) || "-"} done=#{objective_field(model.progress_summary, :objective_completed_task_count) || "-"}",
+        objective_error_line(model)
+      ]
+      |> Enum.reject(&is_nil/1)
+    else
+      ["Objective: none"]
+    end
+  end
+
+  defp objective_error_line(%Model{} = model) do
+    case objective_error(model) do
+      nil -> nil
+      error -> "  Error: #{Helpers.short(error, 120)}"
+    end
+  end
+
+  defp objective_error(%Model{} = model) do
+    kind =
+      objective_field(model.progress_summary, :objective_error_kind) ||
+        objective_field(model.objective_loop, :latest_error_kind)
+
+    message =
+      objective_field(model.progress_summary, :objective_error_message) ||
+        objective_field(model.objective_loop, :latest_error_message) ||
+        objective_field(objective_field(model.objective_loop, :latest_error), :message)
+
+    cond do
+      present?(kind) and present?(message) -> "#{kind}: #{message}"
+      present?(message) -> to_string(message)
+      present?(kind) -> to_string(kind)
+      true -> nil
+    end
+  end
+
   defp run_lines(%Model{} = model) do
     run = Model.selected_run(model)
 
@@ -44,23 +94,21 @@ defmodule RunicAI.Terminal.ExRatatui.Views.Activity do
     ]
   end
 
-  defp hitl_lines([]), do: ["HITL: none"]
-
-  defp hitl_lines(reviews) do
-    pending = Enum.filter(reviews, &(&1.status in ["pending", "review"]))
-
-    case pending do
+  defp hitl_lines(%Model{} = model) do
+    case Helpers.pending_hitl_items(model) do
       [] ->
         ["HITL: none"]
 
-      reviews ->
-        ["HITL:" | Enum.map(Enum.take(reviews, 3), &review_line/1)]
+      items ->
+        ["HITL:" | Enum.map(Enum.take(items, 3), &review_line/1)]
     end
   end
 
   defp review_line(review) do
-    reason = get_in(review.details || %{}, ["reason"]) || get_in(review.details || %{}, [:reason])
-    "  #{review.status} #{review.kind || "review"} #{Helpers.short(reason || review.id, 72)}"
+    details = field(review, :details) || %{}
+    reason = field(details, :reason) || field(review, :reason)
+
+    "  #{field(review, :status) || "pending"} #{field(review, :kind) || "review"} #{Helpers.short(reason || field(review, :id), 72)}"
   end
 
   defp tool_lines([]), do: ["Tools: none"]
@@ -96,4 +144,34 @@ defmodule RunicAI.Terminal.ExRatatui.Views.Activity do
   defp repair_lines(repairs) do
     ["Repairs:" | Enum.map(Enum.take(repairs, -3), &"  #{&1.status} #{&1.strategy}")]
   end
+
+  defp objective_iteration(%Model{} = model) do
+    current =
+      objective_field(model.progress_summary, :objective_iteration) ||
+        objective_field(model.objective_loop, :iteration_count)
+
+    max =
+      objective_field(model.progress_summary, :objective_max_iterations) ||
+        objective_field(model.objective_loop, :max_iterations)
+
+    cond do
+      current && max -> "#{current}/#{max}"
+      current -> to_string(current)
+      true -> nil
+    end
+  end
+
+  defp objective_field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp objective_field(map, key) when is_map(map), do: Map.get(map, key)
+  defp objective_field(_map, _key), do: nil
+
+  defp present?(value), do: value not in [nil, ""]
+
+  defp field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key)
+  defp field(_map, _key), do: nil
 end

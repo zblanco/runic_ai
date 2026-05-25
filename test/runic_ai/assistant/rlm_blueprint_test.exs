@@ -10,6 +10,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
   alias RunicAI.LLM.TestClient
+  alias RunicAI.RLM.ComponentRuntime
 
   test "constructs and validates a workflow blueprint" do
     split = ComponentBlueprint.new!("split", :source_splitter)
@@ -116,6 +117,52 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
 
     assert report.status == :rejected
     assert Enum.any?(report.diagnostics, &(&1.code == :function_tier_rejected))
+  end
+
+  test "tool_leaf components validate against the active capability profile" do
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Check sandbox status",
+        [ComponentBlueprint.new!("sandbox", :tool_leaf, params: %{tool: "sandbox_status"})],
+        stop_conditions: ["sandbox status returned"]
+      )
+
+    assert BlueprintValidator.report(blueprint, profile: :local_workbench).status == :accepted
+
+    report = BlueprintValidator.report(blueprint, profile: :safe)
+
+    assert report.status == :rejected
+    assert Enum.any?(report.diagnostics, &(&1.code == :toolset_disabled))
+
+    disabled_report =
+      BlueprintValidator.report(blueprint,
+        profile: :local_workbench,
+        disabled_tools: ["sandbox_status"]
+      )
+
+    assert disabled_report.status == :rejected
+    assert Enum.any?(disabled_report.diagnostics, &(&1.code == :toolset_disabled))
+  end
+
+  test "tool_leaf runtime executes visible tools through the capability registry" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Check sandbox status",
+        [ComponentBlueprint.new!("sandbox", :tool_leaf, params: %{tool: "sandbox_status"})],
+        stop_conditions: ["sandbox status returned"]
+      )
+
+    {:ok, runtime} =
+      ComponentRuntime.initial_context(workspace, blueprint, profile: :local_workbench)
+
+    component = hd(blueprint.components)
+
+    assert {:ok, status} = ComponentRuntime.execute_node(component, %{}, runtime)
+    assert status.default_backend == :just_bash
+    assert [%{name: :just_bash}] = status.backends
   end
 
   test "round-trips generated blueprints through JSON-safe maps" do

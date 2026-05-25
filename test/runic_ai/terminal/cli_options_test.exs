@@ -19,6 +19,10 @@ defmodule RunicAI.Terminal.CliOptionsTest do
                "never",
                "--max-turns",
                "3",
+               "--max-runtime-ms",
+               "1000",
+               "--proposal-timeout-ms",
+               "300",
                "--jsonl",
                "tmp/trace.jsonl"
              ])
@@ -28,6 +32,8 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.detail == :expanded
     assert opts.approve == :never
     assert opts.max_turns == 3
+    assert opts.max_runtime_ms == 1_000
+    assert opts.proposal_timeout_ms == 300
     assert opts.renderer == :auto
     assert opts.color == :auto
     assert opts.theme == :runic
@@ -64,6 +70,39 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.progress == :off
     assert opts.unicode == :never
     assert opts.graph == :mermaid
+  end
+
+  test "parses capability profile and toolset options" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "inspect repo",
+               "--cwd",
+               cwd,
+               "--profile",
+               "local-workbench",
+               "--toolsets",
+               "terminal,code-execution",
+               "--disable-tool",
+               "run_command",
+               "--disable-tool=process_kill",
+               "--allow-tool",
+               "read_file",
+               "--tool-config",
+               "terminal.timeout_ms=120000",
+               "--tool-config",
+               "terminal.shell_review=always"
+             ])
+
+    assert opts.profile == "local-workbench"
+    assert opts.toolsets == ["terminal", "code-execution"]
+    assert opts.disabled_tools == ["run_command", "process_kill"]
+    assert opts.allowed_tools == ["read_file"]
+
+    assert opts.tool_config == %{
+             "terminal" => %{"timeout_ms" => 120_000, "shell_review" => "always"}
+           }
   end
 
   test "allows help without an objective" do
@@ -138,6 +177,51 @@ defmodule RunicAI.Terminal.CliOptionsTest do
 
     assert opts.client == RunicAI.Coding.Codex.Client
     assert opts.client_label == "codex"
+    assert opts.model == nil
+    assert opts.model_resolution.decision == "codex_account_default"
+    assert opts.model_resolution.effective_model == "codex-account-default"
+  end
+
+  test "remaps legacy Runic default model before Codex execution" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "summarize repo",
+               "--cwd",
+               cwd,
+               "--client",
+               "codex",
+               "--model",
+               "openai:gpt-5.4-mini"
+             ])
+
+    assert opts.model == nil
+    assert opts.requested_model == "openai:gpt-5.4-mini"
+    assert opts.model_resolution.decision == "codex_account_default"
+
+    assert Enum.any?(
+             opts.model_resolution.warnings,
+             &String.contains?(&1, "legacy Runic default")
+           )
+  end
+
+  test "rejects provider-prefixed explicit models for Codex before launch" do
+    cwd = tmp_dir()
+
+    assert {:error, error} =
+             CliOptions.parse([
+               "summarize repo",
+               "--cwd",
+               cwd,
+               "--client",
+               "codex",
+               "--model",
+               "openai:gpt-4o"
+             ])
+
+    assert error.message =~ "unsupported model for local Codex client"
+    assert error.details.requested_model == "openai:gpt-4o"
   end
 
   test "parses explicit concurrency options" do
@@ -170,6 +254,102 @@ defmodule RunicAI.Terminal.CliOptionsTest do
              max_llm_map_concurrency: 3,
              max_llm_map_calls: 12
            ]
+  end
+
+  test "parses bounded RLM repair controls" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "repair objective",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--repair",
+               "--max-repairs",
+               "2"
+             ])
+
+    assert opts.repair? == true
+    assert opts.max_repairs == 2
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "repair objective",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--no-repair",
+               "--max-repairs",
+               "0"
+             ])
+
+    assert opts.repair? == false
+    assert opts.max_repairs == 0
+  end
+
+  test "parses opt-in RLM objective loop controls" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "build OpsLogic",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--objective-loop",
+               "--max-objective-iterations",
+               "4"
+             ])
+
+    assert opts.objective_loop? == true
+    assert opts.max_objective_iterations == 4
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "build OpsLogic",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--no-objective-loop"
+             ])
+
+    assert opts.objective_loop? == false
+  end
+
+  test "keeps deterministic project generation opt-in for RLM patch runs" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "build OpsLogic",
+               "--agent",
+               "rlm",
+               "--mode",
+               "patch",
+               "--cwd",
+               cwd
+             ])
+
+    assert opts.seed_project_generation? == false
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "build OpsLogic",
+               "--agent",
+               "rlm",
+               "--mode",
+               "patch",
+               "--cwd",
+               cwd,
+               "--seed-project-generation"
+             ])
+
+    assert opts.seed_project_generation? == true
   end
 
   test "does not add concurrency defaults to standard agent unless requested" do

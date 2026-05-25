@@ -10,6 +10,8 @@ defmodule RunicAI.RLM.ComponentRuntime do
 
   alias RunicAI.Assistant.RLM.ComponentBlueprint
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
+  alias RunicAI.Agent.CapabilityResolver
+  alias RunicAI.Agent.ToolExecution
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
   alias RunicAI.RLM.ComponentError
@@ -23,6 +25,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
   alias RunicAI.RLM.Components.RecordGroup
   alias RunicAI.RLM.Components.RecordMap
   alias RunicAI.RLM.Components.ReportComposer
+  alias RunicAI.RLM.Components.SafeCompute
   alias RunicAI.RLM.Components.SourceDiscovery
   alias RunicAI.RLM.Components.SourceMaterializer
   alias RunicAI.RLM.Components.SourceSplitter
@@ -47,7 +50,8 @@ defmodule RunicAI.RLM.ComponentRuntime do
          blueprint_id: blueprint.id,
          run_id: Keyword.get(opts, :run_id),
          model: Keyword.get(opts, :model),
-         write_policy: Keyword.get(opts, :write_policy)
+         write_policy: Keyword.get(opts, :write_policy),
+         capability_profile: Keyword.get(opts, :capability_profile)
        },
        event_sink: Keyword.get(opts, :event_sink),
        opts: opts
@@ -260,6 +264,41 @@ defmodule RunicAI.RLM.ComponentRuntime do
     DocumentCompare.run(input, params, workspace: runtime_context(runtime).workspace)
   end
 
+  defp dispatch(%ComponentBlueprint{type: type, params: params}, input, runtime)
+       when type in [
+              :collection_compute,
+              :string_compute,
+              :json_compute,
+              :artifact_compute,
+              :time_compute,
+              :score_compute
+            ] do
+    base = runtime_context(runtime)
+
+    SafeCompute.run(type, input, params,
+      workspace: base.workspace,
+      max_tier: max_function_tier(base, runtime_opts(runtime))
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :tool_leaf, params: params}, input, runtime) do
+    base = runtime_context(runtime)
+    opts = runtime_opts(runtime)
+    tool_name = get(params, :tool, nil) || get(params, :name, nil)
+    arguments = tool_arguments(params, input)
+
+    with {:ok, resolved} <- tool_capabilities(base.workspace, opts),
+         :ok <- require_tool_name(tool_name, params) do
+      ToolExecution.execute(resolved.registry, tool_name, arguments,
+        capability_profile: resolved.profile,
+        review_decider: Keyword.get(opts, :review_decider),
+        run_id: get(base.metadata, :run_id, nil) || Keyword.get(opts, :run_id),
+        session_id: Keyword.get(opts, :session_id),
+        context: %{workspace: base.workspace, input: input, params: params}
+      )
+    end
+  end
+
   defp dispatch(%ComponentBlueprint{type: :llm_leaf, params: params} = component, input, runtime) do
     base = runtime_context(runtime)
 
@@ -345,6 +384,43 @@ defmodule RunicAI.RLM.ComponentRuntime do
 
   defp component_input([single]), do: single
   defp component_input(input), do: input
+
+  defp require_tool_name(tool_name, _params) when is_binary(tool_name) and tool_name != "",
+    do: :ok
+
+  defp require_tool_name(_tool_name, params) do
+    {:error,
+     Error.validation("tool_leaf requires a tool name",
+       source: __MODULE__,
+       details: %{params: params}
+     )}
+  end
+
+  defp tool_capabilities(%Workspace{} = workspace, opts) do
+    CapabilityResolver.resolve(workspace,
+      agent: :assistant,
+      mode: Keyword.get(opts, :mode, :verify),
+      profile: Keyword.get(opts, :profile),
+      toolsets: Keyword.get(opts, :toolsets, []),
+      disabled_tools: Keyword.get(opts, :disabled_tools, []),
+      tool_config: Keyword.get(opts, :tool_config, %{}),
+      approval: Keyword.get(opts, :approval, Keyword.get(opts, :approve)),
+      write_policy: Keyword.get(opts, :write_policy),
+      memory_store: Keyword.get(opts, :memory_store),
+      memory_store_opts: Keyword.get(opts, :memory_store_opts),
+      session_store: Keyword.get(opts, :session_store)
+    )
+  end
+
+  defp tool_arguments(params, input) do
+    params
+    |> get(:args, get(params, :arguments, %{}))
+    |> case do
+      args when is_map(args) -> args
+      nil -> %{}
+      other -> %{input: input, value: other}
+    end
+  end
 
   defp source_input(input, base, params) do
     explicit = get(params, :sources, nil) || get(params, :paths, nil) || get(params, :globs, nil)

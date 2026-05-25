@@ -30,6 +30,7 @@ defmodule RunicAI.Coding.Prompt do
       "",
       "Tool scope:",
       "- Prefer workspace-relative paths for all file and command cwd arguments.",
+      "- When the task asks you to run, execute, or invoke a local command, use the run_command tool instead of saying you are paused or waiting.",
       tool_scope(recipe),
       "",
       project_instructions(workspace),

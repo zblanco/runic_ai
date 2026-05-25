@@ -74,6 +74,7 @@ defmodule RunicAI.Coding.RLM.CodebaseEnvironment do
   def register_file(%__MODULE__{} = env, path, opts \\ []) when is_binary(path) do
     with {:ok, resolved} <- Workspace.resolve_path(env.workspace, path, :read),
          {:ok, content} <- File.read(resolved.path),
+         :ok <- validate_text_file(resolved.relative, content),
          metadata = file_metadata(resolved.relative, content, opts),
          {:ok, ref, rlm_env} <-
            RLM.put_source(env.environment, content,
@@ -93,6 +94,9 @@ defmodule RunicAI.Coding.RLM.CodebaseEnvironment do
     else
       {:error, %Error{} = error} ->
         {:error, error}
+
+      :skip_binary ->
+        {:ok, env, nil}
 
       {:error, reason} ->
         {:error,
@@ -248,7 +252,12 @@ defmodule RunicAI.Coding.RLM.CodebaseEnvironment do
   end
 
   defp ignored_file?(%{path: path}) do
-    String.starts_with?(path, "_build/") or String.starts_with?(path, "deps/")
+    String.starts_with?(path, "_build/") or String.starts_with?(path, "deps/") or
+      String.starts_with?(path, "tmp/")
+  end
+
+  defp validate_text_file(_path, content) when is_binary(content) do
+    if String.valid?(content), do: :ok, else: :skip_binary
   end
 
   defp file_metadata(relative, content, opts) do

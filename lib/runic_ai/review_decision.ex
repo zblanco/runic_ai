@@ -20,10 +20,10 @@ defmodule RunicAI.ReviewDecision do
           metadata: map()
         }
 
-  @spec new(String.t(), status(), keyword()) :: {:ok, t()} | {:error, Error.t()}
-  def new(resume_key, status, opts \\ [])
-      when is_binary(resume_key) and is_list(opts) do
+  @spec new(term(), status() | String.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
+  def new(resume_key, status, opts \\ []) when is_list(opts) do
     metadata = Keyword.get(opts, :metadata, %{})
+    status = normalize_status(status)
 
     with :ok <- validate_resume_key(resume_key),
          :ok <- validate_status(status),
@@ -39,7 +39,7 @@ defmodule RunicAI.ReviewDecision do
     end
   end
 
-  @spec new!(String.t(), status(), keyword()) :: t()
+  @spec new!(term(), status() | String.t(), keyword()) :: t()
   def new!(resume_key, status, opts \\ []) do
     case new(resume_key, status, opts) do
       {:ok, review_decision} -> review_decision
@@ -60,10 +60,10 @@ defmodule RunicAI.ReviewDecision do
   def from_input(%__MODULE__{} = review_decision), do: validate(review_decision)
 
   def from_input(input) when is_map(input) do
-    new(Map.get(input, :resume_key), Map.get(input, :status),
-      edited_value: Map.get(input, :edited_value),
-      actor: Map.get(input, :actor),
-      metadata: Map.get(input, :metadata, %{})
+    new(field(input, :resume_key), field(input, :status),
+      edited_value: field(input, :edited_value),
+      actor: field(input, :actor),
+      metadata: field(input, :metadata) || %{}
     )
   end
 
@@ -82,7 +82,7 @@ defmodule RunicAI.ReviewDecision do
     end
   end
 
-  defp validate_resume_key(resume_key) when resume_key != "", do: :ok
+  defp validate_resume_key(resume_key) when is_binary(resume_key) and resume_key != "", do: :ok
 
   defp validate_resume_key(resume_key) do
     {:error,
@@ -110,4 +110,13 @@ defmodule RunicAI.ReviewDecision do
        source: __MODULE__
      )}
   end
+
+  defp normalize_status(status) when status in @valid_statuses, do: status
+  defp normalize_status("approved"), do: :approved
+  defp normalize_status("rejected"), do: :rejected
+  defp normalize_status("edited"), do: :edited
+  defp normalize_status("cancelled"), do: :cancelled
+  defp normalize_status(status), do: status
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
 end

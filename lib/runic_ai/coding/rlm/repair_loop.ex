@@ -87,11 +87,13 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     iteration = length(history) + 1
     context = Map.fetch!(result, :context)
     repair_needs = repair_needs(context)
-    repair_objective = repair_objective(result, repair_needs, iteration, repair_opts)
+    repair_plan = repair_plan(result, repair_needs, iteration)
+    repair_objective = repair_objective(result, repair_needs, repair_plan, iteration, repair_opts)
     repair_workspace = repair_workspace(environment.workspace, result, repair_opts)
 
     emit_stage(opts, :repair_attempt_started, :running, %{
       iteration: iteration,
+      repair_plan: repair_plan,
       repair_needs: Enum.map(repair_needs, &repair_need_summary/1)
     })
 
@@ -102,7 +104,8 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
         opts,
         repair_opts,
         iteration,
-        repair_needs
+        repair_needs,
+        repair_plan
       )
 
     context =
@@ -124,6 +127,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       changed_files: attempt.changed_files,
       delta: Map.take(attempt.delta, [:created, :modified, :deleted]),
       error: error_summary(attempt.error),
+      repair_plan: repair_plan,
       scorecard_status: scorecard_status(final_scorecard(result)),
       repair_needs: Enum.map(repair_needs(result.context), &repair_need_summary/1)
     }
@@ -175,6 +179,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       |> Map.put_new(:child_results, [])
       |> Map.put_new(:changed_files, [])
       |> Map.put_new(:command_results, [])
+      |> Map.put_new(:runtime_smokes, [])
       |> Map.put_new(:verification_observations, [])
       |> Map.put_new(:scorecards, [])
       |> Map.put_new(:repair_needs, [])
@@ -210,7 +215,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     end
   end
 
-  defp repair_objective(result, repair_needs, iteration, repair_opts) do
+  defp repair_objective(result, repair_needs, repair_plan, iteration, repair_opts) do
     base =
       Keyword.get(repair_opts, :objective) || original_objective(result) ||
         result.proposal.objective
@@ -224,6 +229,9 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     Blocking repair needs:
     #{inspect(Enum.map(repair_needs, &repair_need_summary/1), pretty: true, limit: 20)}
 
+    Structured repair plan:
+    #{inspect(repair_plan, pretty: true, limit: 20)}
+
     Prior repair attempts and current handoff context:
     #{inspect(repair_handoff_summary(result), pretty: true, limit: 20)}
 
@@ -236,6 +244,9 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       removing scaffold placeholders or making cosmetic edits.
     - Treat semantic repair instructions, failed command output, and concrete
       source/test checks as the repair acceptance checklist.
+    - Follow the structured repair plan: address the observed failure, test the
+      hypothesis with the planned edit, run the verification command, and stop
+      only when the stop condition is met.
     - Replace default scaffold files with working project-specific code rather
       than deleting them and leaving references broken.
     - Run the relevant verification command before claiming completion.
@@ -255,6 +266,271 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       metadata: Map.get(repair_need, :metadata, %{})
     }
   end
+
+  defp repair_plan(result, repair_needs, iteration) do
+    primary_need = List.first(repair_needs)
+    recent_failure = latest_command_failure(result)
+
+    %{
+      iteration: iteration,
+      observed_failure: observed_failure(primary_need, recent_failure),
+      hypothesis: repair_hypothesis(primary_need, recent_failure),
+      planned_edit: planned_edit(primary_need),
+      verification_command: verification_command(result, recent_failure),
+      stop_condition: repair_stop_condition(result)
+    }
+  end
+
+  defp observed_failure(nil, nil), do: "The latest objective scorecard is incomplete."
+
+  defp observed_failure(repair_need, recent_failure) do
+    [
+      repair_need && Map.get(repair_need, :reason),
+      repair_need && semantic_failure_summary(repair_need),
+      repair_need && llm_judge_failure_summary(repair_need),
+      repair_need && runtime_smoke_failure_summary(repair_need),
+      recent_failure && command_failure_label(recent_failure),
+      output_preview(repair_need) || (recent_failure && field(recent_failure, :output_preview))
+    ]
+    |> Enum.reject(&blank?/1)
+    |> Enum.join(" | ")
+    |> case do
+      "" -> "The latest objective scorecard is incomplete."
+      text -> text
+    end
+  end
+
+  defp repair_hypothesis(nil, recent_failure) when not is_nil(recent_failure) do
+    "A failed verification command is exposing a code or test contract gap that must be patched before rerunning the command."
+  end
+
+  defp repair_hypothesis(repair_need, recent_failure) do
+    category = repair_need |> metadata() |> field(:category)
+
+    base =
+      case category do
+        :compiler_warning ->
+          "The implementation compiles with warnings that must be removed before the compile gate can pass."
+
+        :compile_error ->
+          "The implementation or generated tests have a compile-time defect."
+
+        :test_failure ->
+          "The generated behavior does not satisfy one or more objective-specific tests."
+
+        :runtime_smoke_failure ->
+          "A runtime smoke for the objective failed or was not observed, so the implementation must patch runnable behavior and rerun the smoke."
+
+        :semantic_requirement_incomplete ->
+          "The implementation is missing a domain requirement from the objective contract."
+
+        :missing_runtime_wiring ->
+          "The runtime supervision or process wiring required by the objective is incomplete."
+
+        :weak_test_coverage ->
+          "The test suite still contains scaffold or low-signal coverage instead of behavioral tests."
+
+        :incomplete_child_result ->
+          "A child workflow did not complete enough work to satisfy the parent objective."
+
+        _other ->
+          "The current workspace state does not yet satisfy the objective contract."
+      end
+
+    if is_nil(recent_failure) do
+      base
+    else
+      base <>
+        " A failed verification command is the runtime evidence to reproduce before and after the patch."
+    end
+  end
+
+  defp planned_edit(nil) do
+    "Inspect the blocking scorecard and patch the smallest source or test slice needed to satisfy it."
+  end
+
+  defp planned_edit(repair_need) do
+    instruction = repair_need |> metadata() |> field(:repair_instruction)
+    target = Map.get(repair_need, :target)
+
+    cond do
+      is_binary(instruction) and instruction != "" ->
+        instruction
+
+      not is_nil(target) ->
+        "Patch the files or behavior related to #{inspect(target)}."
+
+      true ->
+        "Patch the smallest source or test slice needed to satisfy this repair need."
+    end
+  end
+
+  defp verification_command(result, recent_failure) do
+    cond do
+      not is_nil(recent_failure) ->
+        command_display(recent_failure)
+
+      command = first_verification_command(result) ->
+        command_display(command)
+
+      true ->
+        "Run the relevant compile, test, or runtime smoke command before claiming completion."
+    end
+  end
+
+  defp repair_stop_condition(result) do
+    proposal_stop_conditions =
+      result
+      |> Map.get(:proposal)
+      |> field(:stop_conditions)
+      |> List.wrap()
+      |> Enum.reject(&blank?/1)
+
+    case proposal_stop_conditions do
+      [] ->
+        "All blocking acceptance checks pass and the latest objective scorecard is satisfied."
+
+      conditions ->
+        "All blocking acceptance checks pass and these stop conditions are true: #{Enum.join(conditions, "; ")}."
+    end
+  end
+
+  defp latest_command_failure(result) do
+    result
+    |> get_in([:context, :command_results])
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.find(&command_failure?/1)
+  end
+
+  defp first_verification_command(result) do
+    result
+    |> Map.get(:proposal)
+    |> case do
+      %WorkflowProposal{} = proposal ->
+        proposal
+        |> verification_commands([])
+        |> List.first()
+        |> case do
+          %{args: args} -> args
+          other -> other
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp command_failure_label(command) do
+    "failed command #{command_display(command)} status=#{inspect(field(command, :status))}"
+  end
+
+  defp command_display(nil), do: nil
+
+  defp command_display(command) when is_map(command) do
+    cond do
+      is_list(field(command, :argv)) ->
+        Enum.join(field(command, :argv), " ")
+
+      is_binary(field(command, :command)) ->
+        field(command, :command)
+
+      true ->
+        inspect(command, limit: 20)
+    end
+  end
+
+  defp output_preview(nil), do: nil
+
+  defp output_preview(repair_need) when is_map(repair_need) do
+    repair_need
+    |> metadata()
+    |> field(:output_preview)
+  end
+
+  defp semantic_failure_summary(repair_need) when is_map(repair_need) do
+    metadata = metadata(repair_need)
+
+    if field(metadata, :category) == :semantic_requirement_incomplete do
+      [
+        requirement_label(field(metadata, :requirement)),
+        field(metadata, :message),
+        field(metadata, :repair_instruction),
+        evidence_refs_label(field(metadata, :evidence_refs))
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(" | ")
+    end
+  end
+
+  defp semantic_failure_summary(_repair_need), do: nil
+
+  defp llm_judge_failure_summary(repair_need) when is_map(repair_need) do
+    metadata = metadata(repair_need)
+    judge = field(metadata, :judge)
+
+    if field(metadata, :category) == :semantic_requirement_incomplete and is_map(judge) do
+      [
+        "LLM semantic judge",
+        field(judge, :source),
+        field(judge, :model),
+        field(judge, :prompt_sha256)
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(": ")
+    end
+  end
+
+  defp llm_judge_failure_summary(_repair_need), do: nil
+
+  defp runtime_smoke_failure_summary(repair_need) when is_map(repair_need) do
+    metadata = metadata(repair_need)
+
+    if field(metadata, :category) == :runtime_smoke_failure do
+      [
+        "runtime smoke",
+        field(metadata, :smoke_id),
+        field(metadata, :message)
+      ]
+      |> Enum.reject(&blank?/1)
+      |> Enum.join(": ")
+    end
+  end
+
+  defp runtime_smoke_failure_summary(_repair_need), do: nil
+
+  defp requirement_label(requirement) when is_map(requirement) do
+    [
+      "semantic requirement",
+      field(requirement, :id),
+      field(requirement, :description)
+    ]
+    |> Enum.reject(&blank?/1)
+    |> Enum.join(": ")
+  end
+
+  defp requirement_label(_requirement), do: nil
+
+  defp evidence_refs_label(refs) do
+    refs =
+      refs
+      |> List.wrap()
+      |> Enum.filter(&is_binary/1)
+      |> Enum.reject(&blank?/1)
+
+    if refs == [], do: nil, else: "evidence refs: #{Enum.join(refs, ", ")}"
+  end
+
+  defp metadata(nil), do: %{}
+
+  defp metadata(value) when is_map(value),
+    do: Map.get(value, :metadata, Map.get(value, "metadata", %{}))
+
+  defp metadata(_value), do: %{}
+
+  defp blank?(nil), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   defp repair_workspace(%Workspace{} = workspace, result, repair_opts) do
     workspace_path =
@@ -346,7 +622,8 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
          opts,
          repair_opts,
          iteration,
-         repair_needs
+         repair_needs,
+         repair_plan
        ) do
     started_at = DateTime.utc_now()
     before_snapshot = WorkspaceDelta.snapshot(workspace, workspace_delta_opts(repair_opts))
@@ -365,6 +642,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
 
     metadata = %{
       repair_need_count: length(repair_needs),
+      repair_plan: repair_plan,
       child_metadata: child_result.metadata,
       checkpoint_ref: nil
     }
@@ -565,7 +843,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
        ) do
     commands = verification_commands(proposal, opts)
 
-    Enum.reduce(commands, context, fn command_args, context ->
+    Enum.reduce(commands, context, fn %{args: command_args, check: check}, context ->
       policy =
         Keyword.get_lazy(opts, :command_policy, fn ->
           CommandPolicy.new!(allowed_commands: ["mix", "git"], allow_shell: false)
@@ -578,6 +856,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
 
           context
           |> update_in([:command_results], &Enum.uniq(List.wrap(&1) ++ [result]))
+          |> maybe_record_runtime_smoke(check, result, node_id)
           |> put_in([:outputs, node_id], result)
           |> update_in([:episodes], &append_unique(&1, episode, fn episode -> episode.id end))
           |> update_in(
@@ -602,10 +881,11 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     |> Enum.filter(&(&1.kind == :verification_gate))
     |> Enum.flat_map(&verification_checks(&1, proposal.objective))
     |> Kernel.++(repair_verification_checks(opts))
-    |> Enum.filter(&(&1.type in [:command_passes, :command_fails_with]))
-    |> Enum.map(&command_args_from_check/1)
+    |> Enum.filter(&(&1.type in [:command_passes, :command_fails_with, :runtime_smoke]))
+    |> Enum.map(fn check -> %{check: check, args: command_args_from_check(check)} end)
     |> Enum.reject(&is_nil/1)
-    |> Enum.uniq()
+    |> Enum.reject(fn command -> is_nil(command.args) end)
+    |> Enum.uniq_by(& &1.args)
   end
 
   defp repair_verification_checks(opts) do
@@ -665,6 +945,37 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     |> case do
       nil -> nil
       args -> Enum.reject(args, fn {_key, value} -> is_nil(value) end) |> Map.new()
+    end
+  end
+
+  defp maybe_record_runtime_smoke(
+         context,
+         %AcceptanceCheck{type: :runtime_smoke} = check,
+         result,
+         node_id
+       ) do
+    smoke = %{
+      id: check_param(check, :id) || check_param(check, :name) || node_id,
+      status: command_status(result),
+      argv: field(result, :argv),
+      command: field(result, :command),
+      cwd: field(result, :cwd),
+      output_preview: field(result, :output_preview) || field(result, :output),
+      source_node_id: node_id
+    }
+
+    update_in(context, [:runtime_smokes], &append_latest(&1, smoke, fn smoke -> smoke.id end))
+  end
+
+  defp maybe_record_runtime_smoke(context, _check, _result, _node_id), do: context
+
+  defp command_status(result) do
+    case field(result, :status) do
+      :pass -> :pass
+      "pass" -> :pass
+      :ok -> :pass
+      "ok" -> :pass
+      other -> other || :fail
     end
   end
 
@@ -908,6 +1219,15 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
   defp append_unique(values, value, fun) do
     (List.wrap(values) ++ [value])
     |> Enum.uniq_by(fun)
+  end
+
+  defp append_latest(values, value, fun) do
+    key = fun.(value)
+
+    values
+    |> List.wrap()
+    |> Enum.reject(&(fun.(&1) == key))
+    |> Kernel.++([value])
   end
 
   defp put_new_key(map, key, value) do

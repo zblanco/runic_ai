@@ -212,10 +212,21 @@ defmodule RunicAI.Terminal.EventPresenter do
       maybe_line("  objective", field(scorecard, :objective_status)),
       maybe_list("  changed files", changed),
       maybe_list("  risks", risks),
+      maybe_line("  objective resume", objective_resume_limit_report(result)),
       maybe_line("  persistence", Map.get(result, :persistence_ref))
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
+  end
+
+  defp objective_resume_limit_report(result) do
+    if Map.get(result, :objective_auto_resume_exhausted?) do
+      attempts = Map.get(result, :objective_resume_attempts)
+      limit = Map.get(result, :objective_resume_limit)
+      kind = Map.get(result, :objective_resume_kind)
+
+      "limit reached after #{attempts}/#{limit} automatic #{kind} resumes"
+    end
   end
 
   defp render_assistant_final_report(result) do

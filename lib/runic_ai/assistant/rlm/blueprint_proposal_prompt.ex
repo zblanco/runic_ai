@@ -94,6 +94,13 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       be discovered.
     - prefer `tabular_parser`, `record_map`, and `record_group` for CSV, JSONL,
       support tickets, and cleanup tasks.
+    - prefer safe computing components before shell/code execution for bounded
+      deterministic work. Use `json_compute` for JSON/JSONL and map queries,
+      `collection_compute` for grouping/deduping/sorting/reducing,
+      `string_compute` for text cleanup/extraction, `time_compute` for local
+      date/time logic, `score_compute` for ranking/scoring, and
+      `artifact_compute` for read-only file manifests/previews or durable
+      artifact IO.
     - use `record_map` to normalize per-record facts before `record_group`;
       preserve original identifiers, names, addresses, timelines, policy terms,
       and invalid values when the objective asks for cleanup or comparison.
@@ -317,6 +324,21 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
         type: "blueprint_transform",
         params: %{function: %{tier: "tier1", expr: %{op: "get", path: ["records"]}}}
       },
+      %{
+        id: "parse_json",
+        type: "json_compute",
+        params: %{op: "records_from_jsonl"}
+      },
+      %{
+        id: "rank",
+        type: "score_compute",
+        params: %{op: "rank_records", score_by: "priority"}
+      },
+      %{
+        id: "deadline",
+        type: "time_compute",
+        params: %{op: "deadline_plan", deadline_path: "due_on"}
+      },
       %{id: "compare", type: "document_compare", params: %{}},
       %{
         id: "respond",
@@ -464,6 +486,10 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       output_path: Keyword.get(opts, :output_path),
       input_paths: Keyword.get(opts, :input_paths, []),
       inferred_input_paths: Keyword.get(opts, :inferred_input_paths, []),
+      capability_profile: Keyword.get(opts, :capability_profile),
+      visible_tools: visible_tools(opts),
+      gated_tools: gated_tools(opts),
+      safe_computing: safe_computing_manifest(),
       read_policy: %{
         local_read_components: ["source_discovery", "source_splitter", "source_materializer"],
         hitl_required_for: ["artifact_writes", "destructive_commands", "side_effecting_actions"]
@@ -472,6 +498,83 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       required_source_cues:
         Keyword.get(opts, :required_source_cues, Keyword.get(opts, :source_cues, [])),
       require_artifact_quality?: Keyword.get(opts, :require_artifact_quality?, false)
+    }
+  end
+
+  defp visible_tools(opts) do
+    case Keyword.get(opts, :capability_profile) do
+      %{visible_tools: visible_tools} when is_list(visible_tools) ->
+        visible_tools
+
+      profile when is_map(profile) ->
+        Map.get(profile, :visible_tools, Map.get(profile, "visible_tools", []))
+
+      _other ->
+        RunicAI.Agent.CapabilityResolver.visible_tool_names_for_profile(opts)
+    end
+  end
+
+  defp gated_tools(opts) do
+    case Keyword.get(opts, :capability_profile) do
+      %{gated_tools: gated_tools} when is_list(gated_tools) ->
+        gated_tools
+
+      profile when is_map(profile) ->
+        Map.get(profile, :gated_tools, Map.get(profile, "gated_tools", []))
+
+      _other ->
+        []
+    end
+  end
+
+  defp safe_computing_manifest do
+    %{
+      preference: "Use Tier 0/Tier 1 safe computing components before execute_code or shell.",
+      components: %{
+        collection_compute: [
+          "map",
+          "filter",
+          "group",
+          "sort",
+          "dedupe",
+          "reduce",
+          "take",
+          "window"
+        ],
+        string_compute: [
+          "split",
+          "join",
+          "replace",
+          "trim",
+          "regex_extract",
+          "text_chunk",
+          "template_render"
+        ],
+        json_compute: [
+          "parse",
+          "encode",
+          "query",
+          "map_pick",
+          "map_drop",
+          "map_merge",
+          "records_from_jsonl",
+          "records_to_jsonl"
+        ],
+        artifact_compute: [
+          "file_manifest",
+          "file_render_preview",
+          "artifact_read",
+          "artifact_write",
+          "io_capture"
+        ],
+        time_compute: ["now", "parse", "shift", "compare", "deadline_plan"],
+        score_compute: ["score_records", "rank_records", "bucket_records", "aggregate_metrics"]
+      },
+      policy: %{
+        tier0: "built-in operations",
+        tier1: "restricted expression trees",
+        tier2: "escalate to reviewed execute_code"
+      }
     }
   end
 end

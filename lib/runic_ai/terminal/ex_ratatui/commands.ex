@@ -115,13 +115,18 @@ defmodule RunicAI.Terminal.ExRatatui.Commands do
       artifacts: [],
       scorecards: [],
       repairs: [],
-      review_requests: []
+      review_requests: [],
+      objective_loop: nil,
+      progress_summary: %{}
     }
   end
 
   def load_run_detail(%Store{} = store, run_id) when is_binary(run_id) do
+    timeline_events = Queries.run_timeline(store, run_id)
+    timeline = Enum.map(timeline_events, &PersistenceView.terminal_event/1)
+
     %{
-      timeline: Enum.map(Queries.run_timeline(store, run_id), &PersistenceView.terminal_event/1),
+      timeline: timeline,
       messages: Enum.map(Queries.messages_for_run(store, run_id), &PersistenceView.message/1),
       runnable_events:
         Enum.map(Queries.runnable_events(store, run_id), &PersistenceView.runnable_event/1),
@@ -134,8 +139,67 @@ defmodule RunicAI.Terminal.ExRatatui.Commands do
       repairs:
         Enum.map(Queries.repair_attempts(store, run_id), &PersistenceView.repair_attempt/1),
       review_requests:
-        Enum.map(Queries.review_requests(store, run_id), &PersistenceView.review_request/1)
+        Enum.map(Queries.review_requests(store, run_id), &PersistenceView.review_request/1),
+      objective_loop: Queries.latest_objective_loop_state(store, run_id),
+      progress_summary: progress_summary(timeline)
     }
+  end
+
+  defp progress_summary(timeline) do
+    progress_events = Enum.filter(timeline, &objective_progress_event?/1)
+
+    case List.last(progress_events) do
+      nil ->
+        %{}
+
+      latest ->
+        data = latest.data || %{}
+        session = field(data, :objective_session) || %{}
+        state = field(data, :objective_session_state) || %{}
+        decision = field(session, :decision) || %{}
+
+        error =
+          field(session, :latest_error) || field(state, :latest_error) ||
+            field(data, :latest_error)
+
+        %{
+          event_count: length(progress_events),
+          latest_event_title: latest.title,
+          objective: field(data, :objective) || field(session, :objective),
+          objective_status: field(session, :status) || field(data, :status) || latest.status,
+          objective_action: field(decision, :action) || field(data, :action),
+          objective_iteration: field(data, :current_iteration) || field(data, :iteration_count),
+          objective_max_iterations:
+            field(data, :max_iterations) || field(session, :max_iterations),
+          objective_open_task_count: task_count(field(data, :open_tasks)),
+          objective_completed_task_count: task_count(field(data, :completed_tasks)),
+          objective_error_kind: field(session, :latest_error_kind) || field(error, :kind),
+          objective_error_message:
+            field(session, :latest_error_message) || field(error, :message),
+          remaining_ms: field(data, :remaining_ms) || field(data, :remaining_runtime_ms),
+          run_deadline_ms: field(data, :run_deadline_ms)
+        }
+        |> compact_map()
+    end
+  end
+
+  defp objective_progress_event?(event) do
+    to_string(event.phase || "") in ["objective_loop_progress", "objective_loop_resume"]
+  end
+
+  defp task_count(tasks) when is_list(tasks), do: length(tasks)
+  defp task_count(_tasks), do: nil
+
+  defp field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key)
+  defp field(_map, _key), do: nil
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 
   @spec search(Model.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -230,6 +294,7 @@ defmodule RunicAI.Terminal.ExRatatui.Commands do
         "none"
       ]
       |> maybe_arg("--model", model.model)
+      |> maybe_arg("--client", model.client)
       |> maybe_arg("--session-id", session_id)
 
     with {:ok, options} <- CliOptions.parse(args),

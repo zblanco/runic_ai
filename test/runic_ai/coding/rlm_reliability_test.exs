@@ -630,6 +630,9 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert [%WorkflowScorecard{objective_status: :objective_incomplete}] =
              result.context.scorecards
 
+    assert %WorkflowScorecard{objective_status: :objective_incomplete} =
+             result.objective_scorecard
+
     failure_ids =
       result.context.scorecards
       |> List.last()
@@ -637,9 +640,9 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
       |> Enum.filter(&(&1.status == :fail))
       |> Enum.map(& &1.id)
 
-    assert "progress-semantic-coverage" in failure_ids
     assert "progress-no-default-scaffold" in failure_ids
     assert "progress-meaningful-tests" in failure_ids
+    assert "progress-implementation-activity" in failure_ids
 
     scaffold_failure =
       result.context.scorecards
@@ -781,6 +784,40 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
            |> Enum.any?(&(get_in(&1, [:params, "workspace_path"]) == "demo"))
   end
 
+  test "objective evidence preserves explicitly changed files under requested tmp projects" do
+    root = sample_project()
+    File.mkdir_p!(Path.join(root, "tmp/ops_logic/lib/ops_logic"))
+    File.mkdir_p!(Path.join(root, "tmp/lib"))
+
+    File.write!(Path.join(root, "tmp/ops_logic/lib/ops_logic/work_orders.ex"), """
+    defmodule OpsLogic.WorkOrders do
+      def schedule, do: :ok
+    end
+    """)
+
+    File.write!(Path.join(root, "tmp/lib/noise.ex"), """
+    defmodule RuntimeNoise do
+    end
+    """)
+
+    workspace = Workspace.new!(root: root)
+
+    evidence =
+      ObjectiveEvidence.gather(workspace, %{
+        changed_files: ["tmp/ops_logic/lib/ops_logic/work_orders.ex"]
+      })
+
+    paths = Enum.map(evidence.files, & &1.path)
+
+    assert "tmp/ops_logic/lib/ops_logic/work_orders.ex" in paths
+    refute "tmp/lib/noise.ex" in paths
+
+    assert %{content: content} =
+             Enum.find(evidence.files, &(&1.path == "tmp/ops_logic/lib/ops_logic/work_orders.ex"))
+
+    assert content =~ "OpsLogic.WorkOrders"
+  end
+
   test "semantic progress does not require lexical term coverage when LLM judge is enabled" do
     root = sample_project()
     File.rm!(Path.join(root, "test/demo_test.exs"))
@@ -887,9 +924,19 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
              )
 
     assert judgement.status == :incomplete
+    assert judgement.metadata.source == :llm_json_text
+    assert judgement.metadata.model == "test:model"
+    assert judgement.metadata.fallback? == true
+    assert judgement.metadata.fallback_reason == :object_generation_failed
+    assert judgement.metadata.prompt_sha256 =~ ~r/^[a-f0-9]{64}$/
 
     assert [%{requirement_id: "transition_history", status: :incomplete}] =
              judgement.requirement_results
+
+    [acceptance_result] = ObjectiveJudge.acceptance_results(contract, judgement)
+    assert acceptance_result.metadata.judge.source == :llm_json_text
+    assert acceptance_result.metadata.judge.model == "test:model"
+    assert acceptance_result.metadata.judge.prompt_sha256 == judgement.metadata.prompt_sha256
   end
 
   test "semantic progress extraction uses the original objective from run metadata" do

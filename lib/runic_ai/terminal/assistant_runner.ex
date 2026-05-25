@@ -4,6 +4,7 @@ defmodule RunicAI.Terminal.AssistantRunner do
   """
 
   alias RunicAI.Assistant.RLM.Agent
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.Error
   alias RunicAI.Ids
   alias RunicAI.Terminal.Event
@@ -146,8 +147,12 @@ defmodule RunicAI.Terminal.AssistantRunner do
         cwd: cwd,
         model: Keyword.get(opts, :model),
         client: Keyword.get(opts, :client),
+        client_label: Keyword.get(opts, :client_label),
+        model_resolution: Keyword.get(opts, :model_resolution),
         inputs: Keyword.get(opts, :input_paths, []),
-        output: Keyword.get(opts, :output_path)
+        output: Keyword.get(opts, :output_path),
+        capability_profile:
+          CapabilityResolver.snapshot_for_launch(cwd, Keyword.put(opts, :agent, :assistant))
       }
     )
   end

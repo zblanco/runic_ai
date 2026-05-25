@@ -6,13 +6,17 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   require Runic
 
   alias Runic.Workflow
+  alias RunicAI.Agent.CapabilityResolver
+  alias RunicAI.Agent.ToolExecution
   alias RunicAI.Coding.Agent, as: StandardAgent
   alias RunicAI.Coding.CommandPolicy
+  alias RunicAI.Coding.CommandResult
   alias RunicAI.Coding.RLM.Checkpoint
   alias RunicAI.Coding.RLM.ChildContract
   alias RunicAI.Coding.RLM.ChildResult
   alias RunicAI.Coding.RLM.CodebaseEnvironment
   alias RunicAI.Coding.RLM.EditPatchSet
+  alias RunicAI.Coding.RLM.ObjectiveContract
   alias RunicAI.Coding.RLM.PlanPatchValidator
   alias RunicAI.Coding.RLM.Reducers
   alias RunicAI.Coding.RLM.RuntimeBudget
@@ -25,12 +29,26 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   alias RunicAI.Error
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
+  alias RunicAI.Ids
   alias RunicAI.RLM.Episode
+  alias RunicAI.RLM.Components.SafeCompute
   alias RunicAI.RLM.PlanPatch
-  alias RunicAI.Tool.Definition
-  alias RunicAI.Tool.Registry
 
   @default_model "openai:gpt-5.4-mini"
+  @default_child_runtime_ms 120_000
+  @child_agent_cleanup_grace_ms 5_000
+  @min_default_child_runtime_ms 250
+  @child_runtime_completion_reserve_ms 2_000
+  @default_child_runtime_by_mode %{
+    read_only: 20_000,
+    explain_repo: 20_000,
+    review: 20_000,
+    triage_bug: 20_000,
+    verify: 30_000,
+    write_tests: 45_000,
+    fix_ci: 45_000,
+    patch: 90_000
+  }
 
   @type compiled :: %{
           required(:workflow) => Workflow.t(),
@@ -45,7 +63,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   def compile(proposal_input, %CodebaseEnvironment{} = environment, opts \\ [])
       when is_list(opts) do
     with {:ok, proposal} <- WorkflowProposal.from_input(proposal_input),
-         report = WorkflowValidator.validate(proposal, Keyword.get(opts, :validation_opts, [])),
+         report = WorkflowValidator.validate(proposal, validation_opts(environment, opts)),
          true <- WorkflowValidationReport.accepted?(report) || {:error, report} do
       {:ok, compile_accepted(proposal, report, environment, opts)}
     else
@@ -73,6 +91,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
           {:ok, map()} | {:error, Error.t()}
   def run(proposal_input, %CodebaseEnvironment{} = environment, input \\ %{}, opts \\ [])
       when is_map(input) and is_list(opts) do
+    opts = maybe_put_run_deadline(opts)
+
     with {:ok, compiled} <- compile(proposal_input, environment, opts),
          {:ok, context} <- execute_once(compiled.proposal, environment, input, opts) do
       {:ok,
@@ -85,6 +105,16 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
          trace: Map.get(context, :trace, []),
          episodes: Map.get(context, :episodes, [])
        }}
+    end
+  end
+
+  defp maybe_put_run_deadline(opts) do
+    case {Keyword.get(opts, :run_deadline_ms), Keyword.get(opts, :max_runtime_ms)} do
+      {nil, max_runtime_ms} when is_integer(max_runtime_ms) and max_runtime_ms > 0 ->
+        Keyword.put(opts, :run_deadline_ms, System.monotonic_time(:millisecond) + max_runtime_ms)
+
+      _other ->
+        opts
     end
   end
 
@@ -199,6 +229,14 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   end
 
   defp execute_node(node, context, opts) do
+    emit_node_stage(opts, :node_started, :running, %{
+      node_id: node.id,
+      kind: node.kind,
+      status: :started
+    })
+
+    emit_node_budget_context(opts, node)
+
     context =
       checkpoint_context(context, :node_started, %{
         node_id: node.id,
@@ -223,6 +261,13 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
           output: output
         })
 
+      emit_node_stage(opts, :node_completed, normalize_event_status(episode.status), %{
+        node_id: node.id,
+        kind: node.kind,
+        status: episode.status,
+        output: summarize_node_output(output)
+      })
+
       {:ok, context}
     else
       {:error, %Error{} = error} ->
@@ -233,6 +278,13 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
             status: :failed,
             error: error
           })
+
+        emit_node_stage(opts, :node_failed, :error, %{
+          node_id: node.id,
+          kind: node.kind,
+          status: :failed,
+          error: error_summary(error)
+        })
 
         {:error, error}
     end
@@ -256,13 +308,38 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     args = tool_args(name, param(node, :args) || %{}, node, context)
     registry = Keyword.get_lazy(opts, :registry, fn -> default_registry(context, opts) end)
 
-    with %Definition{} = definition <- Registry.fetch!(registry, name),
-         {:ok, output} <- Definition.execute(definition, args) do
+    with {:ok, output} <-
+           ToolExecution.execute(registry, name, args,
+             capability_profile: Keyword.get(opts, :capability_profile),
+             review_decider: Keyword.get(opts, :review_decider),
+             run_id: get_in(context, [:metadata, :run_id]),
+             session_id: Keyword.get(opts, :session_id),
+             context: %{workspace: context.workspace, node_id: node.id, params: node.params}
+           ) do
       ok_episode(node, output)
     end
   rescue
     exception ->
       {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp dispatch_node(%{kind: :computing} = node, context, opts) do
+    input =
+      case parent_outputs(node, context) do
+        [single] -> single
+        outputs -> outputs
+      end
+
+    family = computing_family(node)
+    params = Map.delete(node.params || %{}, :family) |> Map.delete("family")
+
+    case SafeCompute.run(family, input, params,
+           workspace: context.workspace,
+           max_tier: Keyword.get(opts, :max_generated_function_tier, :tier1)
+         ) do
+      {:ok, output} -> ok_episode(node, output)
+      {:error, error} -> {:error, error}
+    end
   end
 
   defp dispatch_node(%{kind: :llm_leaf} = node, context, opts) do
@@ -294,6 +371,9 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
     with {:ok, workspace} <- agent_workspace(node, context) do
       task = scoped_agent_task(task, workspace, context)
+      child_timeout_ms = child_runtime_timeout(node, agent_opts, context, opts)
+      agent_opts = maybe_put_child_runtime(agent_opts, child_timeout_ms)
+      agent_opts = maybe_put_child_live_event_sink(agent_opts, node, opts)
 
       contract =
         node
@@ -310,7 +390,15 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
         end
 
       child_result =
-        case run_standard_agent_child(mode, workspace, task, agent_opts, node, opts) do
+        case run_standard_agent_child(
+               mode,
+               workspace,
+               task,
+               agent_opts,
+               node,
+               child_timeout_ms,
+               opts
+             ) do
           {:ok, summary} ->
             ChildResult.from_agent_summary(summary, child_contract, id: node.id)
 
@@ -322,7 +410,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     end
   end
 
-  defp dispatch_node(%{kind: :edit} = node, context, _opts) do
+  defp dispatch_node(%{kind: :edit} = node, context, opts) do
     patch_set =
       param(node, :patch_set) ||
         %{
@@ -333,7 +421,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
           metadata: param(node, :metadata) || %{}
         }
 
-    with {:ok, output} <- EditPatchSet.apply(context.workspace, patch_set) do
+    with {:ok, patch_set} <- maybe_review_rlm_node(:edit, node, patch_set, context, opts),
+         {:ok, output} <- EditPatchSet.apply(context.workspace, patch_set) do
       status = if output.status == :ok, do: :satisfied, else: :failed
       episode(node, output, status)
     end
@@ -387,10 +476,20 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   defp dispatch_node(%{kind: :command} = node, context, opts) do
     policy =
       Keyword.get_lazy(opts, :command_policy, fn ->
-        CommandPolicy.new!(allowed_commands: ["mix", "git"], allow_shell: false)
+        rlm_command_policy(context, opts,
+          allowed_commands: ["mix", "git"],
+          allow_shell: false,
+          allow_just_bash: false
+        )
       end)
 
-    Tools.run_command(context.workspace, command_args(node), policy)
+    args = command_args(node)
+
+    with {:ok, args} <- maybe_review_rlm_node(:command, node, args, context, opts) do
+      Tools.run_command(context.workspace, args, policy,
+        event_sink: Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+      )
+    end
     |> case do
       {:ok, output} -> ok_episode(node, output)
       {:error, error} -> {:error, error}
@@ -398,10 +497,10 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   end
 
   defp dispatch_node(%{kind: :script} = node, context, opts) do
-    if Keyword.get(opts, :allow_scripts?, false) do
+    if script_allowed?(opts) do
       policy =
         Keyword.get_lazy(opts, :script_command_policy, fn ->
-          CommandPolicy.new!(
+          rlm_command_policy(context, opts,
             allowed_commands: ["just_bash"],
             allow_shell: false,
             allow_just_bash: true,
@@ -409,16 +508,16 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
           )
         end)
 
-      Tools.run_command(
-        context.workspace,
-        %{
-          backend: :just_bash,
-          command: "just_bash",
-          shell: param(node, :script) || "",
-          timeout_ms: param(node, :timeout_ms) || 10_000
-        },
-        policy
-      )
+      args = %{
+        backend: :just_bash,
+        command: "just_bash",
+        shell: param(node, :script) || "",
+        timeout_ms: param(node, :timeout_ms) || 10_000
+      }
+
+      with {:ok, args} <- maybe_review_rlm_node(:script, node, args, context, opts) do
+        Tools.run_command(context.workspace, args, policy)
+      end
       |> case do
         {:ok, output} -> ok_episode(node, output)
         {:error, error} -> {:error, error}
@@ -428,7 +527,14 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     end
   end
 
-  defp ok_episode(node, output), do: episode(node, output, :satisfied)
+  defp ok_episode(node, output), do: episode(node, output, episode_status(output))
+
+  defp episode_status(%CommandResult{status: :pass}), do: :satisfied
+
+  defp episode_status(%CommandResult{status: status}) when status in [:fail, :timeout, :blocked],
+    do: :partial
+
+  defp episode_status(_output), do: :satisfied
 
   defp episode(node, output, status) do
     episode =
@@ -457,7 +563,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     |> update_in([:changed_files], &Enum.uniq(List.wrap(&1) ++ changed_paths))
     |> update_in(
       [:artifacts],
-      &append_unique(&1, output, fn artifact -> inspect(artifact.id || artifact) end)
+      fn artifacts -> append_unique(artifacts, output, &artifact_identity/1) end
     )
   end
 
@@ -474,18 +580,124 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     |> update_in([:repair_needs], &Enum.uniq(List.wrap(&1) ++ output.repair_needs))
   end
 
-  defp record_special_output(context, %{kind: :command}, output) do
-    update_in(context, [:command_results], &Enum.uniq(List.wrap(&1) ++ [output]))
+  defp record_special_output(context, %{kind: :command} = node, output) do
+    context
+    |> update_in([:command_results], &Enum.uniq(List.wrap(&1) ++ [output]))
+    |> maybe_record_runtime_smoke(node, output)
+  end
+
+  defp record_special_output(context, %{kind: :deterministic_step} = node, output) do
+    context
+    |> maybe_record_objective_contract(node, output)
+    |> update_in([:artifacts], &Enum.uniq(List.wrap(&1) ++ List.wrap(output)))
   end
 
   defp record_special_output(context, _node, output) do
     update_in(context, [:artifacts], &Enum.uniq(List.wrap(&1) ++ List.wrap(output)))
   end
 
+  defp maybe_record_runtime_smoke(context, node, output) do
+    if runtime_smoke_node?(node) do
+      update_in(
+        context,
+        [:runtime_smokes],
+        &append_latest(&1, runtime_smoke_observation(node, output), fn smoke -> smoke.id end)
+      )
+    else
+      context
+    end
+  end
+
+  defp runtime_smoke_node?(node) do
+    metadata = node_metadata(node)
+
+    node_id(node) == "runtime_smoke" or
+      metadata_value(metadata, :purpose) in [:runtime_smoke, "runtime_smoke"] or
+      metadata_value(metadata, :runtime_smoke?) in [true, "true"]
+  end
+
+  defp runtime_smoke_observation(node, output) do
+    metadata = node_metadata(node)
+
+    %{
+      id: metadata_value(metadata, :smoke_id) || metadata_value(metadata, :id) || node_id(node),
+      status: command_status(output),
+      argv: map_value(output, :argv),
+      command: map_value(output, :command),
+      cwd: map_value(output, :cwd),
+      output_preview: map_value(output, :output_preview) || map_value(output, :output),
+      source_node_id: node_id(node)
+    }
+  end
+
+  defp command_status(output) do
+    case map_value(output, :status) do
+      :pass -> :pass
+      "pass" -> :pass
+      :ok -> :pass
+      "ok" -> :pass
+      other -> other || :fail
+    end
+  end
+
+  defp node_metadata(node) do
+    args =
+      node
+      |> param(:args)
+      |> normalize_map()
+
+    %{}
+    |> Map.merge(normalize_map(Map.get(node, :metadata, %{})))
+    |> Map.merge(normalize_map(map_value(args, :metadata)))
+    |> Map.merge(normalize_map(param(node, :metadata)))
+  end
+
+  defp node_id(node), do: Map.get(node, :id) || Map.get(node, "id")
+
+  defp metadata_value(metadata, key), do: map_value(metadata, key)
+
+  defp map_value(map, key) when is_map(map),
+    do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
+  defp map_value(_map, _key), do: nil
+
+  defp maybe_record_objective_contract(context, node, output) do
+    if objective_contract_output?(node, output) do
+      case ObjectiveContract.from_input(output) do
+        {:ok, %ObjectiveContract{} = contract} -> Map.put(context, :objective_contract, contract)
+        {:error, _error} -> context
+      end
+    else
+      context
+    end
+  end
+
+  defp objective_contract_output?(node, output) do
+    node.id in ["acceptance_contract", "objective_contract"] or
+      (is_map(output) and not is_nil(map_field(output, :objective)) and
+         is_list(map_field(output, :requirements)))
+  end
+
+  defp map_field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
   defp append_unique(values, value, fun) do
     (List.wrap(values) ++ [value])
     |> Enum.uniq_by(fun)
   end
+
+  defp append_latest(values, value, fun) do
+    key = fun.(value)
+
+    values
+    |> List.wrap()
+    |> Enum.reject(&(fun.(&1) == key))
+    |> Kernel.++([value])
+  end
+
+  defp artifact_identity(%{id: id}) when not is_nil(id), do: inspect(id)
+  defp artifact_identity(%{"id" => id}) when not is_nil(id), do: inspect(id)
+  defp artifact_identity(artifact), do: inspect(artifact)
 
   defp acceptance_results(output), do: get_in(output, [:evaluation, :results]) || []
 
@@ -501,6 +713,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
       child_results: [],
       changed_files: [],
       command_results: [],
+      runtime_smokes: [],
       verification_observations: [],
       scorecards: [],
       repair_needs: [],
@@ -528,6 +741,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
       |> update_in([:child_results], &Enum.uniq((&1 || []) ++ (context.child_results || [])))
       |> update_in([:changed_files], &Enum.uniq((&1 || []) ++ (context.changed_files || [])))
       |> update_in([:command_results], &Enum.uniq((&1 || []) ++ (context.command_results || [])))
+      |> update_in([:runtime_smokes], &Enum.uniq((&1 || []) ++ (context.runtime_smokes || [])))
       |> update_in(
         [:verification_observations],
         &Enum.uniq((&1 || []) ++ (context.verification_observations || []))
@@ -603,13 +817,222 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   defp reducer_opts(node), do: param(node, :opts) || []
 
   defp default_registry(context, opts) do
-    Tools.default_registry(context.workspace,
-      command_policy:
-        Keyword.get_lazy(opts, :command_policy, fn ->
-          CommandPolicy.new!(allowed_commands: ["git", "mix"], allow_shell: false)
-        end)
+    if CapabilityResolver.requested?(opts) do
+      CapabilityResolver.resolve!(context.workspace,
+        agent: :rlm,
+        mode: Keyword.get(opts, :mode, :verify),
+        profile: Keyword.get(opts, :profile),
+        toolsets: Keyword.get(opts, :toolsets, []),
+        disabled_tools: Keyword.get(opts, :disabled_tools, []),
+        tool_config: Keyword.get(opts, :tool_config, %{}),
+        approval: Keyword.get(opts, :approval, Keyword.get(opts, :approve)),
+        write_policy: Keyword.get(opts, :write_policy),
+        memory_store: Keyword.get(opts, :memory_store),
+        memory_store_opts: Keyword.get(opts, :memory_store_opts),
+        session_store: Keyword.get(opts, :session_store)
+      ).registry
+    else
+      Tools.default_registry(context.workspace,
+        command_policy:
+          Keyword.get_lazy(opts, :command_policy, fn ->
+            CommandPolicy.new!(allowed_commands: ["git", "mix"], allow_shell: false)
+          end),
+        memory_store: Keyword.get(opts, :memory_store),
+        memory_store_opts: Keyword.get(opts, :memory_store_opts),
+        session_store: Keyword.get(opts, :session_store)
+      )
+    end
+  end
+
+  defp rlm_command_policy(context, opts, fallback_opts) do
+    if CapabilityResolver.requested?(opts) do
+      CapabilityResolver.resolve!(context.workspace,
+        agent: :rlm,
+        mode: Keyword.get(opts, :mode, :verify),
+        profile: Keyword.get(opts, :profile),
+        toolsets: Keyword.get(opts, :toolsets, []),
+        disabled_tools: Keyword.get(opts, :disabled_tools, []),
+        tool_config: Keyword.get(opts, :tool_config, %{}),
+        approval: Keyword.get(opts, :approval, Keyword.get(opts, :approve)),
+        write_policy: Keyword.get(opts, :write_policy),
+        memory_store: Keyword.get(opts, :memory_store),
+        memory_store_opts: Keyword.get(opts, :memory_store_opts),
+        session_store: Keyword.get(opts, :session_store)
+      ).command_policy
+    else
+      CommandPolicy.new!(fallback_opts)
+    end
+  end
+
+  defp script_allowed?(opts) do
+    Keyword.get(opts, :allow_scripts?, false) or
+      (CapabilityResolver.requested?(opts) and
+         :code_execution in CapabilityResolver.enabled_toolsets(opts))
+  end
+
+  defp computing_family(node) do
+    case param(node, :family) || param(node, :component) || param(node, :type) do
+      family
+      when family in [
+             :collection_compute,
+             :string_compute,
+             :json_compute,
+             :artifact_compute,
+             :time_compute,
+             :score_compute
+           ] ->
+        family
+
+      family when is_binary(family) ->
+        case String.replace(family, "-", "_") do
+          "collection" -> :collection_compute
+          "collection_compute" -> :collection_compute
+          "string" -> :string_compute
+          "string_compute" -> :string_compute
+          "json" -> :json_compute
+          "json_compute" -> :json_compute
+          "artifact" -> :artifact_compute
+          "artifact_compute" -> :artifact_compute
+          "time" -> :time_compute
+          "time_compute" -> :time_compute
+          "score" -> :score_compute
+          "score_compute" -> :score_compute
+          _other -> :collection_compute
+        end
+
+      _other ->
+        :collection_compute
+    end
+  end
+
+  defp validation_opts(%CodebaseEnvironment{} = environment, opts) do
+    opts
+    |> Keyword.get(:validation_opts, [])
+    |> Keyword.merge(
+      mode: Keyword.get(opts, :mode, :verify),
+      profile: Keyword.get(opts, :profile),
+      toolsets: Keyword.get(opts, :toolsets, []),
+      disabled_tools: Keyword.get(opts, :disabled_tools, []),
+      tool_config: Keyword.get(opts, :tool_config, %{}),
+      capability_profile: Keyword.get(opts, :capability_profile),
+      workspace: environment.workspace
     )
   end
+
+  defp maybe_review_rlm_node(kind, node, value, context, opts) do
+    decider = Keyword.get(opts, :review_decider)
+
+    cond do
+      not rlm_node_review_required?(kind, value) ->
+        {:ok, value}
+
+      is_function(decider, 2) ->
+        # RLM command/script/edit nodes are side-effect capable. If they reach
+        # execution, the capability profile has made them visible, but HITL is
+        # still the runtime boundary.
+        review_rlm_node(decider, kind, node, value, context, opts)
+
+      true ->
+        {:ok, value}
+    end
+  end
+
+  defp rlm_node_review_required?(:command, value) when is_map(value) do
+    metadata = Map.get(value, :metadata) || Map.get(value, "metadata") || %{}
+
+    not (Map.get(metadata, :requires_review?) == false or
+           Map.get(metadata, "requires_review?") == false or Map.get(metadata, :review?) == false or
+           Map.get(metadata, "review?") == false)
+  end
+
+  defp rlm_node_review_required?(_kind, _value), do: true
+
+  defp review_rlm_node(decider, kind, node, value, context, opts) do
+    safety = rlm_node_review_safety(kind, value)
+
+    request =
+      RunicAI.ReviewRequest.new!(:rlm_node_execution,
+        checkpoint: :pre_tool,
+        resume_key:
+          "review:rlm:#{get_in(context, [:metadata, :run_id]) || Keyword.get(opts, :run_id) || System.unique_integer([:positive])}:#{node.id}:#{System.unique_integer([:positive])}",
+        options: [:approve, :reject, :edit, :cancel],
+        subject: %{kind: kind, node_id: node.id, value: value},
+        details: %{
+          kind: kind,
+          node_id: node.id,
+          value: value,
+          reason: :gated_rlm_node,
+          safe?: safety.safe?,
+          risk: safety.risk
+        },
+        metadata: %{
+          safe?: safety.safe?,
+          risk: safety.risk,
+          node_kind: kind,
+          requires_review?: true
+        }
+      )
+
+    case decider.(request, %{workspace: context.workspace, node: node, params: value}) do
+      {:ok, %RunicAI.ReviewDecision{status: :approved}} ->
+        {:ok, value}
+
+      {:ok, %RunicAI.ReviewDecision{status: :edited, edited_value: edited}} ->
+        {:ok, normalize_review_edit(edited, value)}
+
+      {:ok, %RunicAI.ReviewDecision{status: status}} when status in [:rejected, :cancelled] ->
+        {:error,
+         Error.validation("RLM node execution denied by review",
+           source: __MODULE__,
+           details: %{node_id: node.id, kind: kind, decision_status: status}
+         )}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error, Error.from_reason(reason, source: __MODULE__)}
+    end
+  end
+
+  defp normalize_review_edit(edited, _original) when is_map(edited), do: edited
+
+  defp normalize_review_edit(edited, original) when is_binary(edited) do
+    case Jason.decode(edited) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _other -> original
+    end
+  end
+
+  defp normalize_review_edit(_edited, original), do: original
+
+  defp rlm_node_review_safety(:edit, %EditPatchSet{metadata: metadata}) do
+    if Map.get(metadata, :generator) == :elixir_project_generator do
+      %{safe?: true, risk: :low}
+    else
+      %{safe?: false, risk: :medium}
+    end
+  end
+
+  defp rlm_node_review_safety(:edit, %{metadata: metadata}) when is_map(metadata) do
+    if Map.get(metadata, :generator) in [:elixir_project_generator, "elixir_project_generator"] do
+      %{safe?: true, risk: :low}
+    else
+      %{safe?: false, risk: :medium}
+    end
+  end
+
+  defp rlm_node_review_safety(:command, value) when is_map(value) do
+    metadata = Map.get(value, :metadata) || Map.get(value, "metadata") || %{}
+
+    if Map.get(metadata, :safe?) == true or Map.get(metadata, "safe?") == true do
+      %{safe?: true, risk: Map.get(metadata, :risk) || Map.get(metadata, "risk") || :low}
+    else
+      %{safe?: false, risk: :medium}
+    end
+  end
+
+  defp rlm_node_review_safety(_kind, _value), do: %{safe?: false, risk: :medium}
 
   defp tool_args("read_many", args, node, context) do
     paths = Map.get(args, :paths) || Map.get(args, "paths")
@@ -667,6 +1090,79 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
+  defp maybe_put_child_runtime(agent_opts, nil), do: agent_opts
+  defp maybe_put_child_runtime(agent_opts, :infinity), do: agent_opts
+
+  defp maybe_put_child_runtime(agent_opts, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: Keyword.put_new(agent_opts, :max_runtime_ms, timeout_ms)
+
+  defp maybe_put_child_live_event_sink(agent_opts, node, opts) do
+    if child_event_sink_enabled?(opts) do
+      child_sink = child_live_event_sink(node, opts)
+
+      agent_opts
+      |> put_or_compose_keyword_event_sink(:event_sink, child_sink)
+      |> maybe_put_child_codex_live_event_sink(child_sink)
+    else
+      agent_opts
+    end
+  end
+
+  defp maybe_put_child_codex_live_event_sink(agent_opts, child_sink) do
+    if codex_child_client?(agent_opts) do
+      Keyword.update(
+        agent_opts,
+        :llm_opts,
+        [event_sink: child_sink],
+        &put_or_compose_keyword_event_sink(&1, :event_sink, child_sink)
+      )
+    else
+      agent_opts
+    end
+  end
+
+  defp codex_child_client?(agent_opts) do
+    Keyword.get(agent_opts, :client) in [:codex, RunicAI.Coding.Codex.Client] or
+      Keyword.get(agent_opts, :client_backend) == :codex or
+      Keyword.get(agent_opts, :codex?, false)
+  end
+
+  defp child_event_sink_enabled?(opts) do
+    sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+    is_function(sink, 1)
+  end
+
+  defp put_or_compose_keyword_event_sink(opts, key, child_sink) do
+    case Keyword.get(opts, key) do
+      existing when is_function(existing, 1) ->
+        Keyword.put(opts, key, fn event ->
+          safe_call_event_sink(existing, event)
+          safe_call_event_sink(child_sink, event)
+        end)
+
+      _other ->
+        Keyword.put(opts, key, child_sink)
+    end
+  end
+
+  defp child_live_event_sink(node, opts) do
+    fn event ->
+      emit_node_stage(opts, :child_agent_event, child_trace_event_status(event), %{
+        node_id: node.id,
+        kind: node.kind,
+        live?: true,
+        child_event: summarize_child_event(event)
+      })
+    end
+  end
+
+  defp safe_call_event_sink(sink, event) do
+    sink.(event)
+  rescue
+    _exception -> :ok
+  end
+
   defp call_standard_agent(mode, workspace, task, opts) when mode in ["read_only", :read_only],
     do: StandardAgent.read_only(workspace, task, opts)
 
@@ -679,23 +1175,326 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   defp call_standard_agent(_mode, workspace, task, opts),
     do: StandardAgent.read_only(workspace, task, opts)
 
-  defp run_standard_agent_child(mode, workspace, task, agent_opts, node, opts) do
+  defp run_standard_agent_child(mode, workspace, task, agent_opts, node, child_timeout_ms, opts) do
+    :ok =
+      emit_node_stage(opts, :child_agent_started, :running, %{
+        node_id: node.id,
+        kind: node.kind,
+        mode: mode,
+        timeout_ms: child_timeout_ms,
+        workspace_root: workspace.root
+      })
+
     RuntimeBudget.run(
       fn ->
+        started_ms = System.monotonic_time(:millisecond)
         workflow = call_standard_agent(mode, workspace, task, agent_opts)
-        {:ok, StandardAgent.summary(workflow)}
+        elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+        forward_child_agent_events(opts, node, workflow)
+
+        if child_elapsed_timeout?(child_timeout_ms, elapsed_ms) do
+          child_timeout_error(node, mode, workspace, task, child_timeout_ms)
+        else
+          summary = StandardAgent.summary(workflow)
+
+          emit_node_stage(opts, :child_agent_completed, :ok, %{
+            node_id: node.id,
+            kind: node.kind,
+            mode: mode,
+            elapsed_ms: elapsed_ms,
+            changed_files: Map.get(summary, :changed_files, []),
+            tools_used: Map.get(summary, :tools_used, []),
+            objective_status: Map.get(summary, :objective_status)
+          })
+
+          {:ok, summary}
+        end
       end,
-      timeout_ms: child_runtime_timeout(node, agent_opts, opts),
+      timeout_ms: child_wrapper_timeout_ms(child_timeout_ms),
+      tick_ms: Keyword.get(opts, :child_progress_tick_ms, 5_000),
+      progress_sink: child_progress_sink(opts, node, mode, workspace),
       stage: :workflow_child_agent,
-      objective: task
+      objective: task,
+      details: %{
+        node_id: node.id,
+        mode: mode,
+        workspace_root: workspace.root
+      }
     )
   end
 
-  defp child_runtime_timeout(node, agent_opts, opts) do
-    param(node, :max_runtime_ms) ||
-      param(node, :timeout_ms) ||
-      Keyword.get(agent_opts, :max_runtime_ms) ||
-      Keyword.get(opts, :max_child_runtime_ms)
+  defp forward_child_agent_events(opts, node, workflow) do
+    workflow
+    |> StandardAgent.trace_events()
+    |> Enum.take(-Keyword.get(opts, :child_forwarded_event_limit, 12))
+    |> Enum.each(fn event ->
+      emit_node_stage(opts, :child_agent_event, normalize_event_status(event.status), %{
+        node_id: node.id,
+        kind: node.kind,
+        child_event: summarize_child_event(event)
+      })
+    end)
+  end
+
+  defp summarize_child_event(event) do
+    %{
+      kind: event.kind,
+      status: event.status,
+      output: summarize_child_event_output(event.output),
+      metadata: event.metadata,
+      observed_at: event.observed_at
+    }
+  end
+
+  defp summarize_child_event_output(output) when is_binary(output) do
+    String.slice(output, 0, 1_000)
+  end
+
+  defp summarize_child_event_output(output) when is_map(output) do
+    output
+    |> Map.take([
+      :tool,
+      :name,
+      :status,
+      :command,
+      :argv,
+      :cwd,
+      :exit_status,
+      :output_preview,
+      :changed_paths,
+      :diagnostics,
+      "tool",
+      "name",
+      "status",
+      "command",
+      "argv",
+      "cwd",
+      "exit_status",
+      "output_preview",
+      "changed_paths",
+      "diagnostics"
+    ])
+  end
+
+  defp summarize_child_event_output(output),
+    do: inspect(output, limit: 20, printable_limit: 1_000)
+
+  defp child_trace_event_status(%{status: status}) when status in [:running, "running"],
+    do: :running
+
+  defp child_trace_event_status(%{status: nil}), do: :running
+  defp child_trace_event_status(%{status: status}), do: normalize_event_status(status)
+  defp child_trace_event_status(_event), do: :running
+
+  defp child_wrapper_timeout_ms(nil), do: nil
+  defp child_wrapper_timeout_ms(:infinity), do: :infinity
+
+  defp child_wrapper_timeout_ms(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0,
+    do: timeout_ms + @child_agent_cleanup_grace_ms
+
+  defp child_elapsed_timeout?(timeout_ms, elapsed_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: elapsed_ms >= timeout_ms
+
+  defp child_elapsed_timeout?(_timeout_ms, _elapsed_ms), do: false
+
+  defp child_timeout_error(node, mode, workspace, task, timeout_ms) do
+    {:error,
+     Error.timeout("RLM runtime budget exhausted",
+       source: RuntimeBudget,
+       details: %{
+         timeout_ms: timeout_ms,
+         stage: :workflow_child_agent,
+         objective: task,
+         node_id: node.id,
+         mode: mode,
+         workspace_root: workspace.root
+       }
+     )}
+  end
+
+  defp child_progress_sink(opts, node, mode, workspace) do
+    fn tick ->
+      emit_node_stage(
+        opts,
+        :child_agent_progress,
+        :running,
+        Map.merge(tick, %{
+          node_id: node.id,
+          kind: node.kind,
+          mode: mode,
+          workspace_root: workspace.root
+        })
+      )
+    end
+  end
+
+  defp child_runtime_timeout(node, agent_opts, context, opts) do
+    requested_timeout_ms =
+      param(node, :max_runtime_ms) ||
+        param(node, :timeout_ms) ||
+        Keyword.get(opts, :max_child_runtime_ms) ||
+        Keyword.get(agent_opts, :child_max_runtime_ms) ||
+        default_child_runtime_timeout(node, opts)
+
+    reserve_ms = downstream_runtime_reserve_ms(node, context, opts)
+    cap_child_timeout_to_remaining_budget(node, requested_timeout_ms, opts, reserve_ms)
+  end
+
+  defp default_child_runtime_timeout(node, opts) do
+    mode = normalize_child_mode(param(node, :mode) || :read_only)
+    target_ms = child_runtime_mode_cap(mode, opts)
+
+    case Keyword.get(opts, :max_runtime_ms) do
+      max_runtime_ms when is_integer(max_runtime_ms) and max_runtime_ms > 0 ->
+        parent_cap_ms =
+          max_runtime_ms
+          |> div(2)
+          |> max(@min_default_child_runtime_ms)
+
+        target_ms
+        |> min(parent_cap_ms)
+
+      :infinity ->
+        target_ms
+
+      _other ->
+        target_ms
+    end
+  end
+
+  defp child_runtime_mode_cap(mode, opts) do
+    caps = Keyword.get(opts, :child_runtime_mode_caps, %{})
+
+    from_opts =
+      case caps do
+        caps when is_map(caps) ->
+          Map.get(caps, mode) || Map.get(caps, Atom.to_string(mode))
+
+        caps when is_list(caps) ->
+          Keyword.get(caps, mode) || Keyword.get(caps, Atom.to_string(mode))
+
+        _other ->
+          nil
+      end
+
+    cond do
+      is_integer(from_opts) and from_opts > 0 ->
+        from_opts
+
+      is_integer(Keyword.get(opts, :default_child_runtime_ms)) ->
+        Keyword.get(opts, :default_child_runtime_ms)
+
+      true ->
+        Map.get(@default_child_runtime_by_mode, mode, @default_child_runtime_ms)
+    end
+  end
+
+  defp normalize_child_mode(mode) when is_atom(mode), do: mode
+
+  defp normalize_child_mode(mode) when is_binary(mode) do
+    case String.replace(mode, "-", "_") do
+      "read_only" -> :read_only
+      "explain_repo" -> :explain_repo
+      "review" -> :review
+      "triage_bug" -> :triage_bug
+      "verify" -> :verify
+      "write_tests" -> :write_tests
+      "fix_ci" -> :fix_ci
+      "patch" -> :patch
+      _other -> :read_only
+    end
+  end
+
+  defp normalize_child_mode(_mode), do: :read_only
+
+  defp downstream_runtime_reserve_ms(node, context, opts) do
+    if Keyword.get(opts, :reserve_downstream_runtime?, true) do
+      context.proposal.nodes
+      |> Enum.reject(&(&1.id == node.id))
+      |> Enum.reduce(0, fn candidate, acc ->
+        acc + downstream_node_reserve_ms(candidate, opts)
+      end)
+      |> min(Keyword.get(opts, :max_downstream_runtime_reserve_ms, 45_000))
+    else
+      0
+    end
+  end
+
+  defp downstream_node_reserve_ms(%{kind: :agent} = node, opts) do
+    mode = normalize_child_mode(param(node, :mode) || :read_only)
+
+    cond do
+      repair_node?(node) ->
+        Keyword.get(opts, :repair_runtime_reserve_ms, 20_000)
+
+      mode in [:verify, :write_tests, :fix_ci] ->
+        Keyword.get(opts, :verification_runtime_reserve_ms, 10_000)
+
+      true ->
+        Keyword.get(opts, :child_runtime_reserve_ms, 5_000)
+    end
+  end
+
+  defp downstream_node_reserve_ms(%{kind: :verification_gate}, opts),
+    do: Keyword.get(opts, :verification_runtime_reserve_ms, 10_000)
+
+  defp downstream_node_reserve_ms(_node, _opts), do: 0
+
+  defp repair_node?(node) do
+    id = String.downcase(to_string(node.id))
+    task = String.downcase(to_string(param(node, :task) || ""))
+    mode = String.downcase(to_string(param(node, :mode) || ""))
+
+    String.contains?(id, "repair") or String.contains?(task, "repair") or
+      String.contains?(mode, "repair")
+  end
+
+  defp cap_child_timeout_to_remaining_budget(_node, nil, _opts, _reserve_ms), do: nil
+  defp cap_child_timeout_to_remaining_budget(_node, :infinity, _opts, _reserve_ms), do: :infinity
+
+  defp cap_child_timeout_to_remaining_budget(node, timeout_ms, opts, reserve_ms) do
+    case Keyword.get(opts, :run_deadline_ms) do
+      deadline_ms when is_integer(deadline_ms) ->
+        remaining_ms = deadline_ms - System.monotonic_time(:millisecond)
+        child_budget_ms = remaining_ms - @child_runtime_completion_reserve_ms - reserve_ms
+
+        emit_node_stage(opts, :child_budget_selected, :running, %{
+          node_id: node.id,
+          kind: node.kind,
+          current_child: node_child_id(node),
+          child_agent_id: node_child_id(node),
+          requested_timeout_ms: timeout_ms,
+          remaining_ms: remaining_ms,
+          downstream_reserve_ms: reserve_ms,
+          completion_reserve_ms: @child_runtime_completion_reserve_ms,
+          selected_timeout_ms:
+            cond do
+              child_budget_ms >= @min_default_child_runtime_ms ->
+                min(timeout_ms, child_budget_ms)
+
+              remaining_ms > 0 ->
+                max(div(remaining_ms, 2), 1)
+
+              true ->
+                1
+            end
+        })
+
+        cond do
+          child_budget_ms >= @min_default_child_runtime_ms ->
+            min(timeout_ms, child_budget_ms)
+
+          remaining_ms > 0 ->
+            max(div(remaining_ms, 2), 1)
+
+          true ->
+            1
+        end
+
+      _other ->
+        timeout_ms
+    end
   end
 
   defp failed_child_result(node, %Error{} = error) do
@@ -895,4 +1694,115 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
   defp maybe_put_client(llm_opts, nil), do: llm_opts
   defp maybe_put_client(llm_opts, client), do: Keyword.put_new(llm_opts, :client, client)
+
+  defp emit_node_stage(opts, stage, status, data) do
+    sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+
+    if is_function(sink, 1) do
+      event = %{
+        id: Ids.unique("rlm-node-stage:#{stage}"),
+        run_id: Keyword.get(opts, :run_id),
+        stage: stage,
+        status: status,
+        at: DateTime.utc_now(),
+        data: data
+      }
+
+      try do
+        sink.(event)
+      rescue
+        _exception -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp emit_node_budget_context(opts, node) do
+    case node_budget_context(opts, node) do
+      nil -> :ok
+      data -> emit_node_stage(opts, :node_budget_selected, :running, data)
+    end
+  end
+
+  defp node_budget_context(opts, node) do
+    max_runtime_ms = Keyword.get(opts, :max_runtime_ms)
+    deadline_ms = Keyword.get(opts, :run_deadline_ms)
+
+    cond do
+      is_integer(deadline_ms) ->
+        remaining_ms = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+        %{
+          node_id: node.id,
+          kind: node.kind,
+          current_child: node_child_id(node),
+          max_runtime_ms: max_runtime_ms,
+          remaining_ms: remaining_ms,
+          selected_timeout_ms: node_selected_timeout_ms(remaining_ms, max_runtime_ms)
+        }
+
+      is_integer(max_runtime_ms) and max_runtime_ms > 0 ->
+        %{
+          node_id: node.id,
+          kind: node.kind,
+          current_child: node_child_id(node),
+          max_runtime_ms: max_runtime_ms,
+          selected_timeout_ms: max_runtime_ms
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp node_child_id(node), do: "#{node.id}:#{node.kind}"
+
+  defp node_selected_timeout_ms(remaining_ms, max_runtime_ms)
+       when is_integer(remaining_ms) and is_integer(max_runtime_ms) and max_runtime_ms > 0,
+       do: min(remaining_ms, max_runtime_ms)
+
+  defp node_selected_timeout_ms(remaining_ms, _max_runtime_ms) when is_integer(remaining_ms),
+    do: remaining_ms
+
+  defp node_selected_timeout_ms(_remaining_ms, max_runtime_ms), do: max_runtime_ms
+
+  defp normalize_event_status(status) when status in [:satisfied, :completed, :ok], do: :ok
+  defp normalize_event_status(status) when status in [:partial, :blocked], do: :blocked
+  defp normalize_event_status(status) when status in [:failed, :error], do: :error
+  defp normalize_event_status(_status), do: :ok
+
+  defp summarize_node_output(%ChildResult{} = result) do
+    %{
+      type: :child_result,
+      status: result.status,
+      summary: result.summary,
+      changed_files: result.changed_files,
+      checks_attempted: result.checks_attempted,
+      commands: result.commands,
+      unresolved_risks: result.unresolved_risks
+    }
+  end
+
+  defp summarize_node_output(%{status: status} = output) do
+    output
+    |> Map.take([:status, :summary, :changed_files, :verification_evidence, :unresolved_risks])
+    |> Map.put_new(:status, status)
+  end
+
+  defp summarize_node_output(output) when is_binary(output) do
+    %{type: :text, preview: String.slice(output, 0, 1_000)}
+  end
+
+  defp summarize_node_output(output) do
+    %{type: :value, preview: inspect(output, limit: 20, printable_limit: 1_000)}
+  end
+
+  defp error_summary(%Error{} = error) do
+    %{
+      kind: error.kind,
+      message: error.message,
+      details: error.details
+    }
+  end
 end

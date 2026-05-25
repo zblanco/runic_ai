@@ -21,7 +21,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
         {:error,
          Error.provider("ReqLLM generate_text failed",
            source: __MODULE__,
-           details: %{reason: reason}
+           details: provider_error_details(reason)
          )}
     end
   rescue
@@ -41,7 +41,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
         {:error,
          Error.provider("ReqLLM stream_text failed",
            source: __MODULE__,
-           details: %{reason: reason}
+           details: provider_error_details(reason)
          )}
     end
   rescue
@@ -71,7 +71,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
         {:error,
          Error.provider("ReqLLM generate_object failed",
            source: __MODULE__,
-           details: %{reason: reason}
+           details: provider_error_details(reason)
          )}
     end
   rescue
@@ -81,4 +81,34 @@ defmodule RunicAI.LLM.ReqLLMClient do
 
   defp normalize_prompt(%Prompt{} = prompt), do: Prompt.to_req_llm(prompt)
   defp normalize_prompt(prompt), do: prompt
+
+  defp provider_error_details(reason) do
+    %{
+      reason: reason,
+      reason_message: reason_message(reason)
+    }
+    |> maybe_put(:status, field(reason, :status))
+    |> maybe_put(:response_body_preview, response_body_preview(field(reason, :response_body)))
+  end
+
+  defp reason_message(reason) when is_exception(reason), do: Exception.message(reason)
+  defp reason_message(reason) when is_binary(reason), do: reason
+  defp reason_message(reason), do: inspect(reason, limit: 20, printable_limit: 512)
+
+  defp response_body_preview(nil), do: nil
+  defp response_body_preview(body) when is_binary(body), do: truncate(body)
+
+  defp response_body_preview(body),
+    do: body |> inspect(limit: 20, printable_limit: 1_000) |> truncate()
+
+  defp truncate(value) when byte_size(value) > 1_000, do: binary_part(value, 0, 1_000) <> "..."
+  defp truncate(value), do: value
+
+  defp field(value, key) when is_map(value),
+    do: Map.get(value, key) || Map.get(value, to_string(key))
+
+  defp field(_value, _key), do: nil
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

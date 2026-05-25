@@ -4,6 +4,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
   """
 
   alias RunicAI.Error
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.RLM.CostEstimate
   alias RunicAI.Coding.RLM.EditPatchSet
   alias RunicAI.Coding.RLM.ProposalNode
@@ -13,8 +14,10 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
   @default_allowed_kinds [
     :llm_leaf,
     :tool,
+    :computing,
     :deterministic_step,
     :agent,
+    :edit,
     :verification_gate,
     :reducer,
     :review_gate,
@@ -57,6 +60,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
 
   defp validate_proposal(%WorkflowProposal{} = proposal, opts) do
     node_ids = Enum.map(proposal.nodes, & &1.id)
+    opts = apply_capability_defaults(opts)
     allowed_kinds = Keyword.get(opts, :allowed_kinds, @default_allowed_kinds)
 
     errors =
@@ -68,6 +72,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
       |> reject_unknown_edges(proposal.edges, node_ids)
       |> reject_cycles(proposal, opts)
       |> reject_unsafe_nodes(proposal.nodes, opts)
+      |> reject_missing_objective_workflow_coverage(proposal, opts)
       |> reject_budget_overflow(proposal, opts)
 
     rejected_nodes = rejected_node_ids(proposal.nodes, errors)
@@ -228,7 +233,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
       not is_binary(command) ->
         node_error(node, "command node requires argv or command", :missing_command)
 
-      command not in allowed_commands ->
+      is_list(allowed_commands) and command not in allowed_commands ->
         node_error(node, "command node uses a disallowed command", :disallowed_command, %{
           command: command
         })
@@ -243,6 +248,14 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
       nil
     else
       node_error(node, "script nodes are disabled by default", :script_disabled)
+    end
+  end
+
+  defp unsafe_node_error(%ProposalNode{kind: :computing} = node, opts) do
+    if Keyword.get(opts, :allow_computing?, true) do
+      nil
+    else
+      node_error(node, "computing nodes require the computing toolset", :computing_disabled)
     end
   end
 
@@ -363,6 +376,93 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
     |> reject_if_over(:max_plan_patches, patch_count, opts)
   end
 
+  defp reject_missing_objective_workflow_coverage(errors, proposal, opts) do
+    if implementation_required?(proposal, opts) do
+      node_kinds = Enum.map(proposal.nodes, & &1.kind)
+
+      errors =
+        require_any_node_kind(errors, node_kinds, [:command, :agent, :edit, :script], proposal)
+
+      errors =
+        if verification_stage_required?(proposal, opts) do
+          require_any_node_kind(errors, node_kinds, [:verification_gate], proposal)
+        else
+          errors
+        end
+
+      if read_only_repo_summary?(proposal) do
+        [
+          error("mutating objective cannot be satisfied by repo Q&A or file-output workflow",
+            reason: :read_only_workflow_for_mutating_objective,
+            node_kinds: node_kinds,
+            proposal_id: proposal.id
+          )
+          | errors
+        ]
+      else
+        errors
+      end
+    else
+      errors
+    end
+  end
+
+  defp require_any_node_kind(errors, node_kinds, required_any, proposal) do
+    if Enum.any?(required_any, &(&1 in node_kinds)) do
+      errors
+    else
+      [
+        error("workflow proposal does not cover required objective stage",
+          reason: :missing_required_objective_stage,
+          required_any_node_kinds: required_any,
+          node_kinds: node_kinds,
+          proposal_id: proposal.id
+        )
+        | errors
+      ]
+    end
+  end
+
+  defp implementation_required?(%WorkflowProposal{} = proposal, opts) do
+    Keyword.get(opts, :require_implementation?, false) or
+      ((Keyword.get(opts, :allow_mutation?, false) or Keyword.get(opts, :mode) == :patch) and
+         mutating_objective?(proposal.objective))
+  end
+
+  defp mutating_objective?(objective) when is_binary(objective) do
+    objective = String.downcase(objective)
+
+    Regex.match?(
+      ~r/(^|[^a-z0-9_])(add|build|change|create|fix|generate|implement|modify|patch|prototype|repair|update|write)([^a-z0-9_]|$)/,
+      objective
+    ) or String.contains?(objective, "proof of concept")
+  end
+
+  defp mutating_objective?(_objective), do: false
+
+  defp verification_stage_required?(%WorkflowProposal{} = proposal, opts) do
+    Keyword.get(opts, :require_verification_stage?, false) or
+      verification_objective?(proposal.objective)
+  end
+
+  defp verification_objective?(objective) when is_binary(objective) do
+    objective = String.downcase(objective)
+
+    Enum.any?(["test", "verify", "verification", "compile", "runtime smoke", "smoke"], fn cue ->
+      String.contains?(objective, cue)
+    end)
+  end
+
+  defp verification_objective?(_objective), do: false
+
+  defp read_only_repo_summary?(%WorkflowProposal{} = proposal) do
+    metadata_recipe = Map.get(proposal.metadata, :recipe) || Map.get(proposal.metadata, "recipe")
+    node_kinds = Enum.map(proposal.nodes, & &1.kind)
+
+    metadata_recipe in [:repo_qa, "repo_qa"] or
+      Enum.all?(node_kinds, &(&1 in [:tool, :reducer, :deterministic_step, :llm_leaf]))
+  end
+
   defp reject_if_over(errors, key, value, opts) do
     case Keyword.get(opts, key) do
       nil ->
@@ -386,6 +486,51 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
 
       true ->
         Keyword.get(opts, :allowed_tools, @read_tools)
+    end
+  end
+
+  defp apply_capability_defaults(opts) do
+    if not CapabilityResolver.requested?(opts) do
+      if Keyword.get(opts, :allow_commands?, false) do
+        Keyword.update(
+          opts,
+          :allowed_kinds,
+          @default_allowed_kinds ++ [:command],
+          &maybe_add_kind(&1, :command, true)
+        )
+      else
+        opts
+      end
+    else
+      toolsets = CapabilityResolver.enabled_toolsets(opts)
+
+      allowed_kinds =
+        opts
+        |> Keyword.get(:allowed_kinds, @default_allowed_kinds)
+        |> maybe_add_kind(:command, :terminal in toolsets)
+        |> maybe_add_kind(:script, :code_execution in toolsets)
+        |> maybe_add_kind(:edit, :patch in toolsets)
+        |> maybe_add_kind(:computing, :computing in toolsets)
+
+      opts
+      |> Keyword.put_new(:allow_commands?, :terminal in toolsets)
+      |> Keyword.put_new(:allow_scripts?, :code_execution in toolsets)
+      |> Keyword.put_new(:allow_mutation?, :patch in toolsets)
+      |> Keyword.put_new(:allow_computing?, :computing in toolsets)
+      |> Keyword.put_new(:allowed_tools, CapabilityResolver.visible_tool_names_for_profile(opts))
+      |> maybe_put_allowed_commands(toolsets)
+      |> Keyword.put(:allowed_kinds, allowed_kinds)
+    end
+  end
+
+  defp maybe_add_kind(kinds, kind, true), do: Enum.uniq(kinds ++ [kind])
+  defp maybe_add_kind(kinds, _kind, false), do: kinds
+
+  defp maybe_put_allowed_commands(opts, toolsets) do
+    if :terminal in toolsets and not Keyword.has_key?(opts, :allowed_commands) do
+      Keyword.put(opts, :allowed_commands, nil)
+    else
+      opts
     end
   end
 

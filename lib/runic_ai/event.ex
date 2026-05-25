@@ -399,8 +399,14 @@ defmodule RunicAI.Event do
        when stage in [
               :episode_completed,
               :node_started,
+              :node_budget_selected,
               :node_completed,
               :node_failed,
+              :child_agent_started,
+              :child_agent_progress,
+              :child_agent_event,
+              :child_agent_completed,
+              :child_budget_selected,
               :execution_started,
               :execution_completed
             ],

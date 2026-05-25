@@ -2,6 +2,7 @@ defmodule RunicAI.Terminal.EventTest do
   use ExUnit.Case, async: true
 
   alias RunicAI.Coding.RLM.ProposalNode
+  alias RunicAI.Coding.RLM.ObjectiveContract
   alias RunicAI.Coding.RLM.WorkflowProposal
   alias RunicAI.Coding.RLM.WorkflowScorecard
   alias RunicAI.Coding.RLM.WorkflowValidationReport
@@ -138,6 +139,30 @@ defmodule RunicAI.Terminal.EventTest do
     assert data["content"] == "Final repo summary for the conversation pane."
   end
 
+  test "normalizes scorecard-only coding RLM completion as a visible assistant message" do
+    events =
+      Event.from_rlm_result(
+        %{
+          objective_scorecard:
+            WorkflowScorecard.new!(
+              objective_status: :objective_satisfied,
+              changed_files: ["lib/demo.ex"],
+              residual_risks: []
+            )
+        },
+        session_id: "session:rlm",
+        run_id: "run:rlm"
+      )
+
+    assert %Event{kind: :message, phase: :assistant, status: :ok, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["message_kind"] == "workflow_output"
+    assert data["content"] =~ "RLM completed."
+    assert data["content"] =~ "Objective status: objective_satisfied"
+    assert data["content"] =~ "- lib/demo.ex"
+  end
+
   test "normalizes assistant artifact outcomes on final chat messages" do
     events =
       Event.from_rlm_result(
@@ -247,6 +272,63 @@ defmodule RunicAI.Terminal.EventTest do
     assert data["content"] == "Useful answer that still needs provenance formatting."
     assert data["blocked?"] == true
     assert data["blocking_reason"] =~ "source/provenance"
+  end
+
+  test "blocked RLM final output carries structured contract and progress evidence" do
+    contract =
+      ObjectiveContract.infer!(
+        "Build an Elixir field service dispatch proof of concept with tests"
+      )
+
+    events =
+      Event.from_rlm_result(
+        %{
+          status: :blocked,
+          output: "RLM runtime budget exhausted during active workflow execution",
+          objective_scorecard:
+            WorkflowScorecard.new!(
+              objective_status: :blocked,
+              residual_risks: ["implementation node timed out before verification"],
+              acceptance_results: [
+                %{id: "source-present", status: :fail, message: "missing source"}
+              ]
+            ),
+          context: %{
+            objective_contract: contract,
+            runtime_timeout: %{elapsed_ms: 65_000, max_runtime_ms: 65_000, remaining_ms: 0},
+            last_event: %{
+              stage: :child_agent_progress,
+              status: :running,
+              data: %{node_id: "implement_project", child_id: "codex-child-1"}
+            },
+            repair_needs: [
+              %{id: "runtime-budget-exhausted", target: "implement_project"}
+            ]
+          }
+        },
+        session_id: "session:rlm-blocked",
+        run_id: "run:rlm-blocked"
+      )
+
+    assert %Event{kind: :message, status: :blocked, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["objective_contract"]["metadata"]["domain"] == "field_service"
+
+    assert data["repair_needs"] == [
+             %{"id" => "runtime-budget-exhausted", "target" => "implement_project"}
+           ]
+
+    assert data["blocked_evidence"]["current_node"] == "implement_project"
+    assert data["blocked_evidence"]["current_child"] == "codex-child-1"
+    assert data["blocked_evidence"]["elapsed_ms"] == 65_000
+    assert [%{"id" => "source-present"}] = data["blocked_evidence"]["unsatisfied_acceptance"]
+    assert Enum.any?(data["next_actions"], &String.contains?(&1, "implement_project"))
+
+    assert %Event{kind: :summary, phase: :scorecard, status: :blocked, data: scorecard_data} =
+             Enum.find(events, &(&1.kind == :summary and &1.phase == :scorecard))
+
+    assert scorecard_data["blocked_evidence"]["current_node"] == "implement_project"
   end
 
   test "normalizes Runic runnable lifecycle stages into JSON-safe trace events" do

@@ -376,6 +376,48 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
     assert is_list(result.compiled.graph_summary.runic.serializers.cytoscape)
   end
 
+  test "assistant workflows compose reports from safe computing components" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    jsonl = """
+    {"ticket":"T1","theme":"login","severity":"high"}
+    {"ticket":"T2","theme":"billing","severity":"medium"}
+    {"ticket":"T3","theme":"login","severity":"high"}
+    """
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Safe compute report",
+        [
+          ComponentBlueprint.new!("parse", :json_compute,
+            params: %{op: :records_from_jsonl, text: jsonl}
+          ),
+          ComponentBlueprint.new!("rank", :score_compute,
+            params: %{
+              op: :rank_records,
+              criteria: [%{path: "severity", equals: "high", weight: 5}]
+            }
+          ),
+          ComponentBlueprint.new!("group", :collection_compute,
+            params: %{op: :group, group_by: "severity"}
+          ),
+          ComponentBlueprint.new!("compose", :report_composer, params: %{title: "Ticket Report"})
+        ],
+        edges: [
+          %{from: "parse", to: "rank"},
+          %{from: "rank", to: "group"},
+          %{from: "group", to: "compose"}
+        ],
+        stop_conditions: ["report composed"]
+      )
+
+    assert {:ok, result} = WorkflowCompiler.run(blueprint, workspace, %{})
+    assert result.output.text =~ "# Ticket Report"
+    assert result.output.text =~ "ticket: T1"
+    assert Enum.find(result.intermediate_outputs["group"].groups, &(&1.key == "high")).count == 2
+  end
+
   test "native map scheduler policy limits concurrency and retries item calls" do
     root = tmp_dir()
     File.write!(Path.join(root, "tickets.jsonl"), ~s({"theme":"login"}\n))

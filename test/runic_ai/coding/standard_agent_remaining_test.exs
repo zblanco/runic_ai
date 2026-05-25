@@ -274,8 +274,12 @@ defmodule RunicAI.Coding.StandardAgentRemainingTest do
     File.write!(Path.join(root, "lib/demo.ex"), demo_source(42))
     File.mkdir_p!(Path.join(root, "_build/dev"))
     File.mkdir_p!(Path.join(root, "deps/example"))
+    File.mkdir_p!(Path.join(root, "tmp"))
+    File.mkdir_p!(Path.join(root, ".runic_ai"))
     File.write!(Path.join(root, "_build/dev/ignored.beam"), "ignored")
     File.write!(Path.join(root, "deps/example/mix.exs"), "ignored")
+    File.write!(Path.join(root, "tmp/rlm-event-trail.jsonl"), "ignored")
+    File.write!(Path.join(root, ".runic_ai/runs.db"), "ignored")
 
     delta = WorkspaceDelta.diff(before, WorkspaceDelta.snapshot(workspace))
 

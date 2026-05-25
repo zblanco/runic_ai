@@ -20,9 +20,23 @@ defmodule RunicAI.Coding.Tools do
   alias RunicAI.Coding.RLM.AcceptanceCheck
   alias RunicAI.Coding.RLM.VerificationAssertions
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Context.Focus
+  alias RunicAI.Context.Ref
   alias RunicAI.Error
+  alias RunicAI.Browser.Session, as: BrowserSession
+  alias RunicAI.Media
+  alias RunicAI.Memory.Entry, as: MemoryEntry
+  alias RunicAI.Memory.LocalStore, as: MemoryLocalStore
+  alias RunicAI.Memory.Query, as: MemoryQuery
+  alias RunicAI.Memory.ReadResult
+  alias RunicAI.Persistence.Queries
+  alias RunicAI.Persistence.SQLite
+  alias RunicAI.Persistence.SQLite.Store, as: SQLiteStore
+  alias RunicAI.Terminal.Event, as: TerminalEvent
   alias RunicAI.Tool.Definition
   alias RunicAI.Tool.Registry
+  alias RunicAI.Wait
+  alias RunicAI.Web
 
   @default_find_ignore ~w(.git .elixir_ls _build deps node_modules)
   @default_list_limit 200
@@ -51,15 +65,35 @@ defmodule RunicAI.Coding.Tools do
     command_policy = CommandPolicy.from_input!(Keyword.get(opts, :command_policy))
     process_registry = Keyword.get(opts, :process_registry)
     patch_dry_run? = Keyword.get(opts, :patch_dry_run?, false)
+    memory_store = Keyword.get(opts, :memory_store, MemoryLocalStore)
+
+    memory_store_opts =
+      case Keyword.get(opts, :memory_store_opts, namespace: workspace.root) do
+        opts when is_list(opts) -> Keyword.put_new(opts, :namespace, workspace.root)
+        _other -> [namespace: workspace.root]
+      end
+
+    session_store = Keyword.get(opts, :session_store)
+    web_opts = Keyword.get(opts, :web_opts, [])
+    media_opts = Keyword.get(opts, :media_opts, [])
+    event_sink = Keyword.get(opts, :event_sink)
+    browser_opts = Keyword.get(opts, :browser_opts, []) |> put_tool_event_sink(event_sink)
+    delegate_opts = Keyword.get(opts, :delegate_opts, [])
 
     tools =
       workspace
       |> read_tools()
       |> Kernel.++(patch_tools(workspace, patch_dry_run?))
-      |> Kernel.++(command_tools(workspace, command_policy))
-      |> Kernel.++(git_tools(workspace, command_policy))
-      |> Kernel.++(profile_tools(workspace, command_policy))
-      |> Kernel.++(process_tools(workspace, command_policy, process_registry))
+      |> Kernel.++(command_tools(workspace, command_policy, event_sink))
+      |> Kernel.++(code_execution_tools(workspace, command_policy, event_sink))
+      |> Kernel.++(git_tools(workspace, command_policy, event_sink))
+      |> Kernel.++(profile_tools(workspace, command_policy, event_sink))
+      |> Kernel.++(process_tools(workspace, command_policy, process_registry, event_sink))
+      |> Kernel.++(memory_tools(workspace, memory_store, memory_store_opts, session_store))
+      |> Kernel.++(web_tools(workspace, web_opts))
+      |> Kernel.++(media_tools(workspace, media_opts))
+      |> Kernel.++(browser_tools(workspace, browser_opts, media_opts))
+      |> Kernel.++(orchestration_tools(workspace, delegate_opts, session_store))
 
     Registry.new!(tools,
       metadata: %{
@@ -318,7 +352,7 @@ defmodule RunicAI.Coding.Tools do
 
   @spec run_command(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def run_command(%Workspace{} = workspace, args, policy \\ nil) when is_map(args) do
+  def run_command(%Workspace{} = workspace, args, policy \\ nil, opts \\ []) when is_map(args) do
     command_input =
       %{
         backend: arg(args, :backend, :argv),
@@ -332,58 +366,478 @@ defmodule RunicAI.Coding.Tools do
         metadata: arg(args, :metadata, %{})
       }
 
-    CommandRunner.run(workspace, command_input, policy: policy)
+    CommandRunner.run(workspace, command_input,
+      policy: policy,
+      event_sink: Keyword.get(opts, :event_sink)
+    )
   end
 
-  @spec git_status(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec execute_code(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def git_status(workspace, args \\ %{}, policy \\ nil) do
-    run_git(workspace, ["status", "--short", "--branch"], args, policy)
+  def execute_code(%Workspace{} = workspace, args, policy \\ nil, opts \\ []) when is_map(args) do
+    runtime = arg(args, :runtime, "bash")
+    code = arg(args, :code, arg(args, :source, nil))
+
+    with {:ok, runtime} <- code_runtime(runtime),
+         {:ok, code} <- non_empty_string(code, :code) do
+      network = normalize_map(arg(args, :network, %{enabled: false}))
+      timeout_ms = arg(args, :timeout_ms, 10_000)
+
+      policy =
+        case policy do
+          nil ->
+            CommandPolicy.new!(
+              allowed_commands: ["just_bash"],
+              allow_shell: false,
+              allow_just_bash: true,
+              timeout_ms: timeout_ms,
+              max_output_bytes: arg(args, :max_output_bytes, 16_384),
+              metadata: %{sandbox_backend: :just_bash, runtime: runtime}
+            )
+
+          policy ->
+            policy
+        end
+
+      command_args = %{
+        backend: :just_bash,
+        command: "just_bash",
+        shell: code,
+        timeout_ms: timeout_ms,
+        metadata: %{
+          runtime: runtime,
+          sandbox_backend: :just_bash,
+          isolation_level: :in_process_virtual,
+          network: network,
+          cwd: arg(args, :sandbox_cwd, "/workspace"),
+          files: normalize_map(arg(args, :files, %{}))
+        }
+      }
+
+      with {:ok, %CommandResult{} = result} <- run_command(workspace, command_args, policy, opts) do
+        {:ok,
+         %{
+           result
+           | metadata:
+               Map.merge(result.metadata, %{
+                 tool: :execute_code,
+                 runtime: runtime,
+                 sandbox_backend: :just_bash,
+                 isolation_level: :in_process_virtual,
+                 network: network,
+                 host_cwd: workspace.root,
+                 sandbox_cwd: command_args.metadata.cwd,
+                 output_cap_bytes: arg(args, :max_output_bytes, 16_384),
+                 changed_artifact_refs: List.wrap(result.artifact_ref) |> Enum.reject(&is_nil/1)
+               })
+         }}
+      end
+    end
   end
 
-  @spec git_diff(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec sandbox_status(Workspace.t(), map()) :: {:ok, map()} | {:error, Error.t()}
+  def sandbox_status(%Workspace{} = workspace, args \\ %{}) when is_map(args) do
+    {:ok,
+     %{
+       status: :available,
+       workspace_root: workspace.root,
+       default_backend: :just_bash,
+       backends: [
+         %{
+           name: :just_bash,
+           available?: Code.ensure_loaded?(JustBash),
+           runtimes: [:bash],
+           isolation_level: :in_process_virtual,
+           network: %{enabled: false},
+           stateful?: false,
+           security_boundary?: false
+         }
+       ],
+       requested_backend: arg(args, :backend, :just_bash)
+     }}
+  end
+
+  @spec memory_write(Workspace.t(), map(), term(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def memory_write(%Workspace{} = workspace, args, store \\ MemoryLocalStore, store_opts \\ [])
+      when is_map(args) and is_list(store_opts) do
+    content = arg(args, :content, nil)
+    summary = arg(args, :summary, nil)
+    kind = normalize_memory_kind(arg(args, :kind, :semantic))
+    salience = arg(args, :salience, 0.7)
+
+    metadata =
+      args
+      |> arg(:metadata, %{})
+      |> normalize_map()
+      |> Map.put_new(:workspace_root, workspace.root)
+      |> Map.put_new(:source, :memory_write_tool)
+
+    with {:ok, content} <- non_empty_string(content, :content),
+         {:ok, entry} <-
+           MemoryEntry.new(
+             id: arg(args, :id, "memory-#{System.unique_integer([:positive])}"),
+             kind: kind,
+             content: content,
+             summary: summary,
+             refs: [],
+             salience: salience,
+             metadata: metadata
+           ),
+         {:ok, write_result} <- memory_store_write(store, [entry], store_opts) do
+      {:ok,
+       %{
+         status: :written,
+         count: 1,
+         namespace: Keyword.get(store_opts, :namespace, workspace.root),
+         entries: [memory_entry_map(entry)],
+         store: memory_store_label(store),
+         store_result: write_result
+       }}
+    end
+  end
+
+  @spec memory_recall(Workspace.t(), map(), term(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def memory_recall(%Workspace{} = workspace, args, store \\ MemoryLocalStore, store_opts \\ [])
+      when is_map(args) and is_list(store_opts) do
+    focus_text = arg(args, :query, arg(args, :focus, arg(args, :goal, "")))
+    limit = arg(args, :limit, 6)
+
+    with {:ok, focus_text} <- non_empty_string(focus_text, :query),
+         {:ok, limit} <- positive_integer(limit, :limit),
+         {:ok, focus} <-
+           Focus.new(
+             goal: focus_text,
+             questions: string_list_or_empty(arg(args, :questions, [])),
+             entities: string_list_or_empty(arg(args, :entities, [])),
+             constraints: string_list_or_empty(arg(args, :constraints, [])),
+             metadata: %{workspace_root: workspace.root}
+           ),
+         {:ok, kinds} <- memory_kinds(arg(args, :kinds, [:episodic, :semantic, :temporal])),
+         {:ok, query} <- MemoryQuery.new(focus: focus, kinds: kinds, limit: limit),
+         {:ok, %ReadResult{} = result} <- memory_store_read(store, query, store_opts) do
+      {:ok,
+       %{
+         status: :ok,
+         query: focus_text,
+         count: length(result.entries),
+         entries: Enum.map(result.entries, &memory_entry_map/1),
+         refs: Enum.map(result.refs, &context_ref_map/1),
+         metadata: result.metadata,
+         store: memory_store_label(store)
+       }}
+    end
+  end
+
+  @spec session_search(Workspace.t(), map(), SQLiteStore.t() | nil) ::
+          {:ok, map()} | {:error, Error.t()}
+  def session_search(%Workspace{} = workspace, args, session_store \\ nil) when is_map(args) do
+    query = arg(args, :query, nil)
+    limit = arg(args, :limit, 8)
+
+    with {:ok, query} <- non_empty_string(query, :query),
+         {:ok, limit} <- positive_integer(limit, :limit) do
+      case session_store do
+        %SQLiteStore{} = store ->
+          events =
+            store
+            |> Queries.search_events(query)
+            |> Enum.take(limit)
+            |> Enum.map(&session_event_map/1)
+
+          {:ok,
+           %{
+             status: :ok,
+             query: query,
+             workspace_root: workspace.root,
+             count: length(events),
+             results: events,
+             source_refs: Enum.map(events, & &1.source_ref)
+           }}
+
+        _other ->
+          {:ok,
+           %{
+             status: :unavailable,
+             query: query,
+             workspace_root: workspace.root,
+             count: 0,
+             results: [],
+             source_refs: [],
+             diagnostic: "session_search requires a SQLite persistence store"
+           }}
+      end
+    end
+  end
+
+  @spec web_search(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def web_search(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    query = arg(args, :query, nil)
+
+    with {:ok, query} <- non_empty_string(query, :query),
+         {:ok, result} <- Web.search(query, args, opts) do
+      result =
+        result
+        |> Map.put(:artifact_ref, persist_tool_artifact(workspace, :web_search, result))
+
+      {:ok, result}
+    end
+  end
+
+  @spec web_extract(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def web_extract(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    url = arg(args, :url, nil)
+
+    with {:ok, url} <- non_empty_string(url, :url),
+         {:ok, result} <- Web.extract(url, args, opts) do
+      artifact_ref = persist_tool_artifact(workspace, :web_extract, result.source)
+      {:ok, put_in(result, [:source, :artifact_ref], artifact_ref)}
+    end
+  end
+
+  @spec vision_analyze(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def vision_analyze(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    with {:ok, input} <- media_image_input(workspace, args),
+         {:ok, result} <- Media.vision_analyze(input, media_call_opts(args, opts)) do
+      {:ok, maybe_persist_text_artifact(workspace, :vision_analysis, result, :text)}
+    end
+  end
+
+  @spec image_generate(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def image_generate(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    prompt = arg(args, :prompt, nil)
+
+    with {:ok, prompt} <- non_empty_string(prompt, :prompt),
+         {:ok, result} <- Media.generate_image(prompt, media_call_opts(args, opts)) do
+      {:ok, persist_media_binary(workspace, :generated_image, result, :image, "image/png")}
+    end
+  end
+
+  @spec speech_generate(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def speech_generate(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    text = arg(args, :text, nil)
+
+    with {:ok, text} <- non_empty_string(text, :text),
+         {:ok, result} <- Media.speak(text, media_call_opts(args, opts)) do
+      media_type = Map.get(result, :media_type, "audio/mpeg")
+      {:ok, persist_media_binary(workspace, :speech_audio, result, :audio, media_type)}
+    end
+  end
+
+  @spec transcribe_audio(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def transcribe_audio(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    with {:ok, audio} <- media_binary_input(workspace, args, :audio),
+         {:ok, result} <- Media.transcribe(audio, media_call_opts(args, opts)) do
+      {:ok, maybe_persist_text_artifact(workspace, :transcription, result, :text)}
+    end
+  end
+
+  @spec ocr_document(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def ocr_document(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    with {:ok, document} <- media_binary_input(workspace, args, :document),
+         {:ok, result} <- Media.ocr(document, media_call_opts(args, opts)) do
+      {:ok, maybe_persist_text_artifact(workspace, :ocr_markdown, result, :markdown)}
+    end
+  end
+
+  @spec browser_navigate(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_navigate(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    url = arg(args, :url, nil)
+
+    with {:ok, url} <- non_empty_string(url, :url),
+         {:ok, session} <- browser_session(opts) do
+      BrowserSession.navigate(session, url, args, event_sink_opts(opts))
+    end
+  end
+
+  @spec browser_snapshot(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_snapshot(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    with {:ok, session} <- browser_session(opts),
+         do: BrowserSession.snapshot(session, args, event_sink_opts(opts))
+  end
+
+  @spec browser_click(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_click(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    selector = arg(args, :selector, arg(args, :ref, nil))
+
+    with {:ok, selector} <- non_empty_string(selector, :selector),
+         {:ok, session} <- browser_session(opts) do
+      BrowserSession.click(session, selector, args, event_sink_opts(opts))
+    end
+  end
+
+  @spec browser_type(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_type(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    selector = arg(args, :selector, arg(args, :ref, nil))
+    text = arg(args, :text, nil)
+
+    with {:ok, selector} <- non_empty_string(selector, :selector),
+         {:ok, text} <- non_empty_string(text, :text),
+         {:ok, session} <- browser_session(opts) do
+      BrowserSession.type(session, selector, text, args, event_sink_opts(opts))
+    end
+  end
+
+  @spec browser_press(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_press(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    key = arg(args, :key, nil)
+
+    with {:ok, key} <- non_empty_string(key, :key),
+         {:ok, session} <- browser_session(opts) do
+      BrowserSession.press(session, key, args, event_sink_opts(opts))
+    end
+  end
+
+  @spec browser_scroll(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_scroll(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    with {:ok, session} <- browser_session(opts),
+         do: BrowserSession.scroll(session, args, event_sink_opts(opts))
+  end
+
+  @spec browser_console(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_console(%Workspace{}, args, opts \\ []) when is_map(args) and is_list(opts) do
+    with {:ok, session} <- browser_session(opts),
+         do: BrowserSession.console(session, args, event_sink_opts(opts))
+  end
+
+  @spec browser_screenshot(Workspace.t(), map(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def browser_screenshot(%Workspace{} = workspace, args, opts \\ [])
+      when is_map(args) and is_list(opts) do
+    with {:ok, session} <- browser_session(opts),
+         {:ok, result} <- BrowserSession.screenshot(session, args, event_sink_opts(opts)) do
+      {:ok, persist_media_binary(workspace, :browser_screenshot, result, :image, "image/png")}
+    end
+  end
+
+  @spec browser_vision(Workspace.t(), map(), keyword(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def browser_vision(%Workspace{} = workspace, args, browser_opts \\ [], media_opts \\ [])
+      when is_map(args) and is_list(browser_opts) and is_list(media_opts) do
+    with {:ok, session} <- browser_session(browser_opts),
+         {:ok, raw_screenshot} <-
+           BrowserSession.screenshot(session, args, event_sink_opts(browser_opts)),
+         screenshot <-
+           persist_media_binary(
+             workspace,
+             :browser_screenshot,
+             raw_screenshot,
+             :image,
+             "image/png"
+           ),
+         image when is_binary(image) <- Map.get(raw_screenshot, :image),
+         {:ok, result} <-
+           Media.vision_analyze(
+             %{
+               prompt: arg(args, :prompt, "Analyze this browser screenshot."),
+               image: image,
+               media_type: Map.get(screenshot, :media_type, "image/png")
+             },
+             media_call_opts(args, media_opts)
+           ) do
+      {:ok,
+       result
+       |> Map.put(:screenshot_artifact_ref, Map.get(screenshot, :artifact_ref))
+       |> Map.put(:browser_url, Map.get(screenshot, :url))}
+    else
+      nil ->
+        {:error,
+         Error.validation("browser screenshot did not include image data", source: __MODULE__)}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @spec clarify(Workspace.t(), map()) :: {:ok, Wait.t()} | {:error, Error.t()}
+  def clarify(%Workspace{} = workspace, args) when is_map(args) do
+    question = arg(args, :question, nil)
+
+    with {:ok, question} <- non_empty_string(question, :question) do
+      {:ok,
+       Wait.new!(:clarify,
+         reason: :user_input_required,
+         payload: %{
+           question: question,
+           choices: string_list_or_empty(arg(args, :choices, [])),
+           default: arg(args, :default, nil)
+         },
+         details: %{workspace_root: workspace.root},
+         metadata: %{tool: :clarify, toolset: :clarify}
+       )}
+    end
+  end
+
+  @spec delegate_task(Workspace.t(), map(), keyword(), SQLiteStore.t() | nil) ::
+          {:ok, map()} | {:error, Error.t()}
+  def delegate_task(%Workspace{} = workspace, args, opts \\ [], session_store \\ nil)
+      when is_map(args) and is_list(opts) do
+    objective = arg(args, :objective, nil)
+
+    with {:ok, objective} <- non_empty_string(objective, :objective),
+         {:ok, result} <- run_delegate(workspace, objective, args, opts),
+         :ok <- record_delegate_events(session_store, args, objective, result) do
+      {:ok, result}
+    end
+  end
+
+  @spec git_status(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def git_diff(workspace, args \\ %{}, policy \\ nil) do
+  def git_status(workspace, args \\ %{}, policy \\ nil, opts \\ []) do
+    run_git(workspace, ["status", "--short", "--branch"], args, policy, opts)
+  end
+
+  @spec git_diff(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
+          {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
+  def git_diff(workspace, args \\ %{}, policy \\ nil, opts \\ []) do
     extra =
       case arg(args, :path, nil) do
         nil -> []
         path -> ["--", path]
       end
 
-    run_git(workspace, ["diff" | extra], args, policy)
+    run_git(workspace, ["diff" | extra], args, policy, opts)
   end
 
-  @spec git_log(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec git_log(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def git_log(workspace, args \\ %{}, policy \\ nil) do
+  def git_log(workspace, args \\ %{}, policy \\ nil, opts \\ []) do
     limit = arg(args, :limit, 20)
 
     with {:ok, limit} <- positive_integer(limit, :limit) do
-      run_git(workspace, ["log", "--oneline", "-n", Integer.to_string(limit)], args, policy)
+      run_git(workspace, ["log", "--oneline", "-n", Integer.to_string(limit)], args, policy, opts)
     end
   end
 
-  @spec git_show(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec git_show(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def git_show(workspace, args, policy \\ nil) do
+  def git_show(workspace, args, policy \\ nil, opts \\ []) do
     ref = arg(args, :ref, "HEAD")
-    run_git(workspace, ["show", "--stat", "--patch", ref], args, policy)
+    run_git(workspace, ["show", "--stat", "--patch", ref], args, policy, opts)
   end
 
-  @spec git_branch(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec git_branch(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil, keyword()) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def git_branch(workspace, args \\ %{}, policy \\ nil) do
-    run_git(workspace, ["branch", "--show-current"], args, policy)
+  def git_branch(workspace, args \\ %{}, policy \\ nil, opts \\ []) do
+    run_git(workspace, ["branch", "--show-current"], args, policy, opts)
   end
 
   @spec run_profile_task(
           Workspace.t(),
           Profile.task(),
           map(),
-          CommandPolicy.t() | keyword() | map() | nil
+          CommandPolicy.t() | keyword() | map() | nil,
+          keyword()
         ) ::
           {:ok, RunicAI.Coding.CommandResult.t()} | {:error, Error.t()}
-  def run_profile_task(%Workspace{} = workspace, task, args \\ %{}, policy \\ nil) do
+  def run_profile_task(%Workspace{} = workspace, task, args \\ %{}, policy \\ nil, opts \\ []) do
     extra_args = arg(args, :args, [])
     cwd = arg(args, :cwd, ".")
 
@@ -396,7 +850,8 @@ defmodule RunicAI.Coding.Tools do
           cwd: cwd,
           timeout_ms: arg(args, :timeout_ms, nil)
         },
-        policy
+        policy,
+        opts
       )
     end
   end
@@ -461,18 +916,24 @@ defmodule RunicAI.Coding.Tools do
     end
   end
 
-  @spec project_command(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  @spec project_command(
+          Workspace.t(),
+          map(),
+          CommandPolicy.t() | keyword() | map() | nil,
+          keyword()
+        ) ::
           {:ok, CommandResult.t()} | {:error, Error.t()}
-  def project_command(%Workspace{} = workspace, args, policy \\ nil) when is_map(args) do
+  def project_command(%Workspace{} = workspace, args, policy \\ nil, opts \\ [])
+      when is_map(args) do
     cond do
       task = arg(args, :task, nil) ->
-        run_profile_task(workspace, normalize_profile_task(task), args, policy)
+        run_profile_task(workspace, normalize_profile_task(task), args, policy, opts)
 
       argv = arg(args, :argv, nil) ->
-        run_command(workspace, Map.put(args, :argv, argv), policy)
+        run_command(workspace, Map.put(args, :argv, argv), policy, opts)
 
       command = arg(args, :command, nil) ->
-        run_command(workspace, Map.put(args, :command, command), policy)
+        run_command(workspace, put_project_command(args, command), policy, opts)
 
       true ->
         {:error,
@@ -483,20 +944,37 @@ defmodule RunicAI.Coding.Tools do
     end
   end
 
-  @spec runtime_smoke(Workspace.t(), map(), CommandPolicy.t() | keyword() | map() | nil) ::
+  defp put_project_command(args, command) when is_binary(command) do
+    if arg(args, :args, []) == [] do
+      args
+      |> Map.delete(:command)
+      |> Map.delete("command")
+      |> Map.put(:argv, OptionParser.split(command))
+    else
+      Map.put(args, :command, command)
+    end
+  end
+
+  @spec runtime_smoke(
+          Workspace.t(),
+          map(),
+          CommandPolicy.t() | keyword() | map() | nil,
+          keyword()
+        ) ::
           {:ok, CommandResult.t()} | {:error, Error.t()}
-  def runtime_smoke(%Workspace{} = workspace, args, policy \\ nil) when is_map(args) do
+  def runtime_smoke(%Workspace{} = workspace, args, policy \\ nil, opts \\ [])
+      when is_map(args) do
     adapter = arg(args, :adapter, workspace.profile.name)
 
     case adapter do
       :mix ->
-        mix_runtime_smoke(workspace, args, policy)
+        mix_runtime_smoke(workspace, args, policy, opts)
 
       "mix" ->
-        mix_runtime_smoke(workspace, args, policy)
+        mix_runtime_smoke(workspace, args, policy, opts)
 
       _other ->
-        project_command(workspace, args, policy)
+        project_command(workspace, args, policy, opts)
     end
   end
 
@@ -511,7 +989,7 @@ defmodule RunicAI.Coding.Tools do
           limit: [type: :pos_integer, default: @default_list_limit]
         ],
         fn args -> list_dir(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "find_files",
@@ -524,7 +1002,7 @@ defmodule RunicAI.Coding.Tools do
           limit: [type: :pos_integer, default: @default_find_limit]
         ],
         fn args -> find_files(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "read_file",
@@ -534,7 +1012,7 @@ defmodule RunicAI.Coding.Tools do
           max_bytes: [type: :pos_integer]
         ],
         fn args -> read_file(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "read_range",
@@ -545,7 +1023,7 @@ defmodule RunicAI.Coding.Tools do
           end_line: [type: :pos_integer, required: true]
         ],
         fn args -> read_range(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "read_many",
@@ -556,7 +1034,7 @@ defmodule RunicAI.Coding.Tools do
           total_max_bytes: [type: :pos_integer]
         ],
         fn args -> read_many(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "search_text",
@@ -569,7 +1047,7 @@ defmodule RunicAI.Coding.Tools do
           limit: [type: :pos_integer, default: @default_search_limit]
         ],
         fn args -> search_text(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "search_regex",
@@ -583,7 +1061,7 @@ defmodule RunicAI.Coding.Tools do
           limit: [type: :pos_integer, default: @default_search_limit]
         ],
         fn args -> search_regex(workspace, args) end,
-        %{category: :coding, mutates?: false}
+        %{category: :coding, toolset: :file, mutates?: false}
       ),
       definition(
         "extract_diagrams",
@@ -598,7 +1076,7 @@ defmodule RunicAI.Coding.Tools do
           max_source_bytes: [type: :pos_integer, default: @default_diagram_preview_max_bytes]
         ],
         fn args -> extract_diagrams(workspace, args) end,
-        %{category: :coding_visualization, mutates?: false}
+        %{category: :coding_visualization, toolset: :file, mutates?: false}
       ),
       definition(
         "render_mermaid",
@@ -612,7 +1090,7 @@ defmodule RunicAI.Coding.Tools do
           color: [type: :string, default: "auto"]
         ],
         fn args -> render_mermaid(workspace, args) end,
-        %{category: :coding_visualization, mutates?: false}
+        %{category: :coding_visualization, toolset: :file, mutates?: false}
       ),
       definition(
         "source_assert",
@@ -622,7 +1100,7 @@ defmodule RunicAI.Coding.Tools do
           context: [type: :any]
         ],
         fn args -> source_assert(workspace, args) end,
-        %{category: :coding_verify, mutates?: false}
+        %{category: :coding_verify, toolset: :verify, mutates?: false}
       ),
       definition(
         "changed_file_inventory",
@@ -632,7 +1110,7 @@ defmodule RunicAI.Coding.Tools do
           include_hashes: [type: :boolean, default: true]
         ],
         fn args -> changed_file_inventory(workspace, args) end,
-        %{category: :coding_verify, mutates?: false}
+        %{category: :coding_verify, toolset: :verify, mutates?: false}
       )
     ]
   end
@@ -657,14 +1135,14 @@ defmodule RunicAI.Coding.Tools do
 
           apply_patch(workspace, args)
         end,
-        %{category: :coding, mutates?: true, requires_review?: true},
+        %{category: :coding, toolset: :patch, mutates?: true, requires_review?: true},
         timeout: 30_000,
         stop_on_error: true
       )
     ]
   end
 
-  defp command_tools(workspace, command_policy) do
+  defp command_tools(workspace, command_policy, event_sink) do
     [
       definition(
         "run_command",
@@ -680,83 +1158,140 @@ defmodule RunicAI.Coding.Tools do
           shell: [type: :string],
           metadata: [type: :any]
         ],
-        fn args -> run_command(workspace, args, command_policy) end,
-        %{category: :coding, mutates?: :command_dependent, requires_review?: true},
+        fn args -> run_command(workspace, args, command_policy, event_sink: event_sink) end,
+        %{
+          category: :coding,
+          toolset: :terminal,
+          mutates?: :command_dependent,
+          requires_review?: true
+        },
         timeout: :infinity,
         stop_on_error: false
       )
     ]
   end
 
-  defp git_tools(workspace, command_policy) do
+  defp code_execution_tools(workspace, command_policy, event_sink) do
+    [
+      definition(
+        "execute_code",
+        "Execute a bounded code snippet in a configured sandbox backend. The initial backend is just_bash and is an in-process virtual runtime, not a hard security boundary.",
+        [
+          runtime: [type: :string, default: "bash"],
+          code: [type: :string, required: true],
+          timeout_ms: [type: :pos_integer],
+          max_output_bytes: [type: :pos_integer],
+          files: [type: :any],
+          network: [type: :any]
+        ],
+        fn args -> execute_code(workspace, args, command_policy, event_sink: event_sink) end,
+        %{
+          category: :coding_code_execution,
+          toolset: :code_execution,
+          mutates?: :sandbox_dependent,
+          requires_review?: true,
+          sandbox_backend: :just_bash,
+          isolation_level: :in_process_virtual
+        },
+        timeout: :infinity,
+        stop_on_error: false
+      ),
+      definition(
+        "sandbox_status",
+        "Describe configured local sandbox/code-execution backends and their isolation metadata.",
+        [backend: [type: :string]],
+        fn args -> sandbox_status(workspace, args) end,
+        %{
+          category: :coding_code_execution,
+          toolset: :code_execution,
+          mutates?: false,
+          requires_review?: false
+        }
+      )
+    ]
+  end
+
+  defp git_tools(workspace, command_policy, event_sink) do
     [
       definition(
         "git_status",
         "Read git status for the workspace.",
         [],
-        fn args -> git_status(workspace, args, command_policy) end,
-        %{category: :coding_git, mutates?: false}
+        fn args -> git_status(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_git, toolset: :git, mutates?: false}
       ),
       definition(
         "git_diff",
         "Read git diff for the workspace or one path.",
         [path: [type: :string]],
-        fn args -> git_diff(workspace, args, command_policy) end,
-        %{category: :coding_git, mutates?: false}
+        fn args -> git_diff(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_git, toolset: :git, mutates?: false}
       ),
       definition(
         "git_log",
         "Read recent git log entries.",
         [limit: [type: :pos_integer, default: 20]],
-        fn args -> git_log(workspace, args, command_policy) end,
-        %{category: :coding_git, mutates?: false}
+        fn args -> git_log(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_git, toolset: :git, mutates?: false}
       ),
       definition(
         "git_show",
         "Read one git revision with stat and patch.",
         [ref: [type: :string, default: "HEAD"]],
-        fn args -> git_show(workspace, args, command_policy) end,
-        %{category: :coding_git, mutates?: false}
+        fn args -> git_show(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_git, toolset: :git, mutates?: false}
       ),
       definition(
         "git_branch",
         "Read current git branch name.",
         [],
-        fn args -> git_branch(workspace, args, command_policy) end,
-        %{category: :coding_git, mutates?: false}
+        fn args -> git_branch(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_git, toolset: :git, mutates?: false}
       )
     ]
   end
 
-  defp profile_tools(workspace, command_policy) do
+  defp profile_tools(workspace, command_policy, event_sink) do
     [
       definition(
         "compile_project",
         "Run the detected project compile command.",
         [args: [type: {:list, :string}, default: []], cwd: [type: :string, default: "."]],
-        fn args -> run_profile_task(workspace, :compile_project, args, command_policy) end,
-        %{category: :coding_profile, mutates?: :profile_dependent}
+        fn args ->
+          run_profile_task(workspace, :compile_project, args, command_policy,
+            event_sink: event_sink
+          )
+        end,
+        %{category: :coding_profile, toolset: :profile, mutates?: :profile_dependent}
       ),
       definition(
         "run_tests",
         "Run the detected project test command.",
         [args: [type: {:list, :string}, default: []], cwd: [type: :string, default: "."]],
-        fn args -> run_profile_task(workspace, :run_tests, args, command_policy) end,
-        %{category: :coding_profile, mutates?: :profile_dependent}
+        fn args ->
+          run_profile_task(workspace, :run_tests, args, command_policy, event_sink: event_sink)
+        end,
+        %{category: :coding_profile, toolset: :profile, mutates?: :profile_dependent}
       ),
       definition(
         "run_formatter",
         "Run the detected project formatter command.",
         [args: [type: {:list, :string}, default: []], cwd: [type: :string, default: "."]],
-        fn args -> run_profile_task(workspace, :run_formatter, args, command_policy) end,
-        %{category: :coding_profile, mutates?: true, requires_review?: true}
+        fn args ->
+          run_profile_task(workspace, :run_formatter, args, command_policy,
+            event_sink: event_sink
+          )
+        end,
+        %{category: :coding_profile, toolset: :profile, mutates?: true, requires_review?: true}
       ),
       definition(
         "run_linter",
         "Run the detected project lint/check command.",
         [args: [type: {:list, :string}, default: []], cwd: [type: :string, default: "."]],
-        fn args -> run_profile_task(workspace, :run_linter, args, command_policy) end,
-        %{category: :coding_profile, mutates?: false}
+        fn args ->
+          run_profile_task(workspace, :run_linter, args, command_policy, event_sink: event_sink)
+        end,
+        %{category: :coding_profile, toolset: :profile, mutates?: false}
       ),
       definition(
         "project_command",
@@ -767,10 +1302,11 @@ defmodule RunicAI.Coding.Tools do
           command: [type: :string],
           args: [type: {:list, :string}, default: []],
           cwd: [type: :string, default: "."],
-          timeout_ms: [type: :pos_integer]
+          timeout_ms: [type: :pos_integer],
+          metadata: [type: :any]
         ],
-        fn args -> project_command(workspace, args, command_policy) end,
-        %{category: :coding_profile, mutates?: :profile_dependent}
+        fn args -> project_command(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_profile, toolset: :profile, mutates?: :profile_dependent}
       ),
       definition(
         "runtime_smoke",
@@ -784,15 +1320,15 @@ defmodule RunicAI.Coding.Tools do
           cwd: [type: :string, default: "."],
           timeout_ms: [type: :pos_integer]
         ],
-        fn args -> runtime_smoke(workspace, args, command_policy) end,
-        %{category: :coding_profile, mutates?: :profile_dependent}
+        fn args -> runtime_smoke(workspace, args, command_policy, event_sink: event_sink) end,
+        %{category: :coding_profile, toolset: :profile, mutates?: :profile_dependent}
       )
     ]
   end
 
-  defp process_tools(_workspace, _command_policy, nil), do: []
+  defp process_tools(_workspace, _command_policy, nil, _event_sink), do: []
 
-  defp process_tools(workspace, command_policy, process_registry) do
+  defp process_tools(workspace, command_policy, process_registry, event_sink) do
     [
       definition(
         "start_process",
@@ -823,17 +1359,23 @@ defmodule RunicAI.Coding.Tools do
             ])
 
           ProcessRegistry.start_process(process_registry, workspace, command_input,
-            policy: command_policy
+            policy: command_policy,
+            event_sink: event_sink
           )
         end,
-        %{category: :coding_process, mutates?: :command_dependent, requires_review?: true}
+        %{
+          category: :coding_process,
+          toolset: :process,
+          mutates?: :command_dependent,
+          requires_review?: true
+        }
       ),
       definition(
         "process_poll",
         "Poll a managed background process.",
         [id: [type: :string, required: true]],
         fn args -> ProcessRegistry.poll(process_registry, arg(args, :id, nil)) end,
-        %{category: :coding_process, mutates?: false}
+        %{category: :coding_process, toolset: :process, mutates?: false}
       ),
       definition(
         "process_log",
@@ -844,7 +1386,7 @@ defmodule RunicAI.Coding.Tools do
             max_bytes: arg(args, :max_bytes, 16_384)
           )
         end,
-        %{category: :coding_process, mutates?: false}
+        %{category: :coding_process, toolset: :process, mutates?: false}
       ),
       definition(
         "process_write",
@@ -853,14 +1395,259 @@ defmodule RunicAI.Coding.Tools do
         fn args ->
           ProcessRegistry.write(process_registry, arg(args, :id, nil), arg(args, :input, ""))
         end,
-        %{category: :coding_process, mutates?: true, requires_review?: true}
+        %{category: :coding_process, toolset: :process, mutates?: true, requires_review?: true}
       ),
       definition(
         "process_kill",
         "Kill a managed background process.",
         [id: [type: :string, required: true]],
         fn args -> ProcessRegistry.kill(process_registry, arg(args, :id, nil)) end,
-        %{category: :coding_process, mutates?: true}
+        %{category: :coding_process, toolset: :process, mutates?: true, requires_review?: true}
+      )
+    ]
+  end
+
+  defp memory_tools(workspace, memory_store, memory_store_opts, session_store) do
+    [
+      definition(
+        "memory_write",
+        "Write an explicit local memory fact with provenance metadata for later recall.",
+        [
+          content: [type: :string, required: true],
+          summary: [type: :string],
+          kind: [type: :string, default: "semantic"],
+          salience: [type: :any],
+          metadata: [type: :any]
+        ],
+        fn args -> memory_write(workspace, args, memory_store, memory_store_opts) end,
+        %{category: :memory, toolset: :memory, mutates?: true, requires_review?: true},
+        stop_on_error: false
+      ),
+      definition(
+        "memory_recall",
+        "Recall explicit local memory entries by focus/query.",
+        [
+          query: [type: :string, required: true],
+          kinds: [type: {:list, :string}],
+          limit: [type: :pos_integer],
+          questions: [type: {:list, :string}],
+          entities: [type: {:list, :string}],
+          constraints: [type: {:list, :string}]
+        ],
+        fn args -> memory_recall(workspace, args, memory_store, memory_store_opts) end,
+        %{category: :memory, toolset: :memory, mutates?: false}
+      ),
+      definition(
+        "session_search",
+        "Search prior persisted RunicAI sessions/events and return compact source-cited results.",
+        [query: [type: :string, required: true], limit: [type: :pos_integer]],
+        fn args -> session_search(workspace, args, session_store) end,
+        %{category: :session_search, toolset: :session_search, mutates?: false}
+      )
+    ]
+  end
+
+  defp web_tools(workspace, web_opts) do
+    [
+      definition(
+        "web_search",
+        "Search configured web providers and return compact source-cited records.",
+        [
+          query: [type: :string, required: true],
+          limit: [type: :pos_integer],
+          provider: [type: :string]
+        ],
+        fn args -> web_search(workspace, args, web_opts) end,
+        %{category: :web, toolset: :web, mutates?: false}
+      ),
+      definition(
+        "web_extract",
+        "Extract one URL or provided HTML body into capped markdown with provenance.",
+        [
+          url: [type: :string, required: true],
+          html: [type: :string],
+          markdown: [type: :string],
+          title: [type: :string],
+          max_bytes: [type: :pos_integer]
+        ],
+        fn args -> web_extract(workspace, args, web_opts) end,
+        %{category: :web, toolset: :web, mutates?: false}
+      )
+    ]
+  end
+
+  defp media_tools(workspace, media_opts) do
+    [
+      definition(
+        "vision_analyze",
+        "Analyze an image path, image URL, or base64 image with the configured vision model.",
+        [
+          prompt: [type: :string, required: true],
+          image_path: [type: :string],
+          image_url: [type: :string],
+          image_base64: [type: :string],
+          media_type: [type: :string],
+          model: [type: :string]
+        ],
+        fn args -> vision_analyze(workspace, args, media_opts) end,
+        %{category: :media, toolset: :media, mutates?: false}
+      ),
+      definition(
+        "image_generate",
+        "Generate an image through the configured media provider and store the binary as an artifact when available.",
+        [
+          prompt: [type: :string, required: true],
+          model: [type: :string],
+          output_path: [type: :string],
+          size: [type: :string]
+        ],
+        fn args -> image_generate(workspace, args, media_opts) end,
+        %{category: :media, toolset: :media, mutates?: false, requires_review?: true},
+        timeout: :infinity
+      ),
+      definition(
+        "speech_generate",
+        "Generate speech audio from text and store the audio as an artifact when available.",
+        [
+          text: [type: :string, required: true],
+          model: [type: :string],
+          voice: [type: :string],
+          output_format: [type: :string]
+        ],
+        fn args -> speech_generate(workspace, args, media_opts) end,
+        %{category: :media, toolset: :media, mutates?: false, requires_review?: true},
+        timeout: :infinity
+      ),
+      definition(
+        "transcribe_audio",
+        "Transcribe an audio file path or base64 audio payload into text.",
+        [
+          audio_path: [type: :string],
+          audio_base64: [type: :string],
+          media_type: [type: :string],
+          model: [type: :string],
+          language: [type: :string]
+        ],
+        fn args -> transcribe_audio(workspace, args, media_opts) end,
+        %{category: :media, toolset: :media, mutates?: false},
+        timeout: :infinity
+      ),
+      definition(
+        "ocr_document",
+        "Run OCR over a document/image path or base64 payload and return markdown.",
+        [
+          document_path: [type: :string],
+          document_base64: [type: :string],
+          document_type: [type: :string],
+          model: [type: :string]
+        ],
+        fn args -> ocr_document(workspace, args, media_opts) end,
+        %{category: :media, toolset: :media, mutates?: false},
+        timeout: :infinity
+      )
+    ]
+  end
+
+  defp browser_tools(workspace, browser_opts, media_opts) do
+    [
+      definition(
+        "browser_navigate",
+        "Navigate the agent browser session to a URL.",
+        [url: [type: :string, required: true]],
+        fn args -> browser_navigate(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: :browser_state}
+      ),
+      definition(
+        "browser_snapshot",
+        "Capture a compact accessibility snapshot and stable element refs from the agent browser.",
+        [],
+        fn args -> browser_snapshot(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: false}
+      ),
+      definition(
+        "browser_click",
+        "Click an element by snapshot ref or selector in the agent browser.",
+        [selector: [type: :string], ref: [type: :string]],
+        fn args -> browser_click(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: :browser_state, requires_review?: true}
+      ),
+      definition(
+        "browser_type",
+        "Type or fill text into an element by snapshot ref or selector in the agent browser.",
+        [selector: [type: :string], ref: [type: :string], text: [type: :string, required: true]],
+        fn args -> browser_type(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: :browser_state, requires_review?: true}
+      ),
+      definition(
+        "browser_press",
+        "Press a key in the agent browser.",
+        [key: [type: :string, required: true]],
+        fn args -> browser_press(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: :browser_state}
+      ),
+      definition(
+        "browser_scroll",
+        "Scroll the agent browser viewport.",
+        [direction: [type: :string], amount: [type: :pos_integer]],
+        fn args -> browser_scroll(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: :browser_state}
+      ),
+      definition(
+        "browser_console",
+        "Read agent browser console events.",
+        [limit: [type: :pos_integer]],
+        fn args -> browser_console(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: false}
+      ),
+      definition(
+        "browser_screenshot",
+        "Capture an agent browser screenshot and store it as an artifact when persistence is enabled.",
+        [path: [type: :string]],
+        fn args -> browser_screenshot(workspace, args, browser_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: false}
+      ),
+      definition(
+        "browser_vision",
+        "Capture an agent browser screenshot and analyze it through the configured media vision model.",
+        [prompt: [type: :string], path: [type: :string], model: [type: :string]],
+        fn args -> browser_vision(workspace, args, browser_opts, media_opts) end,
+        %{category: :browser, toolset: :browser, mutates?: false},
+        timeout: :infinity
+      )
+    ]
+  end
+
+  defp orchestration_tools(workspace, delegate_opts, session_store) do
+    [
+      definition(
+        "clarify",
+        "Pause the run and ask the operator a focused clarification question.",
+        [
+          question: [type: :string, required: true],
+          choices: [type: {:list, :string}],
+          default: [type: :string]
+        ],
+        fn args -> clarify(workspace, args) end,
+        %{category: :orchestration, toolset: :clarify, mutates?: false}
+      ),
+      definition(
+        "delegate_task",
+        "Launch or simulate a restricted child task and return only the compact final summary and refs.",
+        [
+          objective: [type: :string, required: true],
+          agent_kind: [type: :string],
+          profile: [type: :string],
+          toolsets: [type: {:list, :string}],
+          context: [type: :any]
+        ],
+        fn args -> delegate_task(workspace, args, delegate_opts, session_store) end,
+        %{
+          category: :orchestration,
+          toolset: :delegation,
+          mutates?: :child_session,
+          requires_review?: true
+        },
+        timeout: :infinity
       )
     ]
   end
@@ -893,6 +1680,7 @@ defmodule RunicAI.Coding.Tools do
   defp model_output(%PatchResult{} = result), do: result |> Map.from_struct() |> model_output()
   defp model_output(%CommandResult{} = result), do: result |> Map.from_struct() |> model_output()
   defp model_output(%ProcessHandle{} = handle), do: handle |> Map.from_struct() |> model_output()
+  defp model_output(%Wait{} = wait), do: wait |> Map.from_struct() |> model_output()
 
   defp model_output(%FileArtifact{} = artifact),
     do: artifact |> Map.from_struct() |> model_output()
@@ -910,7 +1698,7 @@ defmodule RunicAI.Coding.Tools do
   defp model_output(value) when is_list(value), do: Enum.map(value, &model_output/1)
   defp model_output(value), do: value
 
-  defp run_git(workspace, git_args, args, policy) do
+  defp run_git(workspace, git_args, args, policy, opts) do
     cwd = arg(args, :cwd, ".")
     timeout_ms = arg(args, :timeout_ms, nil)
 
@@ -922,7 +1710,8 @@ defmodule RunicAI.Coding.Tools do
     run_command(
       workspace,
       %{argv: ["git" | git_args], cwd: cwd, timeout_ms: timeout_ms},
-      git_policy
+      git_policy,
+      opts
     )
   end
 
@@ -2218,6 +3007,16 @@ defmodule RunicAI.Coding.Tools do
      )}
   end
 
+  defp code_runtime(runtime) when runtime in [:bash, "bash", :sh, "sh"], do: {:ok, :bash}
+
+  defp code_runtime(runtime) do
+    {:error,
+     Error.validation("unsupported code execution runtime",
+       source: __MODULE__,
+       details: %{runtime: runtime, supported_runtimes: [:bash]}
+     )}
+  end
+
   defp inventory_paths(workspace, []) do
     with {:ok, found} <- find_files(workspace, %{path: ".", limit: 100}) do
       {:ok, Enum.map(found.files, & &1.path)}
@@ -2302,6 +3101,448 @@ defmodule RunicAI.Coding.Tools do
     end
   end
 
+  defp normalize_memory_kind(kind) when kind in [:episodic, :semantic, :temporal], do: kind
+
+  defp normalize_memory_kind(kind) when is_binary(kind) do
+    case kind |> String.downcase() |> String.replace("-", "_") do
+      "episodic" -> :episodic
+      "semantic" -> :semantic
+      "temporal" -> :temporal
+      _other -> :semantic
+    end
+  end
+
+  defp normalize_memory_kind(_kind), do: :semantic
+
+  defp memory_kinds(nil), do: {:ok, [:episodic, :semantic, :temporal]}
+  defp memory_kinds(""), do: {:ok, [:episodic, :semantic, :temporal]}
+
+  defp memory_kinds(values) do
+    values =
+      values
+      |> List.wrap()
+      |> Enum.map(&normalize_memory_kind/1)
+      |> Enum.uniq()
+
+    invalid = Enum.reject(values, &(&1 in [:episodic, :semantic, :temporal]))
+
+    if invalid == [] do
+      {:ok, values}
+    else
+      {:error,
+       Error.validation("memory kinds contain invalid values",
+         source: __MODULE__,
+         details: %{kinds: values, invalid: invalid}
+       )}
+    end
+  end
+
+  defp string_list_or_empty(nil), do: []
+  defp string_list_or_empty(""), do: []
+
+  defp string_list_or_empty(values) when is_list(values) do
+    values
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp string_list_or_empty(value), do: string_list_or_empty([value])
+
+  defp memory_store_write(nil, entries, opts),
+    do: memory_store_write(MemoryLocalStore, entries, opts)
+
+  defp memory_store_write({store, store_opts}, entries, opts) when is_list(store_opts),
+    do: memory_store_write(store, entries, Keyword.merge(opts, store_opts))
+
+  defp memory_store_write(store, entries, opts) when is_atom(store),
+    do: normalize_memory_store_result(store.write(entries, opts))
+
+  defp memory_store_write(store, entries, opts) when is_function(store, 2),
+    do: normalize_memory_store_result(store.(entries, opts))
+
+  defp memory_store_write(store, _entries, _opts) do
+    {:error,
+     Error.validation("memory store must be a module, {module, opts}, function, or nil",
+       source: __MODULE__,
+       details: %{store: inspect(store)}
+     )}
+  end
+
+  defp memory_store_read(nil, query, opts),
+    do: memory_store_read(MemoryLocalStore, query, opts)
+
+  defp memory_store_read({store, store_opts}, query, opts) when is_list(store_opts),
+    do: memory_store_read(store, query, Keyword.merge(opts, store_opts))
+
+  defp memory_store_read(store, query, opts) when is_atom(store),
+    do: normalize_memory_store_result(store.read(query, opts))
+
+  defp memory_store_read(store, query, opts) when is_function(store, 2),
+    do: normalize_memory_store_result(store.(query, opts))
+
+  defp memory_store_read(store, _query, _opts) do
+    {:error,
+     Error.validation("memory store must be a module, {module, opts}, function, or nil",
+       source: __MODULE__,
+       details: %{store: inspect(store)}
+     )}
+  end
+
+  defp normalize_memory_store_result({:ok, result}), do: {:ok, result}
+  defp normalize_memory_store_result({:error, %Error{} = error}), do: {:error, error}
+
+  defp normalize_memory_store_result({:error, reason}),
+    do: {:error, Error.from_reason(reason, source: __MODULE__)}
+
+  defp normalize_memory_store_result(result), do: {:ok, result}
+
+  defp memory_entry_map(%MemoryEntry{} = entry) do
+    %{
+      id: entry.id,
+      kind: entry.kind,
+      content: entry.content,
+      summary: entry.summary,
+      salience: entry.salience,
+      valid_from: datetime_iso(entry.valid_from),
+      valid_until: datetime_iso(entry.valid_until),
+      refs: Enum.map(entry.refs, &context_ref_map/1),
+      metadata: entry.metadata,
+      source_ref: "memory:#{entry.id}"
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp context_ref_map(%Ref{} = ref) do
+    %{
+      kind: ref.kind,
+      target_id: ref.target_id,
+      label: ref.label,
+      source_ref: Ref.key(ref),
+      provenance: ref.provenance,
+      metadata: ref.metadata
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp context_ref_map(ref), do: %{source_ref: to_string(ref)}
+
+  defp memory_store_label(nil), do: :local_ets
+  defp memory_store_label(MemoryLocalStore), do: :local_ets
+  defp memory_store_label({store, _opts}), do: memory_store_label(store)
+  defp memory_store_label(store) when is_atom(store), do: store
+  defp memory_store_label(store) when is_function(store), do: :function
+  defp memory_store_label(_store), do: :unknown
+
+  defp session_event_map(event) do
+    data = event.data_json || %{}
+    detail = event.detail || event.title || ""
+    snippet = session_event_snippet(event, data)
+
+    %{
+      id: event.id,
+      source_ref: "terminal_event:#{event.id}",
+      session_id: event.session_id,
+      run_id: event.run_id || Map.get(data, "run_id") || Map.get(data, :run_id),
+      sequence: event.sequence,
+      agent: event.agent,
+      kind: event.kind,
+      phase: event.phase,
+      status: event.status,
+      title: event.title,
+      detail: detail,
+      snippet: snippet,
+      at: datetime_iso(event.at)
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp session_event_snippet(event, data) do
+    [
+      event.title,
+      event.detail,
+      Map.get(data, "reply_text") || Map.get(data, :reply_text),
+      get_in(data, ["output", "text"]) || get_in(data, [:output, :text])
+    ]
+    |> Enum.find(&is_binary/1)
+    |> case do
+      nil -> inspect(data, limit: 20, printable_limit: 1_000)
+      text -> text
+    end
+    |> truncate_output(500)
+  end
+
+  defp media_call_opts(args, opts) do
+    opts =
+      opts
+      |> maybe_put_arg(:model, args)
+      |> maybe_put_arg(:voice, args)
+      |> maybe_put_arg(:size, args)
+      |> maybe_put_arg(:output_format, args)
+      |> maybe_put_arg(:language, args)
+      |> maybe_put_arg(:document_type, args)
+
+    opts
+  end
+
+  defp media_image_input(%Workspace{} = workspace, args) do
+    prompt = arg(args, :prompt, nil)
+    media_type = arg(args, :media_type, "image/png")
+
+    cond do
+      image_url = arg(args, :image_url, nil) ->
+        {:ok, %{prompt: prompt, image_url: image_url, media_type: media_type}}
+
+      image_base64 = arg(args, :image_base64, nil) ->
+        case Base.decode64(image_base64) do
+          {:ok, image} ->
+            {:ok, %{prompt: prompt, image: image, media_type: media_type}}
+
+          :error ->
+            {:error, Error.validation("image_base64 is not valid base64", source: __MODULE__)}
+        end
+
+      image_path = arg(args, :image_path, nil) ->
+        with {:ok, resolved} <- Workspace.resolve_path(workspace, image_path, :read),
+             {:ok, image} <- File.read(resolved.path) do
+          {:ok, %{prompt: prompt, image: image, media_type: media_type, path: resolved.relative}}
+        else
+          {:error, %Error{} = error} -> {:error, error}
+          {:error, reason} -> {:error, Error.from_reason(reason, source: __MODULE__)}
+        end
+
+      true ->
+        {:error,
+         Error.validation("vision input requires image_path, image_url, or image_base64",
+           source: __MODULE__
+         )}
+    end
+  end
+
+  defp media_binary_input(%Workspace{} = workspace, args, kind) do
+    path_key = :"#{kind}_path"
+    base64_key = :"#{kind}_base64"
+    media_type = arg(args, :media_type, arg(args, :document_type, "application/octet-stream"))
+
+    cond do
+      path = arg(args, path_key, nil) ->
+        with {:ok, resolved} <- Workspace.resolve_path(workspace, path, :read),
+             {:ok, binary} <- File.read(resolved.path) do
+          if kind == :audio do
+            {:ok, {:binary, binary, media_type}}
+          else
+            {:ok, binary}
+          end
+        else
+          {:error, %Error{} = error} -> {:error, error}
+          {:error, reason} -> {:error, Error.from_reason(reason, source: __MODULE__)}
+        end
+
+      encoded = arg(args, base64_key, nil) ->
+        case Base.decode64(encoded) do
+          {:ok, binary} ->
+            if kind == :audio, do: {:ok, {:binary, binary, media_type}}, else: {:ok, binary}
+
+          :error ->
+            {:error, Error.validation("#{base64_key} is not valid base64", source: __MODULE__)}
+        end
+
+      true ->
+        {:error,
+         Error.validation("#{kind} input requires #{path_key} or #{base64_key}",
+           source: __MODULE__
+         )}
+    end
+  end
+
+  defp persist_media_binary(workspace, kind, result, field, fallback_media_type) do
+    binary = Map.get(result, field)
+    media_type = Map.get(result, :media_type, fallback_media_type)
+
+    artifact_ref =
+      if is_binary(binary),
+        do: persist_tool_artifact(workspace, kind, %{media_type: media_type, content: binary})
+
+    result =
+      if is_binary(binary) do
+        result
+        |> Map.put(:"#{field}_byte_size", byte_size(binary))
+        |> Map.delete(field)
+      else
+        result
+      end
+
+    result
+    |> Map.put(:artifact_ref, artifact_ref)
+    |> Map.put_new(:media_type, media_type)
+  end
+
+  defp maybe_persist_text_artifact(workspace, kind, result, field) do
+    content = Map.get(result, field)
+
+    artifact_ref =
+      if is_binary(content) and content != "", do: persist_tool_artifact(workspace, kind, result)
+
+    Map.put(result, :artifact_ref, artifact_ref)
+  end
+
+  defp persist_tool_artifact(%Workspace{} = workspace, kind, payload) do
+    content =
+      cond do
+        is_binary(Map.get(payload, :content)) -> Map.get(payload, :content)
+        is_binary(Map.get(payload, :markdown)) -> Map.get(payload, :markdown)
+        is_binary(Map.get(payload, :text)) -> Map.get(payload, :text)
+        true -> Jason.encode!(model_output(payload))
+      end
+
+    sha256 = Patch.sha256(content)
+
+    artifact = %{
+      content: content,
+      sha256: sha256,
+      path: "#{kind}:#{sha256}",
+      artifact_kind: kind,
+      metadata: %{tool_artifact?: true, kind: kind, workspace_root: workspace.root}
+    }
+
+    case Persistence.put_artifact(workspace.persistence, artifact) do
+      {:ok, ref} -> ref
+      {:error, _error} -> nil
+    end
+  end
+
+  defp browser_session(opts) do
+    case Keyword.get(opts, :session) || Keyword.get(opts, :browser_session) do
+      nil ->
+        backend = Keyword.get(opts, :backend) || default_browser_backend()
+        backend_opts = Keyword.get(opts, :backend_opts, opts)
+
+        BrowserSession.start_link(
+          backend: backend,
+          backend_opts: backend_opts,
+          inactivity_timeout_ms: Keyword.get(opts, :inactivity_timeout_ms, 120_000)
+        )
+
+      session ->
+        {:ok, session}
+    end
+  end
+
+  defp run_delegate(%Workspace{} = workspace, objective, args, opts) do
+    agent_kind = arg(args, :agent_kind, "standard")
+    profile = arg(args, :profile, "coding_read")
+    toolsets = string_list_or_empty(arg(args, :toolsets, []))
+    subagent_id = arg(args, :subagent_id, "subagent:#{System.unique_integer([:positive])}")
+
+    base = %{
+      status: :completed,
+      subagent_id: subagent_id,
+      agent_kind: agent_kind,
+      objective: objective,
+      profile: profile,
+      toolsets: toolsets,
+      summary: "Delegated task recorded for restricted child execution.",
+      artifact_refs: [],
+      intermediate_events_included?: false,
+      workspace_root: workspace.root
+    }
+
+    case Keyword.get(opts, :runner) || Keyword.get(opts, :delegate_fun) do
+      nil ->
+        {:ok, base}
+
+      runner when is_function(runner, 3) ->
+        case runner.(objective, args, %{
+               workspace: workspace,
+               profile: profile,
+               toolsets: toolsets
+             }) do
+          {:ok, result} -> {:ok, sanitize_delegate_result(Map.merge(base, normalize_map(result)))}
+          {:error, %Error{} = error} -> {:error, error}
+          {:error, reason} -> {:error, Error.from_reason(reason, source: __MODULE__)}
+          result when is_map(result) -> {:ok, sanitize_delegate_result(Map.merge(base, result))}
+        end
+
+      runner ->
+        {:error,
+         Error.validation("delegate runner must be a function of arity 3",
+           source: __MODULE__,
+           details: %{runner: inspect(runner)}
+         )}
+    end
+  end
+
+  defp sanitize_delegate_result(result) do
+    %{
+      status: Map.get(result, :status, :completed),
+      subagent_id: Map.get(result, :subagent_id),
+      agent_kind: Map.get(result, :agent_kind, "standard"),
+      objective: Map.get(result, :objective),
+      profile: Map.get(result, :profile),
+      toolsets: Map.get(result, :toolsets, []),
+      summary: Map.get(result, :summary) || Map.get(result, :output) || "",
+      artifact_refs: List.wrap(Map.get(result, :artifact_refs, [])),
+      source_refs: List.wrap(Map.get(result, :source_refs, [])),
+      intermediate_events_included?: false,
+      workspace_root: Map.get(result, :workspace_root)
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp record_delegate_events(nil, _args, _objective, _result), do: :ok
+
+  defp record_delegate_events(%SQLiteStore{} = store, args, objective, result) do
+    session_id = arg(args, :session_id, nil)
+    run_id = arg(args, :run_id, nil)
+
+    event =
+      TerminalEvent.new!(:subagent,
+        session_id: session_id,
+        agent: :standard,
+        phase: :delegation,
+        status: :ok,
+        title: "Subagent completed",
+        detail: Map.get(result, :summary),
+        data: %{
+          run_id: run_id,
+          subagent_id: Map.fetch!(result, :subagent_id),
+          agent_kind: Map.get(result, :agent_kind),
+          objective: objective,
+          result: result
+        }
+      )
+
+    case SQLite.record_terminal_event(store, event) do
+      {:ok, _event} -> :ok
+      {:error, reason} -> {:error, Error.from_reason(reason, source: __MODULE__)}
+    end
+  end
+
+  defp record_delegate_events(_store, _args, _objective, _result), do: :ok
+
+  defp default_browser_backend do
+    if System.find_executable("agent-browser") do
+      RunicAI.Browser.Backends.AgentBrowser
+    else
+      RunicAI.Browser.Backends.Fake
+    end
+  end
+
+  defp maybe_put_arg(opts, key, args) do
+    case arg(args, key, nil) do
+      nil -> opts
+      value -> Keyword.put(opts, key, value)
+    end
+  end
+
+  defp datetime_iso(nil), do: nil
+  defp datetime_iso(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp datetime_iso(value), do: value
+
   defp normalize_profile_task(task) when is_atom(task), do: task
   defp normalize_profile_task("compile_project"), do: :compile_project
   defp normalize_profile_task("run_tests"), do: :run_tests
@@ -2309,7 +3550,7 @@ defmodule RunicAI.Coding.Tools do
   defp normalize_profile_task("run_linter"), do: :run_linter
   defp normalize_profile_task(task), do: task
 
-  defp mix_runtime_smoke(workspace, args, policy) do
+  defp mix_runtime_smoke(workspace, args, policy, opts) do
     case arg(args, :code, nil) do
       code when is_binary(code) and code != "" ->
         run_command(
@@ -2320,17 +3561,32 @@ defmodule RunicAI.Coding.Tools do
             timeout_ms: arg(args, :timeout_ms, nil),
             metadata: %{runtime_smoke?: true, adapter: :mix}
           },
-          policy
+          policy,
+          opts
         )
 
       _other ->
-        project_command(workspace, args, policy)
+        project_command(workspace, args, policy, opts)
     end
   end
 
   defp normalize_map(value) when is_map(value), do: value
   defp normalize_map(value) when is_list(value), do: Map.new(value)
   defp normalize_map(_value), do: %{}
+
+  defp put_tool_event_sink(opts, nil), do: opts
+
+  defp put_tool_event_sink(opts, event_sink) when is_function(event_sink, 1),
+    do: Keyword.put_new(opts, :event_sink, event_sink)
+
+  defp put_tool_event_sink(opts, _event_sink), do: opts
+
+  defp event_sink_opts(opts) do
+    case Keyword.get(opts, :event_sink) do
+      event_sink when is_function(event_sink, 1) -> [event_sink: event_sink]
+      _other -> []
+    end
+  end
 
   defp arg(map, key, default) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))

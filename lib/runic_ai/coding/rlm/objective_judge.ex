@@ -15,6 +15,7 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
   alias RunicAI.LLM.Result
 
   @default_model "openai:gpt-5.4-mini"
+  @audit_excerpt_limit 4_000
 
   @type requirement_result :: %{
           required(:requirement_id) => String.t(),
@@ -46,6 +47,8 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
 
   @spec acceptance_results(ObjectiveContract.t(), map()) :: [AcceptanceCheck.result()]
   def acceptance_results(%ObjectiveContract{} = contract, judgement) when is_map(judgement) do
+    judge_metadata = normalize_map(field(judgement, :metadata))
+
     result_by_id =
       judgement
       |> Map.get(:requirement_results, Map.get(judgement, "requirement_results", []))
@@ -79,7 +82,8 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
                 confidence: field(result, :confidence),
                 evidence_refs: string_list(field(result, :evidence_refs)),
                 repair_instruction: field(result, :repair_instruction),
-                category: :semantic_requirement
+                category: :semantic_requirement,
+                judge: judge_metadata
               },
               normalize_map(field(result, :metadata))
             )
@@ -186,9 +190,13 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
   end
 
   defp llm_judge_object(model, contract, evidence, llm_opts) do
-    case LLM.generate_object(model, prompt(contract, evidence), schema(), llm_opts) do
+    prompt = prompt(contract, evidence)
+
+    case LLM.generate_object(model, prompt, schema(), llm_opts) do
       {:ok, object} ->
-        normalize_judgement(object, contract)
+        object
+        |> normalize_judgement(contract)
+        |> annotate_judgement(judge_audit(:llm_object, model, prompt, fallback?: false))
 
       {:error, error} ->
         llm_judge_json_text(model, contract, evidence, llm_opts, fallback_error: error)
@@ -196,20 +204,41 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
   end
 
   defp llm_judge_json_text(model, contract, evidence, llm_opts, opts \\ []) do
+    base_prompt = prompt(contract, evidence)
+
     prompt = """
-    #{prompt(contract, evidence)}
+    #{base_prompt}
 
     Return only one valid JSON object. Do not wrap it in Markdown fences.
     """
 
+    audit_opts =
+      case Keyword.get(opts, :fallback_error) do
+        nil -> [fallback?: false]
+        error -> [fallback?: true, fallback_reason: :object_generation_failed, error: error]
+      end
+
     case LLM.generate_text(model, prompt, llm_opts) do
       {:ok, %Result{} = result} ->
-        result
-        |> Result.text()
+        response_text = Result.text(result)
+
+        response_text
         |> decode_json()
         |> case do
-          {:ok, object} -> normalize_judgement(object, contract)
-          error -> error
+          {:ok, object} ->
+            object
+            |> normalize_judgement(contract)
+            |> annotate_judgement(
+              judge_audit(
+                :llm_json_text,
+                model,
+                prompt,
+                Keyword.merge(audit_opts, response_text: response_text)
+              )
+            )
+
+          error ->
+            error
         end
 
       {:retry, error} ->
@@ -219,6 +248,44 @@ defmodule RunicAI.Coding.RLM.ObjectiveJudge do
         {:error, Keyword.get(opts, :fallback_error, error)}
     end
   end
+
+  defp annotate_judgement({:ok, judgement}, audit) do
+    {:ok, update_in(judgement, [:metadata], &Map.merge(audit, normalize_map(&1)))}
+  end
+
+  defp annotate_judgement(error, _audit), do: error
+
+  defp judge_audit(source, model, prompt, opts) do
+    %{
+      source: source,
+      model: model,
+      prompt_sha256: sha256(prompt),
+      prompt_excerpt: excerpt(prompt),
+      response_excerpt: excerpt(Keyword.get(opts, :response_text)),
+      fallback?: Keyword.get(opts, :fallback?, false)
+    }
+    |> maybe_put(:fallback_reason, Keyword.get(opts, :fallback_reason))
+    |> maybe_put(:error, error_summary(Keyword.get(opts, :error)))
+  end
+
+  defp sha256(text) when is_binary(text) do
+    :crypto.hash(:sha256, text) |> Base.encode16(case: :lower)
+  end
+
+  defp excerpt(nil), do: nil
+
+  defp excerpt(text) when is_binary(text) do
+    text
+    |> String.trim()
+    |> String.slice(0, @audit_excerpt_limit)
+  end
+
+  defp error_summary(nil), do: nil
+  defp error_summary(%Error{} = error), do: error.message
+  defp error_summary(error), do: inspect(error, limit: 20)
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp normalize_judgement({:ok, judgement}, contract),
     do: normalize_judgement(judgement, contract)

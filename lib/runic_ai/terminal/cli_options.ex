@@ -6,6 +6,7 @@ defmodule RunicAI.Terminal.CliOptions do
   side effects and reused by future terminal frontends.
   """
 
+  alias RunicAI.Agent.ModelClientResolver
   alias RunicAI.Error
 
   @agents [:standard, :rlm, :assistant]
@@ -43,17 +44,30 @@ defmodule RunicAI.Terminal.CliOptions do
     :sqlite_path,
     :persistence,
     :model,
+    :requested_model,
+    :model_resolution,
     :client,
     :client_label,
     :max_turns,
     :max_runtime_ms,
+    :max_objective_iterations,
+    :proposal_timeout_ms,
+    :repair?,
+    :max_repairs,
+    :seed_project_generation?,
     :max_concurrency,
     :max_llm_map_concurrency,
     :max_llm_map_calls,
     :session_id,
+    :profile,
     async?: nil,
     input_paths: [],
     output_path: nil,
+    toolsets: [],
+    disabled_tools: [],
+    allowed_tools: [],
+    tool_config: %{},
+    objective_loop?: false,
     allow_generated_functions: :tier1,
     write_policy: :docs_only,
     agent: :standard,
@@ -76,6 +90,10 @@ defmodule RunicAI.Terminal.CliOptions do
   @spec parse([String.t()]) :: {:ok, t()} | {:error, Error.t()}
   def parse(args) when is_list(args) do
     input_values = repeated_option_values(args, "input")
+    toolset_values = repeated_option_values(args, "toolsets")
+    disabled_tool_values = repeated_option_values(args, "disable-tool")
+    allowed_tool_values = repeated_option_values(args, "allow-tool")
+    tool_config_values = repeated_option_values(args, "tool-config")
 
     {opts, rest, invalid} =
       OptionParser.parse(args,
@@ -93,10 +111,21 @@ defmodule RunicAI.Terminal.CliOptions do
           async: :boolean,
           max_turns: :integer,
           max_runtime_ms: :integer,
+          max_objective_iterations: :integer,
+          proposal_timeout_ms: :integer,
+          objective_loop: :boolean,
+          repair: :boolean,
+          max_repairs: :integer,
+          seed_project_generation: :boolean,
           max_concurrency: :integer,
           max_llm_map_concurrency: :integer,
           max_llm_map_calls: :integer,
           session_id: :string,
+          profile: :string,
+          toolsets: :string,
+          disable_tool: :string,
+          allow_tool: :string,
+          tool_config: :string,
           mode: :string,
           input: :string,
           output: :string,
@@ -144,7 +173,23 @@ defmodule RunicAI.Terminal.CliOptions do
          {:ok, graph} <- normalize_choice(Keyword.get(opts, :graph, "text"), @graph_modes, :graph),
          {:ok, input_paths} <- normalize_input_paths(input_values, cwd),
          {:ok, output_path} <- normalize_workspace_path(Keyword.get(opts, :output), cwd, :output),
+         {:ok, profile} <- normalize_optional_profile(Keyword.get(opts, :profile)),
+         {:ok, toolsets} <-
+           normalize_csv_values(toolset_values ++ Keyword.get_values(opts, :toolsets)),
+         {:ok, disabled_tools} <-
+           normalize_csv_values(disabled_tool_values ++ Keyword.get_values(opts, :disable_tool)),
+         {:ok, allowed_tools} <-
+           normalize_csv_values(allowed_tool_values ++ Keyword.get_values(opts, :allow_tool)),
+         {:ok, tool_config} <-
+           normalize_tool_config(tool_config_values ++ Keyword.get_values(opts, :tool_config)),
          {:ok, client, client_label} <- normalize_client(Keyword.get(opts, :client)),
+         {:ok, resolved_launch, model_resolution} <-
+           ModelClientResolver.resolve(
+             agent: agent,
+             model: Keyword.get(opts, :model),
+             client: client,
+             client_label: client_label
+           ),
          {:ok, jsonl_path} <- normalize_jsonl_path(Keyword.get(opts, :jsonl), cwd),
          {:ok, persistence} <-
            normalize_persistence(Keyword.get(opts, :persistence), Keyword.get(opts, :sqlite)),
@@ -157,6 +202,13 @@ defmodule RunicAI.Terminal.CliOptions do
            ),
          :ok <- validate_positive(Keyword.get(opts, :max_turns), :max_turns),
          :ok <- validate_positive(Keyword.get(opts, :max_runtime_ms), :max_runtime_ms),
+         :ok <-
+           validate_positive(
+             Keyword.get(opts, :max_objective_iterations),
+             :max_objective_iterations
+           ),
+         :ok <- validate_positive(Keyword.get(opts, :proposal_timeout_ms), :proposal_timeout_ms),
+         :ok <- validate_non_negative(Keyword.get(opts, :max_repairs), :max_repairs),
          :ok <- validate_positive(Keyword.get(opts, :max_concurrency), :max_concurrency),
          :ok <-
            validate_positive(
@@ -169,9 +221,11 @@ defmodule RunicAI.Terminal.CliOptions do
          objective: objective,
          agent: agent,
          cwd: cwd,
-         model: Keyword.get(opts, :model),
+         model: Keyword.get(resolved_launch, :model),
+         requested_model: Keyword.get(opts, :model),
+         model_resolution: model_resolution,
          client: client,
-         client_label: client_label,
+         client_label: Keyword.get(resolved_launch, :client_label, client_label),
          interactive?: Keyword.get(opts, :interactive, false),
          jsonl_path: jsonl_path,
          sqlite_path: sqlite_path,
@@ -181,10 +235,21 @@ defmodule RunicAI.Terminal.CliOptions do
          async?: Keyword.get(opts, :async),
          max_turns: Keyword.get(opts, :max_turns),
          max_runtime_ms: Keyword.get(opts, :max_runtime_ms),
+         max_objective_iterations: Keyword.get(opts, :max_objective_iterations),
+         proposal_timeout_ms: Keyword.get(opts, :proposal_timeout_ms),
+         objective_loop?: Keyword.get(opts, :objective_loop, false),
+         repair?: Keyword.get(opts, :repair),
+         max_repairs: Keyword.get(opts, :max_repairs),
+         seed_project_generation?: Keyword.get(opts, :seed_project_generation, false),
          max_concurrency: Keyword.get(opts, :max_concurrency),
          max_llm_map_concurrency: Keyword.get(opts, :max_llm_map_concurrency),
          max_llm_map_calls: Keyword.get(opts, :max_llm_map_calls),
          session_id: Keyword.get(opts, :session_id),
+         profile: profile,
+         toolsets: toolsets,
+         disabled_tools: disabled_tools,
+         allowed_tools: allowed_tools,
+         tool_config: tool_config,
          input_paths: input_paths,
          output_path: output_path,
          allow_generated_functions: allow_generated_functions,
@@ -236,7 +301,18 @@ defmodule RunicAI.Terminal.CliOptions do
       --max-llm-map-calls N
       --max-turns N
       --max-runtime-ms N
+      --objective-loop / --no-objective-loop
+      --max-objective-iterations N
+      --proposal-timeout-ms N
+      --repair / --no-repair
+      --max-repairs N
+      --seed-project-generation / --no-seed-project-generation
       --session-id ID
+      --profile safe|coding-read|coding-patch|coding-verify|local-workbench|research|full-local
+      --toolsets a,b,c
+      --disable-tool NAME
+      --allow-tool NAME
+      --tool-config key=value
     """
   end
 
@@ -340,6 +416,86 @@ defmodule RunicAI.Terminal.CliOptions do
      Error.validation("invalid runic_ai.agent #{field}",
        source: __MODULE__,
        details: %{field: field, value: value, valid: choices}
+     )}
+  end
+
+  defp normalize_optional_profile(nil), do: {:ok, nil}
+  defp normalize_optional_profile(""), do: {:ok, nil}
+
+  defp normalize_optional_profile(profile) when is_binary(profile) do
+    {:ok, profile |> String.trim() |> String.replace("_", "-")}
+  end
+
+  defp normalize_optional_profile(profile), do: {:ok, profile}
+
+  defp normalize_csv_values(values) when is_list(values) do
+    {:ok,
+     values
+     |> Enum.flat_map(fn
+       value when is_binary(value) -> String.split(value, [",", "\n"], trim: true)
+       value -> [to_string(value)]
+     end)
+     |> Enum.map(&String.trim/1)
+     |> Enum.reject(&(&1 == ""))
+     |> Enum.uniq()}
+  end
+
+  defp normalize_tool_config(values) when is_list(values) do
+    Enum.reduce_while(values, {:ok, %{}}, fn value, {:ok, acc} ->
+      case parse_tool_config(value) do
+        {:ok, key_path, parsed_value} ->
+          {:cont, {:ok, put_nested_config(acc, key_path, parsed_value)}}
+
+        {:error, %Error{} = error} ->
+          {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  defp parse_tool_config(value) when is_binary(value) do
+    case String.split(value, "=", parts: 2) do
+      [key, config_value] ->
+        key_path =
+          key
+          |> String.trim()
+          |> String.split(".", trim: true)
+
+        if key_path == [] do
+          invalid_tool_config(value)
+        else
+          {:ok, key_path, parse_tool_config_value(String.trim(config_value))}
+        end
+
+      _other ->
+        invalid_tool_config(value)
+    end
+  end
+
+  defp parse_tool_config(value), do: invalid_tool_config(value)
+
+  defp parse_tool_config_value("true"), do: true
+  defp parse_tool_config_value("false"), do: false
+
+  defp parse_tool_config_value(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _other -> value
+    end
+  end
+
+  defp put_nested_config(config, [key], value), do: Map.put(config, key, value)
+
+  defp put_nested_config(config, [key | rest], value) do
+    Map.update(config, key, put_nested_config(%{}, rest, value), fn nested ->
+      put_nested_config(Map.new(nested || %{}), rest, value)
+    end)
+  end
+
+  defp invalid_tool_config(value) do
+    {:error,
+     Error.validation("invalid runic_ai.agent --tool-config",
+       source: __MODULE__,
+       details: %{tool_config: value, expected: "key=value"}
      )}
   end
 
@@ -501,6 +657,17 @@ defmodule RunicAI.Terminal.CliOptions do
   defp validate_positive(value, field) do
     {:error,
      Error.validation("runic_ai.agent #{field} must be a positive integer",
+       source: __MODULE__,
+       details: %{field: field, value: value}
+     )}
+  end
+
+  defp validate_non_negative(nil, _field), do: :ok
+  defp validate_non_negative(value, _field) when is_integer(value) and value >= 0, do: :ok
+
+  defp validate_non_negative(value, field) do
+    {:error,
+     Error.validation("runic_ai.agent #{field} must be a non-negative integer",
        source: __MODULE__,
        details: %{field: field, value: value}
      )}

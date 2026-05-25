@@ -72,6 +72,32 @@ defmodule RunicAI.Coding.StandardAgentTest do
     assert :coding_tool_observation in kinds
   end
 
+  test "explicit local-workbench profile exposes review-gated command and code tools" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      {:ok, TestClient.result("Local workbench tools are visible.")}
+    end
+
+    workflow =
+      Agent.verify(workspace, "Inspect local tooling.",
+        model: "test:model",
+        client: client,
+        profile: :local_workbench,
+        max_turns: 1
+      )
+
+    summary = Agent.summary(workflow)
+
+    assert summary.reply == "Local workbench tools are visible."
+    assert "read_file" in summary.visible_tools
+    assert "apply_patch" in summary.visible_tools
+    assert "run_command" in summary.visible_tools
+    assert "execute_code" in summary.visible_tools
+    assert "sandbox_status" in summary.visible_tools
+  end
+
   test "patch agent repairs a bad patch from diagnostics and summarizes changed files" do
     root = sample_project()
     workspace = Workspace.new!(root: root)

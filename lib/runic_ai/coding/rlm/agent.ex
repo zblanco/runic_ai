@@ -73,18 +73,43 @@ defmodule RunicAI.Coding.RLM.Agent do
   def run(workspace_input, objective, opts \\ [])
       when is_binary(objective) and is_list(opts) do
     run_id = Checkpoint.run_id(opts)
-    opts = Keyword.put_new(opts, :run_id, run_id)
+    started_at_ms = System.monotonic_time(:millisecond)
+    tracker = start_event_tracker()
 
-    fn -> run_unbounded(workspace_input, objective, opts) end
-    |> RuntimeBudget.run(
-      timeout_ms: Keyword.get(opts, :max_runtime_ms),
-      stage: :rlm_agent_run,
-      objective: objective
-    )
-    |> tap(fn
-      {:error, error} -> emit_stage(opts, :failed, :error, %{error: error})
-      _other -> :ok
-    end)
+    opts =
+      opts
+      |> Keyword.put_new(:run_id, run_id)
+      |> Keyword.put_new(:run_started_at_ms, started_at_ms)
+      |> maybe_put_run_deadline(started_at_ms)
+      |> wrap_event_tracker(tracker)
+
+    try do
+      fn -> run_unbounded(workspace_input, objective, opts) end
+      |> RuntimeBudget.run(
+        timeout_ms: Keyword.get(opts, :max_runtime_ms),
+        stage: :rlm_agent_run,
+        objective: objective,
+        timeout_handler: fn details ->
+          parent_timeout_result(details, tracker, opts, objective)
+        end
+      )
+      |> tap(fn
+        {:error, error} -> emit_stage(opts, :failed, :error, %{error: error})
+        _other -> :ok
+      end)
+    after
+      stop_event_tracker(tracker)
+    end
+  end
+
+  defp maybe_put_run_deadline(opts, started_at_ms) do
+    case Keyword.get(opts, :max_runtime_ms) do
+      max_runtime_ms when is_integer(max_runtime_ms) and max_runtime_ms > 0 ->
+        Keyword.put_new(opts, :run_deadline_ms, started_at_ms + max_runtime_ms)
+
+      _other ->
+        opts
+    end
   end
 
   defp run_unbounded(workspace_input, objective, opts) do
@@ -115,11 +140,18 @@ defmodule RunicAI.Coding.RLM.Agent do
              },
              run_id: run_id
            ),
+         :ok <-
+           emit_stage(opts, :proposal_started, :running, %{
+             objective: objective,
+             source_count: map_size(environment.source_index.refs_by_id),
+             max_runtime_ms: Keyword.get(opts, :max_runtime_ms),
+             run_deadline_ms: Keyword.get(opts, :run_deadline_ms)
+           }),
          {:ok, proposal, report} <-
            Checkpoint.result(
              persistence,
              :proposal,
-             fn -> Coordinator.propose(objective, environment, opts) end,
+             fn -> propose_with_progress(objective, environment, opts) end,
              run_id: run_id,
              input: %{objective: objective}
            ),
@@ -178,7 +210,7 @@ defmodule RunicAI.Coding.RLM.Agent do
             result
           end
 
-        emit_stage(opts, :completed, :ok, %{
+        emit_stage(opts, :completed, completion_status(result), %{
           objective_scorecard: Map.get(result, :objective_scorecard),
           repair_status: Map.get(result, :repair_status),
           persistence_ref: Map.get(result, :persistence_ref)
@@ -197,6 +229,79 @@ defmodule RunicAI.Coding.RLM.Agent do
       |> Map.put_new(:original_objective, objective)
 
     Keyword.put(opts, :metadata, metadata)
+  end
+
+  defp propose_with_progress(objective, environment, opts) do
+    timeout_ms = proposal_timeout_ms(opts)
+
+    result =
+      RuntimeBudget.run(
+        fn ->
+          opts = put_proposal_llm_timeout(opts, timeout_ms)
+
+          case Coordinator.propose(objective, environment, opts) do
+            {:ok, proposal, report} -> {:ok, {proposal, report}}
+            {:error, error} -> {:error, error}
+          end
+        end,
+        timeout_ms: timeout_ms,
+        tick_ms: Keyword.get(opts, :proposal_progress_tick_ms, 5_000),
+        stage: :proposal_generation,
+        objective: objective,
+        details: %{
+          source_count: map_size(environment.source_index.refs_by_id),
+          run_deadline_ms: Keyword.get(opts, :run_deadline_ms)
+        },
+        progress_sink: fn tick ->
+          emit_stage(opts, :proposal_progress, :running, tick)
+        end
+      )
+
+    case result do
+      {:ok, {proposal, report}} -> {:ok, proposal, report}
+      other -> other
+    end
+  end
+
+  defp put_proposal_llm_timeout(opts, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 5_000 do
+    Keyword.put_new(opts, :proposal_llm_timeout_ms, timeout_ms - 4_000)
+  end
+
+  defp put_proposal_llm_timeout(opts, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0 do
+    Keyword.put_new(opts, :proposal_llm_timeout_ms, timeout_ms)
+  end
+
+  defp put_proposal_llm_timeout(opts, _timeout_ms), do: opts
+
+  defp proposal_timeout_ms(opts) do
+    explicit = Keyword.get(opts, :proposal_timeout_ms)
+    remaining = remaining_runtime_ms(opts)
+
+    cond do
+      is_integer(explicit) and explicit > 0 and is_integer(remaining) and remaining > 0 ->
+        min(explicit, remaining)
+
+      is_integer(explicit) and explicit > 0 ->
+        explicit
+
+      is_integer(remaining) and remaining > 0 ->
+        remaining
+
+      true ->
+        nil
+    end
+  end
+
+  defp remaining_runtime_ms(opts) do
+    case Keyword.get(opts, :run_deadline_ms) do
+      deadline_ms when is_integer(deadline_ms) ->
+        max(deadline_ms - System.monotonic_time(:millisecond), 1)
+
+      _other ->
+        nil
+    end
   end
 
   @spec run!(Workspace.t() | keyword() | map() | Path.t(), String.t(), keyword()) :: run_result()
@@ -267,4 +372,196 @@ defmodule RunicAI.Coding.RLM.Agent do
 
     :ok
   end
+
+  defp start_event_tracker do
+    case Elixir.Agent.start_link(fn -> %{last_event: nil} end) do
+      {:ok, pid} -> pid
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp stop_event_tracker(nil), do: :ok
+
+  defp stop_event_tracker(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: Elixir.Agent.stop(pid, :normal, 100), else: :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp wrap_event_tracker(opts, nil), do: opts
+
+  defp wrap_event_tracker(opts, tracker) do
+    original_sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+
+    tracked_sink = fn event ->
+      Elixir.Agent.update(tracker, &Map.put(&1, :last_event, event))
+
+      if is_function(original_sink, 1) do
+        original_sink.(event)
+      end
+    end
+
+    opts
+    |> Keyword.put(:event_sink, tracked_sink)
+    |> Keyword.delete(:stage_sink)
+  end
+
+  defp last_tracked_event(nil), do: nil
+
+  defp last_tracked_event(tracker) when is_pid(tracker) do
+    Elixir.Agent.get(tracker, &Map.get(&1, :last_event), 100)
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp parent_timeout_result(details, tracker, opts, objective) do
+    last_event = last_tracked_event(tracker)
+
+    if active_execution_event?(last_event) do
+      result = blocked_timeout_result(objective, details, last_event)
+
+      emit_stage(opts, :completed, :blocked, %{
+        runtime_timeout: details,
+        current_event: last_event
+      })
+
+      {:ok, result}
+    else
+      {:error,
+       Error.timeout("RLM runtime budget exhausted",
+         source: __MODULE__,
+         details: details
+       )}
+    end
+  end
+
+  defp active_execution_event?(%{stage: stage}) do
+    stage in [
+      :node_started,
+      :node_budget_selected,
+      :child_budget_selected,
+      :child_agent_started,
+      :child_agent_progress,
+      :child_agent_event,
+      :child_agent_completed
+    ]
+  end
+
+  defp active_execution_event?(_event), do: false
+
+  defp blocked_timeout_result(objective, details, last_event) do
+    timeout_message = "RLM runtime budget exhausted during active workflow execution"
+
+    %{
+      status: :blocked,
+      output: timeout_message,
+      trace: [
+        %{
+          status: :blocked,
+          kind: :runtime_budget,
+          node_id: get_in(last_event, [:data, :node_id])
+        }
+      ],
+      episodes: [],
+      context: %{
+        runtime_timeout: details,
+        last_event: last_event,
+        repair_needs: [
+          %{
+            id: "runtime-budget-exhausted",
+            reason: timeout_message,
+            target: get_in(last_event, [:data, :node_id]),
+            evidence: details
+          }
+        ]
+      },
+      objective: objective,
+      objective_scorecard: nil
+    }
+  end
+
+  defp completion_status(result) do
+    cond do
+      objective_satisfied?(result) ->
+        :ok
+
+      repair_needs?(result) ->
+        :blocked
+
+      failed_trace?(result) ->
+        :blocked
+
+      true ->
+        scorecard_completion_status(result)
+    end
+  end
+
+  defp objective_satisfied?(result) do
+    result
+    |> current_scorecard()
+    |> case do
+      nil ->
+        false
+
+      scorecard ->
+        scorecard_field(scorecard, :objective_status) in [
+          :objective_satisfied,
+          "objective_satisfied"
+        ]
+    end
+  end
+
+  defp failed_trace?(result) do
+    result
+    |> Map.get(:trace, [])
+    |> List.wrap()
+    |> Enum.any?(fn trace ->
+      map_field(trace, :status) in [:failed, "failed", :error, "error"]
+    end)
+  end
+
+  defp scorecard_completion_status(result) do
+    case current_scorecard(result) do
+      nil ->
+        :ok
+
+      scorecard ->
+        if scorecard_field(scorecard, :objective_status) in [
+             :objective_satisfied,
+             "objective_satisfied"
+           ] do
+          :ok
+        else
+          :blocked
+        end
+    end
+  end
+
+  defp current_scorecard(result),
+    do: latest_scorecard(result) || Map.get(result, :objective_scorecard)
+
+  defp repair_needs?(result) do
+    result
+    |> get_in([:context, :repair_needs])
+    |> List.wrap()
+    |> Enum.any?()
+  end
+
+  defp latest_scorecard(result) do
+    result
+    |> Map.get(:context, %{})
+    |> Map.get(:scorecards, [])
+    |> List.wrap()
+    |> List.last()
+  end
+
+  defp scorecard_field(scorecard, key) when is_map(scorecard),
+    do: Map.get(scorecard, key) || Map.get(scorecard, Atom.to_string(key))
+
+  defp scorecard_field(_scorecard, _key), do: nil
+
+  defp map_field(map, key) when is_map(map),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp map_field(_map, _key), do: nil
 end

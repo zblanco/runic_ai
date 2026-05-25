@@ -80,7 +80,11 @@ defmodule RunicAI.Terminal.ReviewPrompt do
 
   defp input_line(opts) do
     input_fun = Keyword.get(opts, :input_fun, &IO.gets/1)
-    input_fun.("> ")
+
+    case input_fun.("> ") do
+      input when is_binary(input) -> input
+      _eof_or_invalid -> nil
+    end
   end
 
   defp parse_choice(input) do

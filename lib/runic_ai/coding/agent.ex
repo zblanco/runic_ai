@@ -9,6 +9,7 @@ defmodule RunicAI.Coding.Agent do
   """
 
   alias Runic.Workflow
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.Coding.AgentState
   alias RunicAI.Coding.Codex
   alias RunicAI.Coding.CommandPolicy
@@ -33,11 +34,13 @@ defmodule RunicAI.Coding.Agent do
     {workspace_input, opts} = normalize_new_args(opts, [])
     workspace = Workspace.from_input!(workspace_input)
     recipe = recipe_from_opts(opts)
-    command_policy = command_policy_from_opts(recipe, opts)
-    registry = registry_from_opts(workspace, recipe, command_policy, opts)
+    capabilities = resolved_capabilities_from_opts(workspace, recipe, opts)
+    command_policy = command_policy_from_opts(recipe, opts, capabilities)
+    registry = registry_from_opts(workspace, recipe, command_policy, opts, capabilities)
+    recipe = recipe_with_capabilities(recipe, capabilities)
 
     workspace
-    |> integrated_opts(recipe, command_policy, registry, opts)
+    |> integrated_opts(recipe, command_policy, registry, opts, capabilities)
     |> maybe_put_client(opts)
     |> IntegratedToolAgent.initial_runtime()
   end
@@ -47,11 +50,13 @@ defmodule RunicAI.Coding.Agent do
     {workspace_input, opts} = normalize_new_args(workspace_input, opts)
     workspace = Workspace.from_input!(workspace_input)
     recipe = recipe_from_opts(opts)
-    command_policy = command_policy_from_opts(recipe, opts)
-    registry = registry_from_opts(workspace, recipe, command_policy, opts)
+    capabilities = resolved_capabilities_from_opts(workspace, recipe, opts)
+    command_policy = command_policy_from_opts(recipe, opts, capabilities)
+    registry = registry_from_opts(workspace, recipe, command_policy, opts, capabilities)
+    recipe = recipe_with_capabilities(recipe, capabilities)
 
     workspace
-    |> integrated_opts(recipe, command_policy, registry, opts)
+    |> integrated_opts(recipe, command_policy, registry, opts, capabilities)
     |> maybe_put_client(opts)
     |> IntegratedToolAgent.new()
   end
@@ -151,11 +156,21 @@ defmodule RunicAI.Coding.Agent do
     workspace = Workspace.from_input!(workspace_input)
     recipe = recipe_from_opts(opts)
 
-    Tools.default_registry(workspace,
-      command_policy: command_policy_from_opts(recipe, opts),
-      process_registry: Keyword.get(opts, :process_registry),
-      patch_dry_run?: recipe.dry_run?
-    )
+    case resolved_capabilities_from_opts(workspace, recipe, opts) do
+      %{registry: registry} ->
+        registry
+
+      nil ->
+        Tools.default_registry(workspace,
+          command_policy: command_policy_from_opts(recipe, opts),
+          process_registry: Keyword.get(opts, :process_registry),
+          patch_dry_run?: recipe.dry_run?,
+          memory_store: Keyword.get(opts, :memory_store),
+          memory_store_opts: Keyword.get(opts, :memory_store_opts),
+          session_store: Keyword.get(opts, :session_store),
+          event_sink: Keyword.get(opts, :event_sink)
+        )
+    end
   end
 
   @spec visible_tools(mode() | String.t() | atom()) :: [String.t()]
@@ -273,7 +288,12 @@ defmodule RunicAI.Coding.Agent do
     end
   end
 
-  defp command_policy_from_opts(%Recipe{} = recipe, opts) do
+  defp command_policy_from_opts(recipe, opts, capabilities \\ nil)
+
+  defp command_policy_from_opts(_recipe, _opts, %{command_policy: %CommandPolicy{} = policy}),
+    do: policy
+
+  defp command_policy_from_opts(%Recipe{} = recipe, opts, _capabilities) do
     case Keyword.get(opts, :command_policy) do
       nil ->
         CommandPolicy.new!(
@@ -293,12 +313,31 @@ defmodule RunicAI.Coding.Agent do
   defp allowed_commands(%Recipe{mode: :verify}), do: ["git", "mix"]
   defp allowed_commands(%Recipe{mode: _mode}), do: ["git"]
 
-  defp registry_from_opts(%Workspace{} = workspace, %Recipe{} = recipe, command_policy, opts) do
+  defp registry_from_opts(
+         %Workspace{} = _workspace,
+         %Recipe{} = _recipe,
+         _command_policy,
+         _opts,
+         %{registry: %Registry{} = registry}
+       ),
+       do: registry
+
+  defp registry_from_opts(
+         %Workspace{} = workspace,
+         %Recipe{} = recipe,
+         command_policy,
+         opts,
+         _capabilities
+       ) do
     Keyword.get_lazy(opts, :registry, fn ->
       Tools.default_registry(workspace,
         command_policy: command_policy,
         process_registry: Keyword.get(opts, :process_registry),
-        patch_dry_run?: recipe.dry_run?
+        patch_dry_run?: recipe.dry_run?,
+        memory_store: Keyword.get(opts, :memory_store),
+        memory_store_opts: Keyword.get(opts, :memory_store_opts),
+        session_store: Keyword.get(opts, :session_store),
+        event_sink: Keyword.get(opts, :event_sink)
       )
     end)
   end
@@ -308,7 +347,8 @@ defmodule RunicAI.Coding.Agent do
          %Recipe{} = recipe,
          _command_policy,
          registry,
-         opts
+         opts,
+         capabilities
        ) do
     [
       default_agent_id: Keyword.get(opts, :agent_id, @default_agent_id),
@@ -334,9 +374,51 @@ defmodule RunicAI.Coding.Agent do
       stop_pattern: Keyword.get(opts, :stop_pattern),
       continue_when: continue_when_from_opts(workspace, recipe, opts),
       final_pattern: Keyword.get(opts, :final_pattern),
-      final_when: Keyword.get(opts, :final_when)
+      final_when: Keyword.get(opts, :final_when),
+      event_sink: Keyword.get(opts, :event_sink)
     ]
+    |> maybe_put_capabilities(capabilities)
   end
+
+  defp resolved_capabilities_from_opts(%Workspace{} = workspace, %Recipe{} = recipe, opts) do
+    if CapabilityResolver.requested?(opts) do
+      CapabilityResolver.resolve!(workspace,
+        agent: Keyword.get(opts, :agent, :standard),
+        mode: recipe.mode,
+        profile: Keyword.get(opts, :profile),
+        toolsets: Keyword.get(opts, :toolsets, []),
+        disabled_tools: Keyword.get(opts, :disabled_tools, []),
+        tool_config: Keyword.get(opts, :tool_config, %{}),
+        approval: Keyword.get(opts, :approval, Keyword.get(opts, :approve)),
+        write_policy: Keyword.get(opts, :write_policy),
+        command_policy: Keyword.get(opts, :command_policy),
+        process_registry: Keyword.get(opts, :process_registry),
+        patch_dry_run?: recipe.dry_run?,
+        memory_store: Keyword.get(opts, :memory_store),
+        memory_store_opts: Keyword.get(opts, :memory_store_opts),
+        session_store: Keyword.get(opts, :session_store)
+      )
+    end
+  end
+
+  defp recipe_with_capabilities(%Recipe{} = recipe, %{visible_tools: visible_tools}) do
+    %{recipe | visible_tools: visible_tools}
+  end
+
+  defp recipe_with_capabilities(%Recipe{} = recipe, _capabilities), do: recipe
+
+  defp maybe_put_capabilities(opts, %{profile: profile, metadata: metadata}) do
+    opts
+    |> Keyword.put(:capability_profile, profile)
+    |> Keyword.update(:state_metadata, %{capability_profile: metadata}, fn existing ->
+      Map.put(existing || %{}, :capability_profile, metadata)
+    end)
+    |> Keyword.update(:metadata, %{capability_profile: metadata}, fn existing ->
+      Map.put(existing || %{}, :capability_profile, metadata)
+    end)
+  end
+
+  defp maybe_put_capabilities(opts, _capabilities), do: opts
 
   defp continue_when_from_opts(%Workspace{} = workspace, %Recipe{} = recipe, opts) do
     cond do

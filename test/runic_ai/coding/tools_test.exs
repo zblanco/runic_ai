@@ -5,8 +5,13 @@ defmodule RunicAI.Coding.ToolsTest do
   alias RunicAI.Coding.Persistence.InMemory
   alias RunicAI.Coding.Tools
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Memory.LocalStore, as: MemoryLocalStore
+  alias RunicAI.Persistence.SQLite
+  alias RunicAI.Persistence.Schemas.SubagentRun
+  alias RunicAI.Terminal.Event
   alias RunicAI.Tool.Definition
   alias RunicAI.Tool.Registry
+  import Ecto.Query
 
   test "lists directories with stable metadata and hidden controls" do
     workspace = sample_workspace()
@@ -455,6 +460,315 @@ defmodule RunicAI.Coding.ToolsTest do
              )
 
     assert result.status == :pass
+  end
+
+  test "execute_code and sandbox_status expose just_bash sandbox metadata" do
+    workspace = sample_workspace()
+
+    assert {:ok, result} =
+             Tools.execute_code(workspace, %{
+               runtime: "bash",
+               code: "echo tool-sandbox",
+               max_output_bytes: 1_024
+             })
+
+    assert result.status == :pass
+    assert result.output == "tool-sandbox\n"
+    assert result.metadata.tool == :execute_code
+    assert result.metadata.runtime == :bash
+    assert result.metadata.sandbox_backend == :just_bash
+    assert result.metadata.isolation_level == :in_process_virtual
+    assert result.metadata.network == %{enabled: false}
+    assert result.metadata.host_cwd == workspace.root
+    assert result.metadata.sandbox_cwd == "/workspace"
+    assert result.metadata.output_cap_bytes == 1_024
+    assert result.metadata.changed_artifact_refs == []
+
+    assert {:ok, status} = Tools.sandbox_status(workspace, %{})
+    assert status.default_backend == :just_bash
+    assert [%{name: :just_bash, runtimes: [:bash], security_boundary?: false}] = status.backends
+  end
+
+  test "memory tools write and recall local entries through a store adapter" do
+    workspace = sample_workspace()
+    store_opts = [namespace: "tools-#{System.unique_integer([:positive])}"]
+    MemoryLocalStore.clear(store_opts)
+
+    assert {:ok, written} =
+             Tools.memory_write(
+               workspace,
+               %{
+                 content: "RunicAI should prefer safe deterministic compute before shell tools.",
+                 summary: "safe compute preference",
+                 kind: "semantic",
+                 salience: 0.9
+               },
+               MemoryLocalStore,
+               store_opts
+             )
+
+    assert written.status == :written
+    assert written.count == 1
+    assert written.store == :local_ets
+
+    assert {:ok, recalled} =
+             Tools.memory_recall(
+               workspace,
+               %{query: "safe deterministic compute", kinds: ["semantic"], limit: 3},
+               MemoryLocalStore,
+               store_opts
+             )
+
+    assert recalled.status == :ok
+    assert [%{content: content, source_ref: source_ref}] = recalled.entries
+    assert content =~ "safe deterministic compute"
+    assert source_ref =~ "memory:"
+  end
+
+  test "session_search reads persisted terminal events through SQLite FTS" do
+    workspace = sample_workspace()
+    {:ok, store} = SQLite.open(database: ":memory:", migrate?: true)
+    on_exit(fn -> SQLite.close(store) end)
+
+    event =
+      Event.new!(:message,
+        session_id: "session:tools",
+        agent: :assistant,
+        phase: :assistant,
+        status: :ok,
+        title: "Sandbox research",
+        detail: "Firecracker microVMs can isolate code execution.",
+        data: %{run_id: "run:tools", reply_text: "Use KVM-backed microVMs for strong isolation."}
+      )
+
+    assert {:ok, _persisted} = SQLite.record_terminal_event(store, event)
+
+    assert {:ok, result} =
+             Tools.session_search(workspace, %{query: "Firecracker", limit: 5}, store)
+
+    assert result.status == :ok
+    assert result.count == 1
+
+    assert [%{source_ref: source_ref, session_id: "session:tools", run_id: "run:tools"}] =
+             result.results
+
+    assert source_ref =~ "terminal_event:"
+  end
+
+  test "web tools search and extract static sources with persisted source artifacts" do
+    {:ok, store} = InMemory.start_link()
+    workspace = sample_workspace(persistence: {InMemory, store})
+
+    web_opts = [
+      provider_opts: [
+        sources: [
+          %{
+            title: "RunicAI Browser Plan",
+            url: "https://example.test/browser",
+            snippet: "Browser tools use compact accessibility snapshots.",
+            html: "<html><title>Browser Plan</title><h1>Agent Browser</h1><p>Use refs.</p></html>"
+          }
+        ]
+      ]
+    ]
+
+    assert {:ok, search} =
+             Tools.web_search(workspace, %{query: "accessibility", limit: 3}, web_opts)
+
+    assert search.count == 1
+    assert [%{source_ref: source_ref}] = search.results
+    assert source_ref =~ "web:"
+    assert search.artifact_ref =~ "mem:"
+
+    assert {:ok, extract} =
+             Tools.web_extract(workspace, %{url: "https://example.test/browser"}, web_opts)
+
+    assert extract.source.markdown =~ "Agent Browser"
+    assert extract.source.artifact_ref =~ "mem:"
+    assert length(InMemory.artifacts(store)) >= 2
+  end
+
+  test "media tools use injected clients and persist generated artifacts" do
+    {:ok, store} = InMemory.start_link()
+    workspace = sample_workspace(persistence: {InMemory, store})
+
+    media_client = fn
+      :generate_image, _model, _prompt, _opts ->
+        {:ok, %{image: "png-bytes", media_type: "image/png"}}
+
+      :speak, _model, _text, _opts ->
+        {:ok, %{audio: "mp3-bytes", media_type: "audio/mpeg", format: "mp3"}}
+
+      :transcribe, _model, _audio, _opts ->
+        {:ok, %{text: "hello transcript", segments: []}}
+
+      :ocr, _model, _document, _opts ->
+        {:ok, %{markdown: "# OCR\n\nhello", pages: []}}
+
+      :vision_analyze, _model, _input, _opts ->
+        {:ok, %{text: "image contains a button"}}
+    end
+
+    opts = [client: media_client, model: "test:model"]
+
+    assert {:ok, image} = Tools.image_generate(workspace, %{prompt: "draw"}, opts)
+    assert image.artifact_ref =~ "mem:"
+    assert image.image_byte_size == 9
+    refute Map.has_key?(image, :image)
+
+    assert {:ok, speech} = Tools.speech_generate(workspace, %{text: "say hi"}, opts)
+    assert speech.artifact_ref =~ "mem:"
+    assert speech.audio_byte_size == 9
+
+    assert {:ok, transcript} =
+             Tools.transcribe_audio(
+               workspace,
+               %{audio_base64: Base.encode64("audio"), media_type: "audio/mpeg"},
+               opts
+             )
+
+    assert transcript.text == "hello transcript"
+    assert transcript.artifact_ref =~ "mem:"
+
+    assert {:ok, ocr} =
+             Tools.ocr_document(workspace, %{document_base64: Base.encode64("pdf")}, opts)
+
+    assert ocr.markdown =~ "OCR"
+    assert ocr.artifact_ref =~ "mem:"
+
+    assert {:ok, vision} =
+             Tools.vision_analyze(
+               workspace,
+               %{prompt: "describe", image_base64: Base.encode64("png"), media_type: "image/png"},
+               opts
+             )
+
+    assert vision.text =~ "button"
+    assert vision.artifact_ref =~ "mem:"
+  end
+
+  test "browser tools use a supervised fake backend and compose screenshots with vision" do
+    {:ok, store} = InMemory.start_link()
+    workspace = sample_workspace(persistence: {InMemory, store})
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    {:ok, session} =
+      RunicAI.Browser.Session.start_link(
+        backend: RunicAI.Browser.Backends.Fake,
+        backend_opts: [
+          html:
+            "<html><title>Fixture</title><h1>Fixture Page</h1><button>Approve</button></html>",
+          console: [%{level: "log", text: "ready"}]
+        ]
+      )
+
+    browser_opts = [
+      session: session,
+      event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+    ]
+
+    media_opts = [
+      client: fn :vision_analyze, _model, input, _opts ->
+        {:ok, %{text: "vision saw #{byte_size(input.image)} bytes"}}
+      end
+    ]
+
+    assert {:ok, nav} =
+             Tools.browser_navigate(workspace, %{url: "https://example.test"}, browser_opts)
+
+    assert nav.action == :navigated
+    assert nav.snapshot =~ "Fixture Page"
+
+    assert {:ok, snapshot} = Tools.browser_snapshot(workspace, %{}, browser_opts)
+    assert map_size(snapshot.refs) >= 1
+
+    assert {:ok, clicked} = Tools.browser_click(workspace, %{ref: "@e1"}, browser_opts)
+    assert clicked.selector == "@e1"
+
+    assert {:ok, console} = Tools.browser_console(workspace, %{}, browser_opts)
+    assert console.count == 1
+
+    assert {:ok, screenshot} = Tools.browser_screenshot(workspace, %{}, browser_opts)
+    assert screenshot.artifact_ref =~ "mem:"
+    assert screenshot.image_byte_size == 8
+
+    assert {:ok, vision} =
+             Tools.browser_vision(workspace, %{prompt: "describe"}, browser_opts, media_opts)
+
+    assert vision.text =~ "8 bytes"
+    assert vision.screenshot_artifact_ref =~ "mem:"
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :browser_operation_started and &1.metadata.operation == :navigate)
+           )
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :browser_operation_completed and &1.metadata.operation == :snapshot and
+                 &1.output.refs_count >= 1)
+           )
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :browser_operation_completed and &1.metadata.operation == :click and
+                 &1.output.selector == "@e1")
+           )
+
+    assert Enum.any?(
+             emitted,
+             &(&1.kind == :browser_operation_completed and &1.metadata.operation == :screenshot and
+                 &1.output.image_byte_size == 8)
+           )
+  end
+
+  test "clarify returns a wait and delegate_task persists compact subagent records" do
+    workspace = sample_workspace()
+
+    assert {:ok, wait} =
+             Tools.clarify(workspace, %{
+               question: "Which file should I edit?",
+               choices: ["README.md", "CHANGELOG.md"]
+             })
+
+    assert wait.kind == :clarify
+    assert wait.payload.question =~ "Which file"
+    assert wait.payload.choices == ["README.md", "CHANGELOG.md"]
+
+    {:ok, store} = SQLite.open(database: ":memory:", migrate?: true)
+    on_exit(fn -> SQLite.close(store) end)
+
+    runner = fn objective, _args, _context ->
+      {:ok, %{summary: "child handled #{objective}", artifact_refs: ["artifact:child"]}}
+    end
+
+    assert {:ok, delegated} =
+             Tools.delegate_task(
+               workspace,
+               %{
+                 objective: "Read README",
+                 agent_kind: "standard",
+                 profile: "coding_read",
+                 session_id: "session:parent",
+                 run_id: "run:parent"
+               },
+               [runner: runner],
+               store
+             )
+
+    assert delegated.summary == "child handled Read README"
+    assert delegated.intermediate_events_included? == false
+
+    subagents =
+      SQLite.with_repo(store, fn ->
+        store.repo.all(from(run in SubagentRun, where: run.parent_session_id == "session:parent"))
+      end)
+
+    assert [%SubagentRun{status: "completed", result_json: result_json}] = subagents
+    assert result_json["summary"] == "child handled Read README"
+    assert result_json["intermediate_events_included?"] == false
   end
 
   defp sample_workspace(opts \\ []) do

@@ -241,12 +241,14 @@ defmodule RunicAI.Persistence.SQLite do
 
     result =
       with_repo(store, fn ->
-        retry_busy_write(fn ->
-          attrs = put_event_sequence(store, attrs)
+        with_terminal_event_sequence_lock(store, attrs, fn ->
+          retry_terminal_event_write(fn ->
+            attrs = put_event_sequence(store, attrs)
 
-          %TerminalEvent{}
-          |> TerminalEvent.changeset(attrs)
-          |> store.repo.insert()
+            %TerminalEvent{}
+            |> TerminalEvent.changeset(attrs)
+            |> store.repo.insert()
+          end)
         end)
       end)
 
@@ -383,6 +385,28 @@ defmodule RunicAI.Persistence.SQLite do
       end
   end
 
+  defp retry_terminal_event_write(fun, opts \\ []) when is_function(fun, 0) do
+    attempts = Keyword.get(opts, :attempts, @default_busy_attempts)
+    backoff_ms = Keyword.get(opts, :backoff_ms, @default_busy_backoff_ms)
+    do_retry_terminal_event_write(fun, attempts, backoff_ms, 1)
+  end
+
+  defp do_retry_terminal_event_write(fun, attempts, backoff_ms, attempt) do
+    retry_busy_write(fun)
+  rescue
+    exception in Ecto.ConstraintError ->
+      if terminal_event_sequence_constraint?(exception) and attempt < attempts do
+        sleep_before_retry(backoff_ms, attempt)
+        do_retry_terminal_event_write(fun, attempts, backoff_ms, attempt + 1)
+      else
+        reraise exception, __STACKTRACE__
+      end
+  end
+
+  defp terminal_event_sequence_constraint?(%Ecto.ConstraintError{constraint: constraint}) do
+    to_string(constraint) == "terminal_events_run_id_sequence_index"
+  end
+
   defp sleep_before_retry(backoff_ms, attempt) do
     Process.sleep(backoff_ms * attempt)
   end
@@ -482,6 +506,18 @@ defmodule RunicAI.Persistence.SQLite do
   end
 
   defp put_event_sequence(_store, attrs), do: attrs
+
+  defp with_terminal_event_sequence_lock(%Store{} = store, attrs, fun)
+       when is_function(fun, 0) do
+    key = {
+      __MODULE__,
+      :terminal_event_sequence,
+      store.dynamic_repo || store.repo,
+      Map.get(attrs, "run_id") || Map.get(attrs, "session_id") || Map.get(attrs, "id")
+    }
+
+    :global.trans({key, self()}, fun, [node()])
+  end
 
   defp sqlite_error(%Error{} = error), do: {:error, error}
 

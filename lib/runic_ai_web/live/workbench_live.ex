@@ -3,7 +3,10 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   use RunicAIWeb, :live_view
 
+  import RunicAIWeb.GraphComponents
+
   alias RunicAI.Event
+  alias RunicAI.LLM.ModelCatalog
   alias RunicAI.Workbench
   alias RunicAIWeb.Markdown
 
@@ -17,6 +20,9 @@ defmodule RunicAIWeb.WorkbenchLive do
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket), do: Workbench.subscribe()
+
+    model_catalog = ModelCatalog.catalog()
+    launch_defaults = launch_defaults(model_catalog)
 
     socket =
       socket
@@ -46,7 +52,9 @@ defmodule RunicAIWeb.WorkbenchLive do
       |> assign(:workbench_refresh_session_id, nil)
       |> assign(:workbench_refresh_generation, 0)
       |> assign(:subscribed_session_id, nil)
-      |> assign(:new_run_form, to_form(launch_defaults(), as: :run))
+      |> assign(:model_catalog, model_catalog)
+      |> assign(:new_run_params, launch_defaults)
+      |> assign(:new_run_form, to_form(launch_defaults, as: :run))
       |> assign(:health, Workbench.health())
 
     {:ok, socket}
@@ -99,6 +107,29 @@ defmodule RunicAIWeb.WorkbenchLive do
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, "Could not start run: #{inspect(reason)}")}
     end
+  end
+
+  def handle_event("change_run_form", %{"run" => params}, socket) do
+    params = Map.merge(socket.assigns.new_run_params, params)
+    {:noreply, put_new_run_form(socket, params)}
+  end
+
+  def handle_event("select_model_provider", %{"run" => %{"model_provider" => provider}}, socket) do
+    params =
+      socket.assigns.new_run_params
+      |> Map.put("model_provider", provider)
+      |> Map.delete("model_id")
+      |> Map.delete("model")
+
+    {:noreply, put_new_run_form(socket, params)}
+  end
+
+  def handle_event("select_model_id", %{"run" => %{"model_id" => model_id}}, socket) do
+    params =
+      socket.assigns.new_run_params
+      |> Map.put("model_id", model_id)
+
+    {:noreply, put_new_run_form(socket, params)}
   end
 
   def handle_event("review_decision", %{"review" => params}, socket) do
@@ -434,6 +465,12 @@ defmodule RunicAIWeb.WorkbenchLive do
       review_requests: [],
       artifacts: [],
       scorecards: [],
+      capability_profile: nil,
+      objective_loop: nil,
+      objective_contract: nil,
+      blocked_evidence: nil,
+      plan_workflow_graph: nil,
+      progress_summary: %{},
       metrics: %{
         messages: 0,
         events: 0,
@@ -446,19 +483,119 @@ defmodule RunicAIWeb.WorkbenchLive do
     }
   end
 
-  defp launch_defaults do
+  defp launch_defaults(model_catalog) do
     cfg = Workbench.config()
+    model = Keyword.get(cfg, :default_model) || model_catalog.default_model
+    {provider, model_id} = model_selection_from_spec(model, model_catalog)
 
     %{
       "objective" => "",
       "agent" => cfg |> Keyword.get(:default_agent, :assistant) |> Atom.to_string(),
       "cwd" => File.cwd!(),
-      "model" => Keyword.get(cfg, :default_model) || "",
+      "model_provider" => provider,
+      "model_id" => model_id,
+      "model" => "#{provider}:#{model_id}",
       "client" => Keyword.get(cfg, :default_client) || "",
       "approve" => cfg |> Keyword.get(:default_approval, :safe) |> Atom.to_string(),
       "mode" => cfg |> Keyword.get(:default_mode, :verify) |> mode_value(),
+      "write_policy" =>
+        cfg
+        |> Keyword.get(
+          :default_write_policy,
+          default_write_policy(Keyword.get(cfg, :default_mode, :verify))
+        )
+        |> write_policy_value(),
+      "profile" => cfg |> Keyword.get(:default_profile, :local_workbench) |> profile_value(),
+      "toolsets" => "",
+      "disabled_tools" => "",
+      "tool_config" => "terminal.shell_review=always",
       "session_id" => nil
     }
+  end
+
+  defp model_selection_from_spec(model, model_catalog) when is_binary(model) do
+    case String.split(model, ":", parts: 2) do
+      [provider, model_id] when provider != "" and model_id != "" ->
+        {provider, model_id}
+
+      _other ->
+        {model_catalog.default_provider, model_catalog.default_model_id}
+    end
+  end
+
+  defp model_selection_from_spec(_model, model_catalog),
+    do: {model_catalog.default_provider, model_catalog.default_model_id}
+
+  defp put_new_run_form(socket, params) do
+    params = normalize_new_run_model_params(params, socket.assigns.model_catalog)
+
+    socket
+    |> assign(:new_run_params, params)
+    |> assign(:new_run_form, to_form(params, as: :run))
+  end
+
+  defp normalize_new_run_model_params(params, model_catalog) do
+    provider =
+      params
+      |> Map.get("model_provider")
+      |> valid_provider_or_default(model_catalog)
+
+    models = Map.get(model_catalog.provider_models, provider, [])
+
+    model_id =
+      params
+      |> Map.get("model_id")
+      |> valid_model_or_default(models, provider, model_catalog)
+
+    params
+    |> Map.put("model_provider", provider)
+    |> Map.put("model_id", model_id)
+    |> Map.put("model", "#{provider}:#{model_id}")
+  end
+
+  defp valid_provider_or_default(provider, model_catalog) when is_binary(provider) do
+    if Map.has_key?(model_catalog.provider_models, provider) do
+      provider
+    else
+      model_catalog.default_provider
+    end
+  end
+
+  defp valid_provider_or_default(_provider, model_catalog), do: model_catalog.default_provider
+
+  defp valid_model_or_default(model_id, models, provider, model_catalog)
+       when is_binary(model_id) do
+    if Enum.any?(models, &(&1.id == model_id)) do
+      model_id
+    else
+      default_model_id(models, provider, model_catalog)
+    end
+  end
+
+  defp valid_model_or_default(_model_id, models, provider, model_catalog),
+    do: default_model_id(models, provider, model_catalog)
+
+  defp default_model_id(models, provider, model_catalog) do
+    cond do
+      provider == model_catalog.default_provider and
+          Enum.any?(models, &(&1.id == model_catalog.default_model_id)) ->
+        model_catalog.default_model_id
+
+      match?([_ | _], models) ->
+        models |> List.first() |> Map.fetch!(:id)
+
+      true ->
+        model_catalog.default_model_id
+    end
+  end
+
+  defp current_model_options(form, model_catalog) do
+    provider =
+      form
+      |> Phoenix.HTML.Form.input_value(:model_provider)
+      |> valid_provider_or_default(model_catalog)
+
+    Map.get(model_catalog.provider_models, provider, [])
   end
 
   defp first_session_id([%{id: id} | _]), do: id
@@ -466,6 +603,21 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   defp mode_value(:read_only), do: "read_only"
   defp mode_value(mode), do: Atom.to_string(mode)
+
+  defp write_policy_value(:workspace_review), do: "workspace_review"
+  defp write_policy_value(:docs_only), do: "docs_only"
+  defp write_policy_value(:none), do: "none"
+  defp write_policy_value(policy) when is_binary(policy), do: String.replace(policy, "-", "_")
+  defp write_policy_value(policy), do: to_string(policy)
+
+  defp default_write_policy(:patch), do: :workspace_review
+  defp default_write_policy("patch"), do: :workspace_review
+  defp default_write_policy(_mode), do: :docs_only
+
+  defp profile_value(profile) when is_atom(profile),
+    do: profile |> Atom.to_string() |> String.replace("_", "-")
+
+  defp profile_value(profile), do: to_string(profile)
 
   @impl true
   def render(%{live_action: :index} = assigns) do
@@ -491,6 +643,7 @@ defmodule RunicAIWeb.WorkbenchLive do
         <.form
           id="landing-run-form"
           for={@new_run_form}
+          phx-change="change_run_form"
           phx-submit="submit_objective"
           class="runic-composer-shell runic-frost grid w-full grid-cols-[1fr_auto] items-end gap-3 rounded-3xl p-3 shadow-[0_22px_70px_rgba(0,0,0,0.34)] max-[700px]:grid-cols-1"
         >
@@ -525,8 +678,23 @@ defmodule RunicAIWeb.WorkbenchLive do
           />
           <input
             type="hidden"
+            name={@new_run_form[:write_policy].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :write_policy)}
+          />
+          <input
+            type="hidden"
             name={@new_run_form[:cwd].name}
             value={Phoenix.HTML.Form.input_value(@new_run_form, :cwd)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:model_provider].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :model_provider)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:model_id].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :model_id)}
           />
           <input
             type="hidden"
@@ -537,6 +705,26 @@ defmodule RunicAIWeb.WorkbenchLive do
             type="hidden"
             name={@new_run_form[:client].name}
             value={Phoenix.HTML.Form.input_value(@new_run_form, :client)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:profile].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :profile)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:toolsets].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :toolsets)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:disabled_tools].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :disabled_tools)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:tool_config].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :tool_config)}
           />
         </.form>
       </section>
@@ -861,6 +1049,21 @@ defmodule RunicAIWeb.WorkbenchLive do
                           <span>blocked draft</span>
                         </div>
                         <p>{blocking_reason(message)}</p>
+                        <div
+                          :if={message_blocked_next_actions(message) != []}
+                          class="mt-3 grid gap-1.5 border-t border-rune-gold/20 pt-3"
+                        >
+                          <div
+                            :for={action <- message_blocked_next_actions(message)}
+                            class="flex items-start gap-2"
+                          >
+                            <.icon
+                              name="hero-arrow-right"
+                              class="mt-0.5 size-3.5 shrink-0 text-rune-gold"
+                            />
+                            <span>{action}</span>
+                          </div>
+                        </div>
                       </div>
 
                       <div
@@ -881,8 +1084,22 @@ defmodule RunicAIWeb.WorkbenchLive do
               </section>
 
               <section :if={@workspace_tab == "plan"} role="tabpanel">
-                <div class="grid grid-cols-4 gap-3.5 max-[1240px]:grid-cols-2 max-[880px]:grid-cols-1">
-                  <.plan_step :for={step <- plan_steps(@snapshot)} step={step} />
+                <div class="grid gap-3.5">
+                  <div class="grid grid-cols-4 gap-3.5 max-[1240px]:grid-cols-2 max-[880px]:grid-cols-1">
+                    <.plan_step :for={step <- plan_steps(@snapshot)} step={step} />
+                  </div>
+                  <div :if={@snapshot.plan_workflow_graph}>
+                    <.graph_canvas
+                      graph={@snapshot.plan_workflow_graph}
+                      id={"plan-workflow-graph-#{dom_id(selected_session_id(@snapshot))}"}
+                    />
+                  </div>
+                  <div class="grid grid-cols-3 gap-3.5 max-[1240px]:grid-cols-2 max-[880px]:grid-cols-1">
+                    <.progress_summary_panel summary={@snapshot.progress_summary} />
+                    <.objective_loop_panel loop={@snapshot.objective_loop} />
+                    <.objective_contract_panel contract={@snapshot.objective_contract} />
+                    <.blocked_evidence_panel evidence={@snapshot.blocked_evidence} />
+                  </div>
                 </div>
               </section>
 
@@ -907,6 +1124,7 @@ defmodule RunicAIWeb.WorkbenchLive do
           <footer class="bg-[linear-gradient(0deg,rgba(10,7,14,0.56),transparent)] pt-0 runic-frost">
             <.form
               for={@new_run_form}
+              phx-change="change_run_form"
               phx-submit="submit_objective"
               class="runic-composer-shell runic-frost grid grid-cols-[1fr_auto] gap-4 rounded-3xl p-3 max-[880px]:grid-cols-1"
             >
@@ -938,7 +1156,7 @@ defmodule RunicAIWeb.WorkbenchLive do
                       value="rlm"
                       selected={Phoenix.HTML.Form.input_value(@new_run_form, :agent) == "rlm"}
                     >
-                      repo rlm
+                      workflow rlm
                     </option>
                   </select>
                   <select
@@ -949,13 +1167,13 @@ defmodule RunicAIWeb.WorkbenchLive do
                       value="verify"
                       selected={Phoenix.HTML.Form.input_value(@new_run_form, :mode) == "verify"}
                     >
-                      verify
+                      verify / inspect
                     </option>
                     <option
                       value="patch"
                       selected={Phoenix.HTML.Form.input_value(@new_run_form, :mode) == "patch"}
                     >
-                      patch
+                      patch / write
                     </option>
                     <option
                       value="read_only"
@@ -973,19 +1191,19 @@ defmodule RunicAIWeb.WorkbenchLive do
                     value="safe"
                     selected={Phoenix.HTML.Form.input_value(@new_run_form, :approve) == "safe"}
                   >
-                    approval: safe
+                    safe auto-approve
                   </option>
                   <option
                     value="ask"
                     selected={Phoenix.HTML.Form.input_value(@new_run_form, :approve) == "ask"}
                   >
-                    approval: ask
+                    ask each time
                   </option>
                   <option
                     value="never"
                     selected={Phoenix.HTML.Form.input_value(@new_run_form, :approve) == "never"}
                   >
-                    approval: never
+                    never approve
                   </option>
                 </select>
                 <details class="rounded-[11px] border border-rune-text/5 bg-black/20 px-3 py-2 text-[11px] leading-5 text-rune-text-soft">
@@ -993,6 +1211,168 @@ defmodule RunicAIWeb.WorkbenchLive do
                     Run setup
                   </summary>
                   <div class="mt-2 grid gap-2">
+                    <label class="grid gap-1">
+                      <span class="font-mono text-[10px] uppercase text-rune-muted">Profile</span>
+                      <select
+                        name={@new_run_form[:profile].name}
+                        class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                      >
+                        <option
+                          value="local-workbench"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :profile) ==
+                              "local-workbench"
+                          }
+                        >
+                          local workbench
+                        </option>
+                        <option
+                          value="coding-verify"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :profile) == "coding-verify"
+                          }
+                        >
+                          coding verify
+                        </option>
+                        <option
+                          value="coding-patch"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :profile) == "coding-patch"
+                          }
+                        >
+                          coding patch
+                        </option>
+                        <option
+                          value="coding-read"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :profile) == "coding-read"
+                          }
+                        >
+                          coding read
+                        </option>
+                        <option
+                          value="safe"
+                          selected={Phoenix.HTML.Form.input_value(@new_run_form, :profile) == "safe"}
+                        >
+                          safe
+                        </option>
+                        <option
+                          value="full-local"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :profile) == "full-local"
+                          }
+                        >
+                          full local
+                        </option>
+                      </select>
+                    </label>
+                    <div class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1">
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Provider
+                        </span>
+                        <select
+                          name={@new_run_form[:model_provider].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            :for={provider <- @model_catalog.providers}
+                            value={provider.id}
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :model_provider) ==
+                                provider.id
+                            }
+                          >
+                            {provider.label}
+                          </option>
+                        </select>
+                      </label>
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">Model</span>
+                        <select
+                          name={@new_run_form[:model_id].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            :for={model <- current_model_options(@new_run_form, @model_catalog)}
+                            value={model.id}
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :model_id) == model.id
+                            }
+                          >
+                            {model.label}
+                          </option>
+                        </select>
+                        <input
+                          type="hidden"
+                          name={@new_run_form[:model].name}
+                          value={Phoenix.HTML.Form.input_value(@new_run_form, :model)}
+                        />
+                      </label>
+                    </div>
+                    <label class="grid gap-1">
+                      <span class="font-mono text-[10px] uppercase text-rune-muted">
+                        Write policy
+                      </span>
+                      <select
+                        name={@new_run_form[:write_policy].name}
+                        class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                      >
+                        <option
+                          value="workspace_review"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :write_policy) ==
+                              "workspace_review"
+                          }
+                        >
+                          workspace writes gated
+                        </option>
+                        <option
+                          value="docs_only"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :write_policy) ==
+                              "docs_only"
+                          }
+                        >
+                          docs only
+                        </option>
+                        <option
+                          value="none"
+                          selected={
+                            Phoenix.HTML.Form.input_value(@new_run_form, :write_policy) == "none"
+                          }
+                        >
+                          no artifact writes
+                        </option>
+                      </select>
+                    </label>
+                    <label class="grid gap-1">
+                      <span class="font-mono text-[10px] uppercase text-rune-muted">Toolsets</span>
+                      <input
+                        type="text"
+                        name={@new_run_form[:toolsets].name}
+                        value={Phoenix.HTML.Form.input_value(@new_run_form, :toolsets)}
+                        placeholder="file,git,patch,terminal,code_execution"
+                        class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none placeholder:text-rune-muted"
+                      />
+                    </label>
+                    <label class="grid gap-1">
+                      <span class="font-mono text-[10px] uppercase text-rune-muted">
+                        Disabled tools
+                      </span>
+                      <input
+                        type="text"
+                        name={@new_run_form[:disabled_tools].name}
+                        value={Phoenix.HTML.Form.input_value(@new_run_form, :disabled_tools)}
+                        placeholder="run_formatter,process_kill"
+                        class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none placeholder:text-rune-muted"
+                      />
+                    </label>
+                    <input
+                      type="hidden"
+                      name={@new_run_form[:tool_config].name}
+                      value={Phoenix.HTML.Form.input_value(@new_run_form, :tool_config)}
+                    />
                     <p>
                       <strong class="text-rune-text">assistant</strong>: structured/source-grounded workflows
                     </p>
@@ -1000,13 +1380,16 @@ defmodule RunicAIWeb.WorkbenchLive do
                       <strong class="text-rune-text">standard</strong>: direct conversational/local runs
                     </p>
                     <p>
-                      <strong class="text-rune-text">repo rlm</strong>: coding/RLM scorecard workflows
+                      <strong class="text-rune-text">workflow rlm</strong>: objective-gated coding/workflow coordination; patch mode keeps it on the RLM runner
                     </p>
                     <p>
-                      <strong class="text-rune-text">verify</strong>: inspect/analyze, <strong class="text-rune-text">patch</strong>: may propose file changes, <strong class="text-rune-text">read only</strong>: no writes expected
+                      <strong class="text-rune-text">verify</strong>: inspect/analyze, <strong class="text-rune-text">patch</strong>: may write workspace files, <strong class="text-rune-text">read only</strong>: no writes expected
                     </p>
                     <p>
-                      <strong class="text-rune-text">safe</strong>: approve low-risk actions, <strong class="text-rune-text">ask</strong>: pause in browser, <strong class="text-rune-text">never</strong>: deny gated actions
+                      <strong class="text-rune-text">safe</strong>: auto-approve low-risk gated actions only, <strong class="text-rune-text">ask</strong>: pause in browser, <strong class="text-rune-text">never</strong>: deny gated actions
+                    </p>
+                    <p>
+                      <strong class="text-rune-text">workspace writes gated</strong>: allow non-doc artifacts inside the selected cwd after policy review
                     </p>
                   </div>
                 </details>
@@ -1027,11 +1410,6 @@ defmodule RunicAIWeb.WorkbenchLive do
                 type="hidden"
                 name={@new_run_form[:cwd].name}
                 value={Phoenix.HTML.Form.input_value(@new_run_form, :cwd)}
-              />
-              <input
-                type="hidden"
-                name={@new_run_form[:model].name}
-                value={Phoenix.HTML.Form.input_value(@new_run_form, :model)}
               />
               <input
                 type="hidden"
@@ -1085,6 +1463,9 @@ defmodule RunicAIWeb.WorkbenchLive do
 
           <div class="runic-scrollbar min-h-0 overflow-y-auto">
             <section :if={@inspector_tab == "trace"} class="pb-4">
+              <div class="px-[18px] pb-3 pt-1">
+                <.progress_summary_panel summary={@snapshot.progress_summary} compact />
+              </div>
               <div :if={@snapshot.events == []} class="px-[22px] py-8 text-sm text-rune-muted">
                 No trace events.
               </div>
@@ -1236,6 +1617,14 @@ defmodule RunicAIWeb.WorkbenchLive do
                   <dd class="truncate">{selected_model(@snapshot) || "-"}</dd>
                   <dt class="text-rune-muted">approval</dt>
                   <dd>{selected_approval(@snapshot) || "-"}</dd>
+                  <dt class="text-rune-muted">profile</dt>
+                  <dd>{capability_name(@snapshot) || "-"}</dd>
+                  <dt class="text-rune-muted">toolsets</dt>
+                  <dd class="truncate">{capability_toolsets(@snapshot)}</dd>
+                  <dt class="text-rune-muted">browser</dt>
+                  <dd class="truncate">{agent_browser_status(@snapshot)}</dd>
+                  <dt class="text-rune-muted">gated</dt>
+                  <dd class="truncate">{capability_gated_tools(@snapshot)}</dd>
                   <dt class="text-rune-muted">database</dt>
                   <dd class="truncate">{Path.basename(to_string(@health.database || "memory"))}</dd>
                   <dt class="text-rune-muted">messages</dt>
@@ -1431,6 +1820,29 @@ defmodule RunicAIWeb.WorkbenchLive do
           class="min-h-[58px] w-full resize-y rounded-[12px] border border-rune-text/5 bg-black/20 px-3 py-2 text-xs leading-5 text-rune-text outline-none placeholder:text-rune-muted"
           placeholder="Rewrite instruction..."
         ></textarea>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="grid gap-1 font-mono text-[10px] uppercase text-rune-muted">
+            Extra loops
+            <input
+              type="number"
+              min="1"
+              name="review[additional_iterations]"
+              class="min-h-[34px] rounded-[11px] border border-rune-text/5 bg-black/20 px-3 py-2 text-xs text-rune-text outline-none"
+              placeholder="1"
+            />
+          </label>
+          <label class="grid gap-1 font-mono text-[10px] uppercase text-rune-muted">
+            Extra runtime ms
+            <input
+              type="number"
+              min="1000"
+              step="1000"
+              name="review[additional_runtime_ms]"
+              class="min-h-[34px] rounded-[11px] border border-rune-text/5 bg-black/20 px-3 py-2 text-xs text-rune-text outline-none"
+              placeholder="300000"
+            />
+          </label>
+        </div>
         <div class="flex flex-wrap gap-2">
           <button
             type="submit"
@@ -1517,6 +1929,231 @@ defmodule RunicAIWeb.WorkbenchLive do
         {@step.detail}
       </em>
     </div>
+    """
+  end
+
+  attr :summary, :any, default: %{}
+  attr :compact, :boolean, default: false
+
+  defp progress_summary_panel(assigns) do
+    ~H"""
+    <section class={[
+      "rounded-2xl border border-rune-text/10 bg-black/25 px-4 py-4 shadow-[inset_0_1px_0_rgba(255,244,211,0.035),0_12px_34px_rgba(0,0,0,0.18)]",
+      !@compact && "min-h-[188px]"
+    ]}>
+      <div class="flex items-start justify-between gap-3">
+        <div class="min-w-0">
+          <span class="font-mono text-[10.5px] font-semibold uppercase text-rune-muted">
+            Live progress
+          </span>
+          <strong class="mt-1 block truncate text-sm leading-snug text-rune-text">
+            {progress_latest_title(@summary)}
+          </strong>
+        </div>
+        <span class="shrink-0 rounded-full border border-rune-text/5 bg-black/25 px-2 py-1 font-mono text-[10px] text-rune-primary">
+          {progress_event_trail(@summary)}
+        </span>
+      </div>
+
+      <p
+        :if={progress_latest_detail(@summary)}
+        class="mt-2 line-clamp-2 text-xs leading-5 text-rune-text-soft"
+      >
+        {progress_latest_detail(@summary)}
+      </p>
+
+      <div :if={progress_facts(@summary) != []} class="mt-3 grid grid-cols-2 gap-2">
+        <div
+          :for={fact <- progress_facts(@summary)}
+          class="rounded-xl border border-rune-text/5 bg-black/20 px-3 py-2"
+        >
+          <span class="block font-mono text-[10px] uppercase text-rune-muted">{fact.label}</span>
+          <span class="mt-1 block truncate text-xs text-rune-text-soft">{fact.value}</span>
+        </div>
+      </div>
+    </section>
+    """
+  end
+
+  attr :contract, :any, default: nil
+
+  attr :loop, :any, default: nil
+
+  defp objective_loop_panel(assigns) do
+    ~H"""
+    <section class="min-h-[188px] rounded-2xl border border-rune-text/10 bg-black/25 px-4 py-4 shadow-[inset_0_1px_0_rgba(255,244,211,0.035),0_12px_34px_rgba(0,0,0,0.18)]">
+      <div class="flex items-start justify-between gap-3">
+        <div class="min-w-0">
+          <span class="font-mono text-[10.5px] font-semibold uppercase text-rune-muted">
+            Objective loop
+          </span>
+          <strong class="mt-1 block truncate text-sm leading-snug text-rune-text">
+            {objective_loop_status(@loop)}
+          </strong>
+        </div>
+        <span
+          :if={objective_loop_action(@loop)}
+          class="shrink-0 rounded-full border border-rune-primary/20 bg-rune-primary/10 px-2 py-1 font-mono text-[10px] text-rune-primary"
+        >
+          {objective_loop_action(@loop)}
+        </span>
+      </div>
+
+      <div :if={objective_loop_facts(@loop) != []} class="mt-3 grid grid-cols-2 gap-2">
+        <div
+          :for={fact <- objective_loop_facts(@loop)}
+          class="rounded-xl border border-rune-text/5 bg-black/20 px-3 py-2"
+        >
+          <span class="block font-mono text-[10px] uppercase text-rune-muted">{fact.label}</span>
+          <span class="mt-1 block truncate text-xs text-rune-text-soft">{fact.value}</span>
+        </div>
+      </div>
+
+      <div :if={objective_loop_tasks(@loop) != []} class="mt-3 grid gap-1.5">
+        <div
+          :for={task <- objective_loop_tasks(@loop)}
+          class="flex items-start gap-2 text-xs leading-5 text-rune-text-soft"
+        >
+          <.icon name="hero-arrow-path" class="mt-0.5 size-3.5 shrink-0 text-rune-gold" />
+          <span>{objective_loop_task_text(task)}</span>
+        </div>
+      </div>
+
+      <div
+        :if={objective_loop_budget_requests(@loop) != []}
+        class="mt-3 rounded-xl border border-rune-warning/20 bg-rune-warning/10 px-3 py-2"
+      >
+        <span class="font-mono text-[10px] uppercase text-rune-warning">Budget request</span>
+        <p class="mt-1 line-clamp-2 text-xs leading-5 text-rune-text-soft">
+          {objective_loop_budget_reason(@loop)}
+        </p>
+      </div>
+
+      <div
+        :if={objective_loop_review_requests(@loop) != []}
+        class="mt-3 rounded-xl border border-rune-primary/20 bg-rune-primary/10 px-3 py-2"
+      >
+        <span class="font-mono text-[10px] uppercase text-rune-primary">Review request</span>
+        <p class="mt-1 line-clamp-2 text-xs leading-5 text-rune-text-soft">
+          {objective_loop_review_reason(@loop)}
+        </p>
+      </div>
+
+      <p
+        :if={
+          objective_loop_facts(@loop) == [] and objective_loop_tasks(@loop) == [] and
+            objective_loop_budget_requests(@loop) == [] and
+            objective_loop_review_requests(@loop) == []
+        }
+        class="mt-6 text-sm leading-6 text-rune-muted"
+      >
+        No objective loop captured for this session.
+      </p>
+    </section>
+    """
+  end
+
+  attr :contract, :any, default: nil
+
+  defp objective_contract_panel(assigns) do
+    ~H"""
+    <section class="min-h-[188px] rounded-2xl border border-rune-text/10 bg-black/25 px-4 py-4 shadow-[inset_0_1px_0_rgba(255,244,211,0.035),0_12px_34px_rgba(0,0,0,0.18)]">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <span class="font-mono text-[10.5px] font-semibold uppercase text-rune-muted">
+            Objective contract
+          </span>
+          <strong class="mt-1 block text-sm leading-snug text-rune-text">
+            {contract_domain(@contract)}
+          </strong>
+        </div>
+        <span
+          :if={contract_profile(@contract)}
+          class="shrink-0 rounded-full border border-rune-text/5 bg-black/25 px-2 py-1 font-mono text-[10px] text-rune-gold"
+        >
+          {contract_profile(@contract)}
+        </span>
+      </div>
+
+      <div
+        :if={contract_evidence_required(@contract) != []}
+        class="mt-3 flex flex-wrap gap-1.5"
+      >
+        <span
+          :for={evidence <- contract_evidence_required(@contract)}
+          class="rounded-full border border-rune-primary/20 bg-rune-primary/10 px-2 py-1 font-mono text-[10px] text-rune-primary"
+        >
+          {evidence}
+        </span>
+      </div>
+
+      <div :if={contract_requirements(@contract) != []} class="mt-3 grid gap-2">
+        <div
+          :for={requirement <- contract_requirements(@contract)}
+          class="rounded-xl border border-rune-text/5 bg-black/20 px-3 py-2"
+        >
+          <span class="block font-mono text-[10px] text-rune-gold">
+            {contract_requirement_id(requirement)}
+          </span>
+          <span class="mt-1 block text-xs leading-5 text-rune-text-soft">
+            {contract_requirement_text(requirement)}
+          </span>
+        </div>
+      </div>
+
+      <p :if={contract_requirements(@contract) == []} class="mt-6 text-sm leading-6 text-rune-muted">
+        No objective contract captured for this session.
+      </p>
+    </section>
+    """
+  end
+
+  attr :evidence, :any, default: nil
+
+  defp blocked_evidence_panel(assigns) do
+    ~H"""
+    <section class="min-h-[188px] rounded-2xl border border-rune-text/10 bg-black/25 px-4 py-4 shadow-[inset_0_1px_0_rgba(255,244,211,0.035),0_12px_34px_rgba(0,0,0,0.18)]">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <span class="font-mono text-[10.5px] font-semibold uppercase text-rune-muted">
+            Blocked evidence
+          </span>
+          <strong class="mt-1 block text-sm leading-snug text-rune-text">
+            {blocked_status(@evidence)}
+          </strong>
+        </div>
+        <span
+          :if={blocked_current_node(@evidence)}
+          class="shrink-0 rounded-full border border-rune-warning/25 bg-rune-warning/10 px-2 py-1 font-mono text-[10px] text-rune-warning"
+        >
+          {blocked_current_node(@evidence)}
+        </span>
+      </div>
+
+      <div :if={blocked_facts(@evidence) != []} class="mt-3 grid grid-cols-2 gap-2">
+        <div
+          :for={fact <- blocked_facts(@evidence)}
+          class="rounded-xl border border-rune-text/5 bg-black/20 px-3 py-2"
+        >
+          <span class="block font-mono text-[10px] uppercase text-rune-muted">{fact.label}</span>
+          <span class="mt-1 block truncate text-xs text-rune-text-soft">{fact.value}</span>
+        </div>
+      </div>
+
+      <div :if={blocked_next_actions(@evidence) != []} class="mt-3 grid gap-1.5">
+        <div
+          :for={action <- blocked_next_actions(@evidence)}
+          class="flex items-start gap-2 text-xs leading-5 text-rune-text-soft"
+        >
+          <.icon name="hero-arrow-right" class="mt-0.5 size-3.5 shrink-0 text-rune-gold" />
+          <span>{action}</span>
+        </div>
+      </div>
+
+      <p :if={blocked_next_actions(@evidence) == []} class="mt-6 text-sm leading-6 text-rune-muted">
+        No blocked evidence for this session.
+      </p>
+    </section>
     """
   end
 
@@ -1964,6 +2601,9 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp selected_title(%{session: %{title: title}}), do: title
   defp selected_title(_snapshot), do: "Local agent workbench"
 
+  defp selected_session_id(%{session: %{id: id}}) when is_binary(id), do: id
+  defp selected_session_id(_snapshot), do: "none"
+
   defp selected_status(%{session: %{status: status}}), do: status
   defp selected_status(_snapshot), do: "idle"
 
@@ -1984,6 +2624,61 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   defp selected_approval(_snapshot), do: nil
 
+  defp capability_name(snapshot) do
+    snapshot
+    |> capability_profile()
+    |> field(:name)
+  end
+
+  defp capability_toolsets(snapshot) do
+    snapshot
+    |> capability_profile()
+    |> field(:toolsets)
+    |> list_label()
+  end
+
+  defp capability_gated_tools(snapshot) do
+    snapshot
+    |> capability_profile()
+    |> field(:gated_tools)
+    |> list_label()
+  end
+
+  defp agent_browser_status(snapshot) do
+    profile = capability_profile(snapshot)
+    toolsets = field(profile, :toolsets) || []
+
+    if "browser" in Enum.map(List.wrap(toolsets), &to_string/1) do
+      "agent browser enabled"
+    else
+      "-"
+    end
+  end
+
+  defp capability_profile(%{capability_profile: profile}) when is_map(profile), do: profile
+
+  defp capability_profile(%{session: %{capability_profile: profile}}) when is_map(profile),
+    do: profile
+
+  defp capability_profile(%{session: %{metadata: metadata}}) when is_map(metadata),
+    do: field(metadata, :capability_profile) || %{}
+
+  defp capability_profile(_snapshot), do: %{}
+
+  defp list_label(values) when is_list(values) and values != [] do
+    values
+    |> Enum.map(&to_string/1)
+    |> Enum.join(", ")
+  end
+
+  defp list_label(_values), do: "-"
+
+  defp field(map, key) when is_map(map) and is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp field(map, key) when is_map(map), do: Map.get(map, key)
+  defp field(_map, _key), do: nil
+
   defp first_present(nil, fallback), do: fallback
   defp first_present("", fallback), do: fallback
   defp first_present(value, _fallback), do: value
@@ -1993,9 +2688,9 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp selected_short_id(_snapshot), do: "new"
 
   defp session_state_label(snapshot) do
-    case review_event(snapshot) do
+    case pending_review(snapshot) do
       nil -> selected_status(snapshot)
-      _event -> "approval required"
+      _review -> "approval required"
     end
   end
 
@@ -2092,6 +2787,383 @@ defmodule RunicAIWeb.WorkbenchLive do
     end
   end
 
+  defp progress_latest_title(summary) do
+    summary
+    |> json_field("latest_event", %{})
+    |> first_json_field(["title", "phase", "kind"])
+    |> present_string()
+    |> case do
+      nil -> "No progress events yet"
+      value -> value
+    end
+  end
+
+  defp progress_latest_detail(summary) do
+    summary
+    |> json_field("latest_event", %{})
+    |> first_json_field(["detail", "status"])
+    |> present_string()
+  end
+
+  defp progress_event_trail(summary) do
+    summary
+    |> first_json_field(["event_trail", "event_count"])
+    |> present_string()
+    |> case do
+      nil -> "0 events"
+      value -> value
+    end
+  end
+
+  defp progress_facts(summary) do
+    [
+      %{label: "objective", value: json_field(summary, "objective_status", nil)},
+      %{label: "action", value: json_field(summary, "objective_action", nil)},
+      %{label: "error", value: objective_progress_error_label(summary)},
+      %{label: "iteration", value: objective_progress_iteration_label(summary)},
+      %{label: "open", value: json_field(summary, "objective_open_task_count", nil)},
+      %{label: "done", value: json_field(summary, "objective_completed_task_count", nil)},
+      %{label: "node", value: json_field(summary, "current_node", nil)},
+      %{label: "child", value: json_field(summary, "current_child", nil)},
+      %{label: "elapsed", value: summary |> json_field("elapsed_ms", nil) |> duration_label()},
+      %{
+        label: "remaining",
+        value: summary |> json_field("remaining_ms", nil) |> duration_label()
+      },
+      %{label: "max", value: summary |> json_field("max_runtime_ms", nil) |> duration_label()},
+      %{
+        label: "child budget",
+        value: summary |> json_field("selected_timeout_ms", nil) |> duration_label()
+      }
+    ]
+    |> Enum.map(fn fact -> %{fact | value: present_string(fact.value)} end)
+    |> Enum.reject(&is_nil(&1.value))
+    |> Enum.take(6)
+  end
+
+  defp objective_progress_error_label(summary) do
+    kind = summary |> json_field("objective_error_kind", nil) |> present_string()
+    message = summary |> json_field("objective_error_message", nil) |> present_string()
+    reason = summary |> json_field("objective_error_reason", nil) |> present_string()
+
+    cond do
+      kind && message && reason -> "#{kind}: #{message} (#{reason})"
+      kind && message -> "#{kind}: #{message}"
+      message && reason -> "#{message} (#{reason})"
+      message -> message
+      reason -> reason
+      kind -> kind
+      true -> nil
+    end
+  end
+
+  defp objective_progress_iteration_label(summary) do
+    current = json_field(summary, "objective_iteration", nil)
+    max = json_field(summary, "objective_max_iterations", nil)
+
+    cond do
+      current && max -> "#{current}/#{max}"
+      current -> current
+      true -> nil
+    end
+  end
+
+  defp duration_label(nil), do: nil
+  defp duration_label(value) when is_binary(value), do: value
+
+  defp duration_label(value) when is_integer(value) do
+    cond do
+      value < 1_000 -> "#{value}ms"
+      value < 60_000 -> "#{Float.round(value / 1_000, 1)}s"
+      true -> "#{Float.round(value / 60_000, 1)}m"
+    end
+  end
+
+  defp duration_label(value), do: value
+
+  defp message_blocked_next_actions(message) when is_map(message) do
+    message
+    |> Map.get(:content_json, %{})
+    |> json_field("blocked_evidence", %{})
+    |> blocked_next_actions()
+  end
+
+  defp message_blocked_next_actions(_message), do: []
+
+  defp objective_loop_status(nil), do: "Not captured"
+
+  defp objective_loop_status(loop) do
+    loop
+    |> first_json_field(["status", "objective_status"])
+    |> present_string()
+    |> case do
+      nil -> "Loop captured"
+      value -> value
+    end
+  end
+
+  defp objective_loop_action(loop) do
+    loop
+    |> first_json_field(["action"])
+    |> present_string()
+  end
+
+  defp objective_loop_facts(loop) do
+    [
+      %{label: "objective", value: loop |> first_json_field(["objective"])},
+      %{label: "iterations", value: objective_loop_iteration_label(loop)},
+      %{label: "error", value: objective_loop_error_label(loop)},
+      %{label: "open", value: loop |> objective_loop_tasks() |> length()},
+      %{
+        label: "done",
+        value: loop |> json_field("completed_tasks", []) |> List.wrap() |> length()
+      }
+    ]
+    |> Enum.map(fn fact -> %{fact | value: present_string(fact.value)} end)
+    |> Enum.reject(&is_nil(&1.value))
+  end
+
+  defp objective_loop_iteration_label(loop) do
+    count = loop |> first_json_field(["iteration_count", "objective_iteration_count"])
+    max = loop |> first_json_field(["max_iterations"])
+
+    cond do
+      is_nil(count) and is_nil(max) -> nil
+      is_nil(max) -> count
+      true -> "#{count || 0}/#{max}"
+    end
+  end
+
+  defp objective_loop_error_label(loop) do
+    kind = loop |> first_json_field(["latest_error_kind", "error_kind"]) |> present_string()
+
+    message =
+      loop |> first_json_field(["latest_error_message", "error_message"]) |> present_string()
+
+    cond do
+      kind && message -> "#{kind}: #{message}"
+      message -> message
+      kind -> kind
+      true -> nil
+    end
+  end
+
+  defp objective_loop_tasks(loop) do
+    loop
+    |> json_field("open_tasks", [])
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.take(5)
+  end
+
+  defp objective_loop_task_text(task) do
+    task
+    |> first_json_field(["title", "reason", "id"])
+    |> present_string()
+    |> case do
+      nil -> json_preview(task)
+      value -> value
+    end
+  end
+
+  defp objective_loop_budget_requests(loop) do
+    loop
+    |> json_field("budget_requests", [])
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.filter(&pending_objective_loop_budget_request?/1)
+    |> Enum.take(3)
+  end
+
+  defp pending_objective_loop_budget_request?(request) do
+    json_field(request, "status", nil) in [nil, "pending", :pending, "waiting", :waiting]
+  end
+
+  defp objective_loop_budget_reason(loop) do
+    loop
+    |> objective_loop_budget_requests()
+    |> List.first()
+    |> case do
+      nil ->
+        nil
+
+      request ->
+        request
+        |> first_json_field(["reason", "suggested_next_action"])
+        |> present_string()
+    end
+  end
+
+  defp objective_loop_review_requests(loop) do
+    loop
+    |> json_field("review_requests", [])
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.filter(&pending_objective_loop_review_request?/1)
+    |> Enum.take(3)
+  end
+
+  defp pending_objective_loop_review_request?(request) do
+    json_field(request, "status", nil) in [nil, "pending", :pending, "waiting", :waiting]
+  end
+
+  defp objective_loop_review_reason(loop) do
+    loop
+    |> objective_loop_review_requests()
+    |> List.first()
+    |> case do
+      nil ->
+        nil
+
+      request ->
+        kind = request |> first_json_field(["kind"]) |> present_string()
+        checkpoint = request |> first_json_field(["checkpoint"]) |> present_string()
+        resume_key = request |> first_json_field(["resume_key"]) |> present_string()
+
+        [kind || "review", checkpoint, resume_key]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join(" / ")
+    end
+  end
+
+  defp contract_domain(nil), do: "Not captured"
+
+  defp contract_domain(contract) do
+    contract
+    |> json_field("metadata", %{})
+    |> first_json_field(["domain", "scenario", "workflow_profile"])
+    |> present_string()
+    |> case do
+      nil -> "General objective"
+      value -> value
+    end
+  end
+
+  defp contract_profile(contract) do
+    contract
+    |> json_field("metadata", %{})
+    |> first_json_field(["generation_profile", "profile", "intent"])
+    |> present_string()
+  end
+
+  defp contract_evidence_required(contract) do
+    contract
+    |> json_field("metadata", %{})
+    |> json_field("evidence_required", [])
+    |> list_strings()
+    |> Enum.take(5)
+  end
+
+  defp contract_requirements(contract) do
+    contract
+    |> json_field("requirements", [])
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.take(6)
+  end
+
+  defp contract_requirement_id(requirement) do
+    requirement
+    |> first_json_field(["id", "name", "kind"])
+    |> present_string()
+    |> case do
+      nil -> "requirement"
+      value -> value
+    end
+  end
+
+  defp contract_requirement_text(requirement) do
+    requirement
+    |> first_json_field(["description", "text", "title", "acceptance"])
+    |> present_string()
+    |> case do
+      nil -> json_preview(requirement)
+      value -> value
+    end
+  end
+
+  defp blocked_status(nil), do: "Not blocked"
+
+  defp blocked_status(evidence) do
+    evidence
+    |> first_json_field(["objective_status", "status", "blocking_reason"])
+    |> present_string()
+    |> case do
+      nil -> "Blocked"
+      value -> value
+    end
+  end
+
+  defp blocked_current_node(evidence) do
+    evidence
+    |> first_json_field(["current_node", "node", "current_step"])
+    |> present_string()
+  end
+
+  defp blocked_facts(evidence) do
+    [
+      %{label: "child", value: evidence |> first_json_field(["current_child", "child"])},
+      %{
+        label: "elapsed",
+        value: evidence |> first_json_field(["elapsed_ms", "elapsed"]) |> duration_label()
+      },
+      %{
+        label: "budget",
+        value:
+          evidence
+          |> first_json_field([
+            "remaining_ms",
+            "remaining_budget_ms",
+            "budget_ms",
+            "max_runtime_ms"
+          ])
+          |> duration_label()
+      },
+      %{
+        label: "event",
+        value: evidence |> json_field("latest_event", %{}) |> json_field("title", nil)
+      }
+    ]
+    |> Enum.map(fn fact -> %{fact | value: present_string(fact.value)} end)
+    |> Enum.reject(&is_nil(&1.value))
+  end
+
+  defp blocked_next_actions(evidence) do
+    evidence
+    |> json_field("next_actions", [])
+    |> list_strings()
+    |> Enum.take(5)
+  end
+
+  defp first_json_field(map, keys) do
+    Enum.find_value(keys, &json_field(map, &1, nil))
+  end
+
+  defp list_strings(value) when is_list(value) do
+    value
+    |> Enum.map(&present_string/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp list_strings(value) do
+    case present_string(value) do
+      nil -> []
+      string -> [string]
+    end
+  end
+
+  defp present_string(value) when is_binary(value) do
+    if String.trim(value) == "", do: nil, else: value
+  end
+
+  defp present_string(nil), do: nil
+  defp present_string(value) when is_atom(value), do: Atom.to_string(value)
+  defp present_string(value) when is_integer(value), do: Integer.to_string(value)
+  defp present_string(value) when is_float(value), do: :erlang.float_to_binary(value, decimals: 2)
+
+  defp present_string(value) when is_map(value) or is_list(value), do: json_preview(value)
+  defp present_string(value), do: to_string(value)
+
   defp json_field(map, key, default) when is_map(map) do
     Map.get(map, key, Map.get(map, String.to_existing_atom(key), default))
   rescue
@@ -2164,13 +3236,29 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   defp review_event(_snapshot), do: nil
 
-  defp pending_review(%{review_requests: reviews}) do
-    Enum.find(reviews, &(&1.status in ["pending", "waiting"]))
+  defp pending_review(%{session: %{status: status}, review_requests: reviews})
+       when status in ["running", "waiting", "review", "blocked"] do
+    reviews
+    |> Enum.filter(&(&1.status in ["pending", "waiting"]))
+    |> Enum.sort_by(&pending_review_rank/1)
+    |> List.first()
   end
 
   defp pending_review(_snapshot), do: nil
 
-  defp pending_review_count(%{review_requests: reviews}) do
+  defp pending_review_rank(%{id: id, resume_key: resume_key})
+       when is_binary(id) and is_binary(resume_key) and id == resume_key,
+       do: 0
+
+  defp pending_review_rank(%{resume_key: resume_key})
+       when is_binary(resume_key) and resume_key != "",
+       do: 1
+
+  defp pending_review_rank(%{checkpoint: checkpoint}) when is_binary(checkpoint), do: 2
+  defp pending_review_rank(_review), do: 3
+
+  defp pending_review_count(%{session: %{status: status}, review_requests: reviews})
+       when status in ["running", "waiting", "review", "blocked"] do
     Enum.count(reviews, &(&1.status in ["pending", "waiting"]))
   end
 
@@ -2187,9 +3275,8 @@ defmodule RunicAIWeb.WorkbenchLive do
   end
 
   defp plan_steps(snapshot) do
-    metrics = snapshot.metrics
     review = review_event(snapshot)
-    current_event = List.first(snapshot.events)
+    events = Map.get(snapshot, :events, [])
 
     [
       %{
@@ -2198,38 +3285,142 @@ defmodule RunicAIWeb.WorkbenchLive do
         title: selected_title(snapshot),
         detail: "accepted - #{format_time(selected_started_at(snapshot))}"
       },
-      %{
-        state: "done",
-        label: "02 context",
-        title: "Loaded persisted session projection.",
-        detail: "#{metrics.messages} messages - #{metrics.events} events"
-      },
-      %{
-        state: execution_state(snapshot),
-        label: "03 execution",
-        title: current_event_title(current_event),
-        detail: selected_model(snapshot) || "streaming terminal events"
-      },
+      workflow_stage_step(snapshot, "02 planning", :planning, events),
+      workflow_stage_step(snapshot, "03 implementation", :implementation, events),
+      workflow_stage_step(snapshot, "04 verification", :verification, events),
+      workflow_stage_step(snapshot, "05 repair", :repair, events),
       %{
         state: if(review, do: "wait", else: "done"),
-        label: "04 review",
+        label: "06 review",
         title: review_title(review),
         detail: selected_approval(snapshot) || "policy: local"
       }
     ]
   end
 
-  defp selected_started_at(%{session: %{started_at: started_at}}), do: started_at
-  defp selected_started_at(_snapshot), do: nil
+  defp workflow_stage_step(snapshot, label, stage, events) do
+    event = first_workflow_stage_event(events, stage)
 
-  defp execution_state(snapshot) do
-    case selected_status(snapshot) do
+    %{
+      state: workflow_stage_state(snapshot, stage, event),
+      label: label,
+      title: workflow_stage_title(stage, event),
+      detail: workflow_stage_detail(snapshot, stage, event)
+    }
+  end
+
+  defp first_workflow_stage_event(events, stage) do
+    Enum.find(events, &workflow_stage_event?(&1, stage))
+  end
+
+  defp workflow_stage_event?(event, stage) do
+    text = event_search_text(event)
+
+    case stage do
+      :planning ->
+        text_contains_any?(text, [
+          "proposal",
+          "proposed",
+          "validated",
+          "workflow_compiled",
+          "rlm_plan",
+          "blueprint"
+        ])
+
+      :implementation ->
+        text_contains_any?(text, [
+          "node_started",
+          "node_completed",
+          "implement",
+          "patch",
+          "edit",
+          "tool_call",
+          "command_started",
+          "command_completed"
+        ])
+
+      :verification ->
+        text_contains_any?(text, [
+          "verify",
+          "verification",
+          "compile_completed",
+          "compiled",
+          "test",
+          "scorecard",
+          "progress_gate"
+        ])
+
+      :repair ->
+        text_contains_any?(text, ["repair", "retry", "correct", "ooda"])
+    end
+  end
+
+  defp workflow_stage_state(_snapshot, _stage, event) when not is_nil(event) do
+    case event_status(event) do
+      status when status in ["failed", "error", :failed, :error] -> "error"
       status when status in ["running", :running] -> "live"
       status when status in ["waiting", "review", :waiting, :review] -> "wait"
+      _status -> "done"
+    end
+  end
+
+  defp workflow_stage_state(snapshot, :repair, nil) do
+    case selected_status(snapshot) do
+      status when status in ["running", :running] -> "wait"
       status when status in ["failed", :failed] -> "error"
       _status -> "done"
     end
   end
+
+  defp workflow_stage_state(snapshot, _stage, nil) do
+    case selected_status(snapshot) do
+      status when status in ["running", :running] -> "wait"
+      status when status in ["failed", :failed] -> "error"
+      _status -> "done"
+    end
+  end
+
+  defp workflow_stage_title(:planning, nil), do: "No workflow plan evidence yet."
+  defp workflow_stage_title(:implementation, nil), do: "No implementation event evidence yet."
+  defp workflow_stage_title(:verification, nil), do: "No verification evidence yet."
+  defp workflow_stage_title(:repair, nil), do: "No repair requested."
+  defp workflow_stage_title(_stage, event), do: current_event_title(event)
+
+  defp workflow_stage_detail(snapshot, :repair, nil) do
+    case selected_status(snapshot) do
+      status when status in ["failed", :failed] -> "repair needed"
+      status when status in ["running", :running] -> "waiting for verification"
+      _status -> "not needed"
+    end
+  end
+
+  defp workflow_stage_detail(_snapshot, _stage, nil), do: "waiting for persisted event"
+
+  defp workflow_stage_detail(_snapshot, _stage, event) do
+    event_phase(event) || event_kind(event) || event_status(event) || "persisted event"
+  end
+
+  defp event_search_text(event) do
+    [
+      event_kind(event),
+      event_phase(event),
+      event_status(event),
+      Map.get(event, :title)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&to_string/1)
+    |> Enum.join(" ")
+    |> String.downcase()
+  end
+
+  defp text_contains_any?(text, needles), do: Enum.any?(needles, &String.contains?(text, &1))
+
+  defp event_kind(event), do: Map.get(event, :kind)
+  defp event_phase(event), do: Map.get(event, :phase)
+  defp event_status(event), do: Map.get(event, :status)
+
+  defp selected_started_at(%{session: %{started_at: started_at}}), do: started_at
+  defp selected_started_at(_snapshot), do: nil
 
   defp current_event_title(nil), do: "Waiting for the next persisted event."
   defp current_event_title(event), do: first_present(event.title, event_summary(event))

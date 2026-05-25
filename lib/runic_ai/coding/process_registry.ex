@@ -8,8 +8,10 @@ defmodule RunicAI.Coding.ProcessRegistry do
   alias RunicAI.Coding.Command
   alias RunicAI.Coding.CommandPolicy
   alias RunicAI.Coding.ProcessHandle
+  alias RunicAI.Coding.TraceRedactor
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
+  alias RunicAI.Trace.Event
 
   @default_log_bytes 131_072
 
@@ -33,7 +35,10 @@ defmodule RunicAI.Coding.ProcessRegistry do
     with {:ok, command} <- Command.from_input(command_input),
          {:ok, policy} <- CommandPolicy.from_input(policy_input),
          {:ok, authorization} <- CommandPolicy.authorize(policy, workspace, command) do
-      GenServer.call(server, {:start_process, command, authorization})
+      GenServer.call(
+        server,
+        {:start_process, command, authorization, Keyword.get(opts, :event_sink)}
+      )
     else
       {:error, %Error{} = error} ->
         {:error, error}
@@ -54,7 +59,7 @@ defmodule RunicAI.Coding.ProcessRegistry do
   def kill(server, id), do: GenServer.call(server, {:kill, id})
 
   @impl true
-  def handle_call({:start_process, command, authorization}, _from, state) do
+  def handle_call({:start_process, command, authorization, event_sink}, _from, state) do
     id = "proc-" <> Integer.to_string(System.unique_integer([:positive]))
     started_at = DateTime.utc_now()
 
@@ -70,7 +75,10 @@ defmodule RunicAI.Coding.ProcessRegistry do
              updated_at: started_at,
              metadata: %{backend: command.backend}
            ) do
-      process = %{port: port, handle: handle, log: "", killed?: false}
+      process = %{port: port, handle: handle, log: "", killed?: false, event_sink: event_sink}
+
+      emit_process_event(event_sink, :coding_process_started, :running, handle, %{output_bytes: 0})
+
       {:reply, {:ok, handle}, put_in(state.processes[id], process)}
     else
       {:error, error} -> {:reply, {:error, error}, state}
@@ -128,6 +136,12 @@ defmodule RunicAI.Coding.ProcessRegistry do
       end
 
       handle = ProcessHandle.update(process.handle, status: :killed)
+
+      emit_process_event(process.event_sink, :coding_process_exited, handle.status, handle, %{
+        exit_status: handle.exit_status,
+        output_bytes: byte_size(process.log)
+      })
+
       process = %{process | handle: handle, killed?: true}
       {:reply, {:ok, handle}, put_in(state.processes[id], process)}
     else
@@ -154,7 +168,7 @@ defmodule RunicAI.Coding.ProcessRegistry do
         :stderr_to_stdout,
         {:args, args},
         {:cd, authorization.cwd},
-        {:env, authorization.env}
+        {:env, port_env(authorization.env)}
       ])
 
     {:ok, port}
@@ -171,7 +185,7 @@ defmodule RunicAI.Coding.ProcessRegistry do
         :stderr_to_stdout,
         {:args, ["-c", shell]},
         {:cd, authorization.cwd},
-        {:env, authorization.env}
+        {:env, port_env(authorization.env)}
       ])
 
     {:ok, port}
@@ -185,6 +199,13 @@ defmodule RunicAI.Coding.ProcessRegistry do
   defp append_log_by_port(state, port, data) do
     update_process_by_port(state, port, fn process ->
       log = truncate_tail(process.log <> data, state.max_log_bytes)
+
+      emit_process_event(process.event_sink, :coding_process_output, :running, process.handle, %{
+        output_preview: String.slice(data, 0, 1_000),
+        output_bytes: byte_size(data),
+        accumulated_output_bytes: byte_size(process.log) + byte_size(data)
+      })
+
       %{process | log: log}
     end)
   end
@@ -196,6 +217,11 @@ defmodule RunicAI.Coding.ProcessRegistry do
           status: if(process.killed?, do: :killed, else: :exited),
           exit_status: status
         )
+
+      emit_process_event(process.event_sink, :coding_process_exited, handle.status, handle, %{
+        exit_status: status,
+        output_bytes: byte_size(process.log)
+      })
 
       %{process | handle: handle}
     end)
@@ -245,4 +271,42 @@ defmodule RunicAI.Coding.ProcessRegistry do
     start = byte_size(binary) - max_bytes
     binary_part(binary, start, max_bytes)
   end
+
+  defp port_env(env) do
+    Enum.map(env, fn {key, value} ->
+      {String.to_charlist(key), String.to_charlist(value)}
+    end)
+  end
+
+  defp emit_process_event(event_sink, kind, status, %ProcessHandle{} = handle, output)
+       when is_function(event_sink, 1) do
+    event =
+      Event.new!(kind,
+        status: status,
+        output:
+          TraceRedactor.redact(
+            Map.merge(
+              %{
+                id: handle.id,
+                command: handle.command,
+                argv: handle.argv,
+                cwd: handle.cwd
+              },
+              output
+            )
+          ),
+        metadata: %{
+          coding?: true,
+          live?: true,
+          source: :process_registry,
+          process_id: handle.id
+        }
+      )
+
+    event_sink.(event)
+  rescue
+    _exception -> :ok
+  end
+
+  defp emit_process_event(_event_sink, _kind, _status, _handle, _output), do: :ok
 end

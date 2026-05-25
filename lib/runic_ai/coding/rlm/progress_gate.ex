@@ -25,6 +25,28 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     ":world"
   ]
 
+  @objective_stop_terms MapSet.new([
+                          "Assertion",
+                          "Build",
+                          "Compiling",
+                          "Continue",
+                          "Elixir",
+                          "ExUnit",
+                          "Failing",
+                          "Generated",
+                          "If",
+                          "Include",
+                          "Mix",
+                          "Observed",
+                          "Original",
+                          "Preserve",
+                          "Repair",
+                          "RLM",
+                          "Send",
+                          "The",
+                          "Use"
+                        ])
+
   @spec enabled?(WorkflowProposal.t(), keyword()) :: boolean()
   def enabled?(%WorkflowProposal{} = proposal, opts) when is_list(opts) do
     policy = Keyword.get(opts, :progress_policy, [])
@@ -70,7 +92,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     objective = semantic_objective(proposal, context, opts)
     policy = Keyword.get(opts, :progress_policy, [])
     terms = objective_terms(objective, policy)
-    workspace_evidence = workspace_evidence(workspace, policy)
+    workspace_evidence = workspace_evidence(workspace, policy, context)
     semantic_enabled? = semantic_progress_enabled?(opts, context)
 
     deterministic_results =
@@ -95,7 +117,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
 
   @spec objective_terms(String.t(), keyword() | map() | false | nil) :: [String.t()]
   def objective_terms(objective, policy \\ []) when is_binary(objective) do
-    (explicit_terms(policy) ++ extracted_terms(objective))
+    (explicit_terms(policy) ++ (objective |> acceptance_objective_text() |> extracted_terms()))
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq_by(&String.downcase/1)
@@ -149,6 +171,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     |> Map.put(:context, context)
     |> Map.put(:episodes, Map.get(context, :episodes, []))
     |> Map.put(:trace, Map.get(context, :trace, []))
+    |> Map.put(:objective_scorecard, scorecard)
     |> Map.put(:output, scorecard)
   end
 
@@ -161,6 +184,12 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   end
 
   defp semantic_coverage_result(terms, evidence, policy, _semantic_enabled?) do
+    if truthy_policy?(policy, :lexical_coverage?) do
+      lexical_semantic_coverage_result(terms, evidence, policy)
+    end
+  end
+
+  defp lexical_semantic_coverage_result(terms, evidence, policy) do
     required = required_term_matches(terms, policy)
     matched = Enum.filter(terms, &contains_term?(evidence.source_text, &1))
     missing = terms -- matched
@@ -237,15 +266,15 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
             }
           )
 
-        semantic_enabled? ->
+        semantic_enabled? or not truthy_policy?(policy, :lexical_coverage?) ->
           AcceptanceCheck.result(
             check,
             :pass,
-            "test files are present; semantic judge evaluates objective coverage",
+            "test files are present and default scaffold assertions are absent",
             %{
               test_files: evidence.test_files,
               matched_terms: matched,
-              semantic_judge?: true
+              semantic_judge?: semantic_enabled?
             }
           )
 
@@ -276,17 +305,23 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
           changed_files: changed
         })
 
-      length(evidence.source_files) >= min_files ->
-        AcceptanceCheck.result(check, :pass, "workspace contains implementation source files", %{
-          source_files: evidence.source_files,
-          min_source_files: min_files
-        })
+      truthy_policy?(policy, :allow_existing_source_without_changes?) and
+          length(evidence.source_files) >= min_files ->
+        AcceptanceCheck.result(
+          check,
+          :pass,
+          "workspace contains implementation source files",
+          %{
+            source_files: evidence.source_files,
+            min_source_files: min_files
+          }
+        )
 
       true ->
         AcceptanceCheck.result(
           check,
           :fail,
-          "workflow did not produce implementation source evidence",
+          "mutating workflow did not record changed implementation files",
           %{
             changed_files: changed,
             source_files: evidence.source_files,
@@ -296,7 +331,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     end
   end
 
-  defp workspace_evidence(%Workspace{} = workspace, policy) do
+  defp workspace_evidence(%Workspace{} = workspace, policy, context) do
     source_globs =
       List.wrap(
         policy_value(policy, :source_globs, [
@@ -319,6 +354,11 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
 
     source_files = matching_files(workspace, source_globs)
     test_files = matching_files(workspace, test_globs)
+    changed = changed_source_or_test_files(workspace, context)
+    changed_tests = Enum.filter(changed, &(&1 in test_files or String.contains?(&1, "/test/")))
+
+    source_files = if changed == [], do: source_files, else: changed
+    test_files = if changed_tests == [], do: test_files, else: changed_tests
     source_entries = read_file_entries(workspace, Enum.uniq(source_files ++ test_files))
     test_entries = read_file_entries(workspace, test_files)
 
@@ -330,6 +370,20 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
       source_text: entries_text(source_entries),
       test_text: entries_text(test_entries)
     }
+  end
+
+  defp changed_source_or_test_files(workspace, context) do
+    context
+    |> changed_files()
+    |> Enum.filter(fn path ->
+      safe_relative_glob?(path) and
+        (String.ends_with?(path, [".ex", ".exs"]) or
+           String.starts_with?(path, ["lib/", "test/"]) or
+           String.contains?(path, ["/lib/", "/test/"])) and
+        File.regular?(Path.join(workspace.root, path))
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp matching_files(workspace, globs) do
@@ -392,6 +446,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
 
     (camel_terms ++ quoted_terms)
     |> Enum.reject(&(String.length(&1) < 3))
+    |> Enum.reject(&MapSet.member?(@objective_stop_terms, &1))
   end
 
   defp scaffold_marker_locations(evidence) do
@@ -447,9 +502,42 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   end
 
   defp semantic_objective(%WorkflowProposal{} = proposal, context, opts) do
-    Keyword.get(opts, :semantic_objective) ||
-      get_in(context, [:metadata, :original_objective]) ||
-      proposal.objective
+    (Keyword.get(opts, :semantic_objective) ||
+       get_in(context, [:metadata, :original_objective]) ||
+       proposal.objective)
+    |> acceptance_objective_text()
+  end
+
+  defp acceptance_objective_text(objective) when is_binary(objective) do
+    objective
+    |> prefer_original_objective()
+    |> truncate_evidence_tail()
+    |> String.trim()
+  end
+
+  defp prefer_original_objective(objective) do
+    case String.split(objective, "Original objective:", parts: 2) do
+      [_before, original] -> original
+      _other -> objective
+    end
+  end
+
+  defp truncate_evidence_tail(objective) do
+    [
+      "Use the failing smoke evidence",
+      "Observed failing smoke",
+      "Observed failing evidence",
+      "Observed failure",
+      "Failing smoke",
+      "\n{\n",
+      "\n```"
+    ]
+    |> Enum.reduce(objective, fn marker, acc ->
+      case String.split(acc, marker, parts: 2) do
+        [head, _tail] -> head
+        _other -> acc
+      end
+    end)
   end
 
   defp semantic_progress_enabled?(opts, context) do
@@ -609,7 +697,10 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   defp mutation_enabled?(opts) do
     validation_opts = Keyword.get(opts, :validation_opts, [])
 
-    Keyword.get(opts, :allow_mutation?, Keyword.get(validation_opts, :allow_mutation?, false))
+    Keyword.get(opts, :allow_mutation?, Keyword.get(validation_opts, :allow_mutation?, false)) or
+      Keyword.get(opts, :mode) == :patch or Keyword.get(validation_opts, :mode) == :patch or
+      :patch in List.wrap(Keyword.get(opts, :toolsets, [])) or
+      :patch in List.wrap(Keyword.get(validation_opts, :toolsets, []))
   end
 
   defp max_terms(policy), do: integer_policy(policy, :max_terms, 12)

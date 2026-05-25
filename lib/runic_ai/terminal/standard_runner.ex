@@ -7,6 +7,7 @@ defmodule RunicAI.Terminal.StandardRunner do
   """
 
   alias RunicAI.Agent.ContinueDecision
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.Coding.Review
   alias RunicAI.Coding.Session, as: CodingSession
   alias RunicAI.Error
@@ -38,7 +39,8 @@ defmodule RunicAI.Terminal.StandardRunner do
         id: session_id,
         policy: policy,
         mode: Keyword.get(opts, :mode, :verify),
-        objective_gate?: Keyword.get(opts, :objective_gate?, true)
+        objective_gate?: Keyword.get(opts, :objective_gate?, true),
+        tool_requirement: Keyword.get(opts, :tool_requirement)
       ]
       |> put_present(:model, Keyword.get(opts, :model))
       |> put_present(:client, Keyword.get(opts, :client))
@@ -285,7 +287,11 @@ defmodule RunicAI.Terminal.StandardRunner do
         cwd: cwd,
         mode: Keyword.get(opts, :mode, :verify),
         model: Keyword.get(opts, :model),
-        client: Keyword.get(opts, :client)
+        client: Keyword.get(opts, :client),
+        client_label: Keyword.get(opts, :client_label),
+        model_resolution: Keyword.get(opts, :model_resolution),
+        capability_profile:
+          CapabilityResolver.snapshot_for_launch(cwd, Keyword.put(opts, :agent, :standard))
       }
     )
   end

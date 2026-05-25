@@ -255,7 +255,8 @@ defmodule RunicAI.Coding.CommandPolicy do
       basename in policy.blocked_commands ->
         blocked_error("command is blocked by command policy", %{command: basename})
 
-      is_list(policy.allowed_commands) and basename not in policy.allowed_commands ->
+      is_list(policy.allowed_commands) and basename not in policy.allowed_commands and
+          not hitl_approved?(command) ->
         blocked_error("command is not in the command allowlist", %{
           command: basename,
           allowed_commands: policy.allowed_commands
@@ -265,6 +266,12 @@ defmodule RunicAI.Coding.CommandPolicy do
         :ok
     end
   end
+
+  defp hitl_approved?(%Command{metadata: metadata}) when is_map(metadata) do
+    get(metadata, :hitl_approved?, false) in [true, "true"]
+  end
+
+  defp hitl_approved?(_command), do: false
 
   defp authorize_env(%__MODULE__{env_allowlist: allowlist}, env) do
     denied = env |> Map.keys() |> Enum.reject(&(&1 in allowlist))

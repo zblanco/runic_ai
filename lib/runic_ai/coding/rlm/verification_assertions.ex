@@ -232,6 +232,7 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     context
     |> Map.get(:runtime_smokes, Map.get(context, "runtime_smokes", []))
     |> List.wrap()
+    |> Enum.reverse()
     |> Enum.find(&matches_identifier?(&1, key))
     |> case do
       nil ->

@@ -9,6 +9,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
   alias RunicAI.Assistant.RLM.BlueprintGraph
   alias RunicAI.Assistant.RLM.FunctionBlueprint
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
+  alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.Error
   alias RunicAI.RLM.ComponentCatalog
 
@@ -37,6 +38,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
           |> check_stop_conditions(blueprint)
           |> check_unique_ids(blueprint)
           |> check_catalog(blueprint)
+          |> check_tool_leaves(blueprint, opts)
           |> check_graph(blueprint)
           |> check_budgets(blueprint, opts)
           |> check_function_policies(blueprint, opts)
@@ -129,6 +131,51 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
             | diagnostics
           ]
       end
+    end)
+  end
+
+  defp check_tool_leaves(diagnostics, %WorkflowBlueprint{} = blueprint, opts) do
+    allowed_tools = allowed_tool_names(opts)
+
+    Enum.reduce(blueprint.components, diagnostics, fn
+      %{id: id, type: :tool_leaf, params: params}, diagnostics ->
+        tool_name = params[:tool] || params["tool"] || params[:name] || params["name"]
+
+        cond do
+          not is_binary(tool_name) or String.trim(tool_name) == "" ->
+            [
+              diagnostic(
+                :error,
+                :missing_tool_name,
+                "tool_leaf components require a tool name",
+                %{
+                  component_id: id
+                }
+              )
+              | diagnostics
+            ]
+
+          allowed_tools != [] and tool_name not in allowed_tools ->
+            [
+              diagnostic(
+                :error,
+                :toolset_disabled,
+                "tool_leaf uses a disabled or unavailable tool",
+                %{
+                  component_id: id,
+                  tool_name: tool_name,
+                  allowed_tools: allowed_tools
+                }
+              )
+              | diagnostics
+            ]
+
+          true ->
+            diagnostics
+        end
+
+      _component, diagnostics ->
+        diagnostics
     end)
   end
 
@@ -247,6 +294,19 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
   defp normalize_max_tier("tier1"), do: :tier1
   defp normalize_max_tier("tier2"), do: :tier2
   defp normalize_max_tier(_tier), do: :tier1
+
+  defp allowed_tool_names(opts) do
+    case Keyword.get(opts, :capability_profile) do
+      %{visible_tools: visible_tools} when is_list(visible_tools) ->
+        visible_tools
+
+      %{"visible_tools" => visible_tools} when is_list(visible_tools) ->
+        visible_tools
+
+      _other ->
+        CapabilityResolver.visible_tool_names_for_profile(opts)
+    end
+  end
 
   defp error_code(%Error{details: details}, default) when is_map(details),
     do: Map.get(details, :code, default)

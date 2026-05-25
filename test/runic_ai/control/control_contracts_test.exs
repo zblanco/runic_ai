@@ -37,12 +37,62 @@ defmodule RunicAI.Control.ControlContractsTest do
     assert %ReviewDecision{status: :approved} =
              ReviewDecision.from_input!(%{resume_key: "resume-2", status: :approved})
 
+    assert %ReviewDecision{
+             resume_key: "resume-3",
+             status: :edited,
+             edited_value: "continue with narrower scope",
+             actor: "web",
+             metadata: %{"source" => "browser"}
+           } =
+             ReviewDecision.from_input!(%{
+               "resume_key" => "resume-3",
+               "status" => "edited",
+               "edited_value" => "continue with narrower scope",
+               "actor" => "web",
+               "metadata" => %{"source" => "browser"}
+             })
+
     assert %ResumeSignal{kind: :external_signal} =
              ResumeSignal.from_input!(%{
                kind: :external_signal,
                resume_key: "resume-2",
                payload: %{released: true}
              })
+
+    assert %ResumeSignal{
+             kind: :review,
+             resume_key: "resume-3",
+             payload: %{"released" => true},
+             metadata: %{"source" => "browser"}
+           } =
+             ResumeSignal.from_input!(%{
+               "kind" => "review",
+               "resume_key" => "resume-3",
+               "payload" => %{"released" => true},
+               "metadata" => %{"source" => "browser"}
+             })
+  end
+
+  test "review decisions and resume signals return validation errors for malformed maps" do
+    assert {:error, review_error} = ReviewDecision.from_input(%{"status" => "approved"})
+    assert review_error.message == "review decision resume_key must be a non-empty string"
+    assert review_error.details.resume_key == nil
+
+    assert {:error, status_error} =
+             ReviewDecision.from_input(%{"resume_key" => "resume-4", "status" => "unknown"})
+
+    assert status_error.message =~ "invalid review decision status"
+    assert status_error.details.status == "unknown"
+
+    assert {:error, signal_error} =
+             ResumeSignal.from_input(%{"kind" => "unregistered", "resume_key" => "resume-5"})
+
+    assert signal_error.message =~ "unsupported resume signal kind"
+    assert signal_error.details.kind == "unregistered"
+
+    assert {:error, resume_key_error} = ResumeSignal.from_input(%{"kind" => "review"})
+    assert resume_key_error.message == "resume signal resume_key must be a non-empty string"
+    assert resume_key_error.details.resume_key == nil
   end
 
   test "budget policy, snapshot, and decision validate" do

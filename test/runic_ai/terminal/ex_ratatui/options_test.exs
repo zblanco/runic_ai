@@ -55,6 +55,31 @@ defmodule RunicAI.Terminal.ExRatatui.OptionsTest do
     assert options.ssh_password == "secret"
   end
 
+  test "uses shared model/client resolver for Codex options" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             Options.parse([
+               "--cwd",
+               cwd,
+               "--client",
+               "codex",
+               "--model",
+               "openai:gpt-5.4-mini"
+             ])
+
+    assert opts.client == "codex"
+    assert opts.client_label == "codex"
+    assert opts.model == nil
+    assert opts.requested_model == "openai:gpt-5.4-mini"
+    assert opts.model_resolution.decision == "codex_account_default"
+
+    assert {:error, error} =
+             Options.parse(["--cwd", cwd, "--client", "codex", "--model", "openai:gpt-4o"])
+
+    assert error.message =~ "unsupported model for local Codex client"
+  end
+
   defp tmp_dir do
     path =
       Path.join(System.tmp_dir!(), "runic-ai-tui-options-#{System.unique_integer([:positive])}")

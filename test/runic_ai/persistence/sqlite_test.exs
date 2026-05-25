@@ -1,6 +1,7 @@
 defmodule RunicAI.Persistence.SQLiteTest do
   use ExUnit.Case, async: true
 
+  alias RunicAI.Coding.RLM.ObjectiveLoop
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.Export
@@ -14,6 +15,7 @@ defmodule RunicAI.Persistence.SQLiteTest do
   alias RunicAI.Persistence.Schemas.TerminalEvent
   alias RunicAI.Persistence.Schemas.ToolCall
   alias RunicAI.Persistence.Schemas.WorkflowRun
+  alias RunicAI.ReviewDecision
   alias RunicAI.RLM.Episode
   alias RunicAI.Terminal.Event
 
@@ -84,6 +86,38 @@ defmodule RunicAI.Persistence.SQLiteTest do
     assert event.id == "event:1"
     assert [%TerminalEvent{id: "event:1"}] = Queries.run_timeline(store, "run:1")
     assert [%TerminalEvent{id: "event:1"}] = Queries.search_events(store, "salience")
+  end
+
+  test "concurrent terminal events retry sequence collisions", %{store: store} do
+    results =
+      1..20
+      |> Task.async_stream(
+        fn index ->
+          SQLite.record_terminal_event(store, %{
+            id: "event:concurrent:#{index}",
+            session_id: "session:concurrent",
+            run_id: "run:concurrent",
+            agent: :rlm,
+            kind: :rlm_node,
+            phase: :node_started,
+            status: :running,
+            title: "Concurrent event #{index}",
+            data_json: %{index: index},
+            at: DateTime.utc_now()
+          })
+        end,
+        max_concurrency: 20,
+        timeout: 10_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, %TerminalEvent{}}, &1))
+
+    events = Queries.run_timeline(store, "run:concurrent")
+    sequences = Enum.map(events, & &1.sequence)
+
+    assert length(events) == 20
+    assert Enum.sort(sequences) == Enum.to_list(1..20)
   end
 
   test "stream chunks project into one accumulating message row", %{store: store} do
@@ -263,6 +297,557 @@ defmodule RunicAI.Persistence.SQLiteTest do
              Queries.scorecards_for_run(store, "run:new")
 
     assert [%TerminalEvent{id: "event:timeline:1"}] = Queries.search_events(store, "source-cue-1")
+  end
+
+  test "objective-loop terminal events are queryable as durable loop state", %{store: store} do
+    at = ~U[2026-05-24 12:00:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-loop:1",
+               session_id: "session:objective-loop",
+               run_id: "run:objective-loop",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective budget approval required",
+               detail: "status: needs_budget_approval, action: request_budget_approval",
+               data_json: %{
+                 run_id: "run:objective-loop",
+                 objective_iteration_count: 2,
+                 objective_session: %{
+                   id: "run:objective-loop",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   iteration_count: 2,
+                   max_iterations: 2,
+                   latest_error: %{
+                     kind: :timeout,
+                     message: "RLM runtime budget exhausted"
+                   },
+                   decision: %{
+                     action: :request_budget_approval,
+                     status: :needs_budget_approval
+                   }
+                 },
+                 objective_decision: %{
+                   action: :request_budget_approval,
+                   status: :needs_budget_approval
+                 },
+                 open_tasks: [
+                   %{id: "compile", title: "mix compile still fails", status: :open}
+                 ],
+                 completed_tasks: [],
+                 budget_requests: [
+                   %{reason: "repair budget exhausted before objective satisfaction"}
+                 ]
+               },
+               at: at
+             })
+
+    assert [%TerminalEvent{phase: "objective_loop"}] =
+             Queries.objective_loop_events(store, "run:objective-loop")
+
+    assert %{
+             action: "request_budget_approval",
+             budget_requests: [
+               %{"reason" => "repair budget exhausted before objective satisfaction"}
+             ],
+             iteration_count: 2,
+             latest_error: %{
+               "kind" => "timeout",
+               "message" => "RLM runtime budget exhausted"
+             },
+             latest_error_kind: "timeout",
+             latest_error_message: "RLM runtime budget exhausted",
+             max_iterations: 2,
+             objective: "Build OpsLogic",
+             open_tasks: [%{"id" => "compile"}],
+             status: "needs_budget_approval",
+             title: "Objective budget approval required"
+           } = Queries.latest_objective_loop_state(store, "run:objective-loop")
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-loop:auto-resume-limit",
+               session_id: "session:objective-loop",
+               run_id: "run:objective-loop",
+               agent: :rlm,
+               kind: :status,
+               phase: :objective_loop_resume,
+               status: :blocked,
+               title: "Objective auto-resume limit reached",
+               detail: "objective still needs budget approval after 1 automatic resumes",
+               data_json: %{
+                 run_id: "run:objective-loop",
+                 objective_session_id: "run:objective-loop",
+                 objective_iteration_count: 2,
+                 objective_session: %{
+                   id: "run:objective-loop",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   iteration_count: 2,
+                   max_iterations: 2,
+                   decision: %{action: :request_budget_approval}
+                 },
+                 objective_session_state: %{
+                   id: "run:objective-loop",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   created_at: at,
+                   updated_at: at,
+                   max_iterations: 2,
+                   iterations: [],
+                   progress_log: [],
+                   completed_tasks: [],
+                   open_tasks: [%{id: "compile", title: "mix compile still fails"}],
+                   review_requests: [],
+                   budget_requests: [%{id: "budget:run:objective-loop:2", status: :pending}],
+                   metadata: %{}
+                 },
+                 objective_decision: %{action: :request_budget_approval},
+                 open_tasks: [%{id: "compile", title: "mix compile still fails"}],
+                 budget_requests: [%{id: "budget:run:objective-loop:2", status: :pending}],
+                 resume_kind: :budget,
+                 resume_key: "budget:run:objective-loop:2",
+                 max_objective_auto_resumes: 1
+               },
+               at: DateTime.add(at, 5, :second)
+             })
+
+    assert [_, %TerminalEvent{phase: "objective_loop_resume"}] =
+             Queries.objective_loop_events(store, "run:objective-loop")
+
+    assert %{
+             action: "request_budget_approval",
+             budget_requests: [%{"id" => "budget:run:objective-loop:2"}],
+             objective: "Build OpsLogic",
+             status: "needs_budget_approval",
+             title: "Objective auto-resume limit reached"
+           } = Queries.latest_objective_loop_state(store, "run:objective-loop")
+
+    assert objective_session = Queries.latest_objective_session(store, "run:objective-loop")
+    assert objective_session.status == :needs_budget_approval
+    assert [%{"id" => "compile"}] = objective_session.open_tasks
+
+    assert Enum.any?(Queries.review_requests(store, "run:objective-loop"), fn review ->
+             review.id == "budget:run:objective-loop:2" and
+               review.kind == "objective_budget_approval" and
+               review.status == "pending" and
+               review.resume_key == "budget:run:objective-loop:2"
+           end)
+  end
+
+  test "objective-loop progress events are reloadable durable loop state", %{store: store} do
+    at = ~U[2026-05-24 12:03:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-progress:1",
+               session_id: "session:objective-progress",
+               run_id: "run:objective-progress",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop_progress,
+               status: :review,
+               title: "Objective iteration errored",
+               detail: "status: needs_budget_approval, action: request_budget_approval",
+               data_json: %{
+                 stage: :objective_loop,
+                 event: :iteration_error,
+                 status: :needs_budget_approval,
+                 action: :request_budget_approval,
+                 objective_session_id: "run:objective-progress",
+                 objective: "Build OpsLogic",
+                 current_iteration: 1,
+                 iteration_count: 1,
+                 max_iterations: 3,
+                 objective_session: %{
+                   id: "run:objective-progress",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   iteration_count: 1,
+                   max_iterations: 3,
+                   latest_error: %{kind: :timeout, message: "RLM runtime budget exhausted"}
+                 },
+                 objective_session_state: %{
+                   id: "run:objective-progress",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   created_at: at,
+                   updated_at: at,
+                   max_iterations: 3,
+                   iterations: [%{iteration: 1, status: :needs_budget_approval}],
+                   progress_log: [],
+                   completed_tasks: [],
+                   open_tasks: [%{id: "implementation", title: "Implement OpsLogic"}],
+                   review_requests: [],
+                   budget_requests: [
+                     %{
+                       id: "budget:run:objective-progress:1",
+                       resume_key: "budget:run:objective-progress:1",
+                       status: :pending,
+                       reason: "runtime budget exhausted during active workflow execution"
+                     }
+                   ],
+                   latest_error: %{kind: :timeout, message: "RLM runtime budget exhausted"},
+                   metadata: %{}
+                 },
+                 open_tasks: [%{id: "implementation", title: "Implement OpsLogic"}],
+                 budget_requests: [
+                   %{
+                     id: "budget:run:objective-progress:1",
+                     resume_key: "budget:run:objective-progress:1",
+                     status: :pending,
+                     reason: "runtime budget exhausted during active workflow execution"
+                   }
+                 ]
+               },
+               at: at
+             })
+
+    assert [%TerminalEvent{phase: "objective_loop_progress"}] =
+             Queries.objective_loop_events(store, "run:objective-progress")
+
+    assert %{
+             action: "request_budget_approval",
+             latest_error_kind: "timeout",
+             latest_error_message: "RLM runtime budget exhausted",
+             pending_budget_requests: [%{"id" => "budget:run:objective-progress:1"}],
+             status: "needs_budget_approval",
+             title: "Objective iteration errored"
+           } = Queries.latest_objective_loop_state(store, "run:objective-progress")
+
+    assert objective_session = Queries.latest_objective_session(store, "run:objective-progress")
+    assert objective_session.status == :needs_budget_approval
+    assert [%{"id" => "implementation"}] = objective_session.open_tasks
+
+    assert [
+             %ReviewRequest{
+               id: "budget:run:objective-progress:1",
+               kind: "objective_budget_approval",
+               status: "pending",
+               resume_key: "budget:run:objective-progress:1"
+             }
+           ] = Queries.review_requests(store, "run:objective-progress")
+  end
+
+  test "objective-loop approval requests project from serialized session state", %{store: store} do
+    at = ~U[2026-05-24 12:04:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-state-review",
+               session_id: "session:objective-state-review",
+               run_id: "run:objective-state-review",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective review approval required",
+               detail: "status: needs_review_approval",
+               data_json: %{
+                 run_id: "run:objective-state-review",
+                 objective_session: %{
+                   id: "run:objective-state-review",
+                   objective: "Plan OpsLogic",
+                   status: :needs_review_approval,
+                   decision: %{action: :request_review_approval}
+                 },
+                 objective_session_state: %{
+                   id: "run:objective-state-review",
+                   objective: "Plan OpsLogic",
+                   status: :needs_review_approval,
+                   created_at: at,
+                   updated_at: at,
+                   max_iterations: 2,
+                   iterations: [%{iteration: 1, status: :needs_review_approval}],
+                   progress_log: [],
+                   completed_tasks: [],
+                   open_tasks: [],
+                   review_requests: [
+                     %{
+                       kind: :objective_plan_approval,
+                       resume_key: "review:state-only:plan",
+                       checkpoint: :plan_review,
+                       status: :pending
+                     }
+                   ],
+                   budget_requests: [],
+                   metadata: %{}
+                 }
+               },
+               at: at
+             })
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-state-budget",
+               session_id: "session:objective-state-budget",
+               run_id: "run:objective-state-budget",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop_progress,
+               status: :review,
+               title: "Objective budget approval required",
+               detail: "status: needs_budget_approval",
+               data_json: %{
+                 stage: :objective_loop,
+                 event: :iteration_completed,
+                 objective_session_id: "run:objective-state-budget",
+                 objective_session_state: %{
+                   id: "run:objective-state-budget",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   created_at: at,
+                   updated_at: at,
+                   max_iterations: 1,
+                   iterations: [%{iteration: 1, status: :needs_budget_approval}],
+                   progress_log: [],
+                   completed_tasks: [],
+                   open_tasks: [%{id: "implementation", title: "Implement OpsLogic"}],
+                   review_requests: [],
+                   budget_requests: [
+                     %{
+                       id: "budget:state-only:1",
+                       resume_key: "budget:state-only:1",
+                       reason: "runtime budget exhausted during active workflow execution",
+                       status: :pending
+                     }
+                   ],
+                   metadata: %{}
+                 }
+               },
+               at: DateTime.add(at, 1, :second)
+             })
+
+    assert %{
+             action: "request_review_approval",
+             pending_review_requests: [%{"resume_key" => "review:state-only:plan"}],
+             status: "needs_review_approval"
+           } = Queries.latest_objective_loop_state(store, "run:objective-state-review")
+
+    assert [
+             %ReviewRequest{
+               id: "review:state-only:plan",
+               kind: "objective_plan_approval",
+               status: "pending",
+               resume_key: "review:state-only:plan"
+             }
+           ] = Queries.review_requests(store, "run:objective-state-review")
+
+    assert %{
+             action: "request_budget_approval",
+             pending_budget_requests: [%{"id" => "budget:state-only:1"}],
+             status: "needs_budget_approval"
+           } = Queries.latest_objective_loop_state(store, "run:objective-state-budget")
+
+    assert [
+             %ReviewRequest{
+               id: "budget:state-only:1",
+               kind: "objective_budget_approval",
+               status: "pending",
+               resume_key: "budget:state-only:1"
+             }
+           ] = Queries.review_requests(store, "run:objective-state-budget")
+  end
+
+  test "objective-loop review requests are queryable as durable loop state", %{store: store} do
+    at = ~U[2026-05-24 12:05:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-loop:review",
+               session_id: "session:objective-review",
+               run_id: "run:objective-review",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective review approval required",
+               detail: "status: needs_review_approval, action: request_review_approval",
+               data_json: %{
+                 run_id: "run:objective-review",
+                 objective_iteration_count: 1,
+                 objective_session: %{
+                   id: "run:objective-review",
+                   objective: "Plan OpsLogic",
+                   status: :needs_review_approval,
+                   iteration_count: 1,
+                   max_iterations: 2,
+                   latest_review_request: %{
+                     kind: :objective_plan_approval,
+                     resume_key: "review:opslogic:plan",
+                     checkpoint: :plan_review
+                   },
+                   decision: %{
+                     action: :request_review_approval,
+                     status: :needs_review_approval
+                   }
+                 },
+                 objective_decision: %{
+                   action: :request_review_approval,
+                   status: :needs_review_approval
+                 },
+                 objective_session_state: %{
+                   id: "run:objective-review",
+                   objective: "Plan OpsLogic",
+                   status: :needs_review_approval,
+                   created_at: at,
+                   updated_at: at,
+                   max_iterations: 2,
+                   iterations: [
+                     %{
+                       iteration: 1,
+                       status: :needs_review_approval,
+                       review_request: %{
+                         kind: :objective_plan_approval,
+                         resume_key: "review:opslogic:plan",
+                         checkpoint: :plan_review
+                       }
+                     }
+                   ],
+                   progress_log: [],
+                   completed_tasks: [],
+                   open_tasks: [],
+                   review_requests: [
+                     %{
+                       kind: :objective_plan_approval,
+                       resume_key: "review:opslogic:plan",
+                       checkpoint: :plan_review
+                     }
+                   ],
+                   budget_requests: [],
+                   metadata: %{plan_path: "tmp/ops_logic/PLAN.md"}
+                 },
+                 review_requests: [
+                   %{
+                     kind: :objective_plan_approval,
+                     resume_key: "review:opslogic:plan",
+                     checkpoint: :plan_review
+                   }
+                 ]
+               },
+               at: at
+             })
+
+    assert %{
+             action: "request_review_approval",
+             latest_review_request: %{"resume_key" => "review:opslogic:plan"},
+             review_requests: [%{"checkpoint" => "plan_review"}],
+             status: "needs_review_approval",
+             title: "Objective review approval required"
+           } = Queries.latest_objective_loop_state(store, "run:objective-review")
+
+    assert objective_session = Queries.latest_objective_session(store, "run:objective-review")
+    assert objective_session.status == :needs_review_approval
+    assert objective_session.metadata == %{"plan_path" => "tmp/ops_logic/PLAN.md"}
+    assert [%{"resume_key" => "review:opslogic:plan"}] = objective_session.review_requests
+    assert [%{"iteration" => 1}] = objective_session.iterations
+
+    runner = fn _workspace, objective, opts ->
+      assert Keyword.fetch!(opts, :objective_iteration) == 2
+      assert objective =~ "Continue the objective after operator approval"
+
+      {:ok,
+       %{
+         objective_scorecard: %{objective_status: :objective_satisfied},
+         context: %{changed_files: ["tmp/ops_logic/mix.exs"]}
+       }}
+    end
+
+    assert {:ok, resumed} =
+             ObjectiveLoop.resume_after_review(
+               :workspace,
+               objective_session,
+               ReviewDecision.new!("review:opslogic:plan", :approved),
+               runner: runner
+             )
+
+    assert resumed.decision.action == :complete
+    assert resumed.session.status == :objective_satisfied
+    assert length(resumed.session.iterations) == 2
+  end
+
+  test "objective-loop resolved request summaries update durable review rows", %{store: store} do
+    at = ~U[2026-05-24 12:10:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-loop:budget-pending",
+               session_id: "session:objective-budget",
+               run_id: "run:objective-budget",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective budget approval required",
+               detail: "status: needs_budget_approval",
+               data_json: %{
+                 run_id: "run:objective-budget",
+                 objective_session: %{
+                   id: "run:objective-budget",
+                   objective: "Build OpsLogic",
+                   status: :needs_budget_approval,
+                   decision: %{action: :request_budget_approval}
+                 },
+                 objective_decision: %{action: :request_budget_approval},
+                 budget_requests: [
+                   %{
+                     id: "budget:run:objective-budget:1",
+                     resume_key: "budget:run:objective-budget:1",
+                     reason: "repair budget exhausted",
+                     status: :pending
+                   }
+                 ]
+               },
+               at: at
+             })
+
+    assert [%ReviewRequest{id: "budget:run:objective-budget:1", status: "pending"}] =
+             Queries.review_requests(store, "run:objective-budget")
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:objective-loop:budget-complete",
+               session_id: "session:objective-budget",
+               run_id: "run:objective-budget",
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :ok,
+               title: "Objective satisfied",
+               detail: "status: objective_satisfied",
+               data_json: %{
+                 run_id: "run:objective-budget",
+                 objective_session: %{
+                   id: "run:objective-budget",
+                   objective: "Build OpsLogic",
+                   status: :objective_satisfied,
+                   decision: %{action: :complete}
+                 },
+                 objective_decision: %{action: :complete},
+                 budget_requests: [
+                   %{
+                     id: "budget:run:objective-budget:1",
+                     resume_key: "budget:run:objective-budget:1",
+                     reason: "repair budget exhausted",
+                     status: :approved,
+                     decision: %{resume_key: "budget:run:objective-budget:1", status: :approved}
+                   }
+                 ]
+               },
+               at: DateTime.add(at, 5, :second)
+             })
+
+    assert [
+             %ReviewRequest{
+               id: "budget:run:objective-budget:1",
+               status: "approved",
+               decision_json: %{"status" => "approved"}
+             }
+           ] = Queries.review_requests(store, "run:objective-budget")
   end
 
   test "terminal events project first-class harness rows and export JSONL", %{store: store} do

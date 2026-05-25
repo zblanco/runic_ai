@@ -13,6 +13,7 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
   alias RunicAI.RLM.Components.ObjectiveScorecard
   alias RunicAI.RLM.Components.RecordGroup
   alias RunicAI.RLM.Components.ReportComposer
+  alias RunicAI.RLM.Components.SafeCompute
   alias RunicAI.RLM.Components.SourceDiscovery
   alias RunicAI.RLM.Components.SourceMaterializer
   alias RunicAI.RLM.Components.SourceSplitter
@@ -271,6 +272,55 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
 
     assert grouped.group_count == 2
     assert Enum.find(grouped.groups, &(&1.key == "login")).count == 2
+  end
+
+  test "safe compute components parse rank group render and shift without arbitrary code" do
+    jsonl = """
+    {"ticket":"T1","theme":"login","severity":"high"}
+    {"ticket":"T2","theme":"billing","severity":"medium"}
+    {"ticket":"T3","theme":"login","severity":"high"}
+    """
+
+    assert {:ok, parsed} = SafeCompute.run(:json_compute, jsonl, %{op: :records_from_jsonl})
+    assert parsed.count == 3
+
+    assert {:ok, ranked} =
+             SafeCompute.run(:score_compute, parsed, %{
+               op: :rank_records,
+               criteria: [
+                 %{path: "severity", equals: "high", weight: 5},
+                 %{path: "theme", contains: "login", weight: 2}
+               ]
+             })
+
+    assert [%{"rank" => 1, "score" => 7.0, "ticket" => "T1"} | _] = ranked.records
+
+    assert {:ok, grouped} =
+             SafeCompute.run(:collection_compute, ranked, %{
+               op: :group,
+               group_by: "severity"
+             })
+
+    assert Enum.find(grouped.groups, &(&1.key == "high")).count == 2
+
+    assert {:ok, rendered} =
+             SafeCompute.run(:string_compute, %{}, %{
+               op: :template_render,
+               template: "Top ticket {{ticket}} scored {{score}}",
+               data: hd(ranked.records)
+             })
+
+    assert rendered.text == "Top ticket T1 scored 7.0"
+
+    assert {:ok, shifted} =
+             SafeCompute.run(:time_compute, %{}, %{
+               op: :shift,
+               value: "2026-05-22",
+               unit: "day",
+               amount: 2
+             })
+
+    assert shifted.value == "2026-05-24T00:00:00Z"
   end
 
   test "record group preserves ticket_id records with fallback identity keys" do

@@ -9,6 +9,7 @@ defmodule RunicAI.Terminal.RunnerTest do
   alias RunicAI.LLM.TestClient
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
+  alias RunicAI.ReviewRequest
   alias RunicAI.RLM.Episode
   alias RunicAI.Terminal.AgentRunner
   alias RunicAI.Terminal.AssistantRunner
@@ -100,17 +101,222 @@ defmodule RunicAI.Terminal.RunnerTest do
     assert Enum.all?(emitted, &(event_run_id(&1) == "terminal-rlm-run"))
   end
 
+  test "RLM runner objective loop continues and emits objective summary events" do
+    root = tmp_dir()
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+    caller = self()
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:objective_loop_iteration, iteration, objective})
+
+      case iteration do
+        1 ->
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_incomplete},
+             context: %{
+               repair_needs: [
+                 %{id: "tests", reason: "meaningful tests missing", target: "test_project"}
+               ]
+             }
+           }}
+
+        2 ->
+          {:ok, rlm_result()}
+      end
+    end
+
+    assert {:ok, result} =
+             RLMRunner.run("Build OpsLogic",
+               cwd: root,
+               session_id: "terminal-rlm-objective-session",
+               run_id: "terminal-rlm-objective-run",
+               objective_loop?: true,
+               max_objective_iterations: 3,
+               run_fun: run_fun,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    assert result.status == :ok
+    assert result.objective_session.status == :objective_satisfied
+    assert result.objective_decision.action == :complete
+    assert_receive {:objective_loop_iteration, 1, "Build OpsLogic"}
+    assert_receive {:objective_loop_iteration, 2, repair_objective}
+    assert repair_objective =~ "meaningful tests missing"
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop_progress and
+                 &1.title == "Objective iteration started" and
+                 json_field(&1.data, :current_iteration) == 1)
+           )
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop_progress and
+                 &1.title == "Objective iteration completed" and
+                 json_field(&1.data, :current_iteration) == 2 and
+                 objective_progress_session_status(&1) in [
+                   :objective_satisfied,
+                   "objective_satisfied"
+                 ])
+           )
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop and &1.title == "Objective satisfied")
+           )
+
+    assert Enum.any?(emitted, &(&1.phase == :scorecard and &1.status == :ok))
+  end
+
+  test "RLM runner objective loop reports budget approval status" do
+    root = tmp_dir()
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    run_fun = fn _cwd, _objective, _opts ->
+      {:ok,
+       %{
+         repair_status: :exhausted,
+         objective_scorecard: %{objective_status: :objective_incomplete},
+         context: %{
+           repair_needs: [
+             %{id: "compile", reason: "mix compile still fails", target: "compile_project"}
+           ]
+         }
+       }}
+    end
+
+    assert {:ok, result} =
+             RLMRunner.run("Build OpsLogic",
+               cwd: root,
+               objective_loop?: true,
+               max_objective_iterations: 3,
+               run_fun: run_fun,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    assert result.status == :needs_budget_approval
+    assert result.objective_decision.action == :request_budget_approval
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop and &1.status == :review and
+                 &1.title == "Objective budget approval required")
+           )
+  end
+
+  test "RLM runner objective loop summary includes latest error detail" do
+    root = tmp_dir()
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    run_fun = fn _cwd, _objective, _opts ->
+      {:error, Error.timeout("RLM runtime budget exhausted", details: %{stage: :repair})}
+    end
+
+    assert {:ok, result} =
+             RLMRunner.run("Build OpsLogic",
+               cwd: root,
+               objective_loop?: true,
+               max_objective_iterations: 3,
+               run_fun: run_fun,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    assert result.status == :needs_budget_approval
+    assert result.objective_session.latest_error.kind == :timeout
+    assert result.objective_decision.action == :request_budget_approval
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop and
+                 &1.title == "Objective budget approval required" and
+                 &1.detail =~ "error: timeout: RLM runtime budget exhausted")
+           )
+  end
+
+  test "RLM runner objective loop reports review approval status" do
+    root = tmp_dir()
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+
+    request =
+      ReviewRequest.new!(:objective_plan_approval,
+        checkpoint: :plan_review,
+        resume_key: "review:terminal:plan",
+        details: %{path: "tmp/ops_logic/PLAN.md"}
+      )
+
+    run_fun = fn _cwd, _objective, _opts ->
+      {:ok,
+       %{
+         objective_scorecard: %{objective_status: :objective_satisfied},
+         review_request: request,
+         context: %{changed_files: ["tmp/ops_logic/PLAN.md"]}
+       }}
+    end
+
+    assert {:ok, result} =
+             RLMRunner.run("Plan OpsLogic",
+               cwd: root,
+               objective_loop?: true,
+               max_objective_iterations: 3,
+               run_fun: run_fun,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    assert result.status == :review
+    assert result.objective_session.status == :needs_review_approval
+    assert result.objective_decision.action == :request_review_approval
+    assert result.objective_decision.request.resume_key == "review:terminal:plan"
+
+    emitted = Elixir.Agent.get(events, & &1)
+
+    assert Enum.any?(
+             emitted,
+             &(&1.phase == :objective_loop and &1.status == :review and
+                 &1.title == "Objective review approval required" and
+                 &1.data
+                 |> Map.get(
+                   :objective_session_state,
+                   Map.get(&1.data, "objective_session_state", %{})
+                 )
+                 |> Map.get("status") == "needs_review_approval" and
+                 &1.data
+                 |> Map.get(:review_requests, Map.get(&1.data, "review_requests", []))
+                 |> List.first()
+                 |> Map.get("resume_key") == "review:terminal:plan")
+           )
+  end
+
   test "agent runner renders RLM final report with WorkflowScorecard structs" do
     root = tmp_dir()
     output = []
+    caller = self()
 
-    run_fun = fn _cwd, _objective, _opts -> {:ok, rlm_result()} end
+    run_fun = fn _cwd, _objective, opts ->
+      send(
+        caller,
+        {:rlm_agent_runner_opts, opts[:repair?], opts[:max_repair_iterations],
+         opts[:seed_project_generation?]}
+      )
+
+      {:ok, rlm_result()}
+    end
 
     {:ok, options} =
       CliOptions.parse([
         "Explain Demo",
         "--agent",
         "rlm",
+        "--mode",
+        "patch",
         "--cwd",
         root,
         "--persistence",
@@ -126,6 +332,7 @@ defmodule RunicAI.Terminal.RunnerTest do
              )
 
     assert result.status == :ok
+    assert_receive {:rlm_agent_runner_opts, true, nil, false}
 
     rendered =
       :rlm_report_output
@@ -135,6 +342,499 @@ defmodule RunicAI.Terminal.RunnerTest do
 
     assert rendered =~ "Final report"
     assert rendered =~ "objective_satisfied"
+  end
+
+  test "agent runner passes objective-loop controls into the RLM runner" do
+    root = tmp_dir()
+    caller = self()
+
+    run_fun = fn _cwd, objective, opts ->
+      send(caller, {:agent_runner_objective_iteration, opts[:objective_iteration], objective})
+
+      {:ok,
+       %{
+         objective_scorecard: %{objective_status: :objective_satisfied},
+         context: %{changed_files: ["tmp/ops_logic/PLAN.md"]}
+       }}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "2"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert result.status == :ok
+    assert result.objective_session.status == :objective_satisfied
+    assert_receive {:agent_runner_objective_iteration, 1, "Build OpsLogic"}
+  end
+
+  test "agent runner prompts and resumes RLM objective budget approvals" do
+    root = tmp_dir()
+    caller = self()
+    {:ok, output} = Elixir.Agent.start_link(fn -> [] end)
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:agent_runner_budget_iteration, iteration, objective})
+
+      case iteration do
+        1 ->
+          {:ok,
+           %{
+             repair_status: :exhausted,
+             objective_scorecard: %{objective_status: :objective_incomplete},
+             context: %{
+               repair_needs: [
+                 %{id: "implementation", reason: "implementation still missing"}
+               ]
+             }
+           }}
+
+        2 ->
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_satisfied},
+             context: %{changed_files: ["tmp/ops_logic/lib/ops_logic.ex"]}
+           }}
+      end
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "1",
+        "--approve",
+        "ask"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               input_fun: fn _prompt ->
+                 send(caller, :agent_runner_budget_prompted)
+                 "approve\n"
+               end,
+               output_fun: fn line -> Elixir.Agent.update(output, &(&1 ++ [line])) end
+             )
+
+    assert result.status == :ok
+    assert result.objective_session.status == :objective_satisfied
+    assert result.objective_decision.action == :complete
+
+    assert_receive {:agent_runner_budget_iteration, 1, "Build OpsLogic"}
+    assert_receive {:agent_runner_budget_iteration, 2, resumed_objective}
+    assert resumed_objective =~ "operator budget approval"
+    assert_receive :agent_runner_budget_prompted
+
+    rendered = output |> Elixir.Agent.get(& &1) |> Enum.join("\n")
+    assert rendered =~ "Review required: objective_budget_approval"
+    assert rendered =~ "repair budget exhausted before objective satisfaction"
+    assert rendered =~ "Objective satisfied"
+  end
+
+  test "agent runner stops blocked when terminal objective budget approval is cancelled" do
+    root = tmp_dir()
+    caller = self()
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:agent_runner_budget_cancel_iteration, iteration, objective})
+
+      {:ok,
+       %{
+         repair_status: :exhausted,
+         objective_scorecard: %{objective_status: :objective_incomplete},
+         context: %{
+           repair_needs: [
+             %{id: "implementation", reason: "implementation still missing"}
+           ]
+         }
+       }}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "1",
+        "--approve",
+        "ask"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               input_fun: fn _prompt ->
+                 send(caller, :agent_runner_budget_cancel_prompted)
+                 "stop\n"
+               end,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert result.status == :blocked
+    assert result.objective_session.status == :blocked
+    assert result.objective_decision.action == :stop_blocked
+    assert result.objective_session.max_iterations == 1
+    assert length(result.objective_session.iterations) == 1
+    assert [%{status: :cancelled}] = result.objective_session.budget_requests
+
+    assert_receive {:agent_runner_budget_cancel_iteration, 1, "Build OpsLogic"}
+    refute_receive {:agent_runner_budget_cancel_iteration, 2, _objective}, 100
+    assert_receive :agent_runner_budget_cancel_prompted
+  end
+
+  test "agent runner reports when objective auto-resume approval limit is reached" do
+    root = tmp_dir()
+    jsonl_path = Path.join(root, "auto-resume-limit.jsonl")
+    caller = self()
+    {:ok, output} = Elixir.Agent.start_link(fn -> [] end)
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:agent_runner_limit_iteration, iteration, objective})
+
+      {:ok,
+       %{
+         repair_status: :exhausted,
+         objective_scorecard: %{objective_status: :objective_incomplete},
+         context: %{
+           repair_needs: [
+             %{id: "implementation", reason: "implementation still missing"}
+           ]
+         }
+       }}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "1",
+        "--jsonl",
+        jsonl_path,
+        "--approve",
+        "ask"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               max_objective_auto_resumes: 1,
+               input_fun: fn _prompt ->
+                 send(caller, :agent_runner_limit_prompted)
+                 "approve\n"
+               end,
+               output_fun: fn line -> Elixir.Agent.update(output, &(&1 ++ [line])) end
+             )
+
+    assert result.status == :needs_budget_approval
+    assert result.objective_auto_resume_exhausted?
+    assert result.objective_resume_attempts == 1
+    assert result.objective_resume_limit == 1
+    assert result.objective_resume_kind == :budget
+
+    assert_receive {:agent_runner_limit_iteration, 1, "Build OpsLogic"}
+    assert_receive {:agent_runner_limit_iteration, 2, resumed_objective}
+    assert resumed_objective =~ "operator budget approval"
+    assert_receive :agent_runner_limit_prompted
+    refute_receive :agent_runner_limit_prompted, 100
+
+    rendered = output |> Elixir.Agent.get(& &1) |> Enum.join("\n")
+    assert rendered =~ "Objective auto-resume limit reached"
+    assert rendered =~ "objective resume: limit reached after 1/1 automatic budget resumes"
+
+    events =
+      jsonl_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert Enum.any?(events, fn event ->
+             get_in(event, ["phase"]) == "objective_loop_resume" and
+               get_in(event, ["title"]) == "Objective auto-resume limit reached" and
+               get_in(event, ["data", "objective_session", "status"]) ==
+                 "needs_budget_approval" and
+               get_in(event, ["data", "objective_decision", "action"]) ==
+                 "request_budget_approval" and
+               get_in(event, ["data", "budget_requests"]) != []
+           end)
+
+    assert Enum.any?(events, fn event ->
+             get_in(event, ["phase"]) == "final" and
+               get_in(event, ["data", "result_status"]) == "needs_budget_approval" and
+               get_in(event, ["data", "objective_status"]) == "needs_budget_approval"
+           end)
+  end
+
+  test "agent runner prompts and resumes RLM objective plan approvals" do
+    root = tmp_dir()
+    caller = self()
+    {:ok, output} = Elixir.Agent.start_link(fn -> [] end)
+
+    review_request =
+      ReviewRequest.new!(:objective_plan_approval,
+        checkpoint: :plan_review,
+        resume_key: "review:terminal:opslogic-plan",
+        details: %{path: "tmp/ops_logic/PLAN.md", reason: "OpsLogic plan is ready"}
+      )
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:agent_runner_review_iteration, iteration, objective})
+
+      case iteration do
+        1 ->
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_satisfied},
+             review_request: review_request,
+             context: %{changed_files: ["tmp/ops_logic/PLAN.md"]}
+           }}
+
+        2 ->
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_satisfied},
+             context: %{changed_files: ["tmp/ops_logic/lib/ops_logic.ex"]}
+           }}
+      end
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Plan and build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "3",
+        "--approve",
+        "ask"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               input_fun: fn _prompt ->
+                 send(caller, :agent_runner_review_prompted)
+                 "approve\n"
+               end,
+               output_fun: fn line -> Elixir.Agent.update(output, &(&1 ++ [line])) end
+             )
+
+    assert result.status == :ok
+    assert result.objective_session.status == :objective_satisfied
+    assert result.objective_decision.action == :complete
+
+    assert_receive {:agent_runner_review_iteration, 1, "Plan and build OpsLogic"}
+    assert_receive {:agent_runner_review_iteration, 2, resumed_objective}
+    assert resumed_objective =~ "operator approval"
+    assert_receive :agent_runner_review_prompted
+
+    rendered = output |> Elixir.Agent.get(& &1) |> Enum.join("\n")
+    assert rendered =~ "Review required: objective_plan_approval"
+    assert rendered =~ "OpsLogic plan is ready"
+    assert rendered =~ "Objective satisfied"
+  end
+
+  test "agent runner stops blocked when terminal objective plan approval is denied" do
+    root = tmp_dir()
+    caller = self()
+
+    review_request =
+      ReviewRequest.new!(:objective_plan_approval,
+        checkpoint: :plan_review,
+        resume_key: "review:terminal:opslogic-plan-deny",
+        details: %{path: "tmp/ops_logic/PLAN.md", reason: "OpsLogic plan is ready"}
+      )
+
+    run_fun = fn _cwd, objective, opts ->
+      iteration = Keyword.fetch!(opts, :objective_iteration)
+      send(caller, {:agent_runner_review_deny_iteration, iteration, objective})
+
+      {:ok,
+       %{
+         objective_scorecard: %{objective_status: :objective_satisfied},
+         review_request: review_request,
+         context: %{changed_files: ["tmp/ops_logic/PLAN.md"]}
+       }}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Plan and build OpsLogic",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--objective-loop",
+        "--max-objective-iterations",
+        "3",
+        "--approve",
+        "ask"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               input_fun: fn _prompt ->
+                 send(caller, :agent_runner_review_denied_prompted)
+                 "deny\n"
+               end,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert result.status == :blocked
+    assert result.objective_session.status == :blocked
+    assert result.objective_decision.action == :stop_blocked
+    assert length(result.objective_session.iterations) == 1
+    assert [%{status: :rejected}] = result.objective_session.review_requests
+
+    assert_receive {:agent_runner_review_deny_iteration, 1, "Plan and build OpsLogic"}
+    refute_receive {:agent_runner_review_deny_iteration, 2, _objective}, 100
+    assert_receive :agent_runner_review_denied_prompted
+  end
+
+  test "agent runner persists model/client preflight and passes resolved Codex model" do
+    root = tmp_dir()
+    jsonl_path = Path.join(root, "preflight.jsonl")
+    caller = self()
+
+    run_fun = fn _cwd, _objective, opts ->
+      send(caller, {:resolved_launch, opts[:model], opts[:client_label], opts[:model_resolution]})
+      {:ok, rlm_result()}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Explain Demo",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--client",
+        "codex",
+        "--model",
+        "openai:gpt-5.4-mini",
+        "--jsonl",
+        jsonl_path,
+        "--persistence",
+        "none"
+      ])
+
+    assert {:ok, result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert result.status == :ok
+
+    assert_receive {:resolved_launch, nil, "codex", resolution}
+    assert resolution.decision == "codex_account_default"
+    assert resolution.effective_model == "codex-account-default"
+
+    events =
+      jsonl_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert Enum.any?(
+             events,
+             &(get_in(&1, ["phase"]) == "model_client_preflight" and
+                 get_in(&1, ["data", "model_resolution", "decision"]) ==
+                   "codex_account_default")
+           )
+  end
+
+  test "agent runner requires tool use for explicit standard command objectives" do
+    root = tmp_dir()
+    caller = self()
+
+    client = fn _model, _prompt, opts ->
+      send(caller, {:tool_choice, Keyword.get(opts, :tool_choice)})
+      {:ok, TestClient.result("plain text fallback")}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Run this exact local command: printf runic_ai_required_tool",
+        "--agent",
+        "standard",
+        "--cwd",
+        root,
+        "--profile",
+        "local-workbench",
+        "--persistence",
+        "none"
+      ])
+
+    options = %{options | client: client, model: "test:model"}
+
+    assert {:ok, _result} =
+             AgentRunner.run(options,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert_receive {:tool_choice, :required}
   end
 
   test "assistant runner renders live stage events and final artifacts from a run function" do
@@ -376,6 +1076,20 @@ defmodule RunicAI.Terminal.RunnerTest do
   end
 
   defp event_run_id(event), do: event.data["run_id"] || event.data[:run_id]
+
+  defp json_field(map, key, default \\ nil)
+
+  defp json_field(map, key, default) when is_map(map) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  end
+
+  defp json_field(_map, _key, default), do: default
+
+  defp objective_progress_session_status(event) do
+    event.data
+    |> json_field(:objective_session, %{})
+    |> json_field(:status)
+  end
 
   defp assistant_result do
     blueprint =

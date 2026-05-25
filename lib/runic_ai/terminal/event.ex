@@ -549,6 +549,8 @@ defmodule RunicAI.Terminal.Event do
             status = final_output_status(result)
             artifact_paths = artifact_paths(result)
             artifact_outcome = artifact_outcome(result, artifact_paths)
+            objective_contract = objective_contract(result)
+            blocked_evidence = blocked_evidence(result, status)
 
             new!(:message,
               session_id: Keyword.get(opts, :session_id),
@@ -568,6 +570,10 @@ defmodule RunicAI.Terminal.Event do
                   blocking_reason: blocking_reason(result),
                   artifact_paths: artifact_paths
                 }
+                |> maybe_put(:objective_contract, objective_contract)
+                |> maybe_put(:repair_needs, repair_needs(result))
+                |> maybe_put(:blocked_evidence, blocked_evidence)
+                |> maybe_put(:next_actions, next_actions(result, status, blocked_evidence))
                 |> maybe_put(:artifact_outcome, artifact_outcome),
               raw: result
             )
@@ -585,11 +591,7 @@ defmodule RunicAI.Terminal.Event do
         :ok
 
       scorecard ->
-        if field(scorecard, :objective_status) in [:objective_incomplete, "objective_incomplete"] do
-          :blocked
-        else
-          :ok
-        end
+        if objective_satisfied?(scorecard), do: :ok, else: :blocked
     end
   end
 
@@ -612,6 +614,146 @@ defmodule RunicAI.Terminal.Event do
     end
   end
 
+  defp objective_satisfied?(scorecard),
+    do: field(scorecard, :objective_status) in [:objective_satisfied, "objective_satisfied"]
+
+  defp objective_contract(result) do
+    field(result, :objective_contract) ||
+      result |> field(:context) |> field(:objective_contract) ||
+      result |> field(:proposal) |> field(:metadata) |> field(:objective_contract) ||
+      scorecard(result) |> field(:metadata) |> field(:objective_contract)
+  end
+
+  defp repair_needs(result) do
+    result
+    |> field(:context)
+    |> field(:repair_needs)
+    |> List.wrap()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp blocked_evidence(_result, status) when status != :blocked, do: nil
+
+  defp blocked_evidence(result, :blocked) do
+    context = field(result, :context) || %{}
+    timeout = field(context, :runtime_timeout) || %{}
+    current_event = field(context, :last_event) || field(context, :current_event)
+    current_node = current_node(current_event) || current_node_from_trace(result)
+    needs = repair_needs(result)
+    scorecard = scorecard(result)
+
+    %{
+      status: field(result, :status) || :blocked,
+      objective_status: field(scorecard, :objective_status),
+      current_node: current_node,
+      current_child: current_child(current_event),
+      elapsed_ms: first_present(field(timeout, :elapsed_ms), field(timeout, :elapsed)),
+      max_runtime_ms: first_present(field(timeout, :max_runtime_ms), field(timeout, :timeout_ms)),
+      remaining_ms: field(timeout, :remaining_ms),
+      latest_progress: current_event,
+      runtime_timeout: timeout,
+      repair_needs: needs,
+      residual_risks:
+        scorecard |> field(:residual_risks) |> List.wrap() |> Enum.reject(&is_nil/1),
+      unsatisfied_acceptance:
+        scorecard |> field(:acceptance_results) |> unsatisfied_acceptance_results(),
+      objective_contract: objective_contract(result)
+    }
+    |> compact_map()
+  end
+
+  defp current_node(event) do
+    data = field(event, :data) || %{}
+
+    field(data, :node_id) ||
+      field(data, :node) ||
+      field(data, :current_node) ||
+      field(event, :node_id) ||
+      field(event, :node)
+  end
+
+  defp current_child(event) do
+    data = field(event, :data) || %{}
+
+    field(data, :child_id) ||
+      field(data, :child_agent_id) ||
+      field(data, :subagent_id) ||
+      field(data, :current_child)
+  end
+
+  defp current_node_from_trace(result) do
+    result
+    |> field(:trace)
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.find_value(fn event ->
+      status = field(event, :status)
+
+      if status in [:blocked, "blocked", :error, "error", :failed, "failed"] do
+        field(event, :node_id) || field(event, :node)
+      end
+    end)
+  end
+
+  defp unsatisfied_acceptance_results(results) do
+    results
+    |> List.wrap()
+    |> Enum.filter(fn result ->
+      field(result, :status) in [:fail, "fail", :blocked, "blocked", :timeout, "timeout"]
+    end)
+  end
+
+  defp next_actions(_result, status, _blocked_evidence) when status != :blocked, do: nil
+
+  defp next_actions(result, :blocked, blocked_evidence) do
+    risks =
+      result
+      |> scorecard()
+      |> field(:residual_risks)
+      |> List.wrap()
+      |> Enum.reject(&is_nil/1)
+
+    needs = repair_needs(result)
+    current_node = field(blocked_evidence || %{}, :current_node)
+
+    []
+    |> maybe_next_action(
+      is_binary(current_node) and current_node != "",
+      "Inspect the blocked RLM node `#{current_node}` and its latest progress evidence."
+    )
+    |> maybe_next_action(
+      needs != [],
+      "Run a repair workflow targeted at the recorded repair needs."
+    )
+    |> maybe_next_action(
+      risks != [],
+      "Address unsatisfied acceptance evidence: #{risks |> Enum.take(3) |> Enum.join("; ")}."
+    )
+    |> case do
+      [] -> ["Inspect blocked evidence and continue with a narrower repair or larger budget."]
+      actions -> actions
+    end
+  end
+
+  defp maybe_next_action(actions, true, action), do: actions ++ [action]
+  defp maybe_next_action(actions, false, _action), do: actions
+
+  defp first_present(nil, fallback), do: fallback
+  defp first_present("", fallback), do: fallback
+  defp first_present(value, _fallback), do: value
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> blank_value?(value) end)
+    |> Map.new()
+  end
+
+  defp blank_value?(nil), do: true
+  defp blank_value?(""), do: true
+  defp blank_value?([]), do: true
+  defp blank_value?(map) when is_map(map), do: map_size(map) == 0
+  defp blank_value?(_value), do: false
+
   defp rlm_scorecard_event(result, opts) do
     case scorecard(result) do
       nil ->
@@ -621,18 +763,22 @@ defmodule RunicAI.Terminal.Event do
         agent = Keyword.get(opts, :agent, :rlm)
         objective_status = field(scorecard, :objective_status)
 
+        status = if(objective_satisfied?(scorecard), do: :ok, else: :blocked)
+        blocked_evidence = blocked_evidence(result, status)
+
         new!(:summary,
           session_id: Keyword.get(opts, :session_id),
           agent: agent,
           phase: :scorecard,
-          status:
-            if(objective_status in [:objective_satisfied, "objective_satisfied"],
-              do: :ok,
-              else: :blocked
-            ),
+          status: status,
           title: "#{rlm_label(agent)} objective #{objective_status}",
           detail: scorecard_detail(scorecard),
-          data: %{scorecard: scorecard},
+          data:
+            %{scorecard: scorecard}
+            |> maybe_put(:objective_contract, objective_contract(result))
+            |> maybe_put(:repair_needs, repair_needs(result))
+            |> maybe_put(:blocked_evidence, blocked_evidence)
+            |> maybe_put(:next_actions, next_actions(result, status, blocked_evidence)),
           raw: scorecard
         )
     end
@@ -741,10 +887,46 @@ defmodule RunicAI.Terminal.Event do
       episode_output_text(result),
       text_candidate(field(result, :repair_history)),
       text_candidate(field(result, :repair_attempts)),
-      text_candidate(field(result, :artifacts))
+      text_candidate(field(result, :artifacts)),
+      scorecard_output_text(result)
     ]
     |> Enum.find(&present_text?/1)
   end
+
+  defp scorecard_output_text(result) do
+    case scorecard(result) do
+      nil ->
+        nil
+
+      scorecard ->
+        changed_files = field(scorecard, :changed_files) || []
+        residual_risks = field(scorecard, :residual_risks) || []
+
+        [
+          "RLM completed.",
+          "",
+          "Objective status: #{field(scorecard, :objective_status) || field(result, :status) || "unknown"}",
+          list_section("Changed files", changed_files),
+          list_section("Residual risks", residual_risks),
+          maybe_report_line("Persistence", field(result, :persistence_ref))
+        ]
+        |> List.flatten()
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join("\n")
+    end
+  end
+
+  defp list_section(_label, []), do: nil
+
+  defp list_section(label, values) when is_list(values) do
+    [label <> ":" | Enum.map(values, &"- #{&1}")]
+  end
+
+  defp list_section(_label, _value), do: nil
+
+  defp maybe_report_line(_label, nil), do: nil
+  defp maybe_report_line(_label, ""), do: nil
+  defp maybe_report_line(label, value), do: "#{label}: #{value}"
 
   defp episode_output_text(result) do
     result

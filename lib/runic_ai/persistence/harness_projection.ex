@@ -50,6 +50,7 @@ defmodule RunicAI.Persistence.HarnessProjection do
     ensure_session!(store, event)
     ensure_workflow_run!(store, event)
     project_event_kind!(store, event)
+    maybe_insert_objective_loop_review_requests!(store, event)
     :ok
   end
 
@@ -74,7 +75,8 @@ defmodule RunicAI.Persistence.HarnessProjection do
         run_id: event.run_id,
         approval: data_field(event, :approve),
         mode: data_field(event, :mode),
-        client: data_field(event, :client)
+        client: data_field(event, :client),
+        capability_profile: data_field(event, :capability_profile)
       }
     }
 
@@ -383,6 +385,154 @@ defmodule RunicAI.Persistence.HarnessProjection do
     }
 
     upsert_by_id!(store, ReviewRequest, attrs.id, attrs, [:details_json, :decision_json])
+  end
+
+  defp maybe_insert_objective_loop_review_requests!(
+         %Store{} = store,
+         %TerminalEvent{phase: "objective_loop"} = event
+       ) do
+    insert_objective_loop_review_requests!(store, event)
+  end
+
+  defp maybe_insert_objective_loop_review_requests!(
+         %Store{} = store,
+         %TerminalEvent{phase: "objective_loop_progress"} = event
+       ) do
+    insert_objective_loop_review_requests!(store, event)
+  end
+
+  defp maybe_insert_objective_loop_review_requests!(
+         %Store{} = store,
+         %TerminalEvent{
+           phase: "objective_loop_resume",
+           title: "Objective auto-resume limit reached"
+         } = event
+       ) do
+    insert_objective_loop_review_requests!(store, event)
+  end
+
+  defp maybe_insert_objective_loop_review_requests!(_store, _event), do: :ok
+
+  defp insert_objective_loop_review_requests!(%Store{} = store, %TerminalEvent{} = event) do
+    event
+    |> objective_loop_operator_requests()
+    |> Enum.each(fn request ->
+      attrs = %{
+        id: field(request, :resume_key) || field(request, :id) || "review:#{event.id}",
+        session_id: event.session_id,
+        workflow_run_id: event.run_id,
+        tool_call_id: nil,
+        kind: field(request, :kind) || "objective_review",
+        checkpoint: field(request, :checkpoint),
+        resume_key: field(request, :resume_key) || field(request, :id),
+        status: objective_request_status(request),
+        details_json: objective_review_details(event, request),
+        decision_json: field(request, :decision) || %{}
+      }
+
+      upsert_by_id!(store, ReviewRequest, attrs.id, attrs, [:details_json, :decision_json])
+    end)
+  end
+
+  defp objective_loop_operator_requests(%TerminalEvent{} = event) do
+    session = field(event.data_json, :objective_session) || %{}
+    state = field(event.data_json, :objective_session_state) || %{}
+
+    decision =
+      field(event.data_json, :objective_decision) ||
+        field(session, :decision) ||
+        %{
+          action: field(event.data_json, :action),
+          status:
+            field(event.data_json, :status) ||
+              field(session, :status) ||
+              field(state, :status)
+        }
+
+    review_requests = objective_loop_review_requests(event)
+    budget_requests = objective_loop_budget_requests(event)
+
+    requested =
+      cond do
+        field(decision, :action) in ["request_review_approval", :request_review_approval] or
+            field(decision, :status) in ["needs_review_approval", :needs_review_approval] ->
+          review_requests
+
+        field(decision, :action) in ["request_budget_approval", :request_budget_approval] or
+            field(decision, :status) in ["needs_budget_approval", :needs_budget_approval] ->
+          budget_requests
+
+        true ->
+          []
+      end
+
+    resolved = Enum.filter(review_requests ++ budget_requests, &resolved_objective_request?/1)
+
+    requested
+    |> Kernel.++(resolved)
+    |> Enum.uniq_by(&(field(&1, :resume_key) || field(&1, :id) || inspect(&1)))
+  end
+
+  defp objective_loop_review_requests(%TerminalEvent{} = event) do
+    data = event.data_json || %{}
+    session = field(data, :objective_session) || %{}
+    state = field(data, :objective_session_state) || %{}
+
+    (field(data, :review_requests) || field(session, :review_requests) ||
+       field(state, :review_requests))
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+  end
+
+  defp objective_loop_budget_requests(%TerminalEvent{} = event) do
+    data = event.data_json || %{}
+    session = field(data, :objective_session) || %{}
+    state = field(data, :objective_session_state) || %{}
+
+    (field(data, :budget_requests) || field(session, :budget_requests) ||
+       field(state, :budget_requests))
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.map(&Map.put_new(&1, "kind", "objective_budget_approval"))
+  end
+
+  defp resolved_objective_request?(request) do
+    field(request, :status) in [
+      "approved",
+      :approved,
+      "edited",
+      :edited,
+      "rejected",
+      :rejected,
+      "denied",
+      :denied,
+      "cancelled",
+      :cancelled
+    ]
+  end
+
+  defp objective_request_status(request) do
+    case field(request, :status) do
+      status when status in ["approved", :approved, "edited", :edited] -> "approved"
+      status when status in ["rejected", :rejected, "denied", :denied] -> "denied"
+      status when status in ["cancelled", :cancelled] -> "cancelled"
+      _other -> "pending"
+    end
+  end
+
+  defp objective_review_details(%TerminalEvent{} = event, request) do
+    request
+    |> field(:details)
+    |> case do
+      details when is_map(details) -> details
+      _other -> %{}
+    end
+    |> Map.merge(%{
+      "objective_loop?" => true,
+      "objective_session_id" => get_in(event.data_json || %{}, ["objective_session", "id"]),
+      "objective_status" => get_in(event.data_json || %{}, ["objective_session", "status"]),
+      "review_request" => request
+    })
   end
 
   defp insert_subagent_run!(%Store{} = store, %TerminalEvent{} = event) do
@@ -753,6 +903,7 @@ defmodule RunicAI.Persistence.HarnessProjection do
     |> maybe_put(:objective, data_field(event, :objective))
     |> maybe_put(:model, data_field(event, :model))
     |> maybe_put(:workspace, data_field(event, :workspace) || data_field(event, :cwd))
+    |> maybe_put(:capability_profile, data_field(event, :capability_profile))
     |> maybe_put(:graph_summary, graph_summary(event))
     |> maybe_put(
       :blueprint,

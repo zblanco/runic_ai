@@ -7,6 +7,8 @@ defmodule RunicAI.Terminal.ExRatatui.Options do
   The persistence defaults are shared: local harness usage defaults to SQLite.
   """
 
+  alias RunicAI.Agent.ModelClientResolver
+  alias RunicAI.Coding.Codex.Client, as: CodexClient
   alias RunicAI.Error
   alias RunicAI.Terminal.CliOptions
 
@@ -22,7 +24,10 @@ defmodule RunicAI.Terminal.ExRatatui.Options do
     :sqlite_path,
     :run_id,
     :model,
+    :requested_model,
+    :model_resolution,
     :client,
+    :client_label,
     :session_id,
     :ssh_port,
     :ssh_password,
@@ -73,6 +78,14 @@ defmodule RunicAI.Terminal.ExRatatui.Options do
          {:ok, mode} <- normalize_choice(Keyword.get(opts, :mode, "verify"), @modes, :mode),
          {:ok, theme} <- normalize_choice(theme_arg(opts), @themes, :theme),
          {:ok, graph} <- normalize_choice(Keyword.get(opts, :graph, "text"), @graph_modes, :graph),
+         {:ok, client_label} <- normalize_client_label(Keyword.get(opts, :client)),
+         {:ok, resolved_launch, model_resolution} <-
+           ModelClientResolver.resolve(
+             agent: agent,
+             model: Keyword.get(opts, :model),
+             client: client_module(client_label),
+             client_label: client_label
+           ),
          :ok <-
            validate_ssh_options(Keyword.get(opts, :ssh), Keyword.get(opts, :ssh_password)) do
       {:ok,
@@ -82,8 +95,11 @@ defmodule RunicAI.Terminal.ExRatatui.Options do
          persistence: persistence,
          sqlite_path: sqlite_path,
          run_id: Keyword.get(opts, :run),
-         model: Keyword.get(opts, :model),
-         client: Keyword.get(opts, :client),
+         model: Keyword.get(resolved_launch, :model),
+         requested_model: Keyword.get(opts, :model),
+         model_resolution: model_resolution,
+         client: client_arg(client_label),
+         client_label: client_label,
          mode: mode,
          approve: approve,
          session_id: Keyword.get(opts, :session_id),
@@ -259,6 +275,26 @@ defmodule RunicAI.Terminal.ExRatatui.Options do
        details: %{ssh: port}
      )}
   end
+
+  defp normalize_client_label(nil), do: {:ok, "default"}
+  defp normalize_client_label(""), do: {:ok, "default"}
+  defp normalize_client_label("default"), do: {:ok, "default"}
+  defp normalize_client_label("req_llm"), do: {:ok, "default"}
+  defp normalize_client_label("codex"), do: {:ok, "codex"}
+
+  defp normalize_client_label(client) do
+    {:error,
+     Error.validation("invalid runic_ai.tui client alias",
+       source: __MODULE__,
+       details: %{client: client, valid: ["default", "req_llm", "codex"]}
+     )}
+  end
+
+  defp client_module("codex"), do: CodexClient
+  defp client_module(_client_label), do: nil
+
+  defp client_arg("default"), do: nil
+  defp client_arg(client_label), do: client_label
 
   defp theme_arg(opts) do
     Keyword.get(opts, :theme) || if(no_color?(), do: "plain", else: "runic")

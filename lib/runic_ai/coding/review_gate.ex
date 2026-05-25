@@ -19,10 +19,10 @@ defmodule RunicAI.Coding.ReviewGate do
     extract_diagrams render_mermaid
     git_status git_diff git_log git_show git_branch
     compile_project run_tests run_linter
-    source_assert changed_file_inventory
+    source_assert changed_file_inventory sandbox_status
   )
 
-  @always_review ~w(run_command start_process process_write process_kill run_formatter)
+  @always_review ~w(run_command execute_code start_process process_write process_kill run_formatter)
 
   @mutating_git ~w(add am apply bisect branch checkout cherry-pick clean commit config
                    gc init merge mv pull push rebase reset restore revert rm stash switch tag worktree)

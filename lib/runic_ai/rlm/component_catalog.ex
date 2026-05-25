@@ -16,6 +16,13 @@ defmodule RunicAI.RLM.ComponentCatalog do
     :record_map,
     :record_group,
     :document_compare,
+    :collection_compute,
+    :string_compute,
+    :json_compute,
+    :artifact_compute,
+    :time_compute,
+    :score_compute,
+    :tool_leaf,
     :llm_leaf,
     :report_composer,
     :blueprint_transform,
@@ -173,6 +180,20 @@ defmodule RunicAI.RLM.ComponentCatalog do
     }
   end
 
+  defp entry!(:collection_compute),
+    do: computing_entry(:collection_compute, "Collection transform result")
+
+  defp entry!(:string_compute),
+    do: computing_entry(:string_compute, "String/text transform result")
+
+  defp entry!(:json_compute), do: computing_entry(:json_compute, "JSON/map transform result")
+
+  defp entry!(:artifact_compute),
+    do: computing_entry(:artifact_compute, "Artifact/file metadata result")
+
+  defp entry!(:time_compute), do: computing_entry(:time_compute, "Time/calendar result")
+  defp entry!(:score_compute), do: computing_entry(:score_compute, "Scoring/ranking result")
+
   defp entry!(:llm_leaf) do
     %{
       type: :llm_leaf,
@@ -183,6 +204,15 @@ defmodule RunicAI.RLM.ComponentCatalog do
           "Inputs for terminal LLM synthesis"
         ),
       outputs: ValueContract.output(:synthesis, "Synthesized model output")
+    }
+  end
+
+  defp entry!(:tool_leaf) do
+    %{
+      type: :tool_leaf,
+      execution_shape: :side_effect_step,
+      inputs: ValueContract.input(:any, "Inputs available to construct tool arguments"),
+      outputs: ValueContract.output(:tool_result, "Tool execution result")
     }
   end
 
@@ -197,6 +227,7 @@ defmodule RunicAI.RLM.ComponentCatalog do
             :record_groups,
             :comparisons,
             :llm_items,
+            :computed,
             :records,
             :source_slices,
             :materialized_slices
@@ -255,6 +286,15 @@ defmodule RunicAI.RLM.ComponentCatalog do
 
   defp entry!(:verification), do: %{entry!(:objective_scorecard) | type: :verification}
 
+  defp computing_entry(type, doc) do
+    %{
+      type: type,
+      execution_shape: :step,
+      inputs: ValueContract.input(:any, "Input data for safe deterministic computing"),
+      outputs: ValueContract.output(:computed, doc)
+    }
+  end
+
   defp normalize_params(:artifact_writer, params) do
     with {:ok, params} <- ensure_map(params),
          :ok <- validate_optional_non_empty_string(params, :path),
@@ -283,6 +323,23 @@ defmodule RunicAI.RLM.ComponentCatalog do
     with {:ok, params} <- ensure_map(params),
          :ok <- validate_optional_positive_integer(params, :max_items),
          :ok <- validate_optional_positive_integer(params, :max_concurrency) do
+      {:ok, params}
+    end
+  end
+
+  defp normalize_params(type, params)
+       when type in [
+              :collection_compute,
+              :string_compute,
+              :json_compute,
+              :artifact_compute,
+              :time_compute,
+              :score_compute
+            ] do
+    with {:ok, params} <- ensure_map(params),
+         :ok <- validate_optional_positive_integer(params, :limit),
+         :ok <- validate_optional_positive_integer(params, :max_bytes),
+         :ok <- validate_optional_positive_integer(params, :max_items) do
       {:ok, params}
     end
   end

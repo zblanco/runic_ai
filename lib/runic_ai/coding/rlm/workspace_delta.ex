@@ -19,7 +19,9 @@ defmodule RunicAI.Coding.RLM.WorkspaceDelta do
                        "cover",
                        "doc",
                        "dist",
-                       "build"
+                       "build",
+                       "tmp",
+                       ".runic_ai"
                      ])
 
   @type file_info :: %{

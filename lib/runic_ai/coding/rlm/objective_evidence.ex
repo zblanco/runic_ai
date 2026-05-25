@@ -84,13 +84,18 @@ defmodule RunicAI.Coding.RLM.ObjectiveEvidence do
     globs = List.wrap(policy_value(policy, :globs, @default_globs))
     max_files = integer_policy(policy, :max_files, 40)
 
+    explicit_changed_files =
+      changed_files
+      |> Enum.filter(&safe_relative_path?/1)
+      |> Enum.filter(&File.regular?(Path.join(workspace.root, &1)))
+
     glob_files =
       globs
       |> Enum.flat_map(&glob_files(workspace, &1))
+      |> Enum.reject(&excluded_path?/1)
 
-    (changed_files ++ glob_files)
+    (explicit_changed_files ++ glob_files)
     |> Enum.uniq()
-    |> Enum.reject(&excluded_path?/1)
     |> Enum.take(max_files)
   end
 
@@ -277,8 +282,14 @@ defmodule RunicAI.Coding.RLM.ObjectiveEvidence do
     |> Enum.any?(&MapSet.member?(@excluded_segments, &1))
   end
 
+  defp safe_relative_path?(relative) when is_binary(relative) and relative != "" do
+    Path.type(relative) == :relative and ".." not in Path.split(relative)
+  end
+
+  defp safe_relative_path?(_relative), do: false
+
   defp safe_relative_glob?(glob) when is_binary(glob) and glob != "" do
-    Path.type(glob) == :relative and ".." not in Path.split(glob)
+    safe_relative_path?(glob)
   end
 
   defp safe_relative_glob?(_glob), do: false

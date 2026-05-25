@@ -28,6 +28,40 @@ defmodule RunicAI.Coding.ProcessRegistryTest do
     assert polled.status == :killed
   end
 
+  test "emits live process lifecycle and output events" do
+    {:ok, registry} = ProcessRegistry.start_link()
+    {:ok, events} = Elixir.Agent.start_link(fn -> [] end)
+    workspace = Workspace.new!(root: tmp_dir())
+    policy = CommandPolicy.new!(allowed_commands: ["cat"])
+
+    assert {:ok, handle} =
+             ProcessRegistry.start_process(registry, workspace, %{argv: ["cat"]},
+               policy: policy,
+               event_sink: fn event -> Elixir.Agent.update(events, &(&1 ++ [event])) end
+             )
+
+    assert :ok = ProcessRegistry.write(registry, handle.id, "hello\n")
+
+    assert eventually(fn ->
+             Elixir.Agent.get(events, fn emitted ->
+               Enum.any?(
+                 emitted,
+                 &(&1.kind == :coding_process_output and
+                     String.contains?(&1.output.output_preview, "hello"))
+               )
+             end)
+           end)
+
+    assert {:ok, _killed} = ProcessRegistry.kill(registry, handle.id)
+
+    assert eventually(fn ->
+             Elixir.Agent.get(events, fn emitted ->
+               Enum.any?(emitted, &(&1.kind == :coding_process_started)) and
+                 Enum.any?(emitted, &(&1.kind == :coding_process_exited))
+             end)
+           end)
+  end
+
   defp eventually(fun, attempts \\ 20)
   defp eventually(_fun, 0), do: false
 

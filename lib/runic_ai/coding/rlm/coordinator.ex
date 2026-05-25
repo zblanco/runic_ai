@@ -6,6 +6,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   alias RunicAI.Coding.RLM.CodebaseEnvironment
   alias RunicAI.Coding.RLM.CoordinationPatterns
   alias RunicAI.Coding.RLM.AcceptanceCheck
+  alias RunicAI.Coding.RLM.ObjectiveContract
   alias RunicAI.Coding.RLM.ProposalNode
   alias RunicAI.Coding.RLM.RecipeLibrary
   alias RunicAI.Coding.RLM.WorkflowProposal
@@ -23,7 +24,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
           {:ok, WorkflowProposal.t(), WorkflowValidationReport.t()} | {:error, Error.t()}
   def propose(objective, %CodebaseEnvironment{} = environment, opts \\ [])
       when is_binary(objective) and is_list(opts) do
-    validation_opts = Keyword.get(opts, :validation_opts, [])
+    opts = normalize_coordination_opts(opts)
+    validation_opts = Keyword.fetch!(opts, :validation_opts)
+    seeded_result = maybe_project_generation_seed(objective, environment, opts, validation_opts)
 
     result =
       cond do
@@ -36,6 +39,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
           command
           |> RecipeLibrary.proposal(objective, sources: source_refs(environment))
           |> validate_candidate(opts, validation_opts, :recipe)
+
+        not is_nil(seeded_result) ->
+          seeded_result
 
         true ->
           generate_and_validate(objective, environment, opts, validation_opts)
@@ -63,7 +69,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     #{Jason.encode!(ProposalNode.allowed_kinds())}
 
     Recipe seeds:
-    #{Jason.encode!(RecipeLibrary.summaries())}
+    #{Jason.encode!(RecipeLibrary.summaries(project_generation?: project_generation_recipe_enabled?(opts)))}
 
     Generic coordination patterns:
     #{Jason.encode!(CoordinationPatterns.prompt_summary())}
@@ -72,11 +78,19 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     #{Jason.encode!(policy_summary(opts))}
 
     Return a bounded workflow proposal. Prefer read-only exploration unless the
-    caller explicitly enables mutation. Include at least one stop condition.
+    caller explicitly enables mutation. When mutation is enabled or the
+    objective asks to build, create, implement, add, update, fix, generate, or
+    prototype a working artifact, do not produce a repository summary,
+    file-dump, or read-only Q&A workflow. Include implementation, verification,
+    and evidence-producing steps, or return a blocked workflow that explains
+    the missing permission or capability.
 
     Required output shape:
     - nodes MUST be a JSON array of objects.
     - each node object MUST include id, kind, and params.
+    - assumptions MUST be a JSON array of strings.
+    - sources MUST be a JSON array of source ref strings from the Sources list,
+      not full source objects.
     - node ids MUST be non-empty strings; never use null ids and never return
       node names as bare strings.
     - edges MUST be a JSON array of objects with from and to fields.
@@ -85,6 +99,8 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
     Node parameter conventions:
     - command nodes use params.args.argv and may only use allowed command executables.
+      Commands must be non-interactive and include flags that disable prompts
+      or dependency installation. For Phoenix scaffolds, use --no-install.
     - agent nodes use params.mode and params.task; when implementing inside a generated subproject, include params.workspace_path with that relative directory.
     - edit nodes use params.operations or params.patch_set; use an agent node for implementation work that is not already a concrete file operation.
     - verification_gate nodes use params.checks or params.contract.
@@ -122,7 +138,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     for high-signal objective terms, and child implementation nodes that do not
     produce concrete edit or verification evidence. Prefer small executable
     implementation steps that create or patch real source and tests before the
-    final verification gate.
+    final verification gate. Avoid over-splitting into many child agent nodes:
+    for small generated projects, prefer one patch agent that implements source,
+    tests, and smoke evidence together, followed by a verification gate.
     """
   end
 
@@ -157,10 +175,12 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       opts
       |> Keyword.get(:llm_opts, [])
       |> maybe_put_client(Keyword.get(opts, :client))
+      |> maybe_put_receive_timeout(Keyword.get(opts, :proposal_llm_timeout_ms))
 
     case generate_proposal_object(model, prompt(objective, environment, opts), opts, llm_opts) do
       {:ok, object} ->
         object
+        |> normalize_generated_candidate(objective)
         |> validate_candidate(opts, validation_opts, :generated)
         |> maybe_repair(objective, environment, opts, validation_opts, model, llm_opts, object)
 
@@ -239,7 +259,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
     case generate_proposal_object(model, repair_prompt, opts, llm_opts) do
       {:ok, repaired_object} ->
-        repaired_object
+        object
+        |> merge_repaired_candidate(repaired_object)
+        |> normalize_generated_candidate(objective)
         |> validate_candidate(opts, validation_opts, :repaired)
         |> case do
           {:ok, _proposal, _report} = result ->
@@ -352,27 +374,15 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   end
 
   defp decode_generated_json(text) when is_binary(text) do
-    text
-    |> strip_markdown_fence()
-    |> Jason.decode()
-    |> case do
-      {:ok, object} when is_map(object) ->
-        {:ok, object}
+    candidates = json_text_candidates(text)
 
-      {:ok, value} ->
-        {:error,
-         Error.validation("generated workflow proposal JSON must decode to an object",
-           source: __MODULE__,
-           details: %{value: value}
-         )}
-
-      {:error, error} ->
-        {:error,
-         Error.validation("generated workflow proposal was not valid JSON",
-           source: __MODULE__,
-           details: %{error: Exception.message(error), text_preview: String.slice(text, 0, 4_000)}
-         )}
-    end
+    Enum.find_value(candidates, fn candidate ->
+      case Jason.decode(candidate) do
+        {:ok, object} when is_map(object) -> {:ok, object}
+        _other -> nil
+      end
+    end) ||
+      decode_generated_json_error(text, candidates)
   end
 
   defp strip_markdown_fence(text) do
@@ -382,6 +392,103 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       [json] -> String.trim(json)
       _other -> text
     end
+  end
+
+  defp json_text_candidates(text) do
+    stripped = strip_markdown_fence(text)
+
+    fenced =
+      ~r/```(?:json)?\s*(.*?)\s*```/si
+      |> Regex.scan(text, capture: :all_but_first)
+      |> Enum.map(fn [json] -> String.trim(json) end)
+
+    balanced =
+      [first_balanced_json_object(text), first_balanced_json_object(stripped)]
+      |> Enum.reject(&is_nil/1)
+
+    [String.trim(text), stripped | fenced ++ balanced]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp first_balanced_json_object(text) when is_binary(text) do
+    text
+    |> String.to_charlist()
+    |> Enum.drop_while(&(&1 != ?{))
+    |> case do
+      [] -> nil
+      chars -> collect_balanced_json(chars, 0, false, false, [])
+    end
+  end
+
+  defp collect_balanced_json([], _depth, _in_string?, _escaped?, _acc), do: nil
+
+  defp collect_balanced_json([char | rest], depth, in_string?, escaped?, acc) do
+    acc = [char | acc]
+
+    cond do
+      in_string? and escaped? ->
+        collect_balanced_json(rest, depth, true, false, acc)
+
+      in_string? and char == ?\\ ->
+        collect_balanced_json(rest, depth, true, true, acc)
+
+      in_string? and char == ?" ->
+        collect_balanced_json(rest, depth, false, false, acc)
+
+      in_string? ->
+        collect_balanced_json(rest, depth, true, false, acc)
+
+      char == ?" ->
+        collect_balanced_json(rest, depth, true, false, acc)
+
+      char == ?{ ->
+        collect_balanced_json(rest, depth + 1, false, false, acc)
+
+      char == ?} ->
+        depth = depth - 1
+
+        if depth == 0 do
+          acc |> Enum.reverse() |> List.to_string()
+        else
+          collect_balanced_json(rest, depth, false, false, acc)
+        end
+
+      true ->
+        collect_balanced_json(rest, depth, false, false, acc)
+    end
+  end
+
+  defp decode_generated_json_error(text, candidates) do
+    {error_message, value} =
+      candidates
+      |> Enum.find_value(fn candidate ->
+        case Jason.decode(candidate) do
+          {:ok, value} -> {:decoded_non_object, value}
+          {:error, error} -> {:decode_error, Exception.message(error)}
+        end
+      end)
+      |> case do
+        {:decoded_non_object, value} ->
+          {"generated workflow proposal JSON must decode to an object", value}
+
+        {:decode_error, message} ->
+          {"generated workflow proposal was not valid JSON", message}
+
+        nil ->
+          {"generated workflow proposal was not valid JSON", "no JSON object candidate found"}
+      end
+
+    details =
+      case error_message do
+        "generated workflow proposal JSON must decode to an object" ->
+          %{value: value, text_preview: String.slice(text, 0, 4_000)}
+
+        _other ->
+          %{error: value, text_preview: String.slice(text, 0, 4_000)}
+      end
+
+    {:error, Error.validation(error_message, source: __MODULE__, details: details)}
   end
 
   defp validate_candidate(candidate, opts, validation_opts, stage) do
@@ -444,6 +551,129 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   defp maybe_put_client(llm_opts, nil), do: llm_opts
   defp maybe_put_client(llm_opts, client), do: Keyword.put_new(llm_opts, :client, client)
 
+  defp maybe_put_receive_timeout(llm_opts, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0,
+       do: Keyword.put_new(llm_opts, :receive_timeout, timeout_ms)
+
+  defp maybe_put_receive_timeout(llm_opts, _timeout_ms), do: llm_opts
+
+  defp normalize_generated_candidate(candidate, objective) when is_map(candidate) do
+    candidate
+    |> unwrap_candidate()
+    |> put_default_objective(objective)
+    |> put_default_stop_conditions()
+  end
+
+  defp normalize_generated_candidate(candidate, _objective), do: candidate
+
+  defp merge_repaired_candidate(previous, repaired) when is_map(previous) and is_map(repaired) do
+    previous
+    |> unwrap_candidate()
+    |> Map.merge(unwrap_candidate(repaired))
+  end
+
+  defp merge_repaired_candidate(_previous, repaired), do: repaired
+
+  defp unwrap_candidate(candidate) when is_map(candidate) do
+    Enum.find_value(
+      [:workflow_proposal, "workflow_proposal", :proposal, "proposal", :workflow, "workflow"],
+      candidate,
+      fn key ->
+        case Map.get(candidate, key) do
+          value when is_map(value) -> value
+          _other -> nil
+        end
+      end
+    ) || candidate
+  end
+
+  defp put_default_objective(candidate, objective) when is_map(candidate) do
+    case field(candidate, :objective) do
+      value when is_binary(value) and value != "" -> candidate
+      _other -> Map.put(candidate, "objective", objective)
+    end
+  end
+
+  defp put_default_stop_conditions(candidate) when is_map(candidate) do
+    case field(candidate, :stop_conditions) do
+      [_first | _rest] ->
+        candidate
+
+      _other ->
+        nodes = normalize_candidate_nodes(field(candidate, :nodes))
+        final_node = List.last(nodes)
+
+        stop_condition =
+          case field(final_node || %{}, :id) do
+            id when is_binary(id) and id != "" -> "workflow reaches final node #{id}"
+            _other -> "workflow reaches its final accepted node"
+          end
+
+        Map.put(candidate, "stop_conditions", [stop_condition])
+    end
+  end
+
+  defp normalize_candidate_nodes(nodes) when is_list(nodes), do: nodes
+  defp normalize_candidate_nodes(_nodes), do: []
+
+  defp maybe_project_generation_seed(objective, environment, opts, validation_opts) do
+    if project_generation_seed_enabled?(objective, opts) do
+      objective_contract = ObjectiveContract.infer!(objective)
+
+      RecipeLibrary.proposal(:project_generation, objective,
+        sources: source_refs(environment),
+        objective_contract: objective_contract
+      )
+      |> validate_candidate(opts, validation_opts, :seeded_recipe)
+    end
+  end
+
+  defp project_generation_seed_enabled?(objective, opts) do
+    project_generation_recipe_enabled?(opts) and
+      mutation_enabled?(opts) and
+      project_generation_objective?(objective)
+  end
+
+  defp project_generation_recipe_enabled?(opts) do
+    Keyword.get(opts, :seed_project_generation?, false)
+  end
+
+  defp project_generation_objective?(objective) when is_binary(objective) do
+    objective = String.downcase(objective)
+
+    build_cue? =
+      Regex.match?(
+        ~r/(^|[^a-z0-9_])(build|create|generate|prototype|implement)([^a-z0-9_]|$)/,
+        objective
+      )
+
+    project_cue? =
+      Enum.any?(
+        [
+          "proof of concept",
+          "platform",
+          "service",
+          "engine",
+          "module",
+          "project",
+          "app",
+          "runtime smoke",
+          "include tests",
+          "elixir"
+        ],
+        &String.contains?(objective, &1)
+      )
+
+    existing_app_adaptation? =
+      String.contains?(objective, "existing project") or
+        String.contains?(objective, "inspect the existing project") or
+        String.contains?(objective, "existing app")
+
+    (build_cue? and project_cue?) or existing_app_adaptation?
+  end
+
+  defp project_generation_objective?(_objective), do: false
+
   defp policy_summary(opts) do
     validation_opts = Keyword.get(opts, :validation_opts, [])
 
@@ -503,7 +733,45 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
   defp mutation_enabled?(opts) do
     validation_opts = Keyword.get(opts, :validation_opts, [])
-    Keyword.get(opts, :mutation?, false) or Keyword.get(validation_opts, :allow_mutation?, false)
+
+    Keyword.get(opts, :mutation?, false) or
+      Keyword.get(opts, :mode) == :patch or
+      Keyword.get(validation_opts, :allow_mutation?, false)
+  end
+
+  defp normalize_coordination_opts(opts) do
+    validation_opts =
+      opts
+      |> Keyword.get(:validation_opts, [])
+      |> inherit_capability_opts(opts)
+      |> maybe_enable_mutation(opts)
+
+    Keyword.put(opts, :validation_opts, validation_opts)
+  end
+
+  defp inherit_capability_opts(validation_opts, opts) do
+    Enum.reduce(
+      [:mode, :profile, :toolsets, :disabled_tools, :tool_config],
+      validation_opts,
+      fn key, acc ->
+        case Keyword.fetch(opts, key) do
+          {:ok, value} -> Keyword.put_new(acc, key, value)
+          :error -> acc
+        end
+      end
+    )
+  end
+
+  defp maybe_enable_mutation(validation_opts, opts) do
+    if Keyword.get(opts, :mode) == :patch or Keyword.get(opts, :mutation?, false) do
+      validation_opts
+      |> Keyword.put_new(:allow_mutation?, true)
+      |> Keyword.put_new(:allow_verification?, true)
+      |> Keyword.put_new(:allow_commands?, true)
+      |> Keyword.put_new(:allowed_commands, ["mix", "git"])
+    else
+      validation_opts
+    end
   end
 
   defp require_node_kinds(%WorkflowProposal{} = proposal, opts) do
@@ -572,13 +840,41 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       kind: error.kind,
       message: error.message,
       details: error.details,
-      source: inspect(error.source)
+      source: inspect(error.source),
+      retryable?: error.retryable?,
+      reason_message: error_reason_message(error),
+      status: error_detail(error, :status),
+      response_body_preview: error_detail(error, :response_body_preview),
+      text_preview: error_detail(error, :text_preview)
     }
+    |> compact_map()
   end
 
   defp error_details(error) when is_map(error), do: error
 
   defp error_details(error) do
     %{kind: :unknown, message: inspect(error), details: %{}}
+  end
+
+  defp error_reason_message(%Error{} = error) do
+    error_detail(error, :reason_message) || reason_message(error_detail(error, :reason))
+  end
+
+  defp reason_message(nil), do: nil
+  defp reason_message(reason) when is_exception(reason), do: Exception.message(reason)
+  defp reason_message(reason) when is_binary(reason), do: reason
+  defp reason_message(reason), do: inspect(reason, limit: 20, printable_limit: 512)
+
+  defp error_detail(%Error{details: details}, key), do: field(details, key)
+
+  defp field(value, key) when is_map(value),
+    do: Map.get(value, key) || Map.get(value, to_string(key))
+
+  defp field(_value, _key), do: nil
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 end

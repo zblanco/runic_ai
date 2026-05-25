@@ -19,6 +19,8 @@ defmodule RunicAI.Terminal.ExRatatui.WorkbenchTest do
   alias RunicAI.Terminal.ExRatatui.RenderCache
   alias RunicAI.Terminal.ExRatatui.SlashCommands
   alias RunicAI.Terminal.ExRatatui.Update
+  alias RunicAI.Terminal.ExRatatui.Views.Activity
+  alias RunicAI.Terminal.ExRatatui.Views.ActivitySummary
   alias RunicAI.Terminal.ExRatatui.Views.Conversation
   alias RunicAI.Terminal.ExRatatui.Views.Details
   alias RunicAI.Terminal.ExRatatui.Views.Logs
@@ -53,6 +55,83 @@ defmodule RunicAI.Terminal.ExRatatui.WorkbenchTest do
     assert snapshot.managed_workflows != []
     assert snapshot.eval_cohort != []
     assert snapshot.signal_views.session_recall != []
+  end
+
+  test "loads and renders objective-loop state in TUI activity surfaces", %{store: store} do
+    seed_objective_loop(store)
+
+    assert {:ok, snapshot} = Commands.load_snapshot(model(store))
+
+    assert snapshot.objective_loop.status == "needs_budget_approval"
+    assert snapshot.objective_loop.action == "request_budget_approval"
+    assert snapshot.progress_summary.objective_status == "running"
+    assert snapshot.progress_summary.objective_action == "continue"
+    assert snapshot.progress_summary.objective_error_kind == "timeout"
+    assert snapshot.progress_summary.objective_error_message == "RLM runtime budget exhausted"
+    assert snapshot.progress_summary.remaining_ms == 12_345
+
+    model = Model.apply_snapshot(model(store), snapshot)
+
+    assert ActivitySummary.widget(model).text =~ "objective=running"
+    assert ActivitySummary.widget(model).text =~ "error=timeout:RLM runtime budget exhausted"
+    assert ActivitySummary.widget(model).text =~ "hitl=2"
+    assert ActivitySummary.widget(model).text =~ "remaining=12.3s"
+
+    assert Activity.widget(model).text =~ "Objective: running"
+    assert Activity.widget(model).text =~ "Tasks: open=1 done=1"
+    assert Activity.widget(model).text =~ "Error: timeout: RLM runtime budget exhausted"
+
+    assert Activity.widget(model).text =~
+             "pending objective_budget_approval repair budget exhausted"
+
+    assert %ExRatatui.Widgets.Markdown{content: details} = Details.widget(model)
+    assert details =~ "- pending: 2"
+    assert details =~ "- objective budgets: 1"
+    assert details =~ "## Objective Loop"
+    assert details =~ "- status: running"
+    assert details =~ "- action: continue"
+    assert details =~ "- remaining: 12.3s"
+    assert details =~ "- error: timeout: RLM runtime budget exhausted"
+  end
+
+  test "loads objective auto-resume cap events into TUI progress summary", %{store: store} do
+    record!(store, %{
+      id: "event:objective-auto-resume-limit",
+      at: DateTime.add(DateTime.utc_now(), 20, :second),
+      session_id: "session:test",
+      run_id: "run:test",
+      agent: :rlm,
+      kind: :status,
+      phase: :objective_loop_resume,
+      status: :blocked,
+      title: "Objective auto-resume limit reached",
+      detail: "objective still needs budget approval after 1 automatic resumes",
+      data: %{
+        run_id: "run:test",
+        objective_session_id: "run:test",
+        objective: "Build OpsLogic",
+        objective_session: %{
+          id: "run:test",
+          objective: "Build OpsLogic",
+          status: :needs_budget_approval,
+          decision: %{action: :request_budget_approval}
+        },
+        objective_decision: %{action: :request_budget_approval},
+        objective_iteration_count: 2,
+        max_objective_auto_resumes: 1,
+        budget_requests: [%{reason: "repair budget exhausted", status: :pending}]
+      }
+    })
+
+    assert {:ok, snapshot} = Commands.load_snapshot(model(store))
+    assert snapshot.progress_summary.latest_event_title == "Objective auto-resume limit reached"
+    assert snapshot.progress_summary.objective == "Build OpsLogic"
+    assert snapshot.progress_summary.objective_status == "needs_budget_approval"
+    assert snapshot.progress_summary.objective_action == "request_budget_approval"
+
+    model = Model.apply_snapshot(model(store), snapshot)
+    assert ActivitySummary.widget(model).text =~ "objective=needs_budget_approval"
+    assert Activity.widget(model).text =~ "Objective: needs_budget_approval"
   end
 
   test "supports search, export, review decisions, managed filters, and eval cohorts", %{
@@ -1512,6 +1591,70 @@ defmodule RunicAI.Terminal.ExRatatui.WorkbenchTest do
       })
 
     :ok
+  end
+
+  defp seed_objective_loop(store) do
+    now = DateTime.utc_now()
+
+    record!(store, %{
+      id: "event:objective-progress",
+      at: DateTime.add(now, 6, :second),
+      session_id: "session:test",
+      agent: :rlm,
+      kind: :summary,
+      phase: :objective_loop_progress,
+      status: :running,
+      title: "Objective iteration completed",
+      detail: "status: running, action: continue, iteration: 2",
+      data: %{
+        run_id: "run:test",
+        stage: :objective_loop,
+        objective: "Build OpsLogic",
+        current_iteration: 2,
+        iteration_count: 2,
+        max_iterations: 3,
+        remaining_runtime_ms: 12_345,
+        run_deadline_ms: 9_999_999,
+        objective_session: %{
+          id: "run:test",
+          objective: "Build OpsLogic",
+          status: :running,
+          latest_error: %{kind: :timeout, message: "RLM runtime budget exhausted"},
+          latest_error_kind: :timeout,
+          latest_error_message: "RLM runtime budget exhausted",
+          decision: %{action: :continue}
+        },
+        open_tasks: [%{id: "compile", title: "Fix compile"}],
+        completed_tasks: [%{id: "plan", title: "Write plan"}]
+      }
+    })
+
+    record!(store, %{
+      id: "event:objective-loop",
+      at: DateTime.add(now, 7, :second),
+      session_id: "session:test",
+      agent: :rlm,
+      kind: :summary,
+      phase: :objective_loop,
+      status: :review,
+      title: "Objective budget approval required",
+      detail: "status: needs_budget_approval",
+      data: %{
+        run_id: "run:test",
+        objective_session: %{
+          id: "run:test",
+          objective: "Build OpsLogic",
+          status: :needs_budget_approval,
+          iteration_count: 2,
+          max_iterations: 3,
+          decision: %{action: :request_budget_approval}
+        },
+        objective_decision: %{action: :request_budget_approval},
+        open_tasks: [%{id: "compile", title: "Fix compile"}],
+        completed_tasks: [%{id: "plan", title: "Write plan"}],
+        budget_requests: [%{reason: "repair budget exhausted"}]
+      }
+    })
   end
 
   defp record!(store, attrs) do

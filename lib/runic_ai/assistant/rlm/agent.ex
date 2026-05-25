@@ -804,7 +804,12 @@ defmodule RunicAI.Assistant.RLM.Agent do
   defp validation_opts(opts) do
     [
       max_generated_function_tier: Keyword.get(opts, :max_generated_function_tier, :tier1),
-      max_nodes: Keyword.get(opts, :max_nodes)
+      max_nodes: Keyword.get(opts, :max_nodes),
+      profile: Keyword.get(opts, :profile),
+      toolsets: Keyword.get(opts, :toolsets, []),
+      disabled_tools: Keyword.get(opts, :disabled_tools, []),
+      tool_config: Keyword.get(opts, :tool_config, %{}),
+      capability_profile: Keyword.get(opts, :capability_profile)
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end

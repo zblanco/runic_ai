@@ -30,4 +30,5 @@ config :runic_ai, :workbench,
   default_client: nil,
   default_approval: :safe,
   default_mode: :verify,
+  default_write_policy: :docs_only,
   theme: :runic

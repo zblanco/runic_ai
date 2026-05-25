@@ -9,6 +9,7 @@ defmodule RunicAI.Coding.Codex.Client do
 
   @behaviour RunicAI.LLM
 
+  alias RunicAI.Agent.ModelClientResolver
   alias RunicAI.Coding.Codex.ExecClient
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
@@ -20,8 +21,9 @@ defmodule RunicAI.Coding.Codex.Client do
   def generate_text(model, prompt, opts \\ []) do
     with {:ok, workspace} <- workspace(opts),
          {:ok, text_prompt} <- prompt_text(prompt),
+         {:ok, codex_opts} <- maybe_put_model(opts, model),
          {:ok, output} <-
-           ExecClient.run(workspace, text_prompt, Keyword.put_new(opts, :model, model)),
+           ExecClient.run(workspace, text_prompt, codex_opts),
          {:ok, text} <- final_text(output.final) do
       {:ok,
        Result.new!(
@@ -91,5 +93,24 @@ defmodule RunicAI.Coding.Codex.Client do
 
   defp final_text(value) do
     {:ok, Jason.encode!(value)}
+  end
+
+  defp maybe_put_model(opts, model) do
+    case ModelClientResolver.normalize_codex_model(model) do
+      {:ok, nil, decision} ->
+        {:ok,
+         opts
+         |> Keyword.delete(:model)
+         |> Keyword.put_new(:model_resolution, decision)}
+
+      {:ok, model, decision} ->
+        {:ok,
+         opts
+         |> Keyword.put_new(:model, model)
+         |> Keyword.put_new(:model_resolution, decision)}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
   end
 end

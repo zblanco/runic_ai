@@ -28,5 +28,6 @@ runic_ai-*.tar
 
 # Local RunicAI workbench data.
 /.runic_ai/
+.runic_ai/
 
 # Planning documents

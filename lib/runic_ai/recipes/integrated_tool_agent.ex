@@ -8,6 +8,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
   alias RunicAI.Agent.State
   alias RunicAI.Agent.TurnRequest
   alias RunicAI.Agent.TurnResult
+  alias RunicAI.Coding.TraceRedactor
   alias RunicAI.Control.BudgetDecision
   alias RunicAI.Control.GuardDecision
   alias RunicAI.Control.GuardRequest
@@ -38,13 +39,17 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
   alias RunicAI.Steps.ResolveIntegratedResume
   alias RunicAI.Steps.SelectTools
   alias RunicAI.Tool.BatchResult
+  alias RunicAI.Tool.CallResult
+  alias RunicAI.Tool.CallRequest
   alias RunicAI.Tool.ExecutionPlan
   alias RunicAI.Tool.RequirementPolicy
   alias RunicAI.Tool.Selection
+  alias RunicAI.Trace.Event
   alias RunicAI.Wait
 
   @pre_answer_checkpoints [:pre_answer, :pre_answer_budget]
   @pre_tool_checkpoints [:pre_tool, :pre_tool_budget]
+  @verification_tools ~w(compile_project run_tests run_formatter run_linter project_command runtime_smoke source_assert)
 
   @spec new(keyword()) :: Workflow.t()
   def new(opts \\ []) do
@@ -235,6 +240,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
                 resolved,
                 Map.fetch!(pending_work.metadata, :execution_plan)
               )
+              |> mark_execution_plan_reviewed(review_decision)
 
             original_turn_result = Map.fetch!(pending_work.metadata, :turn_result)
 
@@ -520,6 +526,8 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
          %TurnResult{} = turn_result,
          lane_opts
        ) do
+    emit_tool_call_events(session, execution_plan, lane_opts)
+
     raw_batch_result =
       ExecuteToolCallsControlled.execute!(execution_plan, selection,
         retry_policy: Map.get(lane_opts, :tool_retry_policy),
@@ -527,6 +535,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
       )
 
     batch_result = ReduceToolResults.reduce!(execution_plan, raw_batch_result)
+    emit_tool_result_events(session, batch_result, lane_opts)
 
     state_after_observations =
       AppendToolObservations.append!(
@@ -658,6 +667,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
   end
 
   defp return_pause(%SessionState{} = session, pause_request, metadata) do
+    emit_pause_event(session, pause_request, lane_options(session))
     RegisterIntegratedPause.register!(session, pause_request, metadata: Enum.into(metadata, %{}))
   end
 
@@ -854,6 +864,150 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
     }
   end
 
+  defp emit_tool_call_events(
+         %SessionState{} = session,
+         %ExecutionPlan{} = execution_plan,
+         lane_opts
+       ) do
+    Enum.each(execution_plan.calls, fn %CallRequest{} = call ->
+      emit_trace_event(
+        lane_opts,
+        Event.new!(:coding_tool_call,
+          agent_id: session.agent.id,
+          conversation_id: session.agent.conversation_id,
+          status: :running,
+          output:
+            TraceRedactor.redact(%{
+              id: call.id,
+              tool: call.tool_name,
+              arguments: call.arguments,
+              request_index: call.request_index
+            }),
+          metadata: %{
+            coding?: true,
+            live?: true,
+            source: :integrated_tool_agent,
+            tool_name: call.tool_name
+          }
+        )
+      )
+    end)
+  end
+
+  defp emit_tool_result_events(
+         %SessionState{} = session,
+         %BatchResult{} = batch_result,
+         lane_opts
+       ) do
+    Enum.each(batch_result.results, fn %CallResult{} = result ->
+      emit_trace_event(lane_opts, tool_observation_event(session, result))
+
+      if result.request.tool_name in @verification_tools do
+        emit_trace_event(lane_opts, verification_observation_event(session, result))
+      end
+    end)
+  end
+
+  defp tool_observation_event(%SessionState{} = session, %CallResult{} = result) do
+    Event.new!(:coding_tool_observation,
+      agent_id: session.agent.id,
+      conversation_id: session.agent.conversation_id,
+      status: result.status,
+      output: TraceRedactor.redact(call_result_summary(result)),
+      metadata: %{
+        coding?: true,
+        live?: true,
+        source: :integrated_tool_agent,
+        tool_name: result.request.tool_name
+      }
+    )
+  end
+
+  defp verification_observation_event(%SessionState{} = session, %CallResult{} = result) do
+    Event.new!(:coding_verification_observation,
+      agent_id: session.agent.id,
+      conversation_id: session.agent.conversation_id,
+      status: result.status,
+      output: TraceRedactor.redact(call_result_summary(result)),
+      metadata: %{
+        coding?: true,
+        live?: true,
+        verification?: true,
+        source: :integrated_tool_agent,
+        tool_name: result.request.tool_name,
+        status: result.status
+      }
+    )
+  end
+
+  defp call_result_summary(%CallResult{} = result) do
+    %{
+      id: result.request.id,
+      tool: result.request.tool_name,
+      status: result.status,
+      output: result.output,
+      error: result.error,
+      started_at: result.started_at,
+      completed_at: result.completed_at,
+      metadata: result.metadata
+    }
+  end
+
+  defp emit_pause_event(%SessionState{} = session, %ReviewRequest{} = request, lane_opts) do
+    emit_trace_event(
+      lane_opts,
+      Event.new!(:review_requested,
+        agent_id: session.agent.id,
+        conversation_id: session.agent.conversation_id,
+        status: :review,
+        output: TraceRedactor.redact(%{details: request.details, subject: request.subject}),
+        metadata:
+          Map.merge(request.metadata || %{}, %{
+            live?: true,
+            source: :integrated_tool_agent,
+            kind: request.kind,
+            checkpoint: request.checkpoint,
+            resume_key: request.resume_key
+          })
+      )
+    )
+  end
+
+  defp emit_pause_event(%SessionState{} = session, %Wait{} = wait, lane_opts) do
+    emit_trace_event(
+      lane_opts,
+      Event.new!(:wait_registered,
+        agent_id: session.agent.id,
+        conversation_id: session.agent.conversation_id,
+        status: :waiting,
+        output: TraceRedactor.redact(%{payload: wait.payload, details: wait.details}),
+        metadata:
+          Map.merge(wait.metadata || %{}, %{
+            live?: true,
+            source: :integrated_tool_agent,
+            kind: wait.kind,
+            resume_key: wait.resume_key
+          })
+      )
+    )
+  end
+
+  defp emit_pause_event(_session, _pause_request, _lane_opts), do: :ok
+
+  defp emit_trace_event(lane_opts, %Event{} = event) do
+    case Map.get(lane_opts, :event_sink) do
+      sink when is_function(sink, 1) ->
+        try do
+          sink.(event)
+        rescue
+          _exception -> :ok
+        end
+
+      _other ->
+        :ok
+    end
+  end
+
   defp complete_tool_trace(%SessionState{} = session, %BatchResult{} = batch_result) do
     traces = Map.get(session.control, :last_tool_traces, [])
 
@@ -897,6 +1051,48 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
 
   defp normalize_resolved_execution_plan(_resolved, %ExecutionPlan{} = execution_plan),
     do: execution_plan
+
+  defp mark_execution_plan_reviewed(
+         %ExecutionPlan{} = execution_plan,
+         %ReviewDecision{status: :approved} = decision
+       ) do
+    metadata = %{
+      hitl_approved?: true,
+      review_resume_key: decision.resume_key,
+      reviewed_at: DateTime.utc_now()
+    }
+
+    %{
+      execution_plan
+      | calls: Enum.map(execution_plan.calls, &mark_call_reviewed(&1, metadata)),
+        metadata: Map.merge(execution_plan.metadata, metadata)
+    }
+  end
+
+  defp mark_execution_plan_reviewed(%ExecutionPlan{} = execution_plan, _decision),
+    do: execution_plan
+
+  defp mark_call_reviewed(%CallRequest{} = call, metadata) do
+    %{
+      call
+      | arguments: put_command_arg_metadata(call.tool_name, call.arguments, metadata),
+        metadata: Map.merge(call.metadata, metadata)
+    }
+  end
+
+  defp put_command_arg_metadata(tool_name, arguments, metadata)
+       when tool_name in ["run_command", "project_command"] and is_map(arguments) do
+    Map.update(arguments, :metadata, metadata, fn existing ->
+      existing
+      |> normalize_metadata_map()
+      |> Map.merge(metadata)
+    end)
+  end
+
+  defp put_command_arg_metadata(_tool_name, arguments, _metadata), do: arguments
+
+  defp normalize_metadata_map(metadata) when is_map(metadata), do: metadata
+  defp normalize_metadata_map(_metadata), do: %{}
 
   defp budget_runtime(%SessionState{} = session) do
     %{
@@ -1037,6 +1233,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
       generation_fallback_policy: Keyword.get(opts, :generation_fallback_policy),
       tool_retry_policy: Keyword.get(opts, :tool_retry_policy),
       tool_fallback_policy: Keyword.get(opts, :tool_fallback_policy),
+      event_sink: Keyword.get(opts, :event_sink),
       pre_tool_guard: Keyword.get(opts, :pre_tool_guard),
       pre_answer_guard: Keyword.get(opts, :pre_answer_guard),
       pre_tool_guard_policy: Keyword.get(opts, :pre_tool_guard_policy),
@@ -1085,6 +1282,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
           generation_fallback_policy: profile[:generation_fallback_policy],
           tool_retry_policy: profile[:tool_retry_policy],
           tool_fallback_policy: profile[:tool_fallback_policy],
+          event_sink: profile[:event_sink],
           pre_tool_guard: profile[:pre_tool_guard],
           pre_answer_guard: profile[:pre_answer_guard],
           pre_tool_guard_policy: profile[:pre_tool_guard_policy],

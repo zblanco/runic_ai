@@ -15,11 +15,12 @@ config :runic_ai, :workbench,
   data_path: Path.expand("../.runic_ai", __DIR__),
   database: Path.expand("../.runic_ai/runs.db", __DIR__),
   migrate?: true,
-  default_agent: :assistant,
-  default_model: nil,
+  default_agent: :standard,
+  default_model: "openai:gpt-5.4-mini",
   default_client: nil,
   default_approval: :safe,
-  default_mode: :verify,
+  default_mode: :patch,
+  default_write_policy: :workspace_review,
   theme: :runic
 
 # Configure the endpoint

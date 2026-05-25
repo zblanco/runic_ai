@@ -18,6 +18,7 @@ defmodule RunicAI.Coding.RLM.RepairController do
       |> Kernel.++(child_repairs(scorecard.child_results))
       |> Kernel.++(command_repairs(scorecard.command_statuses))
       |> Enum.uniq_by(&{&1.reason, inspect(&1.target)})
+      |> Enum.sort_by(&repair_priority/1)
     end
   end
 
@@ -29,8 +30,14 @@ defmodule RunicAI.Coding.RLM.RepairController do
       |> String.downcase()
 
     cond do
+      field(evidence, :type) in [:runtime_smoke, "runtime_smoke"] ->
+        :runtime_smoke_failure
+
       field(evidence, :type) in [:semantic_requirement, "semantic_requirement"] ->
         :semantic_requirement_incomplete
+
+      String.contains?(text, "runtime_smoke") or String.contains?(text, "runtime smoke") ->
+        :runtime_smoke_failure
 
       String.contains?(text, "warning") ->
         :compiler_warning
@@ -67,10 +74,15 @@ defmodule RunicAI.Coding.RLM.RepairController do
           %{
             category: classify(result),
             check_type: result.type,
-            status: result.status
+            status: result.status,
+            message: result.message
           }
           |> maybe_put(:repair_instruction, repair_instruction(result))
           |> maybe_put(:output_preview, output_preview(result))
+          |> maybe_put(:requirement, requirement(result))
+          |> maybe_put(:evidence_refs, evidence_refs(result))
+          |> maybe_put(:judge, judge(result))
+          |> maybe_put(:smoke_id, smoke_id(result))
       )
     end)
   end
@@ -138,7 +150,7 @@ defmodule RunicAI.Coding.RLM.RepairController do
     field(result, :metadata)
     |> case do
       metadata when is_map(metadata) ->
-        field(metadata, :repair_instruction) || observed_output(metadata)
+        field(metadata, :repair_instruction)
 
       _metadata ->
         nil
@@ -154,8 +166,47 @@ defmodule RunicAI.Coding.RLM.RepairController do
     |> preview()
   end
 
+  defp requirement(result) do
+    result
+    |> field(:metadata)
+    |> case do
+      metadata when is_map(metadata) -> field(metadata, :requirement)
+      _metadata -> nil
+    end
+  end
+
+  defp evidence_refs(result) do
+    result
+    |> field(:metadata)
+    |> case do
+      metadata when is_map(metadata) -> field(metadata, :evidence_refs)
+      _metadata -> nil
+    end
+  end
+
+  defp judge(result) do
+    result
+    |> field(:metadata)
+    |> case do
+      metadata when is_map(metadata) -> field(metadata, :judge)
+      _metadata -> nil
+    end
+  end
+
+  defp smoke_id(result) do
+    result
+    |> field(:metadata)
+    |> case do
+      metadata when is_map(metadata) ->
+        field(metadata, :id) || metadata |> field(:smoke) |> field(:id)
+
+      _metadata ->
+        nil
+    end
+  end
+
   defp observed_output(metadata) when is_map(metadata) do
-    case field(metadata, :observed) do
+    case field(metadata, :observed) || field(metadata, :smoke) do
       observed when is_map(observed) ->
         field(observed, :output_preview) || field(observed, :output)
 
@@ -190,6 +241,20 @@ defmodule RunicAI.Coding.RLM.RepairController do
       value when is_binary(value) -> value
       nil -> "unknown command"
       value -> inspect(value)
+    end
+  end
+
+  defp repair_priority(%RepairNeed{} = need) do
+    case field(need.metadata, :category) do
+      :compile_error -> 0
+      :test_failure -> 1
+      :runtime_smoke_failure -> 2
+      :semantic_requirement_incomplete -> 3
+      :missing_runtime_wiring -> 4
+      :compiler_warning -> 4
+      :weak_test_coverage -> 5
+      :incomplete_child_result -> 6
+      _other -> 10
     end
   end
 end

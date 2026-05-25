@@ -20,6 +20,8 @@ defmodule RunicAI.RLM.ValueContract do
     :synthesis,
     :report,
     :artifact,
+    :tool_result,
+    :computed,
     :scorecard,
     :budget_summary,
     :any
