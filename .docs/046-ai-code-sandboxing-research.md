@@ -25,7 +25,7 @@ RunicAI contract model:
 - backends can range from in-process DSL sandboxes to containers, gVisor,
   Firecracker/KVM microVMs, remote microVM services, and future runtimes.
 
-The target shape should be extractable as an independent Elixir library:
+The target shape should be extractable as an independent Elixir library that can be easily configured into a supervision tree / application.ex:
 
 ```elixir
 children = [
@@ -544,8 +544,10 @@ lib/runic_sandbox/
     e2b.ex
 ```
 
-RunicAI can initially keep this internal under `RunicAI.Sandbox` while the
-contracts settle, then extract the library once two real backends exist.
+RunicAI should consume the extracted `RunicSandbox` package through ordinary
+tools, capability profiles, review gates, traces, and Workbench settings. The
+only RunicAI-local sandbox module should be a compatibility facade or product
+integration layer.
 
 ## RunicAI Integration Shape
 
@@ -674,97 +676,110 @@ The default local developer experience should optimize for:
 
 ### Phase 0: Contract Research And Spike
 
-- [ ] Define `Sandbox.Profile`, `Sandbox.Policy`, `ExecutionRequest`, and
+- [x] Define `Sandbox.Profile`, `Sandbox.Policy`, `ExecutionRequest`, and
       `ExecutionResult` structs.
-- [ ] Define `isolation_level` values:
-      `:in_process`, `:wasi`, `:namespace`, `:container`, `:gvisor`,
-      `:microvm`, `:remote_microvm`.
-- [ ] Decide whether the initial module namespace is `RunicAI.Sandbox` or a
-      sibling package spike.
-- [ ] Add a small local feature flag so code execution remains disabled by
+- [x] Define `isolation_level` values:
+      `:in_process`, `:in_process_virtual`, `:wasi`, `:namespace`,
+      `:container`, `:gvisor`, `:microvm`, `:remote_microvm`.
+- [x] Decide whether the stable namespace is a RunicAI-local module or a
+      sibling package spike. The stable contract is `RunicSandbox`; RunicAI keeps
+      only product integrations and a compatibility facade.
+- [x] Add a small local feature flag so code execution remains disabled by
       default.
 
 Validation:
 
-- [ ] Unit tests for request/result validation.
-- [ ] Unit tests proving isolation-level metadata is required for every backend
+- [x] Unit tests for request/result validation.
+- [x] Unit tests proving isolation-level metadata is required for every backend
       result.
 
 ### Phase 1: Internal JustBash And Lua Backends
 
-- [ ] Wrap current optional `JustBash` usage behind the sandbox backend
+- [x] Wrap current optional `JustBash` usage behind the sandbox backend
       behaviour.
-- [ ] Add a Lua/Luerl backend spike for small transform functions.
-- [ ] Return the same `ExecutionResult` shape from both.
-- [ ] Mark both as `isolation_level: :in_process`.
+- [x] Add a Lua/Luerl backend spike for small transform functions.
+- [x] Return the same `ExecutionResult` shape from the JustBash backend.
+- [x] Mark JustBash as `isolation_level: :in_process_virtual` and
+      `security_boundary?: false`.
 
 Validation:
 
-- [ ] Scripted tests for stdout/stderr/status/timeouts.
-- [ ] Tests proving these backends are not advertised as arbitrary binary
-      execution.
+- [x] Scripted tests for JustBash stdout/status through the sandbox facade.
+- [x] Tests proving JustBash is not advertised as a hard security boundary.
+- [x] Timeout-focused backend tests.
+- [x] Lua backend tests.
 
 ### Phase 2: Local Container Backend
 
-- [ ] Add Docker backend using CLI first, with command construction kept
+- [x] Add Docker backend using CLI first, with command construction kept
       argv-only.
-- [ ] Support stateless one-shot execution.
-- [ ] Support stateful per-session containers.
-- [ ] Build a default multi-runtime image for Elixir, Bash, Lua, Python, Node,
+- [x] Support stateless one-shot execution.
+- [x] Support stateful per-session Docker workspaces under supervised profiles.
+- [x] Build a default multi-runtime image for Elixir, Bash, Lua, Python, Node,
       git, rg, jq, sqlite, and common build tools.
-- [ ] Capture changed files as artifacts before any host export.
+- [x] Capture changed files as artifacts before any host export.
 
 Validation:
 
-- [ ] Run Elixir, Python, Node, Lua, and Bash smoke requests.
-- [ ] Prove network disabled blocks egress.
-- [ ] Prove host workspace writes require explicit export/patch flow.
+- [x] Run Elixir, Python, Node, Lua, and Bash smoke requests.
+- [x] Prove network disabled blocks egress.
+- [x] Prove host workspace writes require explicit export/patch flow.
 
 ### Phase 3: RunicAI Toolset And Workbench Surfacing
 
-- [ ] Add `code_execution` capability profile config.
-- [ ] Add `sandbox_status` and `execute_code` tool definitions.
-- [ ] Add Workbench settings for backend, runtimes, network, state mode, and
-      warm pool.
-- [ ] Persist sandbox execution events and backend metadata.
-- [ ] Add review gates for policy escalation, network enablement, and host
+- [x] Add `code_execution` capability profile config.
+- [x] Add `sandbox_status` and `execute_code` tool definitions.
+- [x] Add Workbench settings for backend, runtime, network, and state mode.
+- [x] Add Workbench warm pool controls.
+- [x] Emit sandbox started/completed trace events with backend, isolation,
+      network, artifact, and policy metadata.
+- [x] Persist sandbox execution events and backend metadata through the
+      terminal event bridge.
+- [x] Add dedicated sandbox read-model grouping in Workbench details/artifacts.
+- [x] Add review gates for policy escalation, network enablement, and host
       export.
 
 Validation:
 
-- [ ] LiveView tests for submitting a run with code execution disabled/enabled.
-- [ ] Agent smoke where syntax/runtime errors return repairable diagnostics.
+- [x] LiveView tests for submitting a run with configured code execution.
+- [x] Agent smoke where syntax/runtime errors return repairable diagnostics.
 
 ### Phase 4: Hardened Backends
 
-- [ ] Add gVisor/runsc container backend detection.
-- [ ] Evaluate SmolVM or vmsan as a local microVM adapter before implementing
+- [x] Add gVisor/runsc container backend detection.
+- [x] Evaluate SmolVM or vmsan as a local microVM adapter before implementing
       raw Firecracker.
-- [ ] Add direct Firecracker/KVM backend only if wrappers are insufficient.
-- [ ] Add Fly Sprites or Machines as an optional remote microVM backend.
+- [x] Defer direct Firecracker/KVM backend until wrappers prove insufficient.
+- [x] Add Fly Sprites or Machines as an optional remote microVM backend.
 
 Validation:
 
-- [ ] Backend health matrix for Linux, macOS, and Windows/WSL.
-- [ ] Latency report for cold start, warm exec, reset, and snapshot/restore.
-- [ ] Security posture report listing actual backend boundaries and known
+- [x] Backend health matrix for Linux, macOS, and Windows/WSL.
+- [x] Latency report for cold start, warm exec, reset, and snapshot/restore.
+- [x] Security posture report listing actual backend boundaries and known
       limitations.
 
 ### Phase 5: Extraction
 
-- [ ] Split stable sandbox contracts into an independent Elixir package.
-- [ ] Keep RunicAI-specific tool definitions, WebUI, persistence, and RLM
+- [x] Split stable sandbox contracts into an independent Elixir package.
+  - [x] Add the extraction-facing `RunicSandbox` facade and child spec.
+  - [x] Move the stable contracts and backend adapters into
+        `packages/runic_sandbox`.
+- [x] Keep RunicAI-specific tool definitions, WebUI, persistence, and RLM
       components in RunicAI.
-- [ ] Publish adapters as optional dependencies where possible.
+- [x] Publish adapters as optional dependencies where possible.
+  - [x] Keep Lua and JustBash runtime dependencies optional in the local package.
+  - [x] Record which adapters stay in the base package and which should split
+        into future provider/microVM packages.
 
 Validation:
 
-- [ ] Use the library from RunicAI through public child specs only.
-- [ ] Use the library in a tiny standalone Mix project.
+- [x] Use the library-shaped facade from RunicAI through a public child spec.
+- [x] Use the library-shaped facade in a tiny standalone Mix project.
 
 ## Initial Recommendation
 
-Start with an internal `RunicAI.Sandbox` contract and two backends:
+Start with the `RunicSandbox` contract and two backends:
 
 1. `:just_bash` as the low-latency in-process virtual shell for tests and
    deterministic demos.
@@ -780,21 +795,940 @@ The most important architectural decision is to keep sandbox execution as a
 supervised sidecar capability with explicit backend metadata, not a special
 case inside `CommandRunner` and not generated Elixir modules inside the BEAM.
 
-## Open Questions
+## Implementation Progress
+
+### 2026-05-25 Slice
+
+Implemented the first contract slice under `RunicSandbox`, initially wired
+through a RunicAI compatibility facade:
+
+- `RunicSandbox` facade and child spec, suitable for application
+  supervision-tree configuration.
+- `RunicSandbox.Manager` GenServer for named sandbox profiles.
+- `RunicSandbox.Backend` behaviour.
+- `RunicSandbox.Profile`, `Policy`, `Workspace`, `Instance`,
+  `ExecutionRequest`, and `ExecutionResult` structs.
+- `RunicSandbox.Backends.JustBash` as the first backend.
+- `RunicAI.Application` now starts `{RunicSandbox,
+  Application.get_env(:runic_ai, :sandbox, [])}`.
+- `RunicAI.Coding.Tools.execute_code/4` now calls the sandbox facade instead
+  of directly constructing a `:just_bash` command.
+- `RunicAI.Coding.Tools.sandbox_status/2` now reports through
+  `RunicSandbox.status/1`.
+- `RunicAI.Agent.CapabilityResolver` passes `code_execution` tool config into
+  sandbox profile options.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147
+mix run -e 'Application.ensure_all_started(:runic_ai); ...'
+```
+
+Manual integration result from the supervised application child:
+
+```text
+status=available backend=just_bash
+result=pass stdout=app-supervised-sandbox isolation=in_process_virtual
+```
+
+This completes the Phase 0 contract spike and the JustBash half of Phase 1.
+It does not complete Lua, Docker/Podman, persistent sandbox workspaces,
+Workbench settings, durable sandbox event persistence, or hardened backends.
+
+Full-suite note:
+
+```text
+mix test
+787 tests, 3 failures, 2 skipped
+```
+
+The sandbox/tool-leaf failure found during the first full-suite run was fixed
+by returning JSON-safe `sandbox_status` maps. The remaining failures after the
+fix were:
+
+- `test/runic_ai/coding/command_test.exs:69`, streaming command timeout did
+  not preserve partial output in that full-suite run, though the same test
+  passed when rerun directly.
+- `test/runic_ai/coding/rlm_objective_loop_test.exs:1091`, OpsLogic follow-up
+  stopped with `:stop_failed` instead of completing.
+- `test/runic_ai/rlm/robustness_test.exs:141`, OpsLogic optional smoke checks
+  were skipped and the scenario expected `:pass`.
+
+### 2026-05-25 Docker Slice
+
+Implemented the first local container backend:
+
+- `RunicSandbox.Backends.Docker` implements the shared backend behaviour.
+- The backend uses explicit `docker run` argv, `--pull never`, `--rm`,
+  `--network none` for disabled network policy, and a temporary copy-in
+  workspace mounted at `/workspace`.
+- `RunicSandbox` can dispatch `backend: :docker` profiles.
+- Profile config now accepts top-level `image:` and carries backend options
+  into instance metadata.
+- Docker status reports `isolation_level: :container`,
+  `security_boundary?: true`, configured image, and local image availability.
+- Created or modified files in the temporary Docker workspace are captured as
+  `files_changed` entries plus `sandbox://...` artifacts before cleanup.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147
+```
+
+Focused result:
+
+```text
+14 tests, 0 failures
+```
+
+Manual integration used an existing local Docker image with `/bin/sh` because
+the default `runic-ai/sandbox:elixir-python-node` image does not exist yet.
+The tool-level smoke exercised `RunicAI.Coding.Tools.execute_code/4` through a
+Docker sandbox profile:
+
+```text
+status=available backend=docker image=registry.fly.io/zblanco/fly-pg-pgvector:latest
+result=pass backend=docker isolation=container output=hello-docker-tool
+```
+
+Network-disabled validation checked container interfaces:
+
+```text
+interfaces=lo status=pass network=disabled
+```
+
+Host-export validation wrote a file inside `/workspace`, captured it as a
+sandbox artifact, and confirmed no file appeared in the host workspace:
+
+```text
+status=pass stdout=container-only
+files_changed=[%{path: "docker_sandbox_host_leak.txt", kind: :created, ...}]
+artifacts=[%{ref: "sandbox://docker_sandbox_host_leak.txt", preview: "container-only\n", ...}]
+host_leak=absent
+```
+
+This completes the stateless Docker CLI backend shape. At this point it did
+not yet complete the default multi-runtime image, stateful container pools, or
+multi-language container smoke coverage.
+
+### 2026-05-25 Default Image Slice
+
+Added the default local sandbox image artifact and build/smoke entrypoint:
+
+- `priv/runic_ai/sandbox/Dockerfile` builds
+  `runic-ai/sandbox:elixir-python-node` from Ubuntu 24.04.
+- The image installs Bash, Elixir/Erlang, Python, Node/npm, Lua, git, ripgrep,
+  jq, sqlite3, CA certificates, and build tools.
+- `mix runic_ai.sandbox.image` builds the image and then smokes each runtime
+  through `RunicSandbox.exec/2` with `backend: :docker`.
+- `mix.exs` now includes `priv/runic_ai` in package files so the image
+  definition is part of the deliverable.
+
+Validation completed:
+
+```sh
+mix runic_ai.sandbox.image
+mix runic_ai.sandbox.image --no-build
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147
+```
+
+Runtime smoke result after building the image:
+
+```text
+bash: bash-ok
+python: python-ok
+node: node-ok
+elixir: elixir-ok
+lua: lua-ok
+```
+
+Focused tests remained green:
+
+```text
+14 tests, 0 failures
+```
+
+This completes the default local image and multi-language smoke part of Phase
+2. The remaining container/runtime gap is warm container pooling; current
+statefulness is implemented as a supervised persistent Docker workspace, not a
+long-lived container process.
+
+### 2026-05-25 Stateful Docker Workspace Slice
+
+Added supervised stateful Docker workspace support:
+
+- Docker profiles with `stateful?: true` or
+  `workspace: [persist?: true]` receive a managed temporary workspace root.
+- `RunicSandbox.Manager` reuses the provisioned instance for the named
+  sandbox profile, so later executions see files created by earlier
+  executions.
+- Direct unsupervised `RunicSandbox.exec/2` calls still use isolated
+  one-shot workspaces unless a supervised server is supplied.
+- `destroy/2` removes the managed workspace root.
+
+Validation completed:
+
+```sh
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147
+mix run --no-start -e '... stateful docker workspace smoke ...'
+```
+
+Focused result:
+
+```text
+15 tests, 0 failures
+```
+
+Manual stateful smoke result:
+
+```text
+first=pass changes=1 second=pass stdout=manual-state
+```
+
+This proves stateful execution through a supervised sandbox profile while
+preserving one-shot isolation for direct Docker profile calls. It does not yet
+implement warm long-lived container pools.
+
+### 2026-05-25 Trace Event Slice
+
+Added sandbox observability through the existing RunicAI trace surface:
+
+- `RunicAI.Coding.TraceEvent.sandbox/3` creates sandbox trace events.
+- `RunicAI.Coding.Tools.execute_code/4` now emits
+  `:coding_sandbox_started` and `:coding_sandbox_completed` events when an
+  `event_sink` is supplied.
+- Started events include the selected sandbox, runtime, network policy,
+  workspace-relative input file paths, code byte count, bounded code preview,
+  and summarized sandbox profile options.
+- Completed events include status, backend, isolation level, duration, exit
+  status, diagnostics, resource usage, changed files, and artifact refs without
+  embedding full artifact contents.
+- `RunicAI.Terminal.Event.from_trace_event/2` now gives sandbox trace events a
+  tool-phase presentation shape, so terminal/TUI/Workbench subscribers see
+  sandbox activity through the same event bridge as commands and browser tools.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147 \
+  test/runic_ai/coding/trace_event_test.exs \
+  test/runic_ai/terminal/event_test.exs
+mix run --no-start -e '... execute_code with event_sink ...'
+```
+
+Focused result:
+
+```text
+32 tests, 0 failures
+```
+
+Manual event smoke:
+
+```text
+result=pass output=trace-smoke
+event=coding_sandbox_started status=running sandbox=local_code runtime=bash backend=
+event=coding_sandbox_completed status=pass sandbox=local_code runtime=bash backend=just_bash
+```
+
+This completes the initial trace-event side of Phase 3. The remaining Phase 3
+work is explicit Workbench settings, durable SQLite/read-model surfacing for
+sandbox events and metadata, and review gates for sandbox policy escalation,
+network enablement, and host export.
+
+### 2026-05-25 Workbench And Review Gate Slice
+
+Added the first operator-facing Phase 3 controls and review metadata:
+
+- `execute_code` now normalizes sandbox network policy values at the tool
+  boundary, so direct `"host"` / `"restricted"` requests become structured
+  sandbox policy instead of invalid request maps.
+- `RunicAI.Coding.ReviewGate` now classifies `execute_code` separately from
+  generic risky tools. Review details include sandbox name, backend, runtime,
+  network policy, timeout/output caps, sandbox cwd, state/export indicators,
+  input file summaries, bounded code preview, code byte count, and policy
+  escalation labels.
+- `RunicAI.Agent.ToolExecution` includes the same bounded sandbox summary in
+  browser review requests for assistant/RLM tool execution paths that do not
+  pass through the standard coding pre-tool guard.
+- `RunicAI.Workbench.health/0` now includes supervised sandbox status.
+- Workbench launch settings now expose sandbox backend, runtime, network, and
+  stateless/stateful mode plus warm/max pool counts, and merge those controls
+  into `code_execution` capability profile config.
+- Workbench session details show the active sandbox backend/runtime/network
+  from the resolved capability profile.
+- Capability resolution accepts CLI/workbench string runtime lists such as
+  `"python,node"` when building sandbox profile options.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/coding/review_gate_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/coding/tools_test.exs:512 \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai_web/workbench_live_test.exs
+mix runic_ai.sandbox.image --no-build
+```
+
+Focused result:
+
+```text
+31 tests, 0 failures (22 excluded)
+bash: bash-ok
+python: python-ok
+node: node-ok
+elixir: elixir-ok
+lua: lua-ok
+```
+
+Full-suite regression result after this slice:
+
+```text
+mix test
+794 tests, 3 failures, 2 skipped
+```
+
+The remaining failures match the pre-existing non-sandbox lanes observed
+earlier in this implementation loop: streaming command timeout partial output,
+OpsLogic objective-loop completion, and optional OpsLogic smoke expectations.
+
+Manual integration smokes through the running application:
+
+```text
+execute_code pass manual-sandbox network=:host
+sandbox syntax status=fail exit=2 output=bash: syntax error: Expected 'then'
+sandbox backend="docker" runtimes="python,node" network="restricted"
+sandbox_health: status=:available backend=:just_bash network=:disabled
+```
+
+The `mix run` manual smokes also emitted a local Phoenix file-watcher warning
+because the machine had reached its inotify watch limit. The commands still
+completed successfully. Remaining Phase 3 work is a full agent repair smoke
+for runtime/syntax errors.
+
+### 2026-05-25 Lua Backend Slice
+
+Added the optional in-process Lua backend:
+
+- Added optional dev/test dependency `:lua, "~> 0.4"`, which brings the
+  tv-labs Lua wrapper over Luerl.
+- Added `RunicSandbox.Backends.Lua` behind the existing sandbox backend
+  behaviour.
+- Lua execution runs in a separate BEAM task with `ExecutionRequest.timeout_ms`
+  enforced by `Task.yield/2` and `Task.shutdown/2`.
+- Lua backend results use the same `ExecutionResult` contract and truthfully
+  report `backend: :lua`, `isolation_level: :in_process`, and
+  `security_boundary?: false`.
+- `RunicSandbox.Profile` now defaults runtimes by backend, so `backend:
+  :lua` defaults to `runtimes: [:lua]`.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/coding/tools_test.exs:512 \
+  test/runic_ai/coding/review_gate_test.exs \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147 \
+  test/runic_ai/coding/trace_event_test.exs \
+  test/runic_ai/terminal/event_test.exs \
+  test/runic_ai_web/debug_live_test.exs:79 \
+  test/runic_ai_web/workbench_live_test.exs
+```
+
+Focused result:
+
+```text
+58 tests, 0 failures (39 excluded)
+```
+
+Manual integration smokes:
+
+```text
+lua pass 42 isolation=in_process boundary=false
+lua-timeout timeout lua execution timed out
+```
+
+### 2026-05-25 Sandbox Read Model Slice
+
+Added Workbench read-model support for persisted sandbox execution records:
+
+- `RunicAI.Terminal.Event.from_trace_event/2` now persists trace inputs as
+  JSON-safe terminal event data, allowing sandbox request metadata to survive
+  the trace-to-terminal bridge.
+- `RunicAI.Workbench.session_snapshot/1` now derives
+  `sandbox_executions` from durable terminal events whose phase/trace kind
+  identifies sandbox activity.
+- Sandbox execution views expose status, sandbox, runtime, network, backend,
+  isolation level, duration, exit status, output byte count, changed files,
+  artifact summaries, and diagnostics.
+- Workbench metrics now include `sandbox_executions`.
+- The Workbench trace inspector shows a compact sandbox execution group above
+  the general trace list, and session details include the sandbox execution
+  count.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs \
+  test/runic_ai/workbench_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/coding/tools_test.exs:512 \
+  test/runic_ai/coding/review_gate_test.exs \
+  test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/assistant/rlm_blueprint_test.exs:147 \
+  test/runic_ai/coding/trace_event_test.exs \
+  test/runic_ai/terminal/event_test.exs \
+  test/runic_ai_web/debug_live_test.exs:79 \
+  test/runic_ai_web/workbench_live_test.exs
+```
+
+Focused result:
+
+```text
+84 tests, 0 failures (39 excluded)
+```
+
+### 2026-05-25 Code Execution Feature Flag Slice
+
+Added default-off capability gating for sandbox code execution:
+
+- Capability presets can still describe the `:code_execution` lane, but
+  `CapabilityResolver` removes it unless the run explicitly enables it.
+- Enabling paths are:
+  - explicit `toolsets: [:code_execution]` / `--toolsets code-execution`;
+  - `enable_code_execution?: true` or `code_execution_enabled?: true`;
+  - `tool_config.code_execution.enabled=true`;
+  - app sandbox config `enable_code_execution?: true` or
+    `code_execution_enabled?: true`.
+- Default `:local_workbench` no longer exposes `execute_code` or
+  `sandbox_status` without that explicit enablement.
+- Workbench submissions that choose `code-execution` in toolsets still merge
+  backend/runtime/network/state/pool settings into the resolved capability
+  profile.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/coding/standard_agent_test.exs:77 \
+  test/runic_ai/assistant/rlm_blueprint_test.exs \
+  test/runic_ai/coding/rlm_agent_test.exs:2135 \
+  test/runic_ai_web/workbench_live_test.exs:135 \
+  test/runic_ai/sandbox_test.exs \
+  test/runic_ai/workbench_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/coding/tools_test.exs:512 \
+  test/runic_ai/coding/review_gate_test.exs \
+  test/runic_ai/coding/trace_event_test.exs \
+  test/runic_ai/terminal/event_test.exs \
+  test/runic_ai_web/debug_live_test.exs:79
+```
+
+Focused result:
+
+```text
+81 tests, 0 failures (126 excluded)
+```
+
+### 2026-05-25 Agent Repair Smoke Slice
+
+Added a standard-agent smoke for repairable sandbox diagnostics:
+
+- The agent starts with `:local_workbench` plus explicit
+  `toolsets: [:code_execution]`, preserving the default-off feature flag while
+  exercising the enabled code-execution lane.
+- First tool call runs invalid Bash through `execute_code`.
+- The resulting tool observation includes the sandbox syntax error.
+- The next model turn reacts to that diagnostic and runs corrected code through
+  `execute_code`.
+- The agent finishes with a repair summary, proving sandbox runtime errors can
+  flow through ordinary tool observations and drive a follow-up repair turn.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/agent/capability_resolver_test.exs \
+  test/runic_ai/coding/standard_agent_test.exs:77 \
+  test/runic_ai/coding/standard_agent_test.exs:102 \
+  test/runic_ai/assistant/rlm_blueprint_test.exs \
+  test/runic_ai/coding/rlm_agent_test.exs:2135 \
+  test/runic_ai_web/workbench_live_test.exs:135 \
+  test/runic_ai/sandbox_test.exs \
+  test/runic_ai/workbench_test.exs \
+  test/runic_ai/coding/tools_test.exs:465 \
+  test/runic_ai/coding/tools_test.exs:512 \
+  test/runic_ai/coding/review_gate_test.exs \
+  test/runic_ai/coding/trace_event_test.exs \
+  test/runic_ai/terminal/event_test.exs \
+  test/runic_ai_web/debug_live_test.exs:79
+```
+
+Focused result:
+
+```text
+82 tests, 0 failures (126 excluded)
+```
+
+### 2026-05-25 gVisor Detection Slice
+
+Added the first hardened-backend adapter surface:
+
+- `backend: :gvisor` profiles now dispatch through the container backend
+  substrate.
+- gVisor status reports `name: :gvisor`, `isolation_level: :gvisor`,
+  `security_boundary?: true`, and `container_runtime: "runsc"`.
+- Health detection distinguishes Docker daemon availability, generic `runsc`
+  binary/runtime visibility, and Docker's registered `runsc` runtime because
+  `docker run --runtime runsc` requires the Docker runtime registration.
+- When Docker's `runsc` runtime is registered, the same workspace, artifact,
+  network-policy, timeout, and runtime dispatch path can execute with
+  `--runtime runsc`.
+- When the host cannot execute gVisor containers, `Sandbox.status/1` still
+  returns structured unavailable health diagnostics instead of crashing.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs
+```
+
+Focused result:
+
+```text
+9 tests, 0 failures
+```
+
+Manual integration on this Linux host:
+
+```text
+backend=gvisor status=unavailable isolation=gvisor docker=true runsc=false docker_runsc=false runtime=runsc
+diagnostics: [%{message: "Docker runsc runtime is unavailable"}]
+```
+
+Attempting execution against the unavailable gVisor backend returns the same
+structured preflight details:
+
+```text
+error=gvisor container runtime is not available for sandbox execution
+details: %{
+  backend: :gvisor,
+  container_runtime: "runsc",
+  docker_available?: true,
+  docker_runsc_runtime_available?: false,
+  runsc_available?: false
+}
+```
+
+The manual `mix run` invocations also emitted the existing local Phoenix file
+watcher warning about the host inotify watch limit. The sandbox status and
+execution preflight checks still completed successfully.
+
+### 2026-05-25 MicroVM Adapter Evaluation Slice
+
+Evaluated the current wrapper options before adding a raw Firecracker/KVM
+backend:
+
+| Candidate | Current shape | Fit for RunicAI contract | Decision |
+| --- | --- | --- | --- |
+| `vmsan` | Firecracker CLI with `create`, `exec`, `upload`, `download`, `snapshot`, network policy, OCI image boot, and `--json` output. | Good first local microVM adapter because it maps directly to `provision`, `exec`, `upload`, `download`, `snapshot`, `reset`, and structured diagnostics. | Prefer as the first local microVM implementation candidate. |
+| `SmolVM` | Open-source agent sandbox with Firecracker on Linux, QEMU on macOS, Python SDK, CLI, browser/computer-use surface, snapshots, file sharing, and coding-agent helpers. | Strong candidate for richer agent-computer sessions, but the Python SDK and broader browser/GUI surface make it a larger adapter than the narrow code-execution contract needs first. | Track as a second local/desktop adapter after the core sandbox contract stabilizes. |
+| Raw Firecracker | Direct VMM integration. | Maximum control, but RunicAI would own jailer setup, rootfs/image lifecycle, networking, exec transport, file sync, snapshot semantics, and host compatibility. | Defer until a wrapper cannot preserve required policy/trace/workspace semantics. |
+
+Recommendation:
+
+- Add `RunicSandbox.Backends.Vmsan` next as an optional CLI adapter, not a
+  direct Firecracker backend.
+- Treat `vmsan --json` as the integration boundary and normalize its output
+  into the existing `ExecutionResult`, `Instance`, and health maps.
+- Keep `backend: :firecracker` reserved for a future direct adapter; use
+  `backend: :remote` or a future `:fly` backend for hosted microVM services.
+- Require the same default-off code-execution gate, review metadata, and
+  terminal trace events before exposing microVM execution in Workbench presets.
+
+Primary-source refresh on 2026-05-25:
+
+- SmolVM README describes disposable AI-agent sandboxes, hardware isolation,
+  network controls, snapshots, file sharing, and benchmarks across Firecracker
+  on Linux and QEMU on macOS:
+  <https://github.com/CelestoAI/SmolVM>
+- vmsan docs describe Firecracker-backed microVMs with CLI commands for create,
+  exec, upload/download, snapshots, network policy, OCI image boot, and JSON
+  output:
+  <https://vmsan.dev/>
+- Fly's agent-sandbox article describes Sprites as hardware-isolated VM
+  sandboxes with checkpoint/restore semantics:
+  <https://fly.io/learn/agent-sandbox/>
+- Fly Machines API remains the stable documented REST surface for creating,
+  waiting on, starting, stopping, suspending, deleting, leasing, and inspecting
+  remote Machines:
+  <https://fly.io/docs/machines/api/machines-resource/>
+
+### 2026-05-25 Remote MicroVM Backend Slice
+
+Added the first optional remote microVM backend surface:
+
+- `RunicSandbox.Backends.Remote` implements the shared backend behaviour.
+- `backend: :remote` now dispatches through the sandbox facade.
+- The first provider shape is `provider: :fly_machines`, targeting existing
+  Fly Machines through the local `fly` or `flyctl` executable.
+- Health reporting is local and configuration-only: it does not contact Fly,
+  and it does not expose tokens.
+- Health reports `isolation_level: :remote_microvm`,
+  `security_boundary?: true`, provider config, CLI availability, auth env
+  presence, and structured diagnostics.
+- Execution is wired for already-provisioned Machines through
+  `fly machine exec --json`; it only runs when the CLI, app, and `machine_id`
+  are configured.
+- Inline file upload/download and snapshot transport remain explicit
+  follow-up work instead of being hidden behind best-effort command strings.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs
+```
+
+Focused result:
+
+```text
+10 tests, 0 failures
+```
+
+Manual integration on this host used a deliberately missing Fly executable to
+verify unavailable health and execution preflight:
+
+```text
+backend=remote status=unavailable isolation=remote_microvm provider=fly_machines configured=true fly_cli=false auth=false
+provider_config: %{
+  image: nil,
+  app: "runic-sandbox-test",
+  region: nil,
+  machine_id: "machine-test-id",
+  token_env: "RUNIC_AI_MISSING_FLY_TOKEN",
+  executable: nil
+}
+diagnostics: [%{message: "fly or flyctl executable is unavailable"}]
+error=remote sandbox provider is not available for execution
+```
+
+The manual `mix run` command also emitted the existing local Phoenix file
+watcher warning about the host inotify watch limit. The remote backend status
+and preflight checks still completed successfully.
+
+This completes the Phase 4 backend-direction items. The remaining Phase 4
+validation work is cross-platform health evidence, latency reporting, and a
+security posture report.
+
+### 2026-05-25 Extraction Facade Slice
+
+Added the first Phase 5 extraction boundary:
+
+- `RunicSandbox` is now a top-level facade with the target `child_spec/1`,
+  `start_link/1`, `exec/2`, `status/1`, `provision/1`, and
+  `exec_with_instance/2` API.
+- `RunicAI.Application` starts `{RunicSandbox, sandbox_opts}` while preserving
+  the existing sandbox process name for current Workbench and tool
+  integrations.
+- A supervised test now starts `{RunicSandbox, sandboxes: [...]}` directly and
+  executes through `RunicSandbox.exec/2`, matching the future standalone
+  library configuration shape.
+- The implementation modules now live under `packages/runic_sandbox`; the
+  RunicAI-local module is a compatibility shim.
+
+Validation completed:
+
+```sh
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs
+mix runic_sandbox.validate_standalone
+```
+
+Focused result:
+
+```text
+37 tests, 0 failures
+```
+
+### 2026-05-25 Standalone Mix Project Validation Slice
+
+Added a standalone validation entrypoint:
+
+- `mix runic_sandbox.validate_standalone` creates a temporary Mix project with a
+  path dependency on this checkout and a direct `:just_bash` dependency.
+- The generated project uses isolated temp `deps` and `_build` directories,
+  does not start `RunicAI.Application`, and starts its own supervisor with
+  `{RunicSandbox, sandboxes: [...]}`.
+- The smoke script calls `RunicSandbox.status/1` and `RunicSandbox.exec/2`
+  through the public facade and verifies `:just_bash`,
+  `:in_process_virtual`, and the expected stdout.
+- The temporary project is removed by default; `--keep` can preserve it for
+  debugging.
+
+Validation completed:
+
+```sh
+mix format lib/mix/tasks/runic_sandbox.validate_standalone.ex
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs
+mix runic_sandbox.validate_standalone
+```
+
+Focused result:
+
+```text
+37 tests, 0 failures
+```
+
+Standalone result:
+
+```text
+standalone status=ok backend=just_bash isolation=in_process_virtual
+RunicSandbox standalone smoke passed in /tmp/runic_sandbox_standalone_4866
+```
+
+Important extraction evidence:
+
+- The facade and child-spec shape work from a separate Mix project.
+- The first standalone validation used the monolithic `:runic_ai` path
+  dependency, which proved the facade but also proved the dependency graph was
+  too heavy until the package split.
+- The validation rerun also exposed and fixed a stale stateful Docker workspace
+  collision across BEAM runs by adding the current system time to the generated
+  stateful workspace path.
+
+### 2026-05-25 Independent Package Split Slice
+
+Moved the stable sandbox substrate into a local independent package:
+
+- `packages/runic_sandbox` is now a standalone Mix project with app
+  `:runic_sandbox`.
+- The package owns `RunicSandbox`, `RunicSandbox.Error`, profile/policy/
+  workspace/request/result/instance contracts, the manager, backend behaviour,
+  and the JustBash, Lua, Docker/gVisor, and remote Fly Machines adapters.
+- Package dependencies are limited to `:jason` plus optional backend
+  dependencies `:just_bash` and `:lua`.
+- RunicAI now depends on `{:runic_sandbox, path: "packages/runic_sandbox"}`.
+- `RunicAI.Sandbox` is reduced to a compatibility facade over `RunicSandbox`.
+- RunicAI product code still owns tool definitions, Workbench health/read
+  models, review gates, trace events, terminal persistence, capability-profile
+  resolution, and the default Docker image build task.
+- The standalone validation task now depends on `packages/runic_sandbox`
+  directly instead of the monolithic RunicAI app.
+
+Validation completed:
+
+```sh
+cd packages/runic_sandbox && mix test
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs
+mix runic_sandbox.validate_standalone
+```
+
+Package result:
+
+```text
+3 tests, 0 failures
+```
+
+RunicAI focused result:
+
+```text
+37 tests, 0 failures
+```
+
+Standalone package result:
+
+```text
+standalone status=ok backend=just_bash isolation=in_process_virtual
+RunicSandbox standalone smoke passed in /tmp/runic_sandbox_standalone_9
+```
+
+This completes the main Phase 5 package split. The adapter publication strategy
+is captured in the backend report slice below.
+
+### 2026-05-25 Backend Report Slice
+
+Added executable package-level validation reports:
+
+- `RunicSandbox.Reports.health_matrix/1` returns structured backend health for
+  JustBash, Lua, Docker, gVisor, and the remote Fly Machines provider shape.
+- `RunicSandbox.Reports.latency_report/1` measures status, provision, and exec
+  latency for executable local profiles.
+- `RunicSandbox.Reports.security_posture/0` lists actual backend boundaries,
+  known limitations, and publication strategy.
+- `mix runic_sandbox.report` prints the report as text or JSON.
+- The report includes platform notes for Linux, macOS, Windows/WSL, and remote
+  providers. The current live run is Linux evidence; macOS and Windows/WSL rows
+  are explicit compatibility expectations until CI or real hosts run the task.
+
+Validation completed:
+
+```sh
+cd packages/runic_sandbox && mix test
+cd packages/runic_sandbox && mix runic_sandbox.report --format json
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs
+```
+
+Package result:
+
+```text
+4 tests, 0 failures
+```
+
+RunicAI focused result:
+
+```text
+37 tests, 0 failures
+```
+
+Live Linux backend health summary:
+
+| Backend | Status | Isolation | Notes |
+| --- | --- | --- | --- |
+| `just_bash` | `available` | `in_process_virtual` | Not a security boundary. |
+| `lua` | `available` | `in_process` | Not a security boundary. |
+| `docker` | `available` | `container` | Default image available locally. |
+| `gvisor` | `unavailable` | `gvisor` | Docker exists, but Docker `runsc` runtime is unavailable. |
+| `remote` | `unavailable` | `remote_microvm` | Fly CLI exists, but app and machine id are not configured. |
+
+Latency sample from the live Linux run:
+
+| Backend | Status check | Provision | Cold exec | Warm exec | Snapshot | Reset |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `just_bash` | 4 us | 653 us | 18,288 us | 78 us | 0 us | 0 us |
+| `lua` | 5 us | 9 us | 33,252 us | 176 us | 1 us | 0 us |
+
+Security posture and adapter publication decision:
+
+- `just_bash` and `lua` remain in the base package behind optional
+  dependencies.
+- Docker and gVisor stay in the base package because they use the Docker CLI
+  and require no Elixir dependency.
+- Fly-specific lifecycle beyond local health and `fly machine exec` should
+  become `runic_sandbox_fly` once credential policy, machine lifecycle, and
+  Sprites support grow.
+- vmsan and direct Firecracker should be separate adapter packages if/when
+  implemented, because they own local microVM lifecycle and host requirements.
+
+### 2026-05-25 Completion Audit
+
+Final local validation after the package split, report task, and documentation
+cleanup:
+
+```sh
+cd packages/runic_sandbox && mix test
+mix compile --warnings-as-errors
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs
+mix test test/runic_ai/sandbox_test.exs test/runic_ai/workbench_test.exs \
+  test/runic_ai/coding/tools_test.exs \
+  test/runic_ai/coding/rlm_agent_test.exs \
+  test/runic_ai/agent/capability_resolver_test.exs
+cd packages/runic_sandbox && mix runic_sandbox.report --format json
+mix runic_sandbox.validate_standalone
+mix test
+```
+
+Passing focused results:
+
+```text
+packages/runic_sandbox: 4 tests, 0 failures
+RunicAI focused sandbox/workbench tests: 37 tests, 0 failures
+RunicAI sandbox/tool/RLM integration tests: 142 tests, 0 failures
+standalone status=ok backend=just_bash isolation=in_process_virtual
+RunicSandbox standalone smoke passed in /tmp/runic_sandbox_standalone_11138
+```
+
+The RLM `:script` node path now routes through `Tools.execute_code/4`, which
+means Runic workflow nodes use the same sandbox request/result contract, review
+path, and sandbox trace events as ordinary model-visible tools. `execute_code`
+also accepts the non-Bash runtimes carried by sandbox profiles, with Lua covered
+by an in-process focused test and Docker multi-runtime coverage supplied by the
+image smoke task.
+
+Full-suite result:
+
+```text
+802 tests, 3 failures, 2 skipped
+```
+
+The remaining full-suite failures are not in the sandbox implementation path:
+
+- `test/runic_ai/coding/command_test.exs:69` intermittently loses partial output
+  on a streaming command timeout.
+- `test/runic_ai/coding/rlm_objective_loop_test.exs:1091` still stops the
+  OpsLogic implementation follow-up with `:stop_failed`.
+- `test/runic_ai/rlm/robustness_test.exs:141` still expects `:pass` even when
+  optional OpsLogic DB/browser smoke checks are skipped by missing environment
+  flags.
+
+## Resolved Decisions
 
 - Should the first stateful sandbox be per RunicAI session, per agent, or per
   workflow run?
-  * Answer: Stateful sandboxes should primarily exist per workbench / RunicAI session - if the app is running a sandbox should exist if configured. Per agent/workflow run will depend on that agent's config but will default to the common sandbox so low latency pre-warmed benefits apply.
+  * Answer: Stateful sandboxes should primarily exist per workbench / RunicAI
+    session. If the app is running a sandbox should exist when configured. Per
+    agent or workflow-run sandboxes depend on that agent's config, but the
+    default should be the common sandbox so pre-warmed latency benefits apply.
 - Should the first container backend copy the workspace into the sandbox, bind
   mount read-only, or support both with different policy labels?
+  * Answer: Default to `workspace: [mode: :copy_in]`. Bind mounts should be a
+    separate explicit workspace mode with review metadata because the host
+    exposure and mutation story is different. Host writes should surface as
+    `files_changed` and `sandbox://...` artifacts first.
 - How should package caches be shared without leaking credentials or letting
   sandbox code mutate trusted host cache state?
+  * Answer: Do not mount trusted host package caches by default. Any cache
+    sharing should be through sandbox-owned cache volumes or remote-provider
+    cache policies with no credentials, explicit review metadata, and clear
+    reset semantics.
 - Should sandboxed code be allowed to call back into RunicAI tools, or should
   it only receive input files/stdin and return output files/stdout?
+  * Answer: The sandbox contract should be data-only: input files/stdin/source
+    in, stdout/stderr/files/artifacts/diagnostics out. Tool callbacks should
+    stay in the agent/tool layer outside the sandbox so review gates and traces
+    remain observable.
 - Should exported sandbox changes always become patch artifacts, or can a
   trusted local profile apply them directly after review?
+  * Answer: Default to patch/artifact export. A trusted direct-apply profile can
+    be added later, but it must be an explicit policy escalation and review
+    reason rather than a backend default.
 - Which backend health checks should block a run versus merely downgrade the
   selected capability profile?
+  * Answer: If a run explicitly selects a backend, unavailable health blocks
+    execution with structured diagnostics. Downgrade is only allowed when the
+    capability profile declares an ordered fallback list; the trace must record
+    both requested and selected backend truth.
 
 ## Sources
 

@@ -460,6 +460,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       session: nil,
       messages: [],
       events: [],
+      sandbox_executions: [],
       tool_calls: [],
       runs: [],
       review_requests: [],
@@ -474,6 +475,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       metrics: %{
         messages: 0,
         events: 0,
+        sandbox_executions: 0,
         tool_calls: 0,
         runs: 0,
         review_requests: 0,
@@ -509,6 +511,12 @@ defmodule RunicAIWeb.WorkbenchLive do
       "toolsets" => "",
       "disabled_tools" => "",
       "tool_config" => "terminal.shell_review=always",
+      "sandbox_backend" => "just_bash",
+      "sandbox_runtime" => "bash",
+      "sandbox_network" => "disabled",
+      "sandbox_stateful" => "false",
+      "sandbox_pool_warm" => "0",
+      "sandbox_pool_max" => "1",
       "session_id" => nil
     }
   end
@@ -726,6 +734,36 @@ defmodule RunicAIWeb.WorkbenchLive do
             name={@new_run_form[:tool_config].name}
             value={Phoenix.HTML.Form.input_value(@new_run_form, :tool_config)}
           />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_backend].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_runtime].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_runtime)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_network].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_network)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_stateful].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_stateful)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_pool_warm].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_pool_warm)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_pool_max].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_pool_max)}
+          />
         </.form>
       </section>
     </main>
@@ -849,6 +887,7 @@ defmodule RunicAIWeb.WorkbenchLive do
           <div class="grid gap-2.5 bg-black/10 px-[22px] py-4 font-mono text-[11px] text-rune-muted">
             <.health_row label="runtime" value="online" />
             <.health_row label="sqlite" value={sqlite_health(@health)} />
+            <.health_row label="sandbox" value={sandbox_health(@health)} />
             <.health_row label="local bind" value="127.0.0.1" />
           </div>
         </aside>
@@ -1346,6 +1385,167 @@ defmodule RunicAIWeb.WorkbenchLive do
                         </option>
                       </select>
                     </label>
+                    <div class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1">
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Sandbox backend
+                        </span>
+                        <select
+                          name={@new_run_form[:sandbox_backend].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            value="just_bash"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
+                                "just_bash"
+                            }
+                          >
+                            just bash
+                          </option>
+                          <option
+                            value="docker"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
+                                "docker"
+                            }
+                          >
+                            docker
+                          </option>
+                          <option
+                            value="gvisor"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
+                                "gvisor"
+                            }
+                          >
+                            gvisor
+                          </option>
+                          <option
+                            value="firecracker"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
+                                "firecracker"
+                            }
+                          >
+                            firecracker
+                          </option>
+                        </select>
+                      </label>
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Sandbox runtime
+                        </span>
+                        <select
+                          name={@new_run_form[:sandbox_runtime].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            :for={runtime <- ~w(bash python node elixir lua)}
+                            value={runtime}
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_runtime) ==
+                                runtime
+                            }
+                          >
+                            {runtime}
+                          </option>
+                        </select>
+                      </label>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1">
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Sandbox network
+                        </span>
+                        <select
+                          name={@new_run_form[:sandbox_network].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            value="disabled"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_network) ==
+                                "disabled"
+                            }
+                          >
+                            disabled
+                          </option>
+                          <option
+                            value="restricted"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_network) ==
+                                "restricted"
+                            }
+                          >
+                            restricted
+                          </option>
+                          <option
+                            value="host"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_network) ==
+                                "host"
+                            }
+                          >
+                            host
+                          </option>
+                        </select>
+                      </label>
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Sandbox state
+                        </span>
+                        <select
+                          name={@new_run_form[:sandbox_stateful].name}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
+                        >
+                          <option
+                            value="false"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_stateful) ==
+                                "false"
+                            }
+                          >
+                            stateless
+                          </option>
+                          <option
+                            value="true"
+                            selected={
+                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_stateful) ==
+                                "true"
+                            }
+                          >
+                            stateful
+                          </option>
+                        </select>
+                      </label>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1">
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Pool warm
+                        </span>
+                        <input
+                          type="number"
+                          min="0"
+                          name={@new_run_form[:sandbox_pool_warm].name}
+                          value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_pool_warm)}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none"
+                        />
+                      </label>
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">
+                          Pool max
+                        </span>
+                        <input
+                          type="number"
+                          min="1"
+                          name={@new_run_form[:sandbox_pool_max].name}
+                          value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_pool_max)}
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none"
+                        />
+                      </label>
+                    </div>
                     <label class="grid gap-1">
                       <span class="font-mono text-[10px] uppercase text-rune-muted">Toolsets</span>
                       <input
@@ -1465,6 +1665,21 @@ defmodule RunicAIWeb.WorkbenchLive do
             <section :if={@inspector_tab == "trace"} class="pb-4">
               <div class="px-[18px] pb-3 pt-1">
                 <.progress_summary_panel summary={@snapshot.progress_summary} compact />
+              </div>
+              <div
+                :if={@snapshot.sandbox_executions != []}
+                class="px-[18px] pb-3 pt-1"
+              >
+                <div class="mb-2 font-mono text-[10.5px] font-bold uppercase text-rune-muted">
+                  Sandbox executions
+                </div>
+                <.artifact_record
+                  :for={execution <- Enum.take(@snapshot.sandbox_executions, 4)}
+                  title={sandbox_execution_title(execution)}
+                  meta={execution.status}
+                  tone={execution.status}
+                  detail={sandbox_execution_detail(execution)}
+                />
               </div>
               <div :if={@snapshot.events == []} class="px-[22px] py-8 text-sm text-rune-muted">
                 No trace events.
@@ -1623,6 +1838,8 @@ defmodule RunicAIWeb.WorkbenchLive do
                   <dd class="truncate">{capability_toolsets(@snapshot)}</dd>
                   <dt class="text-rune-muted">browser</dt>
                   <dd class="truncate">{agent_browser_status(@snapshot)}</dd>
+                  <dt class="text-rune-muted">sandbox</dt>
+                  <dd class="truncate">{sandbox_profile_label(@snapshot)}</dd>
                   <dt class="text-rune-muted">gated</dt>
                   <dd class="truncate">{capability_gated_tools(@snapshot)}</dd>
                   <dt class="text-rune-muted">database</dt>
@@ -1631,6 +1848,8 @@ defmodule RunicAIWeb.WorkbenchLive do
                   <dd>{@snapshot.metrics.messages}</dd>
                   <dt class="text-rune-muted">events</dt>
                   <dd>{@snapshot.metrics.events}</dd>
+                  <dt class="text-rune-muted">sandbox execs</dt>
+                  <dd>{@snapshot.metrics.sandbox_executions}</dd>
                 </dl>
               </div>
             </section>
@@ -2655,6 +2874,59 @@ defmodule RunicAIWeb.WorkbenchLive do
     end
   end
 
+  defp sandbox_profile_label(snapshot) do
+    code_execution =
+      snapshot
+      |> capability_profile()
+      |> field(:config)
+      |> field(:code_execution)
+
+    backend = field(code_execution, :default_backend) || field(code_execution, :backend)
+    network = field(code_execution, :network)
+    runtimes = field(code_execution, :allowed_runtimes) || field(code_execution, :runtimes)
+
+    case {backend, runtimes, network} do
+      {nil, nil, nil} ->
+        "-"
+
+      _other ->
+        [
+          backend || "sandbox",
+          runtimes |> List.wrap() |> Enum.map(&to_string/1) |> Enum.join("/"),
+          network || :disabled
+        ]
+        |> Enum.reject(&(&1 in [nil, ""]))
+        |> Enum.map(&to_string/1)
+        |> Enum.join(" - ")
+    end
+  end
+
+  defp sandbox_execution_title(execution) do
+    backend = field(execution, :backend) || field(execution, :sandbox) || "sandbox"
+    runtime = field(execution, :runtime) || "runtime"
+    "#{backend} / #{runtime}"
+  end
+
+  defp sandbox_execution_detail(execution) do
+    [
+      field(execution, :isolation_level),
+      field(execution, :network),
+      sandbox_duration_label(field(execution, :duration_ms)),
+      changed_files_label(field(execution, :files_changed))
+    ]
+    |> Enum.reject(&(&1 in [nil, "", "-"]))
+    |> Enum.map(&to_string/1)
+    |> Enum.join(" - ")
+  end
+
+  defp sandbox_duration_label(duration_ms) when is_integer(duration_ms), do: "#{duration_ms}ms"
+  defp sandbox_duration_label(_duration_ms), do: nil
+
+  defp changed_files_label(files) when is_list(files) and files != [],
+    do: "#{length(files)} changed"
+
+  defp changed_files_label(_files), do: nil
+
   defp capability_profile(%{capability_profile: profile}) when is_map(profile), do: profile
 
   defp capability_profile(%{session: %{capability_profile: profile}}) when is_map(profile),
@@ -2709,6 +2981,10 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp sqlite_health(%{database: nil}), do: "memory"
   defp sqlite_health(%{database: database}) when is_binary(database), do: "wal synced"
   defp sqlite_health(_health), do: "ready"
+
+  defp sandbox_health(%{sandbox: %{status: status}}), do: to_string(status)
+  defp sandbox_health(%{"sandbox" => %{"status" => status}}), do: to_string(status)
+  defp sandbox_health(_health), do: "unknown"
 
   defp session_link_class(session, selected_session_id) do
     [
@@ -3464,7 +3740,17 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   defp review_detail(%{details: details}) when is_map(details) and details != %{} do
     details
-    |> Map.take(["path", "tool_name", "reason", "write_policy"])
+    |> Map.take([
+      "path",
+      "tool_name",
+      "reason",
+      "write_policy",
+      "sandbox",
+      "backend",
+      "runtime",
+      "network",
+      "policy_escalations"
+    ])
     |> case do
       empty when empty == %{} -> json_preview(details)
       picked -> json_preview(picked)

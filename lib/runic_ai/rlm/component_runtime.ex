@@ -16,6 +16,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
   alias RunicAI.Error
   alias RunicAI.RLM.ComponentError
   alias RunicAI.RLM.Components.ArtifactWriter
+  alias RunicAI.RLM.Components.ArtifactMaterializer
   alias RunicAI.RLM.Components.BlueprintTransform
   alias RunicAI.RLM.Components.BudgetLedger
   alias RunicAI.RLM.Components.DocumentCompare
@@ -30,10 +31,28 @@ defmodule RunicAI.RLM.ComponentRuntime do
   alias RunicAI.RLM.Components.SourceMaterializer
   alias RunicAI.RLM.Components.SourceSplitter
   alias RunicAI.RLM.Components.TabularParser
+  alias RunicAI.RLM.EnvironmentRef
+  alias RunicAI.RLM.TaskKind
   alias RunicAI.ReviewDecision
   alias RunicAI.ReviewRequest
 
   @default_model "openai:gpt-5.4-mini"
+  @sandbox_execute_argument_keys [
+    :session_id,
+    "session_id",
+    :runtime,
+    "runtime",
+    :code,
+    "code",
+    :timeout_ms,
+    "timeout_ms",
+    :max_output_bytes,
+    "max_output_bytes",
+    :files,
+    "files",
+    :network,
+    "network"
+  ]
 
   @spec initial_context(Workspace.t(), WorkflowBlueprint.t(), keyword()) ::
           {:ok, map()} | {:error, Error.t()}
@@ -87,6 +106,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
     items =
       case component.type do
         :llm_map -> LLMMap.items(input, params)
+        :lambda_map -> LLMMap.items(input, params)
         :record_map -> RecordMap.items(input, params)
         :blueprint_transform -> transform_items(input, params)
       end
@@ -117,6 +137,9 @@ defmodule RunicAI.RLM.ComponentRuntime do
     result =
       case component.type do
         :llm_map ->
+          LLMMap.map_item(envelope.item, envelope.index, envelope.input, params, opts)
+
+        :lambda_map ->
           LLMMap.map_item(envelope.item, envelope.index, envelope.input, params, opts)
 
         :record_map ->
@@ -281,21 +304,222 @@ defmodule RunicAI.RLM.ComponentRuntime do
     )
   end
 
-  defp dispatch(%ComponentBlueprint{type: :tool_leaf, params: params}, input, runtime) do
+  defp dispatch(%ComponentBlueprint{type: :artifact_materializer, params: params}, input, runtime) do
     base = runtime_context(runtime)
-    opts = runtime_opts(runtime)
+    ArtifactMaterializer.run(base.workspace, input, params)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_status, params: params}, input, runtime) do
+    execute_capability_tool(
+      "sandbox_status",
+      sandbox_status_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_execute, params: params}, input, runtime) do
+    execute_capability_tool(
+      "execute_code",
+      sandbox_execute_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_open_session, params: params}, input, runtime) do
+    execute_capability_tool(
+      "open_sandbox_session",
+      tool_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_session_exec, params: params}, input, runtime) do
+    execute_capability_tool(
+      "sandbox_exec",
+      sandbox_session_arguments(params, input) |> sandbox_execute_arguments(input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_write_file, params: params}, input, runtime) do
+    execute_capability_tool(
+      "sandbox_write_file",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_read_file, params: params}, input, runtime) do
+    execute_capability_tool(
+      "sandbox_read_file",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_list_files, params: params}, input, runtime) do
+    execute_capability_tool(
+      "sandbox_list_files",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_checkpoint, params: params}, input, runtime) do
+    execute_capability_tool(
+      "checkpoint_sandbox",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_restore, params: params}, input, runtime) do
+    execute_capability_tool(
+      "restore_sandbox",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_close_session, params: params}, input, runtime) do
+    execute_capability_tool(
+      "close_sandbox_session",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_start_service, params: params}, input, runtime) do
+    execute_capability_tool(
+      "start_sandbox_service",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_stop_service, params: params}, input, runtime) do
+    execute_capability_tool(
+      "stop_sandbox_service",
+      sandbox_service_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_list_services, params: params}, input, runtime) do
+    execute_capability_tool(
+      "list_sandbox_services",
+      sandbox_session_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_open_proxy, params: params}, input, runtime) do
+    execute_capability_tool(
+      "open_sandbox_proxy",
+      sandbox_service_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :sandbox_close_proxy, params: params}, input, runtime) do
+    execute_capability_tool(
+      "close_sandbox_proxy",
+      sandbox_proxy_arguments(params, input),
+      params,
+      input,
+      runtime
+    )
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_plan, params: params}, input, runtime) do
+    base = runtime_context(runtime)
+    objective = get(params, :objective, nil) || base.objective
+    task_kind = get(params, :task_kind, get(params, :task_type, :summarization))
+    source_refs = lambda_source_refs(input, params)
+
+    with {:ok, task_kind} <- normalize_task_kind(task_kind),
+         :ok <- require_lambda_source_refs(source_refs, params) do
+      RunicAI.RLM.lambda_plan(objective, task_kind, source_refs,
+        policy: get(params, :policy, nil),
+        probes: get(params, :probes, []),
+        metadata: %{component_id: get(params, :component_id, nil)}
+      )
+    end
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_split, params: params}, input, runtime) do
+    base = runtime_context(runtime)
+    SourceSplitter.run(base.workspace, source_input(input, base, params), params)
+  end
+
+  defp dispatch(
+         %ComponentBlueprint{type: :lambda_map, params: params} = component,
+         input,
+         runtime
+       ) do
+    base = runtime_context(runtime)
+
+    opts =
+      base
+      |> llm_component_opts(runtime_opts(runtime))
+      |> component_llm_opts(component)
+
+    LLMMap.run(input, params, opts)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_filter}, input, _runtime), do: {:ok, input}
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_reduce, params: params}, input, runtime) do
+    HierarchicalReduce.run(input, Map.put_new(params, :strategy, :join), runtime_opts(runtime))
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_cross, params: params}, input, runtime) do
+    DocumentCompare.run(input, params, workspace: runtime_context(runtime).workspace)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_review, params: params}, input, runtime) do
+    base = runtime_context(runtime)
+    ObjectiveScorecard.run(base.workspace, scorecard_context(base, input), input, params)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :lambda_generate, params: params}, input, _runtime) do
+    ReportComposer.run(input, params)
+  end
+
+  defp dispatch(%ComponentBlueprint{type: :tool_leaf, params: params}, input, runtime) do
     tool_name = get(params, :tool, nil) || get(params, :name, nil)
     arguments = tool_arguments(params, input)
 
-    with {:ok, resolved} <- tool_capabilities(base.workspace, opts),
-         :ok <- require_tool_name(tool_name, params) do
-      ToolExecution.execute(resolved.registry, tool_name, arguments,
-        capability_profile: resolved.profile,
-        review_decider: Keyword.get(opts, :review_decider),
-        run_id: get(base.metadata, :run_id, nil) || Keyword.get(opts, :run_id),
-        session_id: Keyword.get(opts, :session_id),
-        context: %{workspace: base.workspace, input: input, params: params}
-      )
+    with :ok <- require_tool_name(tool_name, params) do
+      execute_capability_tool(tool_name, arguments, params, input, runtime)
     end
   end
 
@@ -396,6 +620,21 @@ defmodule RunicAI.RLM.ComponentRuntime do
      )}
   end
 
+  defp execute_capability_tool(tool_name, arguments, params, input, runtime) do
+    base = runtime_context(runtime)
+    opts = runtime_opts(runtime)
+
+    with {:ok, resolved} <- tool_capabilities(base.workspace, opts) do
+      ToolExecution.execute(resolved.registry, tool_name, arguments,
+        capability_profile: resolved.profile,
+        review_decider: Keyword.get(opts, :review_decider),
+        run_id: get(base.metadata, :run_id, nil) || Keyword.get(opts, :run_id),
+        session_id: Keyword.get(opts, :session_id),
+        context: %{workspace: base.workspace, input: input, params: params}
+      )
+    end
+  end
+
   defp tool_capabilities(%Workspace{} = workspace, opts) do
     CapabilityResolver.resolve(workspace,
       agent: :assistant,
@@ -420,6 +659,177 @@ defmodule RunicAI.RLM.ComponentRuntime do
       nil -> %{}
       other -> %{input: input, value: other}
     end
+  end
+
+  defp sandbox_status_arguments(params, input) do
+    case tool_arguments(params, input) do
+      args when map_size(args) > 0 ->
+        args
+
+      _empty ->
+        params
+    end
+  end
+
+  defp sandbox_execute_arguments(params, input) do
+    params
+    |> tool_arguments(input)
+    |> Map.merge(Map.drop(params || %{}, [:args, "args", :arguments, "arguments"]))
+    |> put_code_from_input(input)
+    |> normalize_sandbox_execute_arguments()
+  end
+
+  defp sandbox_session_arguments(params, input) do
+    params
+    |> tool_arguments(input)
+    |> Map.merge(Map.drop(params || %{}, [:args, "args", :arguments, "arguments"]))
+    |> put_session_id_from_input(input)
+  end
+
+  defp put_session_id_from_input(args, input) do
+    if present?(get(args, :session_id, nil) || get(args, :id, nil)) do
+      args
+    else
+      case input_session_id(input) do
+        nil -> args
+        id -> Map.put(args, :session_id, id)
+      end
+    end
+  end
+
+  defp input_session_id(%{session: session}), do: input_session_id(session)
+  defp input_session_id(%{"session" => session}), do: input_session_id(session)
+  defp input_session_id(%{id: id}) when is_binary(id), do: id
+  defp input_session_id(%{"id" => id}) when is_binary(id), do: id
+  defp input_session_id(%{session_id: id}) when is_binary(id), do: id
+  defp input_session_id(%{"session_id" => id}) when is_binary(id), do: id
+  defp input_session_id(_input), do: nil
+
+  defp sandbox_service_arguments(params, input) do
+    params
+    |> sandbox_session_arguments(input)
+    |> put_service_id_from_input(input)
+  end
+
+  defp put_service_id_from_input(args, input) do
+    if present?(get(args, :service_id, nil)) do
+      args
+    else
+      case input_service_id(input) do
+        nil -> args
+        id -> Map.put(args, :service_id, id)
+      end
+    end
+  end
+
+  defp input_service_id(%{service: service}), do: input_service_id(service)
+  defp input_service_id(%{"service" => service}), do: input_service_id(service)
+  defp input_service_id(%{service_id: id}) when is_binary(id), do: id
+  defp input_service_id(%{"service_id" => id}) when is_binary(id), do: id
+  defp input_service_id(%{id: id}) when is_binary(id), do: id
+  defp input_service_id(%{"id" => id}) when is_binary(id), do: id
+  defp input_service_id(_input), do: nil
+
+  defp sandbox_proxy_arguments(params, input) do
+    params
+    |> tool_arguments(input)
+    |> Map.merge(Map.drop(params || %{}, [:args, "args", :arguments, "arguments"]))
+    |> put_proxy_id_from_input(input)
+  end
+
+  defp put_proxy_id_from_input(args, input) do
+    if present?(get(args, :proxy_id, nil)) do
+      args
+    else
+      case input_proxy_id(input) do
+        nil -> args
+        id -> Map.put(args, :proxy_id, id)
+      end
+    end
+  end
+
+  defp input_proxy_id(%{proxy: proxy}), do: input_proxy_id(proxy)
+  defp input_proxy_id(%{"proxy" => proxy}), do: input_proxy_id(proxy)
+  defp input_proxy_id(%{proxy_id: id}) when is_binary(id), do: id
+  defp input_proxy_id(%{"proxy_id" => id}) when is_binary(id), do: id
+  defp input_proxy_id(%{id: id}) when is_binary(id), do: id
+  defp input_proxy_id(%{"id" => id}) when is_binary(id), do: id
+  defp input_proxy_id(_input), do: nil
+
+  defp normalize_sandbox_execute_arguments(args) do
+    args = Map.take(args, @sandbox_execute_argument_keys)
+
+    case get(args, :runtime, nil) do
+      runtime when is_atom(runtime) -> Map.put(args, :runtime, Atom.to_string(runtime))
+      _runtime -> args
+    end
+  end
+
+  defp put_code_from_input(args, input) do
+    if present?(get(args, :code, nil) || get(args, :source, nil)) do
+      args
+    else
+      case input_code(input) do
+        nil -> args
+        code -> Map.put(args, :code, code)
+      end
+    end
+  end
+
+  defp input_code(%{code: code}) when is_binary(code), do: code
+  defp input_code(%{"code" => code}) when is_binary(code), do: code
+  defp input_code(%{source: code}) when is_binary(code), do: code
+  defp input_code(%{"source" => code}) when is_binary(code), do: code
+  defp input_code(code) when is_binary(code), do: code
+  defp input_code(_input), do: nil
+
+  defp lambda_source_refs(input, params) do
+    source_refs =
+      get(params, :source_refs, nil) ||
+        get(params, :sources, nil) ||
+        get(input, :source_refs, nil) ||
+        get(input, :sources, [])
+
+    source_refs
+    |> List.wrap()
+    |> Enum.filter(&match?(%EnvironmentRef{}, &1))
+  end
+
+  defp require_lambda_source_refs([_first | _rest], _params), do: :ok
+
+  defp require_lambda_source_refs(source_refs, params) do
+    {:error,
+     Error.validation("lambda_plan requires EnvironmentRef source refs",
+       source: __MODULE__,
+       details: %{source_refs: source_refs, params: params}
+     )}
+  end
+
+  defp normalize_task_kind(task_kind) when is_atom(task_kind) do
+    if TaskKind.valid?(task_kind) do
+      {:ok, task_kind}
+    else
+      invalid_task_kind(task_kind)
+    end
+  end
+
+  defp normalize_task_kind(task_kind) when is_binary(task_kind) do
+    TaskKind.valid_kinds()
+    |> Enum.find(&(Atom.to_string(&1) == task_kind))
+    |> case do
+      nil -> invalid_task_kind(task_kind)
+      task_kind -> {:ok, task_kind}
+    end
+  end
+
+  defp normalize_task_kind(task_kind), do: invalid_task_kind(task_kind)
+
+  defp invalid_task_kind(task_kind) do
+    {:error,
+     Error.validation("invalid lambda_plan task kind",
+       source: __MODULE__,
+       details: %{task_kind: task_kind, valid_kinds: TaskKind.valid_kinds()}
+     )}
   end
 
   defp source_input(input, base, params) do

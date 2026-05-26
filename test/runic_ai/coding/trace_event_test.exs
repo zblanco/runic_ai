@@ -25,6 +25,10 @@ defmodule RunicAI.Coding.TraceEventTest do
     assert TraceEvent.search(%{matches: []}).kind == :coding_search
     assert TraceEvent.patch(%{status: :ok}).kind == :coding_patch
     assert TraceEvent.command(%{status: :pass}).kind == :coding_command
+
+    assert TraceEvent.sandbox(:coding_sandbox_completed, %{status: :pass}).kind ==
+             :coding_sandbox_completed
+
     assert TraceEvent.process(%{status: :running}).kind == :coding_process
   end
 

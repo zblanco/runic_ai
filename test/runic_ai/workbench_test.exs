@@ -2,9 +2,11 @@ defmodule RunicAI.WorkbenchTest do
   use ExUnit.Case, async: false
 
   alias RunicAI.Event
+  alias RunicAI.Coding.TraceEvent
   alias RunicAI.Workbench
   alias RunicAI.Persistence.SQLite
   alias RunicAI.ReviewRequest
+  alias RunicAI.Terminal.Event, as: TerminalEvent
 
   setup do
     SQLite.migrate!(Workbench.store!())
@@ -175,6 +177,62 @@ defmodule RunicAI.WorkbenchTest do
     assert snapshot.progress_summary.remaining_ms == 42_000
     assert snapshot.progress_summary.selected_timeout_ms == 30_000
     assert snapshot.progress_summary.latest_event.title == "RLM child budget selected"
+  end
+
+  test "session snapshot groups sandbox execution events from durable terminal events" do
+    session_id = unique_session_id("sandbox-events")
+    run_id = session_id <> ":run"
+
+    trace_event =
+      TraceEvent.sandbox(
+        :coding_sandbox_completed,
+        %{
+          status: :pass,
+          backend: :just_bash,
+          isolation_level: :in_process_virtual,
+          duration_ms: 12,
+          exit_status: 0,
+          output_bytes: 6,
+          files_changed: [%{path: "out.txt", kind: :created}],
+          artifacts: [%{ref: "sandbox://out.txt"}],
+          diagnostics: []
+        },
+        status: :pass,
+        input: %{
+          sandbox: :local_code,
+          runtime: :bash,
+          network: :disabled
+        },
+        metadata: %{
+          sandbox?: true,
+          sandbox: :local_code,
+          runtime: :bash,
+          network: :disabled
+        }
+      )
+
+    terminal_event =
+      TerminalEvent.from_trace_event(trace_event,
+        session_id: session_id,
+        agent: :standard
+      )
+
+    terminal_event = %{terminal_event | data: Map.put(terminal_event.data, :run_id, run_id)}
+
+    assert {:ok, _event} = Workbench.record_terminal_event(terminal_event)
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+    assert snapshot.metrics.sandbox_executions == 1
+
+    assert [
+             %{
+               backend: "just_bash",
+               runtime: "bash",
+               network: "disabled",
+               isolation_level: "in_process_virtual",
+               files_changed: [%{"path" => "out.txt"}]
+             }
+           ] = snapshot.sandbox_executions
   end
 
   test "session snapshot exposes objective-loop live progress fields" do
@@ -1034,6 +1092,82 @@ defmodule RunicAI.WorkbenchTest do
              )
 
       assert Enum.any?(snapshot.runs, &(&1.id == run_id))
+    end)
+  end
+
+  test "browser launch records enabled sandbox code execution configuration" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, &__MODULE__.fake_assistant_run/3)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("sandbox-launch")
+
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Run sandboxed code from the browser",
+               "agent" => "standard",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "verify",
+               "profile" => "local-workbench",
+               "toolsets" => "code_execution",
+               "tool_config" => %{
+                 "code_execution" => %{
+                   "enabled" => true,
+                   "state_model" => "persistent_workspace",
+                   "transport_model" => "docker_cli",
+                   "checkpoint_policy" => %{"mode" => "manual"}
+                 }
+               },
+               "sandbox_backend" => "docker",
+               "sandbox_runtime" => "python",
+               "sandbox_network" => "restricted",
+               "sandbox_stateful" => "true",
+               "sandbox_pool_warm" => "1",
+               "sandbox_pool_max" => "2"
+             })
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      launch_event =
+        Enum.find(snapshot.events, fn event ->
+          event.title == "Workbench run queued" and get_in(event.data, ["run_id"]) == run_id
+        end)
+
+      assert launch_event
+      assert get_in(launch_event.data, ["toolsets"]) == ["code_execution"]
+      assert get_in(launch_event.data, ["tool_config", "code_execution", "enabled"]) == true
+      assert get_in(launch_event.data, ["tool_config", "code_execution", "backend"]) == "docker"
+
+      assert get_in(launch_event.data, ["tool_config", "code_execution", "network"]) ==
+               "restricted"
+
+      assert get_in(launch_event.data, ["sandbox", "backend"]) == "docker"
+      assert get_in(launch_event.data, ["sandbox", "runtimes"]) == ["python"]
+      assert get_in(launch_event.data, ["sandbox", "network"]) == "restricted"
+      assert get_in(launch_event.data, ["sandbox", "stateful?"]) == true
+      assert get_in(launch_event.data, ["sandbox", "pool"]) == %{"max" => 2, "warm" => 1}
+
+      visible_tools = get_in(launch_event.data, ["capability_profile", "visible_tools"])
+      assert "execute_code" in visible_tools
+      assert "sandbox_status" in visible_tools
+
+      capability_event =
+        Enum.find(snapshot.events, fn event ->
+          event.phase == "capability_profile_updated" and get_in(event.data, ["run_id"]) == run_id
+        end)
+
+      assert capability_event
+      assert get_in(capability_event.data, ["sandbox", "backend"]) == "docker"
+      assert get_in(capability_event.data, ["sandbox", "stateful?"]) == true
     end)
   end
 

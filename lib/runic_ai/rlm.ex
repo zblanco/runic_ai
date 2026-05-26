@@ -6,6 +6,7 @@ defmodule RunicAI.RLM do
   alias RunicAI.Error
   alias RunicAI.RLM.Environments.InMemory
   alias RunicAI.RLM.EnvironmentRef
+  alias RunicAI.RLM.LambdaPlan
   alias RunicAI.RLM.Planner
   alias RunicAI.RLM.Slice
   alias RunicAI.RLM.SliceSet
@@ -85,6 +86,15 @@ defmodule RunicAI.RLM do
   @spec plan(atom(), [EnvironmentRef.t()], keyword()) :: {:ok, term()} | {:error, term()}
   def plan(task_kind, source_refs, opts \\ []) when is_list(source_refs) and is_list(opts) do
     Planner.plan(task_kind, source_refs, opts)
+  end
+
+  @spec lambda_plan(String.t(), atom(), [EnvironmentRef.t()], keyword()) ::
+          {:ok, LambdaPlan.t()} | {:error, term()}
+  def lambda_plan(objective, task_kind, source_refs, opts \\ [])
+      when is_binary(objective) and is_list(source_refs) and is_list(opts) do
+    with {:ok, plan} <- Planner.plan(task_kind, source_refs, opts) do
+      LambdaPlan.from_plan(objective, plan, opts)
+    end
   end
 
   defp environment_module(%module{} = _environment, function, arity) do

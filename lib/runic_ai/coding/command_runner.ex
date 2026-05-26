@@ -43,7 +43,7 @@ defmodule RunicAI.Coding.CommandRunner do
     outcome =
       command
       |> command_fun(authorization, event_sink, started_mono)
-      |> invoke(authorization.timeout_ms)
+      |> invoke(invoke_timeout(command, authorization, event_sink))
 
     completed_at = DateTime.utc_now()
     duration_ms = System.monotonic_time(:millisecond) - started_mono
@@ -194,6 +194,13 @@ defmodule RunicAI.Coding.CommandRunner do
     exception ->
       {:exception, exception}
   end
+
+  defp invoke_timeout(%Command{backend: backend}, authorization, event_sink)
+       when backend in [:argv, :shell] do
+    if streaming_event_sink?(event_sink), do: :infinity, else: authorization.timeout_ms
+  end
+
+  defp invoke_timeout(_command, authorization, _event_sink), do: authorization.timeout_ms
 
   defp execute_streaming_command(command, authorization, event_sink, started_mono, open_port_fun) do
     case open_port_fun.() do

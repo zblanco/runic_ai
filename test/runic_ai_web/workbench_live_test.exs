@@ -151,7 +151,13 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
         "profile" => "local-workbench",
         "toolsets" => "terminal,code-execution",
         "disabled_tools" => "run_command",
-        "tool_config" => "terminal.timeout_ms=90000"
+        "tool_config" => "terminal.timeout_ms=90000",
+        "sandbox_backend" => "docker",
+        "sandbox_runtime" => "python",
+        "sandbox_network" => "restricted",
+        "sandbox_stateful" => "true",
+        "sandbox_pool_warm" => "1",
+        "sandbox_pool_max" => "4"
       }
     })
 
@@ -172,6 +178,24 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert "execute_code" in profile["visible_tools"]
     refute "run_command" in profile["visible_tools"]
     assert "run_command" in profile["disabled_tools"]
+
+    code_execution = profile["config"]["code_execution"]
+    assert code_execution["default_backend"] == "docker"
+    assert code_execution["allowed_runtimes"] == ["python"]
+    assert code_execution["network"] == "restricted"
+    assert code_execution["stateful?"]
+    assert code_execution["pool"] == %{"warm" => 1, "max" => 4}
+
+    assert profile_event.data_json["sandbox"] == %{
+             "backend" => "docker",
+             "network" => "restricted",
+             "review" => "unsafe_actions",
+             "runtimes" => ["python"],
+             "sandbox" => "local_code",
+             "stateful?" => true,
+             "pool" => %{"warm" => 1, "max" => 4},
+             "workspace" => %{"mode" => "copy_in", "persist?" => true}
+           }
   end
 
   test "new session route starts with an empty objective state and sidebar launch affordance", %{
@@ -191,6 +215,9 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert html =~ "patch / write"
     assert html =~ "safe auto-approve"
     assert html =~ "workspace writes gated"
+    assert html =~ "Sandbox backend"
+    assert html =~ "Sandbox runtime"
+    assert html =~ "Pool warm"
     assert html =~ "pause in browser"
     assert html =~ "Existing session remains in history"
 

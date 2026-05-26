@@ -19,10 +19,15 @@ defmodule RunicAI.Coding.ReviewGate do
     extract_diagrams render_mermaid
     git_status git_diff git_log git_show git_branch
     compile_project run_tests run_linter
-    source_assert changed_file_inventory sandbox_status
+    source_assert changed_file_inventory sandbox_status sandbox_read_file
+    sandbox_list_files close_sandbox_session list_sandbox_services close_sandbox_proxy
   )
 
-  @always_review ~w(run_command execute_code start_process process_write process_kill run_formatter)
+  @always_review ~w(
+    run_command execute_code start_process process_write process_kill run_formatter
+    open_sandbox_session sandbox_exec sandbox_write_file checkpoint_sandbox restore_sandbox
+    start_sandbox_service stop_sandbox_service open_sandbox_proxy
+  )
 
   @mutating_git ~w(add am apply bisect branch checkout cherry-pick clean commit config
                    gc init merge mv pull push rebase reset restore revert rm stash switch tag worktree)
@@ -96,6 +101,10 @@ defmodule RunicAI.Coding.ReviewGate do
     else
       classify_patch(call, opts)
     end
+  end
+
+  defp classify_call(%CallRequest{tool_name: "execute_code"} = call, _request, _opts) do
+    review(sandbox_review_reason(call), call, sandbox_review_details(call))
   end
 
   defp classify_call(%CallRequest{tool_name: name} = call, _request, _opts)
@@ -241,6 +250,107 @@ defmodule RunicAI.Coding.ReviewGate do
       true -> :risky_coding_tool
     end
   end
+
+  defp sandbox_review_reason(%CallRequest{} = call) do
+    escalations = sandbox_policy_escalations(call)
+
+    cond do
+      :network in escalations -> :sandbox_network_policy_escalation
+      :persist_changes in escalations -> :sandbox_persisted_workspace_execution
+      :workspace_export in escalations -> :sandbox_workspace_export
+      true -> :sandbox_code_execution
+    end
+  end
+
+  defp sandbox_review_details(%CallRequest{} = call) do
+    arguments = call.arguments
+    source = get(arguments, :code, get(arguments, :source, ""))
+    files = get(arguments, :files, %{})
+    network = normalize_sandbox_network(get(arguments, :network, :disabled))
+    workspace = get(arguments, :workspace, %{})
+
+    %{
+      tool_name: "execute_code",
+      sandbox: get(arguments, :sandbox, :local_code),
+      backend: get(arguments, :backend, get(arguments, :sandbox_backend, nil)),
+      runtime: get(arguments, :runtime, :bash),
+      network: network,
+      timeout_ms: get(arguments, :timeout_ms, nil),
+      max_output_bytes: get(arguments, :max_output_bytes, nil),
+      sandbox_cwd: get(arguments, :sandbox_cwd, "/workspace"),
+      state_model: get(arguments, :state_model, nil),
+      transport_model: get(arguments, :transport_model, nil),
+      session: get(arguments, :session, nil),
+      checkpoint_policy: get(arguments, :checkpoint_policy, nil),
+      service_policy: get(arguments, :service_policy, nil),
+      checkpoint_id: get(arguments, :checkpoint_id, nil),
+      service_id: get(arguments, :service_id, nil),
+      proxy_id: get(arguments, :proxy_id, nil),
+      persist_changes?: truthy?(get(arguments, :persist_changes?, false)),
+      workspace: workspace_summary(workspace),
+      input_files: input_file_summaries(files),
+      input_file_count: files |> input_file_summaries() |> length(),
+      code_bytes: byte_size(to_string(source)),
+      code_preview: source |> to_string() |> String.slice(0, 1_000),
+      policy_escalations: sandbox_policy_escalations(call)
+    }
+  end
+
+  defp sandbox_policy_escalations(%CallRequest{} = call) do
+    arguments = call.arguments
+    network = normalize_sandbox_network(get(arguments, :network, :disabled))
+    workspace = get(arguments, :workspace, %{})
+
+    []
+    |> maybe_escalate(network != :disabled, :network)
+    |> maybe_escalate(truthy?(get(arguments, :persist_changes?, false)), :persist_changes)
+    |> maybe_escalate(exporting_workspace?(workspace), :workspace_export)
+    |> Enum.reverse()
+  end
+
+  defp maybe_escalate(escalations, true, escalation), do: [escalation | escalations]
+  defp maybe_escalate(escalations, false, _escalation), do: escalations
+
+  defp normalize_sandbox_network(value) when value in [:disabled, :host, :restricted], do: value
+  defp normalize_sandbox_network("disabled"), do: :disabled
+  defp normalize_sandbox_network("host"), do: :host
+  defp normalize_sandbox_network("restricted"), do: :restricted
+  defp normalize_sandbox_network(%{enabled: false}), do: :disabled
+  defp normalize_sandbox_network(%{"enabled" => false}), do: :disabled
+  defp normalize_sandbox_network(%{enabled: true}), do: :host
+  defp normalize_sandbox_network(%{"enabled" => true}), do: :host
+  defp normalize_sandbox_network(_value), do: :disabled
+
+  defp workspace_summary(workspace) when is_map(workspace) do
+    %{
+      mode: get(workspace, :mode, nil),
+      persist?: truthy?(get(workspace, :persist?, false)),
+      mount: get(workspace, :mount, nil),
+      host_root: get(workspace, :host_root, nil)
+    }
+  end
+
+  defp workspace_summary(_workspace), do: %{}
+
+  defp exporting_workspace?(workspace) when is_map(workspace) do
+    get(workspace, :mode, nil) in [:bind, "bind", :stateful, "stateful"] or
+      truthy?(get(workspace, :persist?, false)) or
+      is_binary(get(workspace, :host_root, nil))
+  end
+
+  defp exporting_workspace?(_workspace), do: false
+
+  defp input_file_summaries(files) when is_map(files) do
+    files
+    |> Enum.map(fn {path, content} ->
+      %{path: to_string(path), bytes: byte_size(to_string(content))}
+    end)
+    |> Enum.sort_by(& &1.path)
+  end
+
+  defp input_file_summaries(_files), do: []
+
+  defp truthy?(value), do: value in [true, "true", 1, "1", true]
 
   defp shell_command?(%CallRequest{} = call) do
     backend = get(call.arguments, :backend, nil)

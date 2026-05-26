@@ -85,6 +85,7 @@ defmodule RunicAI.Coding.StandardAgentTest do
         model: "test:model",
         client: client,
         profile: :local_workbench,
+        toolsets: [:code_execution],
         max_turns: 1
       )
 
@@ -96,6 +97,211 @@ defmodule RunicAI.Coding.StandardAgentTest do
     assert "run_command" in summary.visible_tools
     assert "execute_code" in summary.visible_tools
     assert "sandbox_status" in summary.visible_tools
+  end
+
+  test "default verify agent keeps sandbox code execution hidden" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      {:ok, TestClient.result("Default verify tools are bounded.")}
+    end
+
+    workflow =
+      Agent.verify(workspace, "Inspect default tool exposure.",
+        model: "test:model",
+        client: client,
+        max_turns: 1
+      )
+
+    summary = Agent.summary(workflow)
+
+    assert summary.reply == "Default verify tools are bounded."
+    assert "run_tests" in summary.visible_tools
+    assert "project_command" in summary.visible_tools
+    refute "execute_code" in summary.visible_tools
+    refute "sandbox_status" in summary.visible_tools
+  end
+
+  test "sandboxed recipes expose sandbox tools without broadening default verify" do
+    sandboxed = Recipe.named(:sandboxed_verify)
+    polyglot = Recipe.named(:polyglot_experiment)
+
+    assert "execute_code" in sandboxed.visible_tools
+    assert "sandbox_status" in sandboxed.visible_tools
+    assert "run_tests" in sandboxed.visible_tools
+    assert "apply_patch" in sandboxed.visible_tools
+    refute "run_command" in sandboxed.visible_tools
+
+    assert polyglot.mode == :read_only
+    assert "read_file" in polyglot.visible_tools
+    assert "git_status" in polyglot.visible_tools
+    assert "execute_code" in polyglot.visible_tools
+    assert "sandbox_status" in polyglot.visible_tools
+    refute "apply_patch" in polyglot.visible_tools
+    refute "run_tests" in polyglot.visible_tools
+    refute "run_command" in polyglot.visible_tools
+
+    refute "execute_code" in Recipe.default_visible_tools(:verify)
+    refute "sandbox_status" in Recipe.default_visible_tools(:verify)
+  end
+
+  test "sandbox prompt guidance includes active sandbox profile summary" do
+    workspace = Workspace.new!(root: sample_project())
+
+    system =
+      Prompt.system(workspace, Recipe.named(:sandboxed_verify),
+        tool_config: %{
+          code_execution: %{
+            backend: :docker,
+            allowed_runtimes: [:python, :node],
+            network: :restricted,
+            stateful?: true,
+            workspace: %{mode: :copy_in, persist?: true},
+            review: :unsafe_actions
+          }
+        }
+      )
+
+    assert system =~ "Sandbox execution:"
+    assert system =~ "Use execute_code for arbitrary generated code"
+
+    assert system =~
+             "Use run_command for project-native host commands only when run_command is visible"
+
+    assert system =~ "backend=docker"
+    assert system =~ "runtimes=python,node"
+    assert system =~ "network=restricted"
+    assert system =~ "stateful=true"
+    assert system =~ "workspace=mode=copy_in,persist?=true"
+  end
+
+  test "sandboxed verify recipe lets the agent choose execute_code for generated code" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, %TurnPrompt{messages: messages}, _opts ->
+      case tool_count(messages) do
+        0 ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call(
+               "execute_code",
+               %{runtime: "bash", code: "printf sandboxed"},
+               id: "call_1"
+             )
+           ])}
+
+        _ ->
+          assert List.last(tool_messages(messages)).content =~ "sandboxed"
+          {:ok, TestClient.result("Generated code ran in the sandbox.")}
+      end
+    end
+
+    workflow =
+      Agent.verify(workspace, "Try generated code safely.",
+        model: "test:model",
+        client: client,
+        recipe: :sandboxed_verify,
+        review_gates?: false,
+        max_turns: 3
+      )
+
+    summary = Agent.summary(workflow)
+
+    assert summary.reply == "Generated code ran in the sandbox."
+    assert summary.tools_used == ["execute_code"]
+    assert "execute_code" in summary.visible_tools
+    refute "run_command" in summary.visible_tools
+  end
+
+  test "local workbench profile lets the agent choose run_command for host project commands" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, %TurnPrompt{messages: messages}, _opts ->
+      case tool_count(messages) do
+        0 ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call(
+               "run_command",
+               %{argv: ["git", "status", "--short"]},
+               id: "call_1"
+             )
+           ])}
+
+        _ ->
+          {:ok, TestClient.result("Host project command ran through run_command.")}
+      end
+    end
+
+    workflow =
+      Agent.verify(workspace, "Run a host project command.",
+        model: "test:model",
+        client: client,
+        profile: :local_workbench,
+        toolsets: [:code_execution],
+        review_gates?: false,
+        max_turns: 3
+      )
+
+    summary = Agent.summary(workflow)
+
+    assert summary.reply == "Host project command ran through run_command."
+    assert summary.tools_used == ["run_command"]
+    assert "run_command" in summary.visible_tools
+    assert "execute_code" in summary.visible_tools
+  end
+
+  test "code execution diagnostics are repairable by the standard agent" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, %TurnPrompt{messages: messages}, _opts ->
+      case tool_count(messages) do
+        0 ->
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call(
+               "execute_code",
+               %{runtime: "bash", code: "if"},
+               id: "call_1"
+             )
+           ])}
+
+        1 ->
+          assert List.last(tool_messages(messages)).content =~ "syntax error"
+
+          {:ok,
+           TestClient.tool_response([
+             TestClient.tool_call(
+               "execute_code",
+               %{runtime: "bash", code: "printf repaired"},
+               id: "call_2"
+             )
+           ])}
+
+        _ ->
+          {:ok, TestClient.result("Sandbox syntax error repaired.")}
+      end
+    end
+
+    workflow =
+      Agent.verify(workspace, "Repair a sandbox syntax error.",
+        model: "test:model",
+        client: client,
+        profile: :local_workbench,
+        toolsets: [:code_execution],
+        review_gates?: false,
+        max_turns: 4
+      )
+
+    summary = Agent.summary(workflow)
+
+    assert summary.reply == "Sandbox syntax error repaired."
+    assert summary.tools_used == ["execute_code"]
+    assert Agent.trace_events(workflow) |> Enum.any?(&(&1.kind == :coding_tool_observation))
   end
 
   test "patch agent repairs a bad patch from diagnostics and summarizes changed files" do

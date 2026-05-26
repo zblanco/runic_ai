@@ -156,6 +156,7 @@ defmodule RunicAI.Terminal.Event do
         recipe: event.recipe,
         metadata: event.metadata,
         measurements: event.measurements,
+        input: event.input,
         output: event.output
       },
       raw: event
@@ -394,6 +395,18 @@ defmodule RunicAI.Terminal.Event do
   defp trace_shape(%TraceEvent{kind: :coding_tool_observation} = event) do
     tool_name = field(event.metadata, :tool_name) || "tool"
     {:tool, :observation, "Tool observation: #{tool_name}", preview(event.output)}
+  end
+
+  defp trace_shape(%TraceEvent{kind: :coding_sandbox_started} = event) do
+    runtime = field(event.metadata, :runtime) || field(event.output, :runtime) || "runtime"
+    sandbox = field(event.metadata, :sandbox) || field(event.output, :sandbox) || "sandbox"
+    {:tool, :sandbox, "Sandbox started: #{sandbox}/#{runtime}", preview(event.output)}
+  end
+
+  defp trace_shape(%TraceEvent{kind: :coding_sandbox_completed} = event) do
+    backend = field(event.output, :backend) || field(event.metadata, :backend) || "backend"
+    isolation = field(event.output, :isolation_level) || field(event.metadata, :isolation_level)
+    {:tool, :sandbox, "Sandbox completed: #{backend}", status_detail(isolation, event.output)}
   end
 
   defp trace_shape(%TraceEvent{kind: :coding_verification_observation} = event) do

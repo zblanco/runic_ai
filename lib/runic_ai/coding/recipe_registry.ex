@@ -31,6 +31,17 @@ defmodule RunicAI.Coding.RecipeRegistry do
       command: "/fix-ci",
       description: "Use failing command output to repair and rerun verification.",
       mode: :verify
+    },
+    sandboxed_verify: %{
+      command: "/sandboxed-verify",
+      description: "Verify with ordinary project tools plus reviewed sandbox code execution.",
+      mode: :verify
+    },
+    polyglot_experiment: %{
+      command: "/polyglot-experiment",
+      description:
+        "Use read/search/git context plus sandboxed code execution without host edits.",
+      mode: :read_only
     }
   }
 

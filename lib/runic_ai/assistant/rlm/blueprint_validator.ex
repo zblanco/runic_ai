@@ -39,6 +39,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
           |> check_unique_ids(blueprint)
           |> check_catalog(blueprint)
           |> check_tool_leaves(blueprint, opts)
+          |> check_sandbox_components(blueprint, opts)
           |> check_graph(blueprint)
           |> check_budgets(blueprint, opts)
           |> check_function_policies(blueprint, opts)
@@ -178,6 +179,54 @@ defmodule RunicAI.Assistant.RLM.BlueprintValidator do
         diagnostics
     end)
   end
+
+  defp check_sandbox_components(diagnostics, %WorkflowBlueprint{} = blueprint, opts) do
+    allowed_tools = allowed_tool_names(opts)
+
+    Enum.reduce(blueprint.components, diagnostics, fn component, diagnostics ->
+      case sandbox_component_tool(component.type) do
+        nil ->
+          diagnostics
+
+        tool_name ->
+          if allowed_tools == [] or tool_name in allowed_tools do
+            diagnostics
+          else
+            [
+              diagnostic(
+                :error,
+                :toolset_disabled,
+                "sandbox component uses a disabled or unavailable tool",
+                %{
+                  component_id: component.id,
+                  component_type: component.type,
+                  tool_name: tool_name,
+                  allowed_tools: allowed_tools
+                }
+              )
+              | diagnostics
+            ]
+          end
+      end
+    end)
+  end
+
+  defp sandbox_component_tool(:sandbox_status), do: "sandbox_status"
+  defp sandbox_component_tool(:sandbox_execute), do: "execute_code"
+  defp sandbox_component_tool(:sandbox_open_session), do: "open_sandbox_session"
+  defp sandbox_component_tool(:sandbox_session_exec), do: "sandbox_exec"
+  defp sandbox_component_tool(:sandbox_write_file), do: "sandbox_write_file"
+  defp sandbox_component_tool(:sandbox_read_file), do: "sandbox_read_file"
+  defp sandbox_component_tool(:sandbox_list_files), do: "sandbox_list_files"
+  defp sandbox_component_tool(:sandbox_checkpoint), do: "checkpoint_sandbox"
+  defp sandbox_component_tool(:sandbox_restore), do: "restore_sandbox"
+  defp sandbox_component_tool(:sandbox_close_session), do: "close_sandbox_session"
+  defp sandbox_component_tool(:sandbox_start_service), do: "start_sandbox_service"
+  defp sandbox_component_tool(:sandbox_stop_service), do: "stop_sandbox_service"
+  defp sandbox_component_tool(:sandbox_list_services), do: "list_sandbox_services"
+  defp sandbox_component_tool(:sandbox_open_proxy), do: "open_sandbox_proxy"
+  defp sandbox_component_tool(:sandbox_close_proxy), do: "close_sandbox_proxy"
+  defp sandbox_component_tool(_type), do: nil
 
   defp check_graph(diagnostics, %WorkflowBlueprint{} = blueprint) do
     graph_diagnostics =

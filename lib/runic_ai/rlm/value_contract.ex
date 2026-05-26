@@ -11,6 +11,7 @@ defmodule RunicAI.RLM.ValueContract do
     :source_request,
     :source_set,
     :source_slices,
+    :lambda_plan,
     :materialized_slices,
     :records,
     :record_items,

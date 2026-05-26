@@ -7,10 +7,12 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
   alias RunicAI.Assistant.RLM.FunctionBlueprint
   alias RunicAI.Assistant.RLM.RepairLoop
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
+  alias RunicAI.Coding.SandboxSessionRegistry
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
   alias RunicAI.LLM.TestClient
   alias RunicAI.RLM.ComponentRuntime
+  alias RunicAI.ReviewDecision
 
   test "constructs and validates a workflow blueprint" do
     split = ComponentBlueprint.new!("split", :source_splitter)
@@ -127,7 +129,10 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
         stop_conditions: ["sandbox status returned"]
       )
 
-    assert BlueprintValidator.report(blueprint, profile: :local_workbench).status == :accepted
+    assert BlueprintValidator.report(blueprint,
+             profile: :local_workbench,
+             toolsets: [:code_execution]
+           ).status == :accepted
 
     report = BlueprintValidator.report(blueprint, profile: :safe)
 
@@ -137,6 +142,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     disabled_report =
       BlueprintValidator.report(blueprint,
         profile: :local_workbench,
+        toolsets: [:code_execution],
         disabled_tools: ["sandbox_status"]
       )
 
@@ -156,13 +162,163 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
       )
 
     {:ok, runtime} =
-      ComponentRuntime.initial_context(workspace, blueprint, profile: :local_workbench)
+      ComponentRuntime.initial_context(workspace, blueprint,
+        profile: :local_workbench,
+        toolsets: [:code_execution]
+      )
 
     component = hd(blueprint.components)
 
     assert {:ok, status} = ComponentRuntime.execute_node(component, %{}, runtime)
     assert status.default_backend == :just_bash
     assert [%{name: :just_bash}] = status.backends
+  end
+
+  test "sandbox components validate against the active capability profile" do
+    {:ok, sandbox_sessions} = SandboxSessionRegistry.start_link()
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Run sandbox code",
+        [
+          ComponentBlueprint.new!("status", :sandbox_status),
+          ComponentBlueprint.new!("execute", :sandbox_execute,
+            params: %{runtime: :bash, code: "echo sandboxed"}
+          )
+        ],
+        edges: [%{from: "status", to: "execute"}],
+        stop_conditions: ["sandbox code returned"]
+      )
+
+    assert BlueprintValidator.report(blueprint,
+             profile: :local_workbench,
+             toolsets: [:code_execution]
+           ).status == :accepted
+
+    report = BlueprintValidator.report(blueprint, profile: :safe)
+
+    assert report.status == :rejected
+    assert Enum.any?(report.diagnostics, &(&1.code == :toolset_disabled))
+
+    disabled_report =
+      BlueprintValidator.report(blueprint,
+        profile: :local_workbench,
+        toolsets: [:code_execution],
+        disabled_tools: ["execute_code"]
+      )
+
+    assert disabled_report.status == :rejected
+
+    assert Enum.any?(
+             disabled_report.diagnostics,
+             &(&1.code == :toolset_disabled and &1.details.tool_name == "execute_code")
+           )
+
+    stateful =
+      WorkflowBlueprint.new!(
+        "Use stateful sandbox",
+        [
+          ComponentBlueprint.new!("open", :sandbox_open_session),
+          ComponentBlueprint.new!("exec", :sandbox_session_exec,
+            params: %{runtime: :bash, code: "echo stateful"}
+          ),
+          ComponentBlueprint.new!("service", :sandbox_start_service,
+            params: %{spec: %{name: "web"}}
+          ),
+          ComponentBlueprint.new!("proxy", :sandbox_open_proxy)
+        ],
+        edges: [
+          %{from: "open", to: "exec"},
+          %{from: "open", to: "service"},
+          %{from: "service", to: "proxy"}
+        ],
+        stop_conditions: ["sandbox code returned"]
+      )
+
+    assert BlueprintValidator.report(stateful,
+             profile: :local_workbench,
+             toolsets: [:code_execution],
+             sandbox_session_registry: sandbox_sessions
+           ).status == :accepted
+  end
+
+  test "sandbox_execute runtime executes through the reviewed capability registry" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Run sandbox code",
+        [
+          ComponentBlueprint.new!("execute", :sandbox_execute,
+            params: %{runtime: :bash, code: "echo component"}
+          )
+        ],
+        stop_conditions: ["sandbox code returned"]
+      )
+
+    {:ok, runtime} =
+      ComponentRuntime.initial_context(workspace, blueprint,
+        profile: :local_workbench,
+        toolsets: [:code_execution],
+        review_decider: fn request, _context ->
+          assert request.details.tool_name == "execute_code"
+          assert request.details.code_preview == "echo component"
+          {:ok, ReviewDecision.new!(request.resume_key, :approved)}
+        end
+      )
+
+    component = hd(blueprint.components)
+
+    assert {:ok, result} = ComponentRuntime.execute_node(component, %{}, runtime)
+    assert result.status == :pass
+    assert result.output == "component\n"
+    assert result.metadata.tool == :execute_code
+  end
+
+  test "sandbox session components execute through reviewed stateful tools" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+    {:ok, sandbox_sessions} = SandboxSessionRegistry.start_link()
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Run stateful sandbox code",
+        [
+          ComponentBlueprint.new!("open", :sandbox_open_session),
+          ComponentBlueprint.new!("exec", :sandbox_session_exec,
+            params: %{runtime: :bash, code: "echo component-session"}
+          ),
+          ComponentBlueprint.new!("close", :sandbox_close_session)
+        ],
+        edges: [%{from: "open", to: "exec"}, %{from: "exec", to: "close"}],
+        stop_conditions: ["sandbox session closed"]
+      )
+
+    review_decider = fn request, _context ->
+      assert request.details.tool_name in ["open_sandbox_session", "sandbox_exec"]
+      {:ok, ReviewDecision.new!(request.resume_key, :approved)}
+    end
+
+    {:ok, runtime} =
+      ComponentRuntime.initial_context(workspace, blueprint,
+        profile: :local_workbench,
+        toolsets: [:code_execution],
+        sandbox_session_registry: sandbox_sessions,
+        review_decider: review_decider
+      )
+
+    [open, exec, close] = blueprint.components
+
+    assert {:ok, opened} = ComponentRuntime.execute_node(open, %{}, runtime)
+    assert opened.id =~ "sandbox_session_"
+
+    assert {:ok, result} = ComponentRuntime.execute_node(exec, opened, runtime)
+    assert result.status == :pass
+    assert result.stdout == "component-session\n"
+
+    assert {:ok, closed} = ComponentRuntime.execute_node(close, result, runtime)
+    assert closed.status == :closed
   end
 
   test "round-trips generated blueprints through JSON-safe maps" do
@@ -222,6 +378,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
              Coordinator.propose(workspace, "Cluster tickets",
                input_paths: ["tickets.jsonl"],
                output_path: ".docs/tickets.md",
+               proposal_strategy: :dynamic,
                client: client,
                model: "test:model"
              )
@@ -261,6 +418,142 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
 
     assert params.group_by == "theme"
     assert params.dedupe_by == ["ticket_id", "ticket", "id"]
+  end
+
+  test "coordinator routed proposal mode records strategy and skips LLM graph synthesis" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "a.md"), "alpha\n")
+    File.write!(Path.join(root, "b.md"), "beta\n")
+    File.write!(Path.join(root, "c.md"), "gamma\n")
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      flunk("routed strategy should use a conservative evidence slice before LLM graph synthesis")
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Extract risks from these files and write a report",
+               input_paths: ["a.md", "b.md", "c.md"],
+               proposal_strategy: :routed,
+               client: client,
+               model: "test:model"
+             )
+
+    assert blueprint.metadata.proposal_kind == :routed_strategy
+    assert blueprint.metadata.strategy_route.strategy == :lambda_workflow
+    assert blueprint.metadata.strategy_route.fallback == :subagent_delegation
+    assert blueprint.metadata.strategy_route.budgets.max_leaf_calls >= 9
+    assert Enum.any?(blueprint.components, &(&1.type == :llm_map))
+    assert Enum.any?(blueprint.components, &(&1.type == :objective_scorecard))
+  end
+
+  test "coordinator evidence-first proposal mode aliases routed least-powerful planning" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "tickets.jsonl"), ~s({"theme":"login"}\n))
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      flunk("evidence-first planning should not synthesize a full workflow graph first")
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Build a reusable parser component for these records",
+               input_paths: ["tickets.jsonl"],
+               proposal_strategy: :evidence_first,
+               repeated_transform?: true,
+               client: client,
+               model: "test:model"
+             )
+
+    assert blueprint.metadata.proposal_kind == :routed_strategy
+    assert blueprint.metadata.strategy_route.strategy == :generated_sandbox_component
+    assert blueprint.metadata.strategy_route.fallback == :sandbox_repl
+    assert Enum.any?(blueprint.components, &(&1.type == :tabular_parser))
+  end
+
+  test "coordinator defaults to evidence-first routing before dynamic graph synthesis" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "a.md"), "alpha\n")
+    File.write!(Path.join(root, "b.md"), "beta\n")
+    File.write!(Path.join(root, "c.md"), "gamma\n")
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, _prompt, _opts ->
+      flunk("default coordinator path should gather evidence before full graph synthesis")
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Extract risks from these files and write a report",
+               input_paths: ["a.md", "b.md", "c.md"],
+               client: client,
+               model: "test:model"
+             )
+
+    assert blueprint.metadata.proposal_kind == :routed_strategy
+    assert blueprint.metadata.strategy_route.strategy == :lambda_workflow
+    assert Enum.any?(blueprint.components, &(&1.type == :llm_map))
+  end
+
+  test "coordinator exposes deterministic routing decisions" do
+    workspace = Workspace.new!(root: tmp_dir())
+
+    decision =
+      Coordinator.route(workspace, "Build a reusable parser component for these CSV exports",
+        repeated_transform?: true
+      )
+
+    assert decision.strategy == :generated_sandbox_component
+    assert decision.fallback == :sandbox_repl
+    assert decision.metadata.workspace_root == workspace.root
+  end
+
+  test "coordinator prepares explicit component-builder subagent assignments" do
+    workspace = Workspace.new!(root: tmp_dir())
+
+    assert {:ok, assignment} =
+             Coordinator.component_builder_assignment(
+               workspace,
+               "Build a reusable parser component for these CSV exports",
+               id: "assignment:component-builder",
+               run_id: "run:parent",
+               max_sandbox_executions: 3
+             )
+
+    assert assignment.id == "assignment:component-builder"
+    assert assignment.role == "component_builder"
+    assert assignment.strategy == :generated_sandbox_component
+    assert assignment.agent_kind == :workflow
+    assert assignment.capability_profile == :local_workbench
+
+    assert assignment.visible_tools == [
+             "open_sandbox_session",
+             "sandbox_write_file",
+             "sandbox_exec",
+             "sandbox_read_file",
+             "sandbox_list_files",
+             "close_sandbox_session"
+           ]
+
+    assert assignment.budgets.max_sandbox_executions == 3
+    assert assignment.budgets.require_tests?
+    assert assignment.review_policy.network == :disabled
+    assert assignment.review_policy.host_materialization == :requires_review
+
+    assert assignment.output_schema.required == [
+             "generated_component",
+             "source_artifacts",
+             "test_artifacts",
+             "verification",
+             "claims"
+           ]
+
+    assert assignment.parent.run_id == "run:parent"
+    assert assignment.parent.strategy == :generated_sandbox_component
+    assert assignment.parent.fallback == :sandbox_repl
+    assert assignment.metadata.assignment_kind == :component_builder
+    assert assignment.metadata.generated_component_policy.require_contract_first?
+    assert assignment.prompt =~ "Propose the component contract before writing code"
+    assert assignment.prompt =~ "Do not materialize code into the host repository"
   end
 
   test "coordinator repairs invalid generated blueprint diagnostics" do
@@ -303,6 +596,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert {:ok, blueprint} =
              Coordinator.propose(workspace, "Write report",
                input_paths: ["input.md"],
+               proposal_strategy: :dynamic,
                client: client,
                model: "test:model",
                fallback?: false
@@ -367,6 +661,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
 
     assert {:ok, blueprint} =
              Coordinator.propose(workspace, "Pick repos",
+               proposal_strategy: :dynamic,
                client: client,
                model: "test:model",
                fallback?: false
@@ -376,6 +671,46 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert_receive {:repair_prompt, prompt}
     assert prompt =~ "tier0 function blueprints require a built-in operation"
     refute prompt =~ "%RunicAI.Error{"
+  end
+
+  test "coordinator changes strategy instead of repairing the same invalid shape repeatedly" do
+    root = tmp_dir()
+    File.write!(Path.join(root, "schema.json"), ~s({"rows":[{"id":1}]}\n))
+    workspace = Workspace.new!(root: root)
+
+    client = fn _model, prompt, _opts ->
+      if prompt =~ "repairing an invalid" do
+        flunk("same-shape repair should be skipped after repeated failures")
+      else
+        blueprint = %{
+          id: "assistant:bad-repeated-shape",
+          objective: "Explore unknown schema",
+          components: [%{id: "only", type: "source_splitter", params: %{}}],
+          edges: [%{from: "missing", to: "only"}],
+          stop_conditions: [],
+          policies: %{},
+          metadata: %{}
+        }
+
+        {:ok, TestClient.result(Jason.encode!(blueprint))}
+      end
+    end
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Explore unknown schema and probe the data",
+               proposal_strategy: :dynamic,
+               input_paths: ["schema.json"],
+               client: client,
+               model: "test:model",
+               fallback?: false,
+               repair_attempts: 2
+             )
+
+    assert blueprint.metadata.proposal_kind == :strategy_change_repair
+    assert blueprint.metadata.strategy_route.strategy == :sandbox_repl
+    assert blueprint.metadata.rerouted_to == :subagent_delegation
+    assert blueprint.metadata.repair_failure.message =~ "rejected"
+    assert Enum.any?(blueprint.components, &(&1.type == :llm_map))
   end
 
   defp tmp_dir do

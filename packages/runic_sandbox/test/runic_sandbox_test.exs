@@ -1,0 +1,2060 @@
+defmodule RunicSandboxTest do
+  use ExUnit.Case, async: false
+
+  alias RunicSandbox.Backend
+  alias RunicSandbox.Capabilities
+  alias RunicSandbox.Checkpoint
+  alias RunicSandbox.ConsumerProfiles
+  alias RunicSandbox.ExecutionRequest
+  alias RunicSandbox.ExecutionResult
+  alias RunicSandbox.FileRef
+  alias RunicSandbox.HostProbe
+  alias RunicSandbox.Lease
+  alias RunicSandbox.Profile
+  alias RunicSandbox.Proxy
+  alias RunicSandbox.Service
+  alias RunicSandbox.Session
+  alias RunicSandbox.SessionEvent
+  alias RunicSandbox.Test.FakeBackend
+  alias RunicSandbox.VmsanCLI
+
+  test "validates request and result contracts" do
+    assert {:ok, request} =
+             ExecutionRequest.new(
+               sandbox: :local_code,
+               runtime: "bash",
+               source: "echo contract",
+               network: %{enabled: false}
+             )
+
+    assert request.runtime == :bash
+    assert request.network == :disabled
+
+    assert {:error, error} =
+             ExecutionResult.new(
+               status: :pass,
+               stdout: "",
+               stderr: "",
+               backend: :just_bash,
+               isolation_level: nil
+             )
+
+    assert error.message =~ "isolation_level"
+  end
+
+  test "profile normalizes extended pool lifecycle options" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :just_bash,
+               pool: [
+                 warm: 1,
+                 max: 3,
+                 idle_ttl_ms: 5_000,
+                 checkout_timeout_ms: 25,
+                 reset_on_checkin?: true,
+                 checkpoint_on_checkout?: true,
+                 backend_affinity: :backend
+               ]
+             )
+
+    assert profile.pool == %{
+             warm: 1,
+             max: 3,
+             idle_ttl_ms: 5_000,
+             checkout_timeout_ms: 25,
+             reset_on_checkin?: true,
+             checkpoint_on_checkout?: true,
+             backend_affinity: :backend
+           }
+
+    assert {:error, error} = Profile.new(name: :local_code, pool: [warm: 2, max: 1])
+    assert error.message == "sandbox pool must include non-negative warm and positive max"
+  end
+
+  test "supervised facade executes through configured sandbox profile" do
+    name = :"runic_sandbox_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           pool: [warm: 0, max: 1],
+           network: :disabled,
+           workspace: [mode: :copy_in, persist?: false]
+         ]
+       ]}
+    )
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.local_code.backend == :just_bash
+
+    assert {:ok, result} =
+             RunicSandbox.exec(
+               %{
+                 sandbox: :local_code,
+                 runtime: :bash,
+                 source: "echo package-sandbox"
+               },
+               server: name
+             )
+
+    assert result.status == :pass
+    assert result.stdout == "package-sandbox\n"
+    assert result.backend == :just_bash
+    refute result.metadata.security_boundary?
+
+    assert {:ok, instance} = RunicSandbox.provision(backend: :just_bash)
+    assert {:ok, snapshot} = RunicSandbox.snapshot(instance)
+    assert snapshot.backend == :just_bash
+    assert :ok = RunicSandbox.reset(instance)
+    assert :ok = RunicSandbox.destroy(instance)
+  end
+
+  test "supervised facade opens sessions through configured sandbox profiles" do
+    name = :"runic_sandbox_session_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           network: :disabled,
+           workspace: [mode: :copy_in, persist?: false]
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.open_session(:local_code, [], server: name)
+    assert session.backend == :just_bash
+    assert session.capabilities.exec?
+
+    assert {:ok, result} =
+             RunicSandbox.exec(session, runtime: :bash, source: "echo supervised-session")
+
+    assert result.stdout == "supervised-session\n"
+
+    assert {:error, error} = RunicSandbox.open_session(:missing, [], server: name)
+    assert error.message == "unknown sandbox profile"
+  end
+
+  test "manager acquires, releases, and enforces pooled session limits" do
+    name = :"runic_sandbox_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [
+             warm: 1,
+             max: 2,
+             idle_ttl_ms: :infinity,
+             checkout_timeout_ms: 0
+           ],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert [%{lifecycle: :idle} = warm] = status.sandboxes.local_code.sessions
+
+    assert {:ok, first} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    assert first.id == warm.id
+
+    assert {:ok, lease} = RunicSandbox.acquire_lease(first, "workspace", server: name)
+    assert lease.resource == "workspace"
+
+    assert {:error, error} = RunicSandbox.acquire_lease(first, "workspace", server: name)
+    assert error.message == "sandbox lease conflicts with an active lease"
+    assert error.retryable?
+
+    assert {:error, error} = RunicSandbox.release_session(first, server: name)
+    assert error.message == "sandbox session has active leases"
+
+    assert :ok = RunicSandbox.release_lease(lease, server: name)
+
+    assert {:ok, second} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    refute second.id == first.id
+
+    assert {:error, error} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    assert error.message == "sandbox session pool is exhausted"
+    assert error.retryable?
+    assert error.details.max == 2
+
+    assert :ok = RunicSandbox.release_session(first, server: name)
+    assert {:ok, reacquired} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    assert reacquired.id == first.id
+
+    assert :ok = RunicSandbox.release_session(reacquired, server: name)
+    assert :ok = RunicSandbox.release_session(second, server: name)
+  end
+
+  test "managed open_session respects pool max and close_session removes entries" do
+    name = :"runic_sandbox_open_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.open_session(:local_code, [], server: name)
+
+    assert {:error, error} = RunicSandbox.open_session(:local_code, [], server: name)
+    assert error.message == "sandbox session pool is exhausted"
+
+    assert :ok = RunicSandbox.close_session(session, server: name)
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.local_code.sessions == []
+
+    assert {:ok, reopened} = RunicSandbox.open_session(:local_code, [], server: name)
+    assert reopened.id != session.id
+    assert :ok = RunicSandbox.close_session(reopened, server: name)
+  end
+
+  test "manager can reset sessions on checkin and reap expired idle sessions" do
+    reset_name = :"runic_sandbox_reset_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: reset_name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1, reset_on_checkin?: true],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: reset_name)
+    assert :ok = RunicSandbox.release_session(session, server: reset_name)
+    assert {:ok, status} = RunicSandbox.status(server: reset_name)
+    assert [%{lifecycle: :idle} = reset] = status.sandboxes.local_code.sessions
+    refute reset.id == session.id
+
+    reap_name = :"runic_sandbox_reap_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: reap_name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1, idle_ttl_ms: 0],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: reap_name)
+    assert :ok = RunicSandbox.release_session(session, server: reap_name)
+    assert {:ok, status} = RunicSandbox.status(server: reap_name)
+    assert status.sandboxes.local_code.sessions == []
+
+    reaper_name = :"runic_sandbox_reaper_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: reaper_name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1, idle_ttl_ms: 10],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: reaper_name)
+    assert :ok = RunicSandbox.release_session(session, server: reaper_name)
+    assert map_size(:sys.get_state(reaper_name).sessions) == 1
+    assert wait_until(fn -> :sys.get_state(reaper_name).sessions == %{} end)
+  end
+
+  test "manager monitors checked-out session owners and frees abandoned capacity" do
+    name = :"runic_sandbox_owner_pool_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    owner =
+      spawn(fn ->
+        {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+        send(parent, {:checked_out, session.id})
+      end)
+
+    assert_receive {:checked_out, session_id}
+    ref = Process.monitor(owner)
+    assert_receive {:DOWN, ^ref, :process, ^owner, _reason}
+
+    assert wait_until(fn -> :sys.get_state(name).sessions == %{} end)
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    refute session.id == session_id
+    assert :ok = RunicSandbox.close_session(session, server: name)
+  end
+
+  test "libbit workspace consumer profile is package-level and provider neutral" do
+    assert {:libbit_workspace, config} =
+             ConsumerProfiles.libbit_workspace(
+               workspace_id: "Acme Workspace 42",
+               tenant_id: "tenant-1",
+               workflow_run_id: "workflow-run-9",
+               agent_id: "agent-7",
+               backend: :sprites,
+               organization: "acme",
+               warm: 1,
+               max: 3
+             )
+
+    assert {:ok, profile} = Profile.from_named_config(:libbit_workspace, config)
+    assert profile.backend == :sprites
+    assert profile.stateful?
+    assert profile.workspace.persist?
+    assert profile.workspace.metadata.workspace_id == "Acme Workspace 42"
+    assert profile.pool.checkpoint_on_checkout?
+    assert profile.metadata.consumer == :libbit
+    assert profile.metadata.tenant_id == "tenant-1"
+    assert profile.metadata.workflow_run_id == "workflow-run-9"
+    assert profile.backend_options.sprite =~ ~r/^libbit-acme-workspace-42-[0-9a-f]{12}$/
+    assert profile.backend_options.organization == "acme"
+    assert profile.backend_options.token_env == "SPRITES_TOKEN"
+
+    sprites =
+      ["a/b", "a b", "a_b"]
+      |> Enum.map(fn workspace_id ->
+        {_name, config} =
+          ConsumerProfiles.libbit_workspace(workspace_id: workspace_id, tenant_id: "tenant-1")
+
+        config[:backend_options].sprite
+      end)
+
+    assert Enum.uniq(sprites) == sprites
+  end
+
+  test "libbit-like workspace isolation contract uses sandbox primitives only" do
+    workspace_id = "workspace-123"
+    workflow_run_id = "workflow-run-123"
+    agent_id = "agent-abc"
+
+    assert {_name, config} =
+             ConsumerProfiles.libbit_workspace(
+               workspace_id: workspace_id,
+               workflow_run_id: workflow_run_id,
+               agent_id: agent_id,
+               backend: :docker,
+               max: 1
+             )
+
+    assert {:ok, profile} = Profile.from_named_config(:libbit_workspace, config)
+    assert {:ok, session} = Backend.open_session(FakeBackend, profile, [])
+
+    assert session.policy.persist_changes?
+    assert session.capabilities.checkpoints?
+    assert session.capabilities.services?
+    assert session.capabilities.proxy?
+
+    assert {:ok, lease} =
+             Backend.acquire_lease(FakeBackend, session, "workspace:#{workspace_id}", [])
+
+    assert lease.mode == :exclusive
+
+    checkpoint_spec = [
+      reason: :before_risky_action,
+      workflow_run_id: workflow_run_id
+    ]
+
+    assert {:ok, checkpoint} = Backend.checkpoint(FakeBackend, session, checkpoint_spec, [])
+
+    assert checkpoint.session_id == session.id
+
+    assert {:ok, result} =
+             Backend.exec_session(
+               FakeBackend,
+               session,
+               ExecutionRequest.new!(
+                 sandbox: :libbit_workspace,
+                 runtime: :bash,
+                 source: "echo workflow #{workflow_run_id} agent #{agent_id}"
+               ),
+               []
+             )
+
+    assert result.status == :pass
+    assert result.stdout =~ workflow_run_id
+    assert result.stdout =~ agent_id
+
+    assert {:ok, artifact} =
+             Backend.write_file(
+               FakeBackend,
+               session,
+               "/workspace/artifacts/result.json",
+               ~s({"ok":true}),
+               []
+             )
+
+    assert artifact.path == "/workspace/artifacts/result.json"
+
+    assert {:ok, [%FileRef{}]} =
+             Backend.list_files(FakeBackend, session, "/workspace/artifacts", [])
+
+    assert {:ok, restored} = Backend.restore(FakeBackend, session, checkpoint, [])
+    assert restored.id == session.id
+
+    assert {:ok, service} = Backend.start_service(FakeBackend, session, [name: "forms"], [])
+    assert {:ok, proxy} = Backend.open_proxy(FakeBackend, session, service, [])
+    assert proxy.service_id == service.id
+
+    assert :ok = Backend.close_proxy(FakeBackend, proxy, [])
+    assert :ok = Backend.release_lease(FakeBackend, lease, [])
+    assert :ok = Backend.close_session(FakeBackend, session, [])
+  end
+
+  test "supervised facade authorizes requests before backend execution" do
+    name = :"runic_sandbox_policy_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           network: :disabled,
+           workspace: [mode: :copy_in, persist?: false]
+         ]
+       ]}
+    )
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               %{sandbox: :local_code, runtime: :python, source: "print('blocked')"},
+               server: name
+             )
+
+    assert error.message == "sandbox runtime is not enabled by profile"
+    assert error.details.runtime == :python
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               %{sandbox: :local_code, runtime: :bash, source: "echo blocked", network: :host},
+               server: name
+             )
+
+    assert error.message == "sandbox network request exceeds profile policy"
+    assert error.details.requested_network == :host
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               %{
+                 sandbox: :local_code,
+                 runtime: :bash,
+                 source: "echo blocked",
+                 persist_changes?: true
+               },
+               server: name
+             )
+
+    assert error.message == "sandbox persistence request exceeds profile policy"
+  end
+
+  test "contract normalization does not create atoms from unknown strings" do
+    unknown_runtime = "runic_unknown_runtime_#{System.unique_integer([:positive])}"
+    unknown_sandbox = "runic_unknown_sandbox_#{System.unique_integer([:positive])}"
+
+    assert {:error, error} =
+             ExecutionRequest.new(
+               sandbox: unknown_sandbox,
+               runtime: "bash",
+               source: "echo blocked"
+             )
+
+    assert error.message =~ "sandbox"
+
+    assert {:error, error} =
+             ExecutionRequest.new(runtime: unknown_runtime, source: "echo blocked")
+
+    assert error.message =~ "runtime"
+
+    assert {:error, error} =
+             Profile.new(name: unknown_sandbox, backend: "not_a_backend")
+
+    assert error.message =~ "profile name"
+
+    assert {:error, error} = RunicSandbox.Policy.new(allowed_runtimes: [unknown_runtime])
+    assert error.message =~ "known atom string"
+
+    assert {:ok, profile} =
+             Profile.new(name: :local_code, backend: "docker", isolation_level: "container")
+
+    assert profile.backend == :docker
+    assert profile.isolation_level == :container
+
+    assert {:error, error} =
+             ExecutionResult.new(
+               status: "made_up_status",
+               stdout: "",
+               stderr: "",
+               backend: :just_bash,
+               isolation_level: :in_process_virtual
+             )
+
+    assert error.message =~ "status"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_runtime) end
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown_sandbox) end
+  end
+
+  test "session contract structs validate provider-neutral metadata" do
+    assert {:ok, capabilities} =
+             Capabilities.new(
+               exec?: true,
+               files?: true,
+               checkpoints?: false,
+               services?: false,
+               proxy?: false,
+               leases?: true,
+               network_policy?: true,
+               persistent_identity?: true
+             )
+
+    assert capabilities.exec?
+    refute capabilities.checkpoints?
+
+    assert {:ok, session} =
+             Session.new(
+               id: "session-1",
+               sandbox: :local_code,
+               backend: :docker,
+               state: "ready",
+               capabilities: capabilities,
+               isolation_level: :container,
+               state_model: "persistent_workspace",
+               transport_model: "docker_cli",
+               persistent_identity?: true,
+               workspace_ref: "workspace://session-1",
+               policy: [network: :disabled, allowed_runtimes: [:bash]]
+             )
+
+    assert session.state == :ready
+    assert session.state_model == :persistent_workspace
+    assert session.transport_model == :docker_cli
+
+    assert {:ok, file} = FileRef.new(path: "/workspace/out.txt", kind: "file", bytes: 3)
+    assert file.kind == :file
+
+    assert {:ok, checkpoint} =
+             Checkpoint.new(
+               id: "checkpoint-1",
+               session_id: session.id,
+               backend: session.backend,
+               ref: "checkpoint://session-1/1"
+             )
+
+    assert checkpoint.backend == :docker
+    assert {:ok, service} = Service.new(id: "svc", session_id: session.id, name: "web")
+    assert service.status == :starting
+
+    assert {:ok, proxy} =
+             Proxy.new(
+               id: "proxy",
+               session_id: session.id,
+               backend: session.backend,
+               service_id: service.id
+             )
+
+    assert proxy.status == :opening
+
+    assert {:error, error} =
+             Proxy.new(id: "proxy", session_id: session.id, service_id: service.id)
+
+    assert error.message =~ "backend"
+
+    assert {:ok, lease} =
+             Lease.new(
+               id: "lease",
+               session_id: session.id,
+               backend: session.backend,
+               resource: "workspace"
+             )
+
+    assert lease.mode == :exclusive
+    assert {:error, error} = Lease.new(id: "lease", session_id: session.id, resource: "workspace")
+    assert error.message =~ "backend"
+
+    assert {:ok, event} =
+             SessionEvent.new(id: "event", session_id: session.id, type: "checkpoint_created")
+
+    assert event.type == :checkpoint_created
+
+    assert {:error, error} = Capabilities.new(exec?: :yes)
+    assert error.message =~ "exec?"
+    assert {:error, error} = Session.new(id: "", sandbox: :local_code, backend: :docker)
+    assert error.message =~ "id"
+  end
+
+  test "backend default session adapter preserves one-shot execution and unsupported capabilities" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :just_bash,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    assert {:ok, unsigned_session} =
+             Backend.open_session(RunicSandbox.Backends.JustBash, profile, [])
+
+    assert unsigned_session.backend == :just_bash
+    assert unsigned_session.capabilities.exec?
+    refute unsigned_session.capabilities.checkpoints?
+    assert unsigned_session.state_model == :one_shot
+
+    assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+    assert session.backend == :just_bash
+    assert session.capabilities.exec?
+    refute session.capabilities.checkpoints?
+    assert session.state_model == :one_shot
+
+    assert {:ok, result} =
+             RunicSandbox.exec(session, runtime: :bash, source: "echo session-contract")
+
+    assert result.status == :pass
+    assert result.stdout == "session-contract\n"
+
+    assert {:error, error} = RunicSandbox.write_file(session, "/workspace/a.txt", "a")
+    assert error.message == "sandbox backend does not support write_file"
+    assert error.details.backend == :just_bash
+    assert :ok = RunicSandbox.close_session(session)
+  end
+
+  test "fake backend exercises session capability callbacks" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :docker,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    assert {:ok, session} = Backend.open_session(FakeBackend, profile, [])
+    assert session.state_model == :checkpointable
+    assert session.transport_model == :local_microvm
+    assert session.capabilities.files?
+    assert session.capabilities.services?
+
+    assert {:ok, file} = Backend.write_file(FakeBackend, session, "/workspace/a.txt", "abc", [])
+    assert file.bytes == 3
+
+    assert {:ok, "fake:/workspace/a.txt"} =
+             Backend.read_file(FakeBackend, session, "/workspace/a.txt", [])
+
+    assert {:ok, [%FileRef{}]} = Backend.list_files(FakeBackend, session, "/workspace", [])
+    assert :ok = Backend.delete_file(FakeBackend, session, "/workspace/a.txt", [])
+
+    assert {:ok, result} =
+             Backend.exec_session(
+               FakeBackend,
+               session,
+               ExecutionRequest.new!(sandbox: :local_code, runtime: :bash, source: "ok"),
+               []
+             )
+
+    assert result.stdout == "ok"
+
+    assert {:ok, checkpoint} = Backend.checkpoint(FakeBackend, session, [], [])
+    assert checkpoint.session_id == session.id
+    assert {:ok, ^session} = Backend.restore(FakeBackend, session, checkpoint, [])
+    assert {:ok, service} = Backend.start_service(FakeBackend, session, [name: "web"], [])
+    assert service.status == :running
+    assert {:ok, [%Service{status: :running}]} = Backend.list_services(FakeBackend, session, [])
+    assert {:ok, proxy} = Backend.open_proxy(FakeBackend, session, service, [])
+    assert proxy.status == :open
+    assert :ok = Backend.close_proxy(FakeBackend, proxy, [])
+    assert {:ok, lease} = Backend.acquire_lease(FakeBackend, session, "workspace", [])
+    assert lease.status == :active
+    assert :ok = Backend.release_lease(FakeBackend, lease, [])
+    assert {:error, error} = RunicSandbox.close_proxy("proxy-1")
+    assert error.message =~ "requires a backend"
+    assert :ok = Backend.close_session(FakeBackend, session, [])
+  end
+
+  test "session authority rejects mutated handles before backend execution" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :just_bash,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+
+    forged =
+      put_in(session.policy.network, :host)
+
+    assert {:error, error} =
+             RunicSandbox.exec(forged,
+               runtime: :bash,
+               source: "echo should-not-run",
+               network: :host
+             )
+
+    assert error.message == "sandbox session authority snapshot does not match the handle"
+
+    forged =
+      put_in(session.capabilities.exec?, false)
+
+    assert {:error, error} = RunicSandbox.exec(forged, runtime: :bash, source: "echo no")
+    assert error.message == "sandbox session authority snapshot does not match the handle"
+    refute function_exported?(RunicSandbox.Session, :reseal, 1)
+    refute Code.ensure_loaded?(RunicSandbox.SessionAuthority)
+  end
+
+  test "session operations enforce profile isolation and close revocation" do
+    assert {:error, error} =
+             RunicSandbox.open_session(:local_code, [],
+               profile: [
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 policy: [isolation_minimum: :microvm]
+               ]
+             )
+
+    assert error.message == "sandbox isolation level is below profile policy"
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :just_bash,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+    assert :ok = RunicSandbox.close_session(session)
+
+    assert {:error, error} = RunicSandbox.exec(session, runtime: :bash, source: "echo no")
+    assert error.message == "sandbox session authority is not active"
+
+    assert {:error, error} = RunicSandbox.checkpoint(session)
+    assert error.message == "sandbox session authority is not active"
+  end
+
+  test "backend health reports expose capability metadata" do
+    profiles = [
+      Profile.new!(name: :just_bash, backend: :just_bash, runtimes: [:bash]),
+      Profile.new!(name: :lua, backend: :lua, runtimes: [:lua]),
+      Profile.new!(name: :docker, backend: :docker, runtimes: [:bash]),
+      Profile.new!(name: :gvisor, backend: :gvisor, runtimes: [:bash]),
+      Profile.new!(name: :vmsan, backend: :vmsan, runtimes: [:bash]),
+      Profile.new!(
+        name: :remote_fly,
+        backend: :remote,
+        runtimes: [:bash],
+        network: :restricted,
+        backend_options: [
+          provider: :fly_machines,
+          app: "runic-sandbox-test",
+          machine_id: "machine-test-id",
+          executable: "runic-sandbox-missing-flyctl"
+        ]
+      )
+    ]
+
+    for profile <- profiles do
+      assert {:ok, status} = RunicSandbox.status(profile: profile)
+      health = hd(status.backends)
+      assert is_map(health.capabilities)
+      assert is_boolean(health.capabilities.exec?)
+      assert is_boolean(health.capabilities.checkpoints?)
+      assert is_boolean(health.capabilities.inline_files?)
+      assert is_boolean(health.capabilities.session_files?)
+      assert is_boolean(health.capabilities.services?)
+      assert is_boolean(health.capabilities.proxy?)
+      assert is_boolean(health.capabilities.persistent_identity?)
+    end
+  end
+
+  test "remote backend health is structured without contacting the provider" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :remote_code,
+               backend: :remote,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: [
+                 provider: :fly_machines,
+                 app: "runic-sandbox-test",
+                 machine_id: "machine-test-id",
+                 token_env: "RUNIC_SANDBOX_MISSING_FLY_TOKEN",
+                 executable: "runic-sandbox-missing-flyctl"
+               ]
+             )
+
+    assert {:ok, status} = RunicSandbox.status(profile: profile)
+
+    assert [
+             %{
+               name: :remote,
+               isolation_level: :remote_microvm,
+               security_boundary?: true,
+               configured?: true,
+               fly_cli_available?: false,
+               available?: false,
+               auth_configured?: false,
+               auth_required?: true,
+               credential_policy: :env_token
+             } = health
+           ] = status.backends
+
+    refute Map.has_key?(health, :provider_config)
+    assert %{message: "fly or flyctl executable is unavailable"} in health.diagnostics
+
+    assert %{requirement: :auth, message: "Remote provider credentials are required"} in health.missing_requirements
+  end
+
+  test "remote backend does not expose provider config through status or snapshot" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :remote_code,
+               backend: :remote,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: [
+                 provider: :fly_machines,
+                 app: "runic-sandbox-test",
+                 machine_id: "machine-test-id",
+                 token_env: "RUNIC_SANDBOX_MISSING_FLY_TOKEN",
+                 executable: "runic-sandbox-missing-flyctl"
+               ]
+             )
+
+    assert {:ok, status} = RunicSandbox.status(profile: profile)
+    health = hd(status.backends)
+    refute Map.has_key?(health, :provider_config)
+    refute inspect(health) =~ "machine-test-id"
+
+    assert {:ok, instance} = RunicSandbox.provision(profile)
+    assert {:ok, snapshot} = RunicSandbox.snapshot(instance)
+    refute Map.has_key?(snapshot, :provider_config)
+    refute inspect(snapshot) =~ "machine-test-id"
+  end
+
+  test "remote credential policy none is not executable through ambient CLI auth" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :remote_code,
+               backend: :remote,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: [
+                 provider: :fly_machines,
+                 app: "runic-sandbox-test",
+                 machine_id: "machine-test-id",
+                 credential_policy: :none,
+                 executable: "sh"
+               ]
+             )
+
+    assert {:ok, status} = RunicSandbox.status(profile: profile)
+    health = hd(status.backends)
+    refute health.available?
+    assert health.credential_policy == :none
+
+    assert %{requirement: :auth, message: "Remote provider credentials are required"} in health.missing_requirements
+
+    assert {:ok, instance} = RunicSandbox.provision(profile)
+
+    assert {:error, error} =
+             RunicSandbox.exec_with_instance(
+               instance,
+               ExecutionRequest.new!(sandbox: :remote_code, runtime: :bash, source: "echo no")
+             )
+
+    assert error.message == "remote sandbox provider is not available for execution"
+  end
+
+  test "docker one-shot workspace is cleaned when file preparation fails" do
+    before = tmp_runic_sandbox_dirs()
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :docker,
+               runtimes: [:bash],
+               network: :disabled,
+               image: "runic-ai/sandbox:elixir-python-node"
+             )
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               [
+                 sandbox: :local_code,
+                 runtime: :bash,
+                 source: "echo blocked",
+                 files: %{"ok.txt" => "secret", "../escape.txt" => "blocked"}
+               ],
+               profile: profile
+             )
+
+    assert error.message == "failed to prepare docker sandbox workspace"
+    assert tmp_runic_sandbox_dirs() -- before == []
+  end
+
+  test "docker session persists files, checkpoints, and restores when local image exists" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+      assert session.state_model == :persistent_workspace
+      assert session.capabilities.session_files?
+      assert session.capabilities.checkpoints?
+
+      assert {:ok, ref} = RunicSandbox.write_file(session, "input.txt", "alpha")
+      assert ref.path == "input.txt"
+      assert {:ok, "alpha"} = RunicSandbox.read_file(session, "input.txt")
+
+      assert {:ok, result} =
+               RunicSandbox.exec(session,
+                 runtime: :bash,
+                 source: "cat input.txt > output.txt && printf done"
+               )
+
+      assert result.status == :pass
+      assert result.stdout == "done"
+      assert {:ok, "alpha"} = RunicSandbox.read_file(session, "output.txt")
+      assert {:ok, files} = RunicSandbox.list_files(session)
+      assert Enum.any?(files, &(&1.path == "input.txt"))
+      assert Enum.any?(files, &(&1.path == "output.txt"))
+
+      assert {:ok, checkpoint} = RunicSandbox.checkpoint(session, id: "phase2")
+      assert checkpoint.metadata.kind == :filesystem
+      assert checkpoint.metadata.authority.version == 1
+      assert {:ok, _ref} = RunicSandbox.write_file(session, "input.txt", "beta")
+      assert {:ok, "beta"} = RunicSandbox.read_file(session, "input.txt")
+      assert {:ok, restored} = RunicSandbox.restore(session, checkpoint)
+      assert {:ok, "alpha"} = RunicSandbox.read_file(restored, "input.txt")
+      assert :ok = RunicSandbox.delete_file(restored, "output.txt")
+      assert {:ok, files} = RunicSandbox.list_files(restored)
+      refute Enum.any?(files, &(&1.path == "output.txt"))
+      assert :ok = RunicSandbox.close_session(restored)
+      assert {:error, error} = RunicSandbox.exec(restored, runtime: :bash, source: "echo no")
+      assert error.message == "sandbox session authority is not active"
+    end
+  end
+
+  test "docker session rejects mutated metadata, symlink paths, and forged checkpoints" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+
+      forged_session = put_in(session.metadata[:workspace_root], System.tmp_dir!())
+      assert {:error, error} = RunicSandbox.read_file(forged_session, "passwd")
+      assert error.message == "sandbox session authority snapshot does not match the handle"
+
+      symlink_path = Path.join(session.metadata.workspace_root, "host-leak")
+      assert :ok = File.ln_s("/etc/passwd", symlink_path)
+
+      assert {:error, error} = RunicSandbox.read_file(session, "host-leak")
+      assert error.message == "sandbox filesystem path may not be a symlink"
+
+      assert {:ok, files} = RunicSandbox.list_files(session)
+      refute Enum.any?(files, &(&1.path == "host-leak"))
+
+      assert {:ok, result} =
+               RunicSandbox.exec(session,
+                 runtime: :bash,
+                 source: "ln -s /etc/passwd container-leak"
+               )
+
+      assert result.status == :pass
+      refute Enum.any?(result.files_changed, &(&1.path == "container-leak"))
+      refute Enum.any?(result.artifacts, &(&1.path == "container-leak"))
+
+      assert {:ok, checkpoint} = RunicSandbox.checkpoint(session, id: "authority")
+
+      forged_path =
+        Path.join(System.tmp_dir!(), "forged_checkpoint_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(forged_path)
+      forged_checkpoint = put_in(checkpoint.metadata[:path], forged_path)
+      assert {:error, error} = RunicSandbox.restore(session, forged_checkpoint)
+      assert error.message == "docker checkpoint authority does not match"
+
+      assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
+  test "docker checkpoint ids cannot shape host checkpoint paths" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+
+      target =
+        Path.join(
+          System.tmp_dir!(),
+          "runic_sandbox_path_escape_#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(target)
+      sentinel = Path.join(target, "sentinel.txt")
+      File.write!(sentinel, "keep")
+
+      escape_id = "a/../../../#{Path.basename(target)}"
+      assert {:ok, checkpoint} = RunicSandbox.checkpoint(session, id: escape_id)
+
+      assert File.read!(sentinel) == "keep"
+      refute String.contains?(checkpoint.id, "/")
+
+      assert String.starts_with?(
+               Path.expand(checkpoint.metadata.path),
+               Path.expand(System.tmp_dir!()) <> "/"
+             )
+
+      refute Path.expand(checkpoint.metadata.path) == Path.expand(target)
+
+      assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
+  test "docker session ids cannot shape host checkpoint paths" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      target =
+        Path.join(
+          System.tmp_dir!(),
+          "runic_sandbox_session_id_escape_#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(target)
+      sentinel = Path.join(target, "sentinel.txt")
+      File.write!(sentinel, "keep")
+
+      session_id = "a/../#{Path.basename(target)}"
+
+      assert {:ok, session} =
+               RunicSandbox.open_session(:local_code, [], profile: profile, id: session_id)
+
+      assert {:ok, checkpoint} = RunicSandbox.checkpoint(session, id: "phase2")
+
+      assert File.read!(sentinel) == "keep"
+      refute String.contains?(Path.basename(checkpoint.metadata.path), "/")
+
+      assert String.starts_with?(
+               Path.expand(checkpoint.metadata.path),
+               Path.expand(System.tmp_dir!()) <> "/"
+             )
+
+      refute Path.expand(checkpoint.metadata.path) == Path.expand(target)
+
+      assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
+  test "docker session executes configured language runtimes when local image exists" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash, :python, :node, :elixir, :lua],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+
+      cases = [
+        {:bash, "printf bash", "bash"},
+        {:python, "print('python', end='')", "python"},
+        {:node, "process.stdout.write('node')", "node"},
+        {:elixir, "IO.write(\"elixir\")", "elixir"},
+        {:lua, "io.write('lua')", "lua"}
+      ]
+
+      for {runtime, source, expected} <- cases do
+        assert {:ok, result} = RunicSandbox.exec(session, runtime: runtime, source: source)
+        assert result.status == :pass
+        assert result.stdout == expected
+      end
+
+      assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
+  test "vmsan CLI builds argv and parses JSON events" do
+    assert VmsanCLI.command(["exec", "vm-1", "echo", "ok"], executable: "/usr/bin/vmsan") ==
+             {"/usr/bin/vmsan", ["--json", "exec", "vm-1", "echo", "ok"]}
+
+    assert VmsanCLI.command(["create"], executable: "vmsan", sudo?: true, path: "/bin") ==
+             {"sudo", ["-n", "env", "PATH=/bin", "vmsan", "--json", "create"]}
+
+    assert VmsanCLI.create_args(
+             vcpus: 2,
+             memory: 512,
+             runtime: :base,
+             network_policy: "deny-all",
+             allowed_domains: ["hex.pm", "github.com"]
+           ) == [
+             "create",
+             "--vcpus",
+             "2",
+             "--memory",
+             "512",
+             "--runtime",
+             "base",
+             "--network-policy",
+             "deny-all",
+             "--allowed-domain",
+             "hex.pm,github.com"
+           ]
+
+    assert VmsanCLI.exec_args("vm-1", ["sh", "-lc", "echo ok"], workdir: "/workspace") ==
+             ["exec", "--workdir", "/workspace", "vm-1", "sh", "-lc", "echo ok"]
+
+    runner = fn "vmsan", ["--json", "exec", "vm-1", "echo", "ok"], _opts ->
+      {"ok\n{\"path\":\"exec\",\"vmId\":\"vm-1\"}\n", 0}
+    end
+
+    assert {:ok, result} =
+             VmsanCLI.run_json(["exec", "vm-1", "echo", "ok"], runner: runner)
+
+    assert result.stream_output == "ok\n"
+    assert result.event["path"] == "exec"
+
+    error_runner = fn "vmsan", ["--json", "exec", "missing-vm", "echo", "ok"], _opts ->
+      {Jason.encode!(%{
+         path: "exec",
+         error: %{
+           message: "VM not found: missing-vm",
+           code: "ERR_VM_NOT_FOUND",
+           fix: "Run 'vmsan list' to see available VMs."
+         }
+       }), 1}
+    end
+
+    assert {:error, error} =
+             VmsanCLI.run_json(["exec", "missing-vm", "echo", "ok"], runner: error_runner)
+
+    assert error.message == "VM not found: missing-vm"
+    assert error.details.code == "ERR_VM_NOT_FOUND"
+
+    nonzero_runner = fn "vmsan", ["--json", "exec", "vm-1", "false"], _opts ->
+      {Jason.encode!(%{path: "exec", vmId: "vm-1"}), 1}
+    end
+
+    assert {:error, nonzero_error} =
+             VmsanCLI.run_json(["exec", "vm-1", "false"], runner: nonzero_runner)
+
+    assert nonzero_error.message == "vmsan command failed"
+    assert nonzero_error.details.exit_status == 1
+  end
+
+  test "vmsan backend reports doctor diagnostics and blocks execution when unavailable" do
+    commands = fn
+      "sh", ["-c", "command -v vmsan"], _opts ->
+        {"/usr/bin/vmsan\n", 0}
+
+      "/usr/bin/vmsan", ["doctor", "--json"], _opts ->
+        {Jason.encode!(vmsan_doctor_fixture()), 1}
+
+      "/usr/bin/vmsan", ["--version"], _opts ->
+        {"0.3.0\n", 0}
+
+      _command, _args, _opts ->
+        {"", 1}
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :vmsan,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    assert {:ok, status} = RunicSandbox.status(profile: profile, commands: commands)
+
+    assert [%{name: :vmsan, isolation_level: :microvm, security_boundary?: true} = health] =
+             status.backends
+
+    refute health.available?
+    assert health.capabilities.session_files?
+    assert health.capabilities.checkpoints?
+
+    assert %{requirement: :firecracker} in Enum.map(
+             health.missing_requirements,
+             &Map.take(&1, [:requirement])
+           )
+
+    assert {:error, error} =
+             RunicSandbox.open_session(:local_code, [], profile: profile, commands: commands)
+
+    assert error.message == "vmsan sandbox provider is not available for execution"
+    assert Enum.any?(error.details.missing_requirements, &(&1.requirement == :kernel_image))
+  end
+
+  test "vmsan backend performs mocked create upload exec snapshot restore and cleanup lifecycle" do
+    agent_pid = self()
+
+    commands = fn
+      "sh", ["-c", "command -v vmsan"], _opts ->
+        {"/usr/bin/vmsan\n", 0}
+
+      "/usr/bin/vmsan", ["doctor", "--json"], _opts ->
+        {Jason.encode!(vmsan_healthy_doctor_fixture()), 0}
+
+      "/usr/bin/vmsan", ["--version"], _opts ->
+        {"0.3.0\n", 0}
+
+      "sudo",
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "create" | _args],
+      _opts ->
+        send(agent_pid, {:vmsan_create, :sudo})
+        {Jason.encode!(%{"path" => "create", "vmId" => "vm-a"}), 0}
+
+      "/usr/bin/vmsan", ["--json", "upload", "--dest", "/workspace", "vm-a", local_path], _opts ->
+        send(agent_pid, {:vmsan_upload, local_path})
+        {Jason.encode!(%{"path" => "upload", "vmId" => "vm-a"}), 0}
+
+      "/usr/bin/vmsan",
+      ["--json", "exec", "--workdir", "/workspace", "vm-a", "sh", "-lc", "cat /workspace/in.txt"],
+      _opts ->
+        send(agent_pid, :vmsan_exec)
+        {"hello\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
+
+      "sudo",
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "snapshot", "create", "vm-a"],
+      _opts ->
+        send(agent_pid, {:vmsan_snapshot, :sudo})
+
+        {Jason.encode!(%{
+           "path" => "snapshot.create",
+           "vmId" => "vm-a",
+           "snapshotId" => "snap-a"
+         }), 0}
+
+      "sudo",
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "remove", "vm-a"],
+      _opts ->
+        send(agent_pid, {:vmsan_remove, :sudo})
+        {Jason.encode!(%{"path" => "remove", "vmId" => "vm-a"}), 0}
+
+      _command, _args, _opts ->
+        {"", 1}
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :vmsan,
+               runtimes: [:bash],
+               network: :disabled,
+               backend_options: %{sudo?: true, executable: "/usr/bin/vmsan"}
+             )
+
+    assert {:ok, session} =
+             RunicSandbox.open_session(:local_code, [],
+               profile: profile,
+               commands: commands,
+               runner: commands
+             )
+
+    assert_receive {:vmsan_create, :sudo}
+    assert session.metadata.sudo?
+    assert File.dir?(session.metadata.transfer_root)
+
+    assert {:ok, result} =
+             RunicSandbox.exec(
+               session,
+               [
+                 runtime: :bash,
+                 source: "cat /workspace/in.txt",
+                 files: %{"in.txt" => "hello"},
+                 timeout_ms: 1_234
+               ],
+               commands: commands,
+               runner: commands
+             )
+
+    assert result.status == :pass
+    assert result.stdout == "hello\n"
+    assert_receive {:vmsan_upload, local_path}
+    assert File.read!(local_path) == "hello"
+    assert_receive :vmsan_exec
+
+    assert {:error, escape_error} =
+             RunicSandbox.exec(
+               session,
+               [
+                 runtime: :bash,
+                 source: "true",
+                 files: %{"../escape.txt" => "nope"}
+               ],
+               commands: commands,
+               runner: commands
+             )
+
+    assert escape_error.message == "vmsan inline file path escapes the request cwd"
+
+    assert {:error, absolute_error} =
+             RunicSandbox.exec(
+               session,
+               [
+                 runtime: :bash,
+                 source: "true",
+                 files: %{"/etc/passwd" => "nope"}
+               ],
+               commands: commands,
+               runner: commands
+             )
+
+    assert absolute_error.message ==
+             "vmsan inline file path must be relative to the request cwd"
+
+    assert {:ok, checkpoint} =
+             RunicSandbox.checkpoint(session, %{}, commands: commands, runner: commands)
+
+    assert checkpoint.id == "snap-a"
+    assert_receive {:vmsan_snapshot, :sudo}
+
+    assert :ok = RunicSandbox.close_session(session, commands: commands, runner: commands)
+    refute File.exists?(session.metadata.transfer_root)
+    assert_receive {:vmsan_remove, :sudo}
+  end
+
+  test "vmsan one-shot execution reports cleanup failure after successful exec" do
+    agent_pid = self()
+
+    commands = fn
+      "sh", ["-c", "command -v vmsan"], _opts ->
+        {"/usr/bin/vmsan\n", 0}
+
+      "/usr/bin/vmsan", ["doctor", "--json"], _opts ->
+        {Jason.encode!(vmsan_healthy_doctor_fixture()), 0}
+
+      "/usr/bin/vmsan", ["--version"], _opts ->
+        {"0.3.0\n", 0}
+
+      "sudo",
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "create" | _args],
+      _opts ->
+        {Jason.encode!(%{"path" => "create", "vmId" => "vm-cleanup"}), 0}
+
+      "/usr/bin/vmsan",
+      ["--json", "exec", "--workdir", "/workspace", "vm-cleanup", "sh", "-lc", "echo ok"],
+      _opts ->
+        {"ok\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-cleanup"}) <> "\n", 0}
+
+      "sudo",
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "remove", "vm-cleanup"],
+      _opts ->
+        send(agent_pid, :cleanup_attempted)
+
+        {Jason.encode!(%{
+           "path" => "remove",
+           "error" => %{"message" => "remove failed", "code" => "ERR_REMOVE"}
+         }), 1}
+
+      _command, _args, _opts ->
+        {"", 1}
+    end
+
+    profile =
+      Profile.new!(
+        name: :local_code,
+        backend: :vmsan,
+        runtimes: [:bash],
+        network: :disabled,
+        backend_options: %{sudo?: true, executable: "/usr/bin/vmsan"}
+      )
+
+    assert {:ok, instance} = RunicSandbox.Backends.Vmsan.provision(profile, commands: commands)
+
+    request =
+      ExecutionRequest.new!(
+        sandbox: :local_code,
+        runtime: :bash,
+        source: "echo ok",
+        timeout_ms: 1_234
+      )
+
+    assert {:error, error} =
+             RunicSandbox.Backends.Vmsan.exec(instance, request,
+               commands: commands,
+               runner: commands
+             )
+
+    assert error.message == "vmsan one-shot cleanup failed"
+    assert error.details.execution_result.stdout == "ok\n"
+    assert error.details.cleanup_error.message == "remove failed"
+    assert_receive :cleanup_attempted
+  end
+
+  test "sprites backend reports redacted status and exercises mocked stateful API lifecycle" do
+    parent = self()
+
+    requester = fn
+      :post, _config, "/v1/sprites", %{}, body, opts ->
+        send(
+          parent,
+          {:sprites_request, :create, Jason.decode!(body), Keyword.get(opts, :headers)}
+        )
+
+        {:ok,
+         %{
+           status: 201,
+           body:
+             Jason.encode!(%{
+               id: "sprite-id-1",
+               name: "runic-test-sprite",
+               organization: "runic",
+               status: "cold",
+               url: "https://runic-test.sprites.app"
+             })
+         }}
+
+      :put, _config, "/v1/sprites/runic-test-sprite/fs/write", query, contents, _opts ->
+        send(parent, {:sprites_request, :write, query, contents})
+        {:ok, %{status: 200, body: Jason.encode!(%{path: query.path, size: byte_size(contents)})}}
+
+      :post, _config, "/v1/sprites/runic-test-sprite/exec", query, stdin, _opts ->
+        send(parent, {:sprites_request, :exec, query, stdin})
+
+        {:ok,
+         %{
+           status: 200,
+           body: Jason.encode!(%{stdout: "sprite-ok\n", stderr: "", exit_code: 0})
+         }}
+
+      :get, _config, "/v1/sprites/runic-test-sprite/fs/read", query, "", _opts ->
+        send(parent, {:sprites_request, :read, query})
+        {:ok, %{status: 200, body: "sprite-file"}}
+
+      :get, _config, "/v1/sprites/runic-test-sprite/fs/list", query, "", _opts ->
+        send(parent, {:sprites_request, :list_files, query})
+
+        {:ok,
+         %{
+           status: 200,
+           body: Jason.encode!(%{entries: [%{name: "out.txt", type: "file", size: 11}]})
+         }}
+
+      :post, _config, "/v1/sprites/runic-test-sprite/checkpoint", %{}, body, _opts ->
+        send(parent, {:sprites_request, :checkpoint, Jason.decode!(body)})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             [
+               Jason.encode!(%{type: "info", data: "Creating checkpoint..."}),
+               Jason.encode!(%{type: "complete", data: "Checkpoint v2 created successfully"})
+             ]
+             |> Enum.join("\n")
+         }}
+
+      :post, _config, "/v1/sprites/runic-test-sprite/checkpoints/v2/restore", %{}, "", _opts ->
+        send(parent, {:sprites_request, :restore})
+        {:ok, %{status: 200, body: Jason.encode!(%{ok: true})}}
+
+      :post, _config, "/v1/sprites/runic-test-sprite/services", %{}, body, _opts ->
+        send(parent, {:sprites_request, :service_create, Jason.decode!(body)})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             Jason.encode!(%{
+               name: "web",
+               cmd: "python",
+               args: ["-m", "http.server", "8000"],
+               http_port: 8000,
+               state: %{status: "running", pid: 42}
+             })
+         }}
+
+      :get, _config, "/v1/sprites/runic-test-sprite/services", %{}, "", _opts ->
+        send(parent, {:sprites_request, :services_list})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             Jason.encode!([
+               %{name: "web", cmd: "python", http_port: 8000, state: %{status: "running"}}
+             ])
+         }}
+
+      :post, _config, "/v1/sprites/runic-test-sprite/services/web/stop", %{}, "", _opts ->
+        send(parent, {:sprites_request, :service_stop})
+        {:ok, %{status: 200, body: Jason.encode!(%{ok: true})}}
+
+      :delete, _config, "/v1/sprites/runic-test-sprite", %{}, "", _opts ->
+        send(parent, {:sprites_request, :delete})
+        {:ok, %{status: 204}}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :sprites_code,
+               backend: :sprites,
+               runtimes: [:bash, :python],
+               network: :restricted,
+               backend_options: %{
+                 sprite: "runic-test-sprite",
+                 organization: "runic",
+                 create_policy: :ephemeral
+               }
+             )
+
+    assert {:ok, status} = RunicSandbox.status(profile: profile, env: env)
+    assert [%{name: :sprites, capabilities: capabilities} = health] = status.backends
+    assert health.available?
+    assert health.token_env == "SPRITES_TOKEN"
+    assert health.token_value == :redacted
+    assert capabilities.session_files?
+    assert capabilities.checkpoints?
+    assert capabilities.services?
+    assert capabilities.proxy?
+    refute inspect(status) =~ "secret-token"
+
+    assert {:ok, session} =
+             RunicSandbox.open_session(:sprites_code, [],
+               profile: profile,
+               env: env,
+               requester: requester
+             )
+
+    assert session.backend == :sprites
+    assert session.state_model == :service_actor
+    assert session.transport_model == :remote_microvm
+    assert session.metadata.token_env == "SPRITES_TOKEN"
+    refute inspect(session) =~ "secret-token"
+    assert_receive {:sprites_request, :create, %{"name" => "runic-test-sprite"}, headers}
+    assert inspect(headers) =~ "secret-token"
+
+    assert {:ok, result} =
+             RunicSandbox.exec(
+               session,
+               [
+                 runtime: :bash,
+                 source: "cat /workspace/in.txt",
+                 files: %{"in.txt" => "sprite-file"}
+               ],
+               env: env,
+               requester: requester
+             )
+
+    assert result.status == :pass
+    assert result.stdout == "sprite-ok\n"
+    assert result.metadata.provider == :sprites
+    assert_receive {:sprites_request, :write, %{path: "/workspace/in.txt"}, "sprite-file"}
+    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat /workspace/in.txt"]}, ""}
+
+    assert {:ok, "sprite-file"} =
+             RunicSandbox.read_file(session, "/workspace/in.txt", env: env, requester: requester)
+
+    assert_receive {:sprites_request, :read, %{path: "/workspace/in.txt"}}
+
+    assert {:ok, [file]} =
+             RunicSandbox.list_files(session, "/workspace", env: env, requester: requester)
+
+    assert file.path == "out.txt"
+    assert file.bytes == 11
+    assert_receive {:sprites_request, :list_files, %{path: "/workspace"}}
+
+    assert {:ok, checkpoint} =
+             RunicSandbox.checkpoint(session, %{comment: "before"},
+               env: env,
+               requester: requester
+             )
+
+    assert checkpoint.id == "v2"
+    assert_receive {:sprites_request, :checkpoint, %{"comment" => "before"}}
+
+    assert {:ok, ^session} =
+             RunicSandbox.restore(session, checkpoint, env: env, requester: requester)
+
+    assert_receive {:sprites_request, :restore}
+
+    assert {:ok, service} =
+             RunicSandbox.start_service(
+               session,
+               [name: "web", cmd: "python", args: ["-m", "http.server", "8000"], http_port: 8000],
+               env: env,
+               requester: requester
+             )
+
+    assert service.name == "web"
+    assert service.status == :running
+    assert_receive {:sprites_request, :service_create, %{"name" => "web"}}
+
+    assert {:ok, [listed_service]} =
+             RunicSandbox.list_services(session, env: env, requester: requester)
+
+    assert listed_service.name == "web"
+    assert_receive {:sprites_request, :services_list}
+
+    assert {:ok, proxy} = RunicSandbox.open_proxy(session, service)
+    assert proxy.backend == :sprites
+    assert proxy.url =~ "/v1/sprites/runic-test-sprite/proxy"
+    assert proxy.metadata.protocol == :websocket_tcp_proxy
+
+    assert :ok = RunicSandbox.stop_service(session, service, env: env, requester: requester)
+    assert_receive {:sprites_request, :service_stop}
+
+    assert :ok = RunicSandbox.close_session(session, env: env, requester: requester)
+    assert_receive {:sprites_request, :delete}
+  end
+
+  test "sprites direct exec forwards adapter opts and honors ephemeral lifecycle" do
+    parent = self()
+
+    requester = fn
+      :post, _config, "/v1/sprites", %{}, body, opts ->
+        send(parent, {:sprites_direct, :create, Jason.decode!(body), Keyword.get(opts, :headers)})
+        {:ok, %{status: 201, body: Jason.encode!(%{id: "sprite-id-1", name: "runic-direct"})}}
+
+      :post, _config, "/v1/sprites/runic-direct/exec", query, "", _opts ->
+        send(parent, {:sprites_direct, :exec, query})
+        {:ok, %{status: 200, body: <<1, "direct-ok\n", 3, 0>>}}
+
+      :delete, _config, "/v1/sprites/runic-direct", %{}, "", _opts ->
+        send(parent, {:sprites_direct, :delete})
+        {:ok, %{status: 204}}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :sprites_code,
+               backend: :sprites,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: %{sprite: "runic-direct", create_policy: :ephemeral}
+             )
+
+    assert {:ok, result} =
+             RunicSandbox.exec(
+               [sandbox: :sprites_code, runtime: :bash, source: "echo direct-ok"],
+               profile: profile,
+               env: env,
+               requester: requester
+             )
+
+    assert result.status == :pass
+    assert result.stdout == "direct-ok\n"
+    assert_receive {:sprites_direct, :create, %{"name" => "runic-direct"}, headers}
+    assert inspect(headers) =~ "secret-token"
+    assert_receive {:sprites_direct, :exec, %{cmd: ["sh", "-lc", "echo direct-ok"]}}
+    assert_receive {:sprites_direct, :delete}
+  end
+
+  test "sprites exec returns structured error for malformed provider exit status" do
+    requester = fn
+      :post, _config, "/v1/sprites/runic-status/exec", _query, "", _opts ->
+        {:ok, %{status: 200, body: Jason.encode!(%{stdout: "ok\n", exit_status: "unknown"})}}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :sprites_code,
+               backend: :sprites,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: %{sprite: "runic-status", create_policy: :use_existing}
+             )
+
+    assert {:ok, session} =
+             RunicSandbox.open_session(:sprites_code, [], profile: profile, env: env)
+
+    assert {:error, error} =
+             RunicSandbox.exec(session, [runtime: :bash, source: "echo ok"],
+               env: env,
+               requester: requester
+             )
+
+    assert error.message == "invalid sprites exec exit status"
+    assert error.details.exit_status == "unknown"
+  end
+
+  test "sprites exec decodes nonzero binary stream frames" do
+    requester = fn
+      :post, _config, "/v1/sprites/runic-status/exec", _query, "", _opts ->
+        {:ok, %{status: 200, body: <<2, "boom\n", 3, 7>>}}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :sprites_code,
+               backend: :sprites,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: %{sprite: "runic-status", create_policy: :use_existing}
+             )
+
+    assert {:ok, session} =
+             RunicSandbox.open_session(:sprites_code, [], profile: profile, env: env)
+
+    assert {:ok, result} =
+             RunicSandbox.exec(session, [runtime: :bash, source: "echo no", cwd: "/home/sprite"],
+               env: env,
+               requester: requester
+             )
+
+    assert result.status == :fail
+    assert result.stdout == ""
+    assert result.stderr == "boom\n"
+    assert result.exit_status == 7
+  end
+
+  test "reports expose health matrix, latency, security posture, and publication strategy" do
+    health =
+      RunicSandbox.Reports.health_matrix([
+        [name: :just_bash, backend: :just_bash, runtimes: [:bash], network: :disabled],
+        [
+          name: :remote_fly,
+          backend: :remote,
+          runtimes: [:bash],
+          network: :restricted,
+          backend_options: [
+            provider: :fly_machines,
+            app: "runic-sandbox-test",
+            machine_id: "machine-test-id",
+            executable: "runic-sandbox-missing-flyctl"
+          ]
+        ]
+      ])
+
+    assert %{host: %{os_family: _}, rows: [just_bash, remote]} = health
+    assert just_bash.backend == :just_bash
+    assert just_bash.isolation_level == :in_process_virtual
+    assert just_bash.transport_model == :in_process
+    assert just_bash.state_model == :one_shot
+    assert just_bash.capabilities.exec?
+    assert remote.backend == :remote
+    assert remote.health.provider == :fly_machines
+    assert remote.transport_model == :provider_cli
+    assert Enum.any?(remote.missing_requirements, &(&1.requirement == :fly_cli))
+
+    latency =
+      RunicSandbox.Reports.latency_report([
+        [name: :just_bash, backend: :just_bash, runtimes: [:bash], network: :disabled]
+      ])
+
+    assert [
+             %{
+               backend: :just_bash,
+               status: %{status: :ok},
+               cold_exec: %{status: :ok},
+               warm_exec: %{status: :ok},
+               session_open: %{status: :ok},
+               session_exec: %{status: :ok},
+               session_checkpoint: %{status: :error},
+               session_restore: %{status: :skipped},
+               session_close: %{status: :ok},
+               snapshot: %{status: :ok},
+               reset: %{status: :ok}
+             }
+           ] = latency.rows
+
+    security = RunicSandbox.Reports.security_posture()
+    assert Enum.any?(security.rows, &(&1.backend == :docker and &1.security_boundary?))
+
+    strategy = RunicSandbox.Reports.publication_strategy()
+    assert strategy.base_package.required_dependencies == [:jason]
+    assert :just_bash in strategy.base_package.optional_dependencies
+    assert Enum.any?(strategy.split_later, &(&1.app == :runic_sandbox_vmsan))
+  end
+
+  test "host probe parses vmsan doctor failures into missing requirements" do
+    output = Jason.encode!(vmsan_doctor_fixture())
+
+    doctor = HostProbe.parse_vmsan_doctor(output, executable: "/usr/bin/vmsan")
+
+    refute doctor.available?
+    assert doctor.summary == %{passed: 5, failed: 8, total: 13}
+
+    requirements = Enum.map(doctor.missing_requirements, & &1.requirement)
+    assert :firecracker in requirements
+    assert :jailer in requirements
+    assert :vmsan_agent in requirements
+    assert :vmsan_nftables in requirements
+    assert :kernel_image in requirements
+    assert :rootfs_image in requirements
+    assert :nftables_kernel in requirements
+  end
+
+  test "host probe redacts sprite token and reports provider readiness from commands" do
+    commands = fn
+      "sh", ["-c", "command -v vmsan"], _opts ->
+        {"/usr/bin/vmsan\n", 0}
+
+      "sh", ["-c", "command -v sprite"], _opts ->
+        {"/usr/local/bin/sprite\n", 0}
+
+      "sh", ["-c", "command -v docker"], _opts ->
+        {"/usr/bin/docker\n", 0}
+
+      "/usr/bin/vmsan", ["--version"], _opts ->
+        {"0.3.0\n", 0}
+
+      "/usr/bin/vmsan", ["doctor", "--json"], _opts ->
+        {Jason.encode!(vmsan_doctor_fixture()), 0}
+
+      "/usr/local/bin/sprite", ["--help"], _opts ->
+        {"sprite help text", 0}
+
+      "/usr/bin/docker", ["info", "--format", "{{json .Runtimes}}"], _opts ->
+        {"{}", 0}
+
+      "uname", ["-a"], _opts ->
+        {"Linux test 6.0 x86_64", 0}
+
+      "systemd-detect-virt", [], _opts ->
+        {"none\n", 0}
+
+      "kvm-ok", [], _opts ->
+        {"INFO: /dev/kvm exists\nKVM acceleration can be used\n", 0}
+
+      _command, _args, _opts ->
+        {"", 1}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    probe = HostProbe.collect(commands: commands, env: env)
+
+    assert probe.vmsan.installed?
+    refute probe.vmsan.available?
+    assert probe.vmsan.doctor.summary.failed == 8
+    assert probe.sprites.installed?
+    assert probe.sprites.auth_configured?
+    assert probe.sprites.token_env == %{name: "SPRITES_TOKEN", present?: true, value: :redacted}
+    refute inspect(probe) =~ "secret-token"
+  end
+
+  defp vmsan_doctor_fixture do
+    %{
+      "path" => "doctor",
+      "checks" => [
+        %{"category" => "System", "name" => "KVM", "status" => "pass", "detail" => "/dev/kvm"},
+        %{
+          "category" => "System",
+          "name" => "TUN device",
+          "status" => "pass",
+          "detail" => "/dev/net/tun"
+        },
+        %{
+          "category" => "System",
+          "name" => "Disk space",
+          "status" => "fail",
+          "detail" => "Could not check disk space"
+        },
+        %{
+          "category" => "System",
+          "name" => "Default interface",
+          "status" => "pass",
+          "detail" => "eno1"
+        },
+        %{
+          "category" => "System",
+          "name" => "nftables kernel",
+          "status" => "fail",
+          "detail" => "nftables kernel support not available"
+        },
+        %{
+          "category" => "System",
+          "name" => "Host firewall",
+          "status" => "pass",
+          "detail" => "No conflicts"
+        },
+        %{
+          "category" => "System",
+          "name" => "Jailer filesystem",
+          "status" => "pass",
+          "detail" => "/"
+        },
+        %{
+          "category" => "Binaries",
+          "name" => "Firecracker",
+          "status" => "fail",
+          "detail" => "Not found"
+        },
+        %{
+          "category" => "Binaries",
+          "name" => "Jailer",
+          "status" => "fail",
+          "detail" => "Not found"
+        },
+        %{
+          "category" => "Binaries",
+          "name" => "Agent",
+          "status" => "fail",
+          "detail" => "Not found"
+        },
+        %{
+          "category" => "Binaries",
+          "name" => "vmsan-nftables",
+          "status" => "fail",
+          "detail" => "Not found"
+        },
+        %{
+          "category" => "Images",
+          "name" => "Kernel",
+          "status" => "fail",
+          "detail" => "Not found"
+        },
+        %{
+          "category" => "Images",
+          "name" => "Rootfs (base)",
+          "status" => "fail",
+          "detail" => "Not found"
+        }
+      ],
+      "summary" => %{"passed" => 5, "failed" => 8, "total" => 13}
+    }
+  end
+
+  defp vmsan_healthy_doctor_fixture do
+    checks =
+      vmsan_doctor_fixture()
+      |> Map.fetch!("checks")
+      |> Enum.map(&Map.put(&1, "status", "pass"))
+
+    %{
+      "path" => "doctor",
+      "checks" => checks,
+      "summary" => %{"passed" => length(checks), "failed" => 0, "total" => length(checks)}
+    }
+  end
+
+  defp tmp_runic_sandbox_dirs do
+    System.tmp_dir!()
+    |> File.ls!()
+    |> Enum.filter(&String.starts_with?(&1, "runic_sandbox_"))
+    |> Enum.sort()
+  end
+
+  defp docker_image_available? do
+    case System.find_executable("docker") do
+      nil ->
+        false
+
+      docker ->
+        case System.cmd(docker, ["image", "inspect", "runic-ai/sandbox:elixir-python-node"],
+               stderr_to_stdout: true
+             ) do
+          {_output, 0} -> true
+          _other -> false
+        end
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp wait_until(fun, timeout_ms \\ 500) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    wait_until(fun, deadline, nil)
+  end
+
+  defp wait_until(fun, deadline, _last_value) do
+    case fun.() do
+      true ->
+        true
+
+      value ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          false
+        else
+          Process.sleep(10)
+          wait_until(fun, deadline, value)
+        end
+    end
+  end
+end

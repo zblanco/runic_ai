@@ -2,10 +2,13 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
   use ExUnit.Case, async: true
 
   alias RunicAI.Coding.PathPolicy
+  alias RunicAI.Coding.Persistence
+  alias RunicAI.Coding.Persistence.InMemory
   alias RunicAI.Coding.Workspace
   alias RunicAI.Event
   alias RunicAI.LLM.TestClient
   alias RunicAI.RLM.Components.ArtifactWriter
+  alias RunicAI.RLM.Components.ArtifactMaterializer
   alias RunicAI.RLM.Components.BlueprintTransform
   alias RunicAI.RLM.Components.BudgetLedger
   alias RunicAI.RLM.Components.DocumentCompare
@@ -130,6 +133,45 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert result.count == 1
     assert result.truncated?
     assert byte_size(hd(result.slices).text) == 8
+  end
+
+  test "artifact materializer reads persisted refs and inline sandbox artifacts with caps" do
+    root = tmp_dir()
+    {:ok, persistence} = InMemory.start_link()
+    workspace = Workspace.new!(root: root, persistence: {InMemory, persistence})
+
+    {:ok, ref} =
+      Persistence.put_artifact(workspace.persistence, %{
+        kind: :sandbox_output,
+        content: "persisted artifact content"
+      })
+
+    input = %{
+      artifact_ref: ref,
+      artifacts: [
+        %{
+          ref: "sandbox://out.txt",
+          path: "out.txt",
+          preview: "inline sandbox artifact",
+          bytes: 23
+        }
+      ]
+    }
+
+    assert {:ok, result} = ArtifactMaterializer.run(workspace, input, %{max_bytes: 9})
+
+    assert result.count == 2
+    assert result.truncated?
+
+    persisted = Enum.find(result.slices, &(&1.ref == ref))
+    assert persisted.text == "persisted"
+    assert persisted.truncated?
+    assert persisted.provenance == [%{artifact_ref: ref}]
+
+    inline = Enum.find(result.slices, &(&1.ref == "sandbox://out.txt"))
+    assert inline.path == "out.txt"
+    assert inline.text == "inline sa"
+    assert inline.truncated?
   end
 
   test "LLM map enforces call limits while accepting scripted clients and concurrency params" do

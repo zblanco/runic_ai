@@ -5,6 +5,8 @@
   inputs: [
     "{mix,.formatter}.exs",
     "{config,lib,test}/**/*.{heex,ex,exs}",
+    "packages/*/{mix,.formatter}.exs",
+    "packages/*/{lib,test}/**/*.{ex,exs}",
     "priv/**/*.{ex,exs}",
     "scripts/**/*.{ex,exs}"
   ]

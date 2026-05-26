@@ -509,14 +509,21 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
         end)
 
       args = %{
-        backend: :just_bash,
-        command: "just_bash",
-        shell: param(node, :script) || "",
-        timeout_ms: param(node, :timeout_ms) || 10_000
+        sandbox: param(node, :sandbox) || script_sandbox_name(opts),
+        backend: param(node, :backend) || script_backend(opts),
+        runtime: param(node, :runtime) || script_runtime(opts),
+        code: param(node, :script) || "",
+        timeout_ms: param(node, :timeout_ms) || 10_000,
+        max_output_bytes: param(node, :max_output_bytes) || 16_384,
+        network: param(node, :network) || script_network(opts),
+        sandbox_cwd: param(node, :sandbox_cwd) || "/workspace"
       }
 
       with {:ok, args} <- maybe_review_rlm_node(:script, node, args, context, opts) do
-        Tools.run_command(context.workspace, args, policy)
+        Tools.execute_code(context.workspace, args, policy,
+          sandbox_opts: script_sandbox_opts(opts),
+          event_sink: Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
+        )
       end
       |> case do
         {:ok, output} -> ok_episode(node, output)
@@ -869,6 +876,193 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
       (CapabilityResolver.requested?(opts) and
          :code_execution in CapabilityResolver.enabled_toolsets(opts))
   end
+
+  defp script_sandbox_opts(opts) do
+    case Keyword.fetch(opts, :sandbox_opts) do
+      {:ok, sandbox_opts} ->
+        sandbox_opts
+
+      :error ->
+        sandbox_opts_from_tool_config(opts)
+    end
+  end
+
+  defp sandbox_opts_from_tool_config(opts) do
+    tool_config = Keyword.get(opts, :tool_config, %{})
+
+    case config_value(tool_config, :code_execution, nil) do
+      config when is_map(config) or is_list(config) ->
+        [
+          profile: [
+            name: config |> config_value(:sandbox, :local_code) |> normalize_sandbox_atom(),
+            backend: script_backend_from_config(config),
+            runtimes:
+              config
+              |> config_value(:allowed_runtimes, config_value(config, :runtimes, [:bash]))
+              |> sandbox_runtime_list(),
+            isolation_level: config_value(config, :isolation_level, nil),
+            policy: sandbox_policy(config),
+            network: config_value(config, :network, :disabled),
+            stateful?: config_value(config, :stateful?, false),
+            pool: config_value(config, :pool, %{warm: 0, max: 1}),
+            workspace: config_value(config, :workspace, %{mode: :copy_in, persist?: false}),
+            backend_options: sandbox_backend_options(config),
+            metadata: sandbox_metadata(config)
+          ]
+        ]
+
+      _other ->
+        []
+    end
+  end
+
+  defp sandbox_policy(config) do
+    case config_value(config, :isolation_minimum, nil) do
+      nil -> []
+      isolation_minimum -> [isolation_minimum: isolation_minimum]
+    end
+  end
+
+  defp sandbox_backend_options(config) do
+    config = normalize_map(config)
+
+    nested =
+      config_value(config, :backend_options, %{})
+      |> normalize_map()
+      |> Map.new(fn {key, value} -> {normalize_config_key(key), value} end)
+
+    config
+    |> Map.take([:image, "image", :executable, "executable", :sudo?, "sudo?"])
+    |> Map.new(fn {key, value} -> {normalize_config_key(key), value} end)
+    |> Map.merge(nested)
+  end
+
+  defp sandbox_metadata(config) do
+    config = normalize_map(config)
+
+    [:state_model, :transport_model, :session, :checkpoint_policy, :service_policy]
+    |> Enum.reduce(%{}, fn key, acc ->
+      case config_value(config, key, nil) do
+        nil -> acc
+        value -> Map.put(acc, key, value)
+      end
+    end)
+  end
+
+  defp normalize_config_key("image"), do: :image
+  defp normalize_config_key("executable"), do: :executable
+  defp normalize_config_key("sudo?"), do: :sudo?
+  defp normalize_config_key(key), do: key
+
+  defp script_sandbox_name(opts),
+    do: opts |> code_execution_config_value(:sandbox, :local_code) |> normalize_sandbox_atom()
+
+  defp script_backend(opts) do
+    case Keyword.fetch(opts, :sandbox_opts) do
+      {:ok, sandbox_opts} -> sandbox_backend_from_opts(sandbox_opts)
+      :error -> script_backend_from_config(code_execution_config(opts))
+    end
+  end
+
+  defp script_runtime(opts) do
+    opts
+    |> code_execution_config_value(:runtime, nil)
+    |> case do
+      nil ->
+        runtimes =
+          opts
+          |> code_execution_config()
+          |> then(fn config ->
+            config_value(config, :allowed_runtimes, config_value(config, :runtimes, [:bash]))
+          end)
+          |> sandbox_runtime_list()
+
+        case runtimes do
+          [runtime | _rest] -> runtime
+          [] -> :bash
+        end
+
+      runtime ->
+        runtime
+    end
+  end
+
+  defp script_network(opts), do: code_execution_config_value(opts, :network, :disabled)
+
+  defp code_execution_config_value(opts, key, default) do
+    opts
+    |> code_execution_config()
+    |> config_value(key, default)
+  end
+
+  defp code_execution_config(opts) do
+    opts
+    |> Keyword.get(:tool_config, %{})
+    |> config_value(:code_execution, %{})
+  end
+
+  defp script_backend_from_config(config) do
+    config
+    |> config_value(:backend, config_value(config, :default_backend, :just_bash))
+    |> normalize_sandbox_backend()
+  end
+
+  defp sandbox_backend_from_opts(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:profile, [])
+    |> config_value(:backend, :just_bash)
+  end
+
+  defp sandbox_backend_from_opts(_opts), do: :just_bash
+
+  defp sandbox_runtime_list(runtimes) when is_list(runtimes), do: runtimes
+
+  defp sandbox_runtime_list(runtimes) when is_binary(runtimes) do
+    runtimes
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(&String.to_existing_atom/1)
+  rescue
+    ArgumentError ->
+      runtimes
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+  end
+
+  defp sandbox_runtime_list(runtime) when is_atom(runtime), do: [runtime]
+  defp sandbox_runtime_list(_runtime), do: [:bash]
+
+  defp normalize_sandbox_atom(value) when is_atom(value), do: value
+
+  defp normalize_sandbox_atom(value) when is_binary(value) and value != "" do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> :just_bash
+  end
+
+  defp normalize_sandbox_atom(_value), do: :just_bash
+
+  defp normalize_sandbox_backend(value) when is_atom(value), do: value
+
+  defp normalize_sandbox_backend(value) when is_binary(value) and value != "" do
+    case value do
+      "just_bash" -> :just_bash
+      "lua" -> :lua
+      "wasmtime" -> :wasmtime
+      "docker" -> :docker
+      "podman" -> :podman
+      "gvisor" -> :gvisor
+      "vmsan" -> :vmsan
+      "firecracker" -> :firecracker
+      "sprites" -> :sprites
+      "remote" -> :remote
+      _other -> value
+    end
+  end
+
+  defp normalize_sandbox_backend(value), do: value
 
   defp computing_family(node) do
     case param(node, :family) || param(node, :component) || param(node, :type) do
@@ -1673,6 +1867,16 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
   defp param(node, key),
     do: Map.get(node.params, key) || Map.get(node.params, Atom.to_string(key))
+
+  defp config_value(config, key, default) when is_map(config) do
+    Map.get(config, key, Map.get(config, Atom.to_string(key), default))
+  end
+
+  defp config_value(config, key, default) when is_list(config) do
+    Keyword.get(config, key, Keyword.get(config, Atom.to_string(key), default))
+  end
+
+  defp config_value(_config, _key, default), do: default
 
   defp command_args(node) do
     args = normalize_map(param(node, :args) || %{})

@@ -34,6 +34,7 @@ defmodule RunicAI.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:runic_sandbox, path: "packages/runic_sandbox"},
       {:runic, "~> 0.1.0-alpha.8"},
       {:req_llm, "~> 1.9"},
       {:ecto_sql, "~> 3.13"},
@@ -64,6 +65,7 @@ defmodule RunicAI.MixProject do
       {:bunt, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:just_bash, "~> 0.3", only: [:dev, :test], optional: true},
+      {:lua, "~> 0.4", only: [:dev, :test], optional: true},
       {:tidewave, "~> 0.5", only: :dev}
     ]
   end
@@ -88,7 +90,7 @@ defmodule RunicAI.MixProject do
   defp package do
     [
       files:
-        ~w(lib config priv/static mix.exs README.md CHANGELOG.md SECURITY.md guides livebooks .formatter.exs),
+        ~w(lib config priv/static priv/runic_ai mix.exs README.md CHANGELOG.md SECURITY.md guides livebooks .formatter.exs),
       links: %{
         "GitHub" => @source_url,
         "Runic" => "https://hex.pm/packages/runic",

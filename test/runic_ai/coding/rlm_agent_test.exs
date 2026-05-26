@@ -2126,6 +2126,49 @@ defmodule RunicAI.Coding.RLMAgentTest do
            ).status == :accepted
   end
 
+  test "script nodes execute through sandbox code execution when enabled" do
+    root = sample_project()
+    environment = CodebaseEnvironment.new!(root, index?: true)
+    parent = self()
+
+    proposal =
+      WorkflowProposal.new!(
+        "Run a helper script",
+        [ProposalNode.new!("script", :script, params: %{script: "echo rlm-sandbox"})],
+        stop_conditions: ["script output captured"]
+      )
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(proposal, environment, %{},
+               validation_opts: [
+                 allowed_kinds: ProposalNode.allowed_kinds(),
+                 allow_scripts?: true
+               ],
+               allow_scripts?: true,
+               tool_config: %{
+                 code_execution: %{
+                   backend: :just_bash,
+                   session: :one_shot,
+                   state_model: :one_shot,
+                   transport_model: :in_process,
+                   checkpoint_policy: %{mode: :none}
+                 }
+               },
+               event_sink: fn event -> send(parent, {:sandbox_event, event}) end
+             )
+
+    assert result.output.status == :pass
+    assert result.output.output == "rlm-sandbox\n"
+    assert result.output.metadata.tool == :execute_code
+    assert result.output.metadata.sandbox_backend == :just_bash
+    assert result.output.metadata.sandbox_capability.state_model == :one_shot
+    assert result.output.metadata.sandbox_capability.transport_model == :in_process
+    assert result.output.metadata.sandbox_capability.checkpoint_policy == %{mode: :none}
+
+    assert_receive {:sandbox_event, %{kind: :coding_sandbox_started}}
+    assert_receive {:sandbox_event, %{kind: :coding_sandbox_completed, status: :pass}}
+  end
+
   test "local workbench capability profile enables command script and edit proposal nodes" do
     proposal =
       WorkflowProposal.new!(
@@ -2149,6 +2192,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     report =
       WorkflowValidator.validate(proposal,
         profile: :local_workbench,
+        toolsets: [:code_execution],
         mode: :verify
       )
 

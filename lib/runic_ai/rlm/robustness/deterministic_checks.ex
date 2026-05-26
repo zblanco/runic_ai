@@ -20,6 +20,8 @@ defmodule RunicAI.RLM.Robustness.DeterministicChecks do
       passed: Enum.count(checks, &(&1.status == :pass)),
       failed: Enum.count(checks, &(&1.status == :fail)),
       skipped: Enum.count(checks, &(&1.status == :skipped)),
+      required_skipped: Enum.count(checks, &required_skipped?/1),
+      optional_skipped: Enum.count(checks, &optional_skipped?/1),
       checks: checks
     }
   end
@@ -184,10 +186,16 @@ defmodule RunicAI.RLM.Robustness.DeterministicChecks do
   defp status(checks) do
     cond do
       Enum.any?(checks, &(&1.status == :fail)) -> :fail
-      Enum.any?(checks, &(&1.status == :skipped)) -> :review
+      Enum.any?(checks, &required_skipped?/1) -> :review
       true -> :pass
     end
   end
+
+  defp required_skipped?(%{status: :skipped} = check), do: not optional_skipped?(check)
+  defp required_skipped?(_check), do: false
+
+  defp optional_skipped?(%{status: :skipped, details: %{optional?: true}}), do: true
+  defp optional_skipped?(_check), do: false
 
   defp normalize_check(check) when is_map(check) do
     check

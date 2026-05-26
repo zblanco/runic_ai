@@ -147,9 +147,23 @@ defmodule RunicAI.Coding.StandardAgentRemainingTest do
   end
 
   test "named recipe registry and selector expose standard commands" do
-    assert RecipeRegistry.names() == [:explain_repo, :fix_ci, :review, :triage_bug, :write_tests]
+    assert RecipeRegistry.names() == [
+             :explain_repo,
+             :fix_ci,
+             :polyglot_experiment,
+             :review,
+             :sandboxed_verify,
+             :triage_bug,
+             :write_tests
+           ]
 
     assert %Recipe{name: :review, mode: :read_only} = RecipeRegistry.fetch!("/review")
+
+    assert %Recipe{name: :sandboxed_verify, mode: :verify} =
+             RecipeRegistry.fetch!("/sandboxed-verify")
+
+    assert %Recipe{name: :polyglot_experiment, mode: :read_only} =
+             RecipeRegistry.fetch!("/polyglot-experiment")
 
     assert %Recipe{name: :fix_ci, mode: :verify} =
              Agent.select_recipe("ignored", classifier: fn _ -> :fix_ci end)

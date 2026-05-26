@@ -96,22 +96,28 @@ defmodule RunicAI.Agent.ToolExecution do
     run_id = Keyword.get(opts, :run_id) || Keyword.get(opts, :session_id)
     toolset = toolset(definition)
 
+    details =
+      Map.merge(
+        %{
+          tool_name: definition.name,
+          arguments: args,
+          toolset: toolset,
+          reason: :gated_tool,
+          capability_profile:
+            opts
+            |> Keyword.get(:capability_profile)
+            |> CapabilityProfile.snapshot()
+        },
+        tool_review_details(definition, args)
+      )
+
     ReviewRequest.new!(:tool_execution,
       checkpoint: :pre_tool,
       resume_key:
         "review:tool:#{run_id || System.unique_integer([:positive])}:#{definition.name}:#{System.unique_integer([:positive])}",
       options: [:approve, :reject, :edit, :cancel],
       subject: %{tool_name: definition.name, arguments: args},
-      details: %{
-        tool_name: definition.name,
-        arguments: args,
-        toolset: toolset,
-        reason: :gated_tool,
-        capability_profile:
-          opts
-          |> Keyword.get(:capability_profile)
-          |> CapabilityProfile.snapshot()
-      },
+      details: details,
       metadata: %{
         safe?: false,
         risk: :medium,
@@ -121,6 +127,101 @@ defmodule RunicAI.Agent.ToolExecution do
       }
     )
   end
+
+  defp tool_review_details(%Definition{name: "execute_code"} = definition, args)
+       when is_map(args) do
+    source = arg(args, :code, arg(args, :source, ""))
+    files = arg(args, :files, %{})
+
+    %{
+      sandbox: arg(args, :sandbox, :local_code),
+      runtime: arg(args, :runtime, :bash),
+      network: normalize_sandbox_network(arg(args, :network, :disabled)),
+      timeout_ms: arg(args, :timeout_ms, nil),
+      max_output_bytes: arg(args, :max_output_bytes, nil),
+      code_bytes: byte_size(to_string(source)),
+      code_preview: source |> to_string() |> String.slice(0, 1_000),
+      input_files: input_file_summaries(files),
+      sandbox_capability:
+        Map.take(definition.metadata, [
+          :sandbox_backend,
+          :isolation_level,
+          :sandbox,
+          :runtimes,
+          :network,
+          :state_model,
+          :transport_model,
+          :session,
+          :checkpoint_policy,
+          :service_policy
+        ])
+    }
+  end
+
+  defp tool_review_details(%Definition{name: name} = definition, args)
+       when name in [
+              "open_sandbox_session",
+              "sandbox_exec",
+              "sandbox_write_file",
+              "checkpoint_sandbox",
+              "restore_sandbox",
+              "start_sandbox_service",
+              "stop_sandbox_service",
+              "open_sandbox_proxy"
+            ] and is_map(args) do
+    source = arg(args, :code, arg(args, :source, ""))
+
+    %{
+      sandbox_operation: name,
+      sandbox: arg(args, :sandbox, :local_code),
+      session_id: arg(args, :session_id, arg(args, :id, nil)),
+      runtime: arg(args, :runtime, nil),
+      network: normalize_sandbox_network(arg(args, :network, :disabled)),
+      path: arg(args, :path, nil),
+      service_id: arg(args, :service_id, nil),
+      checkpoint_ref: arg(args, :checkpoint_ref, nil),
+      code_bytes: byte_size(to_string(source)),
+      code_preview: source |> to_string() |> String.slice(0, 1_000),
+      sandbox_capability: sandbox_capability(definition)
+    }
+  end
+
+  defp tool_review_details(%Definition{}, _args), do: %{}
+
+  defp sandbox_capability(%Definition{} = definition) do
+    Map.take(definition.metadata, [
+      :sandbox_backend,
+      :isolation_level,
+      :sandbox,
+      :runtimes,
+      :network,
+      :state_model,
+      :transport_model,
+      :session,
+      :checkpoint_policy,
+      :service_policy
+    ])
+  end
+
+  defp normalize_sandbox_network(value) when value in [:disabled, :host, :restricted], do: value
+  defp normalize_sandbox_network("disabled"), do: :disabled
+  defp normalize_sandbox_network("host"), do: :host
+  defp normalize_sandbox_network("restricted"), do: :restricted
+  defp normalize_sandbox_network(%{enabled: false}), do: :disabled
+  defp normalize_sandbox_network(%{"enabled" => false}), do: :disabled
+  defp normalize_sandbox_network(%{enabled: true}), do: :host
+  defp normalize_sandbox_network(%{"enabled" => true}), do: :host
+  defp normalize_sandbox_network(_value), do: :disabled
+
+  defp input_file_summaries(files) when is_map(files) do
+    files
+    |> Enum.map(fn {path, content} ->
+      %{path: to_string(path), bytes: byte_size(to_string(content))}
+    end)
+    |> Enum.sort_by(& &1.path)
+  end
+
+  defp input_file_summaries(_files), do: []
 
   defp normalize_edit(%{"arguments" => arguments}, _args) when is_map(arguments),
     do: {:ok, arguments}
@@ -156,4 +257,6 @@ defmodule RunicAI.Agent.ToolExecution do
     metadata = definition.metadata || %{}
     Map.get(metadata, :toolset, Map.get(metadata, "toolset"))
   end
+
+  defp arg(map, key, default), do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
 end

@@ -11,6 +11,8 @@ defmodule RunicAI.Coding.TraceEvent do
           | :coding_search
           | :coding_patch
           | :coding_command
+          | :coding_sandbox_started
+          | :coding_sandbox_completed
           | :coding_process
 
   @spec file_read(Path.t(), map(), keyword()) :: Event.t()
@@ -31,6 +33,11 @@ defmodule RunicAI.Coding.TraceEvent do
   @spec command(map(), keyword()) :: Event.t()
   def command(payload, opts \\ []) when is_map(payload) do
     new(:coding_command, payload, opts)
+  end
+
+  @spec sandbox(atom(), map(), keyword()) :: Event.t()
+  def sandbox(kind, payload, opts \\ []) when is_atom(kind) and is_map(payload) do
+    new(kind, payload, opts)
   end
 
   @spec process(map(), keyword()) :: Event.t()

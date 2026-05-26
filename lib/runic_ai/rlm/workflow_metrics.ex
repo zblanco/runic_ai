@@ -18,6 +18,9 @@ defmodule RunicAI.RLM.WorkflowMetrics do
     materialized_bytes: 0,
     llm_map_calls: 0,
     record_map_calls: 0,
+    lambda_map_calls: 0,
+    lambda_reduce_calls: 0,
+    lambda_review_calls: 0,
     reduce_calls: 0,
     artifact_writes: 0,
     elapsed_ms: 0
@@ -121,6 +124,7 @@ defmodule RunicAI.RLM.WorkflowMetrics do
     |> merge_materialized_metrics(component)
     |> merge_map_metrics(component)
     |> merge_reduce_metrics(component)
+    |> merge_review_metrics(component)
     |> merge_artifact_metrics(component)
   end
 
@@ -157,20 +161,37 @@ defmodule RunicAI.RLM.WorkflowMetrics do
     Map.update!(metrics, :record_map_calls, &(&1 + map_item_count(component)))
   end
 
+  defp merge_map_metrics(metrics, %{type: :lambda_map} = component) do
+    Map.update!(metrics, :lambda_map_calls, &(&1 + map_item_count(component)))
+  end
+
   defp merge_map_metrics(metrics, _component), do: metrics
 
   defp merge_reduce_metrics(metrics, %{type: type} = component)
-       when type in [:llm_leaf, :blueprint_reduce] do
+       when type in [:llm_leaf, :blueprint_reduce, :lambda_reduce] do
     calls =
       case component.execution_shape do
         :reduce -> max(get_in(component.native_counts, [:fan_in_count]) || 0, 1)
         _other -> max(integer_field(component.output, :groups), 1)
       end
 
-    Map.update!(metrics, :reduce_calls, &(&1 + calls))
+    metrics
+    |> Map.update!(:reduce_calls, &(&1 + calls))
+    |> maybe_update_lambda_reduce_calls(type, calls)
   end
 
   defp merge_reduce_metrics(metrics, _component), do: metrics
+
+  defp maybe_update_lambda_reduce_calls(metrics, :lambda_reduce, calls),
+    do: Map.update!(metrics, :lambda_reduce_calls, &(&1 + calls))
+
+  defp maybe_update_lambda_reduce_calls(metrics, _type, _calls), do: metrics
+
+  defp merge_review_metrics(metrics, %{type: :lambda_review} = component) do
+    Map.update!(metrics, :lambda_review_calls, &(&1 + component.production_count))
+  end
+
+  defp merge_review_metrics(metrics, _component), do: metrics
 
   defp merge_artifact_metrics(metrics, %{type: :artifact_writer, output: output}) do
     writes =

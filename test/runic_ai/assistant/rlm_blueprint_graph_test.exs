@@ -15,6 +15,11 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
   alias RunicAI.RLM.ComponentCatalog
   alias RunicAI.RLM.ComponentFactory
   alias RunicAI.RLM.ComponentRuntime
+  alias RunicAI.RLM.CostEstimate
+  alias RunicAI.RLM.EnvironmentRef
+  alias RunicAI.RLM.Environments.InMemory
+  alias RunicAI.RLM.LambdaPlan
+  alias RunicAI.RLM.Policy
   alias RunicAI.RLM.WorkflowExecutor
   alias RunicAI.RLM.WorkflowResults
   alias RunicAI.LLM.TestClient
@@ -374,6 +379,85 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
 
     assert result.compiled.graph_summary.runic.serializers.mermaid =~ "flowchart"
     assert is_list(result.compiled.graph_summary.runic.serializers.cytoscape)
+  end
+
+  test "workflow compiler executes Lambda-style map reduce generate smoke" do
+    root = tmp_dir()
+
+    File.write!(Path.join(root, "notes.txt"), """
+    Alpha team found a risky payment retry path.
+    Beta team proposed queue backpressure and alerting.
+    Gamma team needs a follow-up owner for dashboard evidence.
+    """)
+
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Extract risk notes",
+        [
+          ComponentBlueprint.new!("split", :lambda_split,
+            params: %{paths: ["notes.txt"], max_bytes: 80}
+          ),
+          ComponentBlueprint.new!("materialize", :source_materializer),
+          ComponentBlueprint.new!("map", :lambda_map,
+            params: %{prompt: "Extract one risk note from {{text}}"}
+          ),
+          ComponentBlueprint.new!("reduce", :lambda_reduce, params: %{strategy: :join}),
+          ComponentBlueprint.new!("generate", :lambda_generate,
+            params: %{title: "Lambda Smoke Report"}
+          )
+        ],
+        edges: [
+          %{from: "split", to: "materialize"},
+          %{from: "materialize", to: "map"},
+          %{from: "map", to: "reduce"},
+          %{from: "reduce", to: "generate"}
+        ],
+        stop_conditions: ["report generated"]
+      )
+
+    client = fn _model, _prompt, _opts ->
+      {:ok, TestClient.result("risk note")}
+    end
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(blueprint, workspace, %{},
+               client: client,
+               async: true
+             )
+
+    assert result.output.text =~ "Lambda Smoke Report"
+    assert result.execution_metrics.lambda_map_calls > 0
+    assert result.execution_metrics.lambda_reduce_calls >= 1
+
+    source_ref = EnvironmentRef.new!(InMemory, "manual-smoke")
+
+    plan =
+      LambdaPlan.new!(
+        "Extract risk notes",
+        :summarization,
+        [source_ref],
+        policy: Policy.new!(),
+        cost_estimate:
+          CostEstimate.new!(
+            leaf_calls: result.execution_metrics.lambda_map_calls,
+            reducer_calls: result.execution_metrics.lambda_reduce_calls
+          ),
+        estimates: %{
+          leaf_calls: result.execution_metrics.lambda_map_calls,
+          reduce_calls: result.execution_metrics.lambda_reduce_calls,
+          review_calls: 1,
+          expected_sandbox_executions: 0
+        }
+      )
+
+    assert %{matched?: true} =
+             LambdaPlan.call_accounting(plan, %{
+               lambda_map_calls: result.execution_metrics.lambda_map_calls,
+               lambda_reduce_calls: result.execution_metrics.lambda_reduce_calls,
+               lambda_review_calls: 1
+             })
   end
 
   test "assistant workflows compose reports from safe computing components" do

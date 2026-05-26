@@ -311,6 +311,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, "Write me a poem about frogs",
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
              )
 
@@ -360,6 +361,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, "Summarize the notes in #{external}",
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                repair_scorecard?: false
              )
 
@@ -399,7 +401,8 @@ defmodule RunicAI.Assistant.RLMAgentTest do
     assert {:ok, result} =
              Agent.run(root, "Summarize the notes in #{external}",
                client: client,
-               model: "test:model"
+               model: "test:model",
+               proposal_strategy: :dynamic
              )
 
     assert result.status == :ok
@@ -493,6 +496,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, "Write me a poem about frogs",
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                blueprint_generation_timeout_ms: 10,
                event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
              )
@@ -532,6 +536,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, "Now write the rest of the story.",
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                conversation_history: [
                  %{
                    role: "assistant",
@@ -579,6 +584,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, objective,
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                proposal_generation: :json_text,
                event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
              )
@@ -651,6 +657,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
              Agent.run(root, "Inside .docs/ - find me the plan prefixed 035 and summarize it",
                client: client,
                model: "test:model",
+               proposal_strategy: :dynamic,
                proposal_generation: :json_text,
                event_sink: fn stage -> Elixir.Agent.update(events, &(&1 ++ [stage])) end
              )

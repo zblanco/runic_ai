@@ -7,12 +7,19 @@ defmodule RunicAI.Application do
 
   @impl true
   def start(_type, _args) do
+    sandbox_opts =
+      :runic_ai
+      |> Application.get_env(:sandbox, [])
+      |> Keyword.put_new(:name, RunicAI.Sandbox)
+
     children = [
       RunicAIWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:runic_ai, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: RunicAI.PubSub},
       {RunicAI.Workbench.StoreServer, Application.get_env(:runic_ai, :workbench, [])},
       {Task.Supervisor, name: RunicAI.Workbench.TaskSupervisor},
+      {RunicSandbox, sandbox_opts},
+      {RunicAI.Coding.SandboxSessionRegistry, name: RunicAI.Coding.SandboxSessionRegistry},
       {RunicAI.Runtime.Registry, []},
       {RunicAI.Runtime.SessionSupervisor, []},
       {Runic.Runner, name: RunicAI.Runtime.Runner},

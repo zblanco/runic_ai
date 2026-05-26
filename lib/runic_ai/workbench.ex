@@ -68,6 +68,12 @@ defmodule RunicAI.Workbench do
     "profile" => :profile,
     "rewrite" => :rewrite,
     "run_id" => :run_id,
+    "sandbox_backend" => :sandbox_backend,
+    "sandbox_network" => :sandbox_network,
+    "sandbox_pool_max" => :sandbox_pool_max,
+    "sandbox_pool_warm" => :sandbox_pool_warm,
+    "sandbox_runtime" => :sandbox_runtime,
+    "sandbox_stateful" => :sandbox_stateful,
     "session_id" => :session_id,
     "tool_config" => :tool_config,
     "toolsets" => :toolsets,
@@ -82,10 +88,43 @@ defmodule RunicAI.Workbench do
   def store!, do: StoreServer.store!()
 
   @spec health() :: map()
-  def health, do: StoreServer.health()
+  def health do
+    StoreServer.health()
+    |> Map.put(:sandbox, sandbox_health())
+  end
+
+  @spec sandbox_status() :: map()
+  def sandbox_status, do: sandbox_health()
 
   @spec config() :: keyword()
   def config, do: Application.get_env(:runic_ai, :workbench, [])
+
+  defp sandbox_health do
+    case Process.whereis(RunicAI.Sandbox) do
+      nil ->
+        %{status: :unavailable, reason: :not_started}
+
+      _pid ->
+        case RunicSandbox.status(server: RunicAI.Sandbox) do
+          {:ok, status} -> sandbox_health_output(status)
+          {:error, error} -> %{status: :unavailable, reason: error}
+        end
+    end
+  rescue
+    exception -> %{status: :unavailable, reason: Exception.message(exception)}
+  end
+
+  defp sandbox_health_output(%_struct{} = value),
+    do: value |> Map.from_struct() |> sandbox_health_output()
+
+  defp sandbox_health_output(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {key, sandbox_health_output(nested)} end)
+  end
+
+  defp sandbox_health_output(value) when is_list(value),
+    do: Enum.map(value, &sandbox_health_output/1)
+
+  defp sandbox_health_output(value), do: value
 
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: Phoenix.PubSub.subscribe(RunicAI.PubSub, @topic)
@@ -166,6 +205,7 @@ defmodule RunicAI.Workbench do
       scorecards = Queries.scorecards_for_run(store, session_id)
       objective_loop = Queries.latest_objective_loop_state(store, session_id)
       event_views = Enum.map(events, &event_view/1)
+      sandbox_execution_views = sandbox_execution_views(event_views)
       scorecard_views = Enum.map(scorecards, &scorecard_view/1)
       objective_contract = objective_contract_view(events, messages, scorecard_views)
       blocked_evidence = blocked_evidence_view(session, events, messages, scorecard_views)
@@ -175,6 +215,7 @@ defmodule RunicAI.Workbench do
         capability_profile: capability_profile_view(session, runs, events),
         messages: Enum.map(messages, &message_view/1),
         events: event_views,
+        sandbox_executions: sandbox_execution_views,
         tool_calls: Enum.map(tools, &tool_call_view/1),
         runs: Enum.map(runs, &run_view/1),
         review_requests: Enum.map(reviews, &review_request_view/1),
@@ -188,6 +229,7 @@ defmodule RunicAI.Workbench do
         metrics: %{
           messages: length(messages),
           events: length(events),
+          sandbox_executions: length(sandbox_execution_views),
           tool_calls: length(tools),
           runs: length(runs),
           review_requests: length(reviews),
@@ -294,6 +336,7 @@ defmodule RunicAI.Workbench do
          {:ok, toolsets} <- normalize_list(value(params, "toolsets")),
          {:ok, disabled_tools} <- normalize_list(value(params, "disabled_tools")),
          {:ok, tool_config} <- normalize_tool_config(value(params, "tool_config")),
+         {:ok, tool_config} <- normalize_sandbox_tool_config(tool_config, params),
          {:ok, capability_resolution} <-
            CapabilityResolver.resolve(cwd,
              agent: agent,
@@ -317,6 +360,7 @@ defmodule RunicAI.Workbench do
       session_id = value(params, "session_id") || Ids.unique("web-session")
       run_id = value(params, "run_id") || Ids.unique("#{agent}:web")
       capability_profile = capability_resolution.metadata
+      sandbox = sandbox_launch_summary(tool_config, capability_profile)
       model = normalize_model_selection(params, cfg)
 
       {:ok,
@@ -336,6 +380,7 @@ defmodule RunicAI.Workbench do
          toolsets: toolsets,
          disabled_tools: disabled_tools,
          tool_config: tool_config,
+         sandbox: sandbox,
          capability_profile: capability_profile,
          run_fun: Keyword.get(cfg, :run_fun),
          max_runtime_ms: max_runtime_ms,
@@ -941,6 +986,7 @@ defmodule RunicAI.Workbench do
           toolsets: launch.toolsets,
           disabled_tools: launch.disabled_tools,
           tool_config: launch.tool_config,
+          sandbox: launch.sandbox,
           capability_profile: launch.capability_profile,
           max_runtime_ms: launch.max_runtime_ms,
           max_objective_iterations: launch.max_objective_iterations,
@@ -968,6 +1014,7 @@ defmodule RunicAI.Workbench do
         profile: launch.profile,
         toolsets: launch.toolsets,
         disabled_tools: launch.disabled_tools,
+        sandbox: launch.sandbox,
         capability_profile: launch.capability_profile,
         trigger: "browser"
       },
@@ -1092,6 +1139,52 @@ defmodule RunicAI.Workbench do
   end
 
   defp event_view(_event), do: nil
+
+  defp sandbox_execution_views(events) do
+    events
+    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(&sandbox_event?/1)
+    |> Enum.map(&sandbox_execution_view/1)
+  end
+
+  defp sandbox_event?(event) do
+    data = field(event, :data) || %{}
+    phase = event |> field(:phase) |> to_string()
+    trace_kind = data |> field(:trace_kind) |> to_string()
+
+    phase == "sandbox" or String.starts_with?(trace_kind, "coding_sandbox_")
+  end
+
+  defp sandbox_execution_view(event) do
+    data = field(event, :data) || %{}
+    metadata = field(data, :metadata) || %{}
+    input = field(data, :input) || field(metadata, :input) || %{}
+    output = field(data, :output) || %{}
+
+    %{
+      id: field(event, :id),
+      run_id: field(event, :run_id),
+      sequence: field(event, :sequence),
+      at: field(event, :at),
+      status: field(event, :status),
+      phase: field(event, :phase),
+      trace_kind: field(data, :trace_kind),
+      title: field(event, :title),
+      detail: field(event, :detail),
+      sandbox: field(metadata, :sandbox) || field(input, :sandbox),
+      runtime: field(metadata, :runtime) || field(input, :runtime),
+      network: field(metadata, :network) || field(input, :network),
+      backend: field(output, :backend) || field(metadata, :backend),
+      isolation_level: field(output, :isolation_level) || field(metadata, :isolation_level),
+      exit_status: field(output, :exit_status),
+      duration_ms: field(output, :duration_ms),
+      output_bytes: field(output, :output_bytes),
+      files_changed: field(output, :files_changed) || [],
+      artifacts: field(output, :artifacts) || [],
+      diagnostics: field(output, :diagnostics) || []
+    }
+    |> compact_map()
+  end
 
   defp plan_workflow_graph_view(events) do
     events
@@ -1586,6 +1679,29 @@ defmodule RunicAI.Workbench do
   defp field(map, key) when is_map(map), do: Map.get(map, key)
   defp field(_map, _key), do: nil
 
+  defp deep_merge(left, right) when is_map(left) and is_map(right) do
+    Enum.reduce(right, left, fn {key, right_value}, acc ->
+      key = equivalent_existing_key(acc, key)
+      Map.update(acc, key, right_value, &deep_merge(&1, right_value))
+    end)
+  end
+
+  defp deep_merge(_left, right), do: right
+
+  defp equivalent_existing_key(map, key) when is_map(map) and is_binary(key) do
+    Enum.find(Map.keys(map), key, fn
+      existing when is_atom(existing) -> Atom.to_string(existing) == key
+      existing -> existing == key
+    end)
+  end
+
+  defp equivalent_existing_key(map, key) when is_map(map) and is_atom(key) do
+    string_key = Atom.to_string(key)
+    Enum.find(Map.keys(map), key, &(&1 == string_key or &1 == key))
+  end
+
+  defp equivalent_existing_key(_map, key), do: key
+
   defp stringify(nil), do: nil
   defp stringify(value), do: to_string(value)
 
@@ -1757,6 +1873,171 @@ defmodule RunicAI.Workbench do
     end)
   end
 
+  defp normalize_sandbox_tool_config(config, params) when is_map(config) and is_map(params) do
+    sandbox_values = [
+      value(params, "sandbox_backend"),
+      value(params, "sandbox_runtime"),
+      value(params, "sandbox_network"),
+      value(params, "sandbox_stateful"),
+      value(params, "sandbox_pool_warm"),
+      value(params, "sandbox_pool_max")
+    ]
+
+    if Enum.all?(sandbox_values, &blank?/1) do
+      {:ok, config}
+    else
+      with {:ok, backend} <- normalize_sandbox_backend(value(params, "sandbox_backend")),
+           {:ok, runtime} <- normalize_sandbox_runtime(value(params, "sandbox_runtime")),
+           {:ok, network} <- normalize_sandbox_network(value(params, "sandbox_network")),
+           {:ok, stateful?} <- normalize_sandbox_stateful(value(params, "sandbox_stateful")),
+           {:ok, pool} <- normalize_sandbox_pool(params) do
+        {:ok,
+         config
+         |> maybe_put_sandbox_config(["code_execution", "backend"], backend)
+         |> maybe_put_sandbox_config(["code_execution", "default_backend"], backend)
+         |> maybe_put_sandbox_config(["code_execution", "runtimes"], [runtime])
+         |> maybe_put_sandbox_config(["code_execution", "allowed_runtimes"], [runtime])
+         |> maybe_put_sandbox_config(["code_execution", "network"], network)
+         |> maybe_put_sandbox_config(["code_execution", "stateful?"], stateful?)
+         |> maybe_put_sandbox_config(["code_execution", "pool"], pool)
+         |> maybe_put_sandbox_config(["code_execution", "workspace", "mode"], "copy_in")
+         |> maybe_put_sandbox_config(["code_execution", "workspace", "persist?"], stateful?)}
+      end
+    end
+  end
+
+  defp normalize_sandbox_tool_config(config, _params), do: {:ok, config}
+
+  defp maybe_put_sandbox_config(config, _path, nil), do: config
+  defp maybe_put_sandbox_config(config, path, value), do: put_nested_config(config, path, value)
+
+  defp normalize_sandbox_backend(value) do
+    value =
+      value
+      |> blank_to_nil()
+      |> case do
+        nil ->
+          "just_bash"
+
+        value ->
+          value |> to_string() |> String.trim() |> String.downcase() |> String.replace("-", "_")
+      end
+
+    if value in ~w(just_bash docker podman gvisor vmsan firecracker sprites remote) do
+      {:ok, value}
+    else
+      {:error, {:invalid_sandbox_backend, value}}
+    end
+  end
+
+  defp normalize_sandbox_runtime(value) do
+    value =
+      value
+      |> blank_to_nil()
+      |> case do
+        nil -> "bash"
+        value -> value |> to_string() |> String.trim() |> String.downcase()
+      end
+
+    if value in ~w(bash sh python node elixir lua) do
+      {:ok, value}
+    else
+      {:error, {:invalid_sandbox_runtime, value}}
+    end
+  end
+
+  defp normalize_sandbox_network(value) do
+    value =
+      value
+      |> blank_to_nil()
+      |> case do
+        nil -> "disabled"
+        value -> value |> to_string() |> String.trim() |> String.downcase()
+      end
+
+    if value in ~w(disabled restricted host) do
+      {:ok, value}
+    else
+      {:error, {:invalid_sandbox_network, value}}
+    end
+  end
+
+  defp normalize_sandbox_stateful(value) when value in [true, false], do: {:ok, value}
+  defp normalize_sandbox_stateful(value) when value in [nil, ""], do: {:ok, false}
+  defp normalize_sandbox_stateful(value) when value in ["true", "1", "yes", "on"], do: {:ok, true}
+
+  defp normalize_sandbox_stateful(value) when value in ["false", "0", "no", "off"],
+    do: {:ok, false}
+
+  defp normalize_sandbox_stateful(value), do: {:error, {:invalid_sandbox_stateful, value}}
+
+  defp normalize_sandbox_pool(params) do
+    with {:ok, warm} <- normalize_non_negative_integer(value(params, "sandbox_pool_warm"), 0),
+         {:ok, max} <- normalize_positive_integer(value(params, "sandbox_pool_max"), 1) do
+      if warm <= max do
+        {:ok, %{"warm" => warm, "max" => max}}
+      else
+        {:error, {:invalid_sandbox_pool, %{warm: warm, max: max}}}
+      end
+    end
+  end
+
+  defp normalize_non_negative_integer(value, default) when value in [nil, ""],
+    do: {:ok, default}
+
+  defp normalize_non_negative_integer(value, _default) when is_integer(value) and value >= 0,
+    do: {:ok, value}
+
+  defp normalize_non_negative_integer(value, _default) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer >= 0 -> {:ok, integer}
+      _other -> {:error, {:invalid_non_negative_integer, value}}
+    end
+  end
+
+  defp normalize_non_negative_integer(value, _default),
+    do: {:error, {:invalid_non_negative_integer, value}}
+
+  defp normalize_positive_integer(value, default) when value in [nil, ""], do: {:ok, default}
+
+  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0,
+    do: {:ok, value}
+
+  defp normalize_positive_integer(value, _default) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer > 0 -> {:ok, integer}
+      _other -> {:error, {:invalid_positive_integer, value}}
+    end
+  end
+
+  defp normalize_positive_integer(value, _default),
+    do: {:error, {:invalid_positive_integer, value}}
+
+  defp blank?(value), do: is_nil(blank_to_nil(value))
+
+  defp sandbox_launch_summary(tool_config, capability_profile) do
+    profile_config =
+      capability_profile
+      |> field(:config)
+      |> field(:code_execution)
+
+    configured = field(tool_config, "code_execution") || %{}
+    code_execution = deep_merge(profile_config || %{}, configured)
+
+    %{
+      sandbox: field(code_execution, :sandbox) || :local_code,
+      backend:
+        field(code_execution, :default_backend) || field(code_execution, :backend) || :just_bash,
+      runtimes:
+        field(code_execution, :allowed_runtimes) || field(code_execution, :runtimes) || [:bash],
+      network: field(code_execution, :network) || :disabled,
+      stateful?: field(code_execution, :stateful?) || false,
+      pool: field(code_execution, :pool) || %{},
+      workspace: field(code_execution, :workspace) || %{},
+      review: field(code_execution, :review) || :unsafe_actions
+    }
+  end
+
   defp parse_config_value("true"), do: true
   defp parse_config_value("false"), do: false
 
@@ -1847,8 +2128,15 @@ defmodule RunicAI.Workbench do
   defp append_tool_config(args, config) when is_map(config) do
     config
     |> flatten_tool_config()
-    |> Enum.reduce(args, fn {key, value}, acc -> acc ++ ["--tool-config", "#{key}=#{value}"] end)
+    |> Enum.reduce(args, fn {key, value}, acc ->
+      acc ++ ["--tool-config", "#{key}=#{tool_config_cli_value(value)}"]
+    end)
   end
+
+  defp tool_config_cli_value(values) when is_list(values),
+    do: values |> Enum.map(&to_string/1) |> Enum.join(",")
+
+  defp tool_config_cli_value(value), do: to_string(value)
 
   defp flatten_tool_config(config, prefix \\ nil) do
     Enum.flat_map(config, fn {key, value} ->

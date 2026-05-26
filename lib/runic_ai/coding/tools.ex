@@ -4,6 +4,12 @@ defmodule RunicAI.Coding.Tools do
 
   These functions are ordinary Elixir APIs and are also exposed through
   `RunicAI.Tool.Definition` values by `default_registry/2`.
+
+  `execute_code/4` and `sandbox_status/2` are the RunicAI-facing sandbox tools.
+  They route arbitrary code execution through `RunicSandbox`, preserve sandbox
+  backend/isolation metadata on the result, and are meant to be exposed through
+  explicit capability profiles or recipes rather than through every default
+  coding mode.
   """
 
   alias RunicAI.Coding.CommandPolicy
@@ -19,6 +25,8 @@ defmodule RunicAI.Coding.Tools do
   alias RunicAI.Coding.Profile
   alias RunicAI.Coding.RLM.AcceptanceCheck
   alias RunicAI.Coding.RLM.VerificationAssertions
+  alias RunicAI.Coding.SandboxSessionRegistry
+  alias RunicAI.Coding.TraceEvent
   alias RunicAI.Coding.Workspace
   alias RunicAI.Context.Focus
   alias RunicAI.Context.Ref
@@ -32,6 +40,8 @@ defmodule RunicAI.Coding.Tools do
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.SQLite.Store, as: SQLiteStore
+  alias RunicSandbox, as: Sandbox
+  alias RunicSandbox.Error, as: SandboxError
   alias RunicAI.Terminal.Event, as: TerminalEvent
   alias RunicAI.Tool.Definition
   alias RunicAI.Tool.Registry
@@ -79,13 +89,25 @@ defmodule RunicAI.Coding.Tools do
     event_sink = Keyword.get(opts, :event_sink)
     browser_opts = Keyword.get(opts, :browser_opts, []) |> put_tool_event_sink(event_sink)
     delegate_opts = Keyword.get(opts, :delegate_opts, [])
+    sandbox_opts = Keyword.get(opts, :sandbox_opts, [])
+
+    sandbox_session_registry =
+      Keyword.get(opts, :sandbox_session_registry) || default_sandbox_session_registry()
 
     tools =
       workspace
       |> read_tools()
       |> Kernel.++(patch_tools(workspace, patch_dry_run?))
       |> Kernel.++(command_tools(workspace, command_policy, event_sink))
-      |> Kernel.++(code_execution_tools(workspace, command_policy, event_sink))
+      |> Kernel.++(
+        code_execution_tools(
+          workspace,
+          command_policy,
+          sandbox_opts,
+          event_sink,
+          sandbox_session_registry
+        )
+      )
       |> Kernel.++(git_tools(workspace, command_policy, event_sink))
       |> Kernel.++(profile_tools(workspace, command_policy, event_sink))
       |> Kernel.++(process_tools(workspace, command_policy, process_registry, event_sink))
@@ -380,8 +402,9 @@ defmodule RunicAI.Coding.Tools do
 
     with {:ok, runtime} <- code_runtime(runtime),
          {:ok, code} <- non_empty_string(code, :code) do
-      network = normalize_map(arg(args, :network, %{enabled: false}))
+      network = normalize_sandbox_network(arg(args, :network, :disabled))
       timeout_ms = arg(args, :timeout_ms, 10_000)
+      max_output_bytes = arg(args, :max_output_bytes, 16_384)
 
       policy =
         case policy do
@@ -391,7 +414,7 @@ defmodule RunicAI.Coding.Tools do
               allow_shell: false,
               allow_just_bash: true,
               timeout_ms: timeout_ms,
-              max_output_bytes: arg(args, :max_output_bytes, 16_384),
+              max_output_bytes: max_output_bytes,
               metadata: %{sandbox_backend: :just_bash, runtime: runtime}
             )
 
@@ -399,62 +422,269 @@ defmodule RunicAI.Coding.Tools do
             policy
         end
 
-      command_args = %{
-        backend: :just_bash,
-        command: "just_bash",
-        shell: code,
+      sandbox_cwd = arg(args, :sandbox_cwd, "/workspace")
+      sandbox_opts = Keyword.get(opts, :sandbox_opts, [])
+      event_sink = Keyword.get(opts, :event_sink)
+
+      request = %{
+        sandbox: arg(args, :sandbox, :local_code),
+        runtime: runtime,
+        mode: :script,
+        source: code,
+        cwd: sandbox_cwd,
         timeout_ms: timeout_ms,
+        max_output_bytes: max_output_bytes,
+        network: network,
+        files: normalize_map(arg(args, :files, %{})),
         metadata: %{
-          runtime: runtime,
-          sandbox_backend: :just_bash,
-          isolation_level: :in_process_virtual,
-          network: network,
-          cwd: arg(args, :sandbox_cwd, "/workspace"),
-          files: normalize_map(arg(args, :files, %{}))
+          host_workspace_root: workspace.root,
+          capability: sandbox_definition_summary(sandbox_opts)
         }
       }
 
-      with {:ok, %CommandResult{} = result} <- run_command(workspace, command_args, policy, opts) do
-        {:ok,
-         %{
-           result
-           | metadata:
-               Map.merge(result.metadata, %{
-                 tool: :execute_code,
-                 runtime: runtime,
-                 sandbox_backend: :just_bash,
-                 isolation_level: :in_process_virtual,
-                 network: network,
-                 host_cwd: workspace.root,
-                 sandbox_cwd: command_args.metadata.cwd,
-                 output_cap_bytes: arg(args, :max_output_bytes, 16_384),
-                 changed_artifact_refs: List.wrap(result.artifact_ref) |> Enum.reject(&is_nil/1)
-               })
-         }}
+      emit_sandbox_event(
+        event_sink,
+        :coding_sandbox_started,
+        :running,
+        workspace,
+        request,
+        %{
+          tool: :execute_code,
+          code_bytes: byte_size(code),
+          code_preview: String.slice(code, 0, 1_000),
+          sandbox_opts: summarize_sandbox_opts(sandbox_opts)
+        }
+      )
+
+      case Sandbox.exec(request, sandbox_opts) do
+        {:ok, sandbox_result} ->
+          command_result =
+            sandbox_result_to_command_result(
+              sandbox_result,
+              code,
+              workspace,
+              policy,
+              %{
+                tool: :execute_code,
+                runtime: runtime,
+                network: network,
+                host_cwd: workspace.root,
+                sandbox_cwd: sandbox_cwd,
+                output_cap_bytes: max_output_bytes,
+                changed_artifact_refs:
+                  sandbox_result.artifacts
+                  |> Enum.map(&Map.get(&1, :ref, Map.get(&1, "ref")))
+                  |> Enum.reject(&is_nil/1),
+                sandbox_capability: sandbox_definition_summary(sandbox_opts)
+              }
+            )
+
+          case command_result do
+            {:ok, %CommandResult{} = result} ->
+              emit_sandbox_event(
+                event_sink,
+                :coding_sandbox_completed,
+                result.status,
+                workspace,
+                request,
+                sandbox_result_output(sandbox_result, result)
+              )
+
+            _other ->
+              :ok
+          end
+
+          command_result
+
+        {:error, error} ->
+          error = sandbox_error_to_runic_ai_error(error)
+
+          result =
+            CommandResult.blocked(nil, error,
+              cwd: sandbox_cwd,
+              metadata: %{
+                tool: :execute_code,
+                runtime: runtime,
+                network: network,
+                host_cwd: workspace.root,
+                sandbox_cwd: sandbox_cwd,
+                sandbox_capability: sandbox_definition_summary(sandbox_opts)
+              }
+            )
+
+          emit_sandbox_event(
+            event_sink,
+            :coding_sandbox_completed,
+            :blocked,
+            workspace,
+            request,
+            %{
+              status: result.status,
+              diagnostics: result.diagnostics,
+              error_kind: error.kind,
+              metadata: result.metadata
+            }
+          )
+
+          {:ok, result}
       end
     end
   end
 
   @spec sandbox_status(Workspace.t(), map()) :: {:ok, map()} | {:error, Error.t()}
   def sandbox_status(%Workspace{} = workspace, args \\ %{}) when is_map(args) do
-    {:ok,
-     %{
-       status: :available,
-       workspace_root: workspace.root,
-       default_backend: :just_bash,
-       backends: [
-         %{
-           name: :just_bash,
-           available?: Code.ensure_loaded?(JustBash),
-           runtimes: [:bash],
-           isolation_level: :in_process_virtual,
-           network: %{enabled: false},
-           stateful?: false,
-           security_boundary?: false
-         }
-       ],
-       requested_backend: arg(args, :backend, :just_bash)
-     }}
+    sandbox_opts = normalize_keyword(arg(args, :sandbox_opts, []))
+
+    with {:ok, status} <- Sandbox.status(sandbox_opts) do
+      {:ok,
+       status
+       |> Map.put(:workspace_root, workspace.root)
+       |> Map.put(:requested_backend, normalize_atom(arg(args, :backend, :just_bash)))
+       |> sandbox_status_output()}
+    end
+  end
+
+  @spec open_sandbox_session(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def open_sandbox_session(%Workspace{} = _workspace, args, registry, opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry) do
+      sandbox_opts = Keyword.get(opts, :sandbox_opts, [])
+      sandbox = normalize_atom(arg(args, :sandbox, :local_code))
+      spec = arg(args, :spec, %{})
+
+      SandboxSessionRegistry.open_session(registry, sandbox, spec, sandbox_opts)
+    end
+  end
+
+  @spec sandbox_exec(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def sandbox_exec(%Workspace{} = _workspace, args, registry, _opts \\ []) when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, runtime} <- code_runtime(arg(args, :runtime, "bash")),
+         {:ok, code} <- non_empty_string(arg(args, :code, arg(args, :source, nil)), :code) do
+      request = %{
+        runtime: runtime,
+        mode: :script,
+        source: code,
+        cwd: arg(args, :sandbox_cwd, "/workspace"),
+        timeout_ms: arg(args, :timeout_ms, 10_000),
+        max_output_bytes: arg(args, :max_output_bytes, 16_384),
+        network: normalize_sandbox_network(arg(args, :network, :disabled)),
+        files: normalize_map(arg(args, :files, %{}))
+      }
+
+      SandboxSessionRegistry.exec(registry, session_id, request)
+    end
+  end
+
+  @spec sandbox_write_file(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def sandbox_write_file(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, path} <- non_empty_string(arg(args, :path, nil), :path),
+         {:ok, content} <- non_empty_string(arg(args, :content, nil), :content) do
+      SandboxSessionRegistry.write_file(registry, session_id, path, content)
+    end
+  end
+
+  @spec sandbox_read_file(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def sandbox_read_file(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, path} <- non_empty_string(arg(args, :path, nil), :path) do
+      SandboxSessionRegistry.read_file(registry, session_id, path,
+        max_bytes: arg(args, :max_bytes, 16_384)
+      )
+    end
+  end
+
+  @spec sandbox_list_files(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def sandbox_list_files(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.list_files(registry, session_id, arg(args, :path, "."))
+    end
+  end
+
+  @spec checkpoint_sandbox(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def checkpoint_sandbox(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.checkpoint(registry, session_id, arg(args, :spec, %{}))
+    end
+  end
+
+  @spec restore_sandbox(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def restore_sandbox(%Workspace{} = _workspace, args, registry, _opts \\ []) when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, checkpoint} <- sandbox_checkpoint(args) do
+      SandboxSessionRegistry.restore(registry, session_id, checkpoint)
+    end
+  end
+
+  @spec close_sandbox_session(Workspace.t(), map(), GenServer.server() | nil, keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def close_sandbox_session(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.close_session(registry, session_id)
+    end
+  end
+
+  def start_sandbox_service(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.start_service(registry, session_id, arg(args, :spec, args))
+    end
+  end
+
+  def stop_sandbox_service(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, service_id} <-
+           non_empty_string(arg(args, :service_id, arg(args, :id, nil)), :service_id) do
+      SandboxSessionRegistry.stop_service(registry, session_id, service_id)
+    end
+  end
+
+  def list_sandbox_services(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.list_services(registry, session_id)
+    end
+  end
+
+  def open_sandbox_proxy(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, service_id} <- non_empty_string(arg(args, :service_id, nil), :service_id) do
+      SandboxSessionRegistry.open_proxy(registry, session_id, service_id)
+    end
+  end
+
+  def close_sandbox_proxy(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, proxy_id} <- non_empty_string(arg(args, :proxy_id, arg(args, :id, nil)), :proxy_id) do
+      SandboxSessionRegistry.close_proxy(registry, proxy_id)
+    end
   end
 
   @spec memory_write(Workspace.t(), map(), term(), keyword()) ::
@@ -1171,11 +1401,19 @@ defmodule RunicAI.Coding.Tools do
     ]
   end
 
-  defp code_execution_tools(workspace, command_policy, event_sink) do
+  defp code_execution_tools(
+         workspace,
+         command_policy,
+         sandbox_opts,
+         event_sink,
+         sandbox_session_registry
+       ) do
+    summary = sandbox_definition_summary(sandbox_opts)
+
     [
       definition(
         "execute_code",
-        "Execute a bounded code snippet in a configured sandbox backend. The initial backend is just_bash and is an in-process virtual runtime, not a hard security boundary.",
+        "Execute a bounded code snippet in the configured sandbox backend.",
         [
           runtime: [type: :string, default: "bash"],
           code: [type: :string, required: true],
@@ -1184,14 +1422,27 @@ defmodule RunicAI.Coding.Tools do
           files: [type: :any],
           network: [type: :any]
         ],
-        fn args -> execute_code(workspace, args, command_policy, event_sink: event_sink) end,
+        fn args ->
+          execute_code(workspace, args, command_policy,
+            event_sink: event_sink,
+            sandbox_opts: sandbox_opts
+          )
+        end,
         %{
           category: :coding_code_execution,
           toolset: :code_execution,
           mutates?: :sandbox_dependent,
           requires_review?: true,
-          sandbox_backend: :just_bash,
-          isolation_level: :in_process_virtual
+          sandbox_backend: summary.backend,
+          isolation_level: summary.isolation_level,
+          sandbox: summary.sandbox,
+          runtimes: summary.runtimes,
+          network: summary.network,
+          state_model: summary.state_model,
+          transport_model: summary.transport_model,
+          session: summary.session,
+          checkpoint_policy: summary.checkpoint_policy,
+          service_policy: summary.service_policy
         },
         timeout: :infinity,
         stop_on_error: false
@@ -1200,13 +1451,158 @@ defmodule RunicAI.Coding.Tools do
         "sandbox_status",
         "Describe configured local sandbox/code-execution backends and their isolation metadata.",
         [backend: [type: :string]],
-        fn args -> sandbox_status(workspace, args) end,
+        fn args -> sandbox_status(workspace, Map.put(args, :sandbox_opts, sandbox_opts)) end,
         %{
           category: :coding_code_execution,
           toolset: :code_execution,
           mutates?: false,
           requires_review?: false
         }
+      )
+    ] ++ stateful_sandbox_tools(workspace, sandbox_session_registry, sandbox_opts, summary)
+  end
+
+  defp stateful_sandbox_tools(_workspace, nil, _sandbox_opts, _summary), do: []
+
+  defp stateful_sandbox_tools(workspace, sandbox_session_registry, sandbox_opts, summary) do
+    metadata = %{
+      category: :coding_code_execution,
+      toolset: :code_execution,
+      sandbox_backend: summary.backend,
+      isolation_level: summary.isolation_level,
+      sandbox: summary.sandbox,
+      runtimes: summary.runtimes,
+      network: summary.network,
+      state_model: summary.state_model,
+      transport_model: summary.transport_model,
+      session: summary.session,
+      checkpoint_policy: summary.checkpoint_policy,
+      service_policy: summary.service_policy
+    }
+
+    [
+      definition(
+        "open_sandbox_session",
+        "Open a managed sandbox session and return an opaque session id.",
+        [sandbox: [type: :string], spec: [type: :any]],
+        fn args ->
+          open_sandbox_session(workspace, args, sandbox_session_registry,
+            sandbox_opts: sandbox_opts
+          )
+        end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "sandbox_exec",
+        "Execute code inside an existing managed sandbox session.",
+        [
+          session_id: [type: :string, required: true],
+          runtime: [type: :string, default: "bash"],
+          code: [type: :string, required: true],
+          timeout_ms: [type: :pos_integer],
+          max_output_bytes: [type: :pos_integer],
+          files: [type: :any],
+          network: [type: :any]
+        ],
+        fn args -> sandbox_exec(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: :sandbox_dependent, requires_review?: true}),
+        timeout: :infinity,
+        stop_on_error: false
+      ),
+      definition(
+        "sandbox_write_file",
+        "Write a file into an existing managed sandbox session.",
+        [
+          session_id: [type: :string, required: true],
+          path: [type: :string, required: true],
+          content: [type: :string, required: true]
+        ],
+        fn args -> sandbox_write_file(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "sandbox_read_file",
+        "Read a bounded file preview from an existing managed sandbox session.",
+        [
+          session_id: [type: :string, required: true],
+          path: [type: :string, required: true],
+          max_bytes: [type: :pos_integer]
+        ],
+        fn args -> sandbox_read_file(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "sandbox_list_files",
+        "List files visible inside an existing managed sandbox session.",
+        [session_id: [type: :string, required: true], path: [type: :string, default: "."]],
+        fn args -> sandbox_list_files(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "checkpoint_sandbox",
+        "Create a checkpoint for an existing managed sandbox session.",
+        [session_id: [type: :string, required: true], spec: [type: :any]],
+        fn args -> checkpoint_sandbox(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "restore_sandbox",
+        "Restore an existing managed sandbox session to a checkpoint.",
+        [
+          session_id: [type: :string, required: true],
+          checkpoint_ref: [type: :string],
+          checkpoint: [type: :any]
+        ],
+        fn args -> restore_sandbox(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "close_sandbox_session",
+        "Close an existing managed sandbox session.",
+        [session_id: [type: :string, required: true]],
+        fn args -> close_sandbox_session(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "start_sandbox_service",
+        "Start a service inside an existing managed sandbox session.",
+        [session_id: [type: :string, required: true], spec: [type: :any]],
+        fn args -> start_sandbox_service(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "stop_sandbox_service",
+        "Stop a service inside an existing managed sandbox session.",
+        [
+          session_id: [type: :string, required: true],
+          service_id: [type: :string, required: true]
+        ],
+        fn args -> stop_sandbox_service(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "list_sandbox_services",
+        "List services inside an existing managed sandbox session.",
+        [session_id: [type: :string, required: true]],
+        fn args -> list_sandbox_services(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "open_sandbox_proxy",
+        "Open a host-visible proxy to a sandbox service.",
+        [
+          session_id: [type: :string, required: true],
+          service_id: [type: :string, required: true]
+        ],
+        fn args -> open_sandbox_proxy(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "close_sandbox_proxy",
+        "Close a host-visible sandbox service proxy.",
+        [proxy_id: [type: :string, required: true]],
+        fn args -> close_sandbox_proxy(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
       )
     ]
   end
@@ -3009,11 +3405,20 @@ defmodule RunicAI.Coding.Tools do
 
   defp code_runtime(runtime) when runtime in [:bash, "bash", :sh, "sh"], do: {:ok, :bash}
 
+  defp code_runtime(runtime) when runtime in [:python, "python", :python3, "python3"],
+    do: {:ok, :python}
+
+  defp code_runtime(runtime) when runtime in [:node, "node", :javascript, "javascript"],
+    do: {:ok, :node}
+
+  defp code_runtime(runtime) when runtime in [:elixir, "elixir"], do: {:ok, :elixir}
+  defp code_runtime(runtime) when runtime in [:lua, "lua"], do: {:ok, :lua}
+
   defp code_runtime(runtime) do
     {:error,
      Error.validation("unsupported code execution runtime",
        source: __MODULE__,
-       details: %{runtime: runtime, supported_runtimes: [:bash]}
+       details: %{runtime: runtime, supported_runtimes: [:bash, :python, :node, :elixir, :lua]}
      )}
   end
 
@@ -3484,6 +3889,7 @@ defmodule RunicAI.Coding.Tools do
       profile: Map.get(result, :profile),
       toolsets: Map.get(result, :toolsets, []),
       summary: Map.get(result, :summary) || Map.get(result, :output) || "",
+      claims: Map.get(result, :claims),
       artifact_refs: List.wrap(Map.get(result, :artifact_refs, [])),
       source_refs: List.wrap(Map.get(result, :source_refs, [])),
       intermediate_events_included?: false,
@@ -3570,9 +3976,342 @@ defmodule RunicAI.Coding.Tools do
     end
   end
 
+  defp sandbox_result_to_command_result(sandbox_result, code, workspace, _policy, metadata) do
+    output = sandbox_result.stdout <> sandbox_result.stderr
+    output_bytes = byte_size(output)
+    output_preview = output
+
+    CommandResult.new(command_result_status(sandbox_result.status),
+      command: code,
+      argv: nil,
+      cwd: workspace.root,
+      exit_status: sandbox_result.exit_status,
+      output: output,
+      output_preview: output_preview,
+      output_bytes: output_bytes,
+      duration_ms: sandbox_result.duration_ms,
+      diagnostics: sandbox_result.diagnostics,
+      metadata:
+        Map.merge(metadata, %{
+          sandbox_backend: sandbox_result.backend,
+          isolation_level: sandbox_result.isolation_level,
+          sandbox_metadata: sandbox_result.metadata,
+          resource_usage: sandbox_result.resource_usage
+        })
+    )
+  end
+
+  defp sandbox_result_output(sandbox_result, %CommandResult{} = result) do
+    %{
+      status: result.status,
+      exit_status: result.exit_status,
+      duration_ms: result.duration_ms,
+      output_bytes: result.output_bytes,
+      output_preview: result.output_preview,
+      backend: sandbox_result.backend,
+      isolation_level: sandbox_result.isolation_level,
+      diagnostics: sandbox_result.diagnostics,
+      resource_usage: sandbox_result.resource_usage,
+      files_changed: sandbox_result.files_changed,
+      artifacts: artifact_summaries(sandbox_result.artifacts),
+      metadata: sandbox_result.metadata
+    }
+  end
+
+  defp emit_sandbox_event(event_sink, kind, status, workspace, request, output)
+       when is_function(event_sink, 1) do
+    event =
+      TraceEvent.sandbox(kind, output,
+        status: status,
+        workspace_root: workspace.root,
+        tool_name: "execute_code",
+        input: sandbox_request_summary(request),
+        metadata: %{
+          coding?: true,
+          sandbox?: true,
+          live?: true,
+          source: :sandbox_tool,
+          workspace_root: workspace.root,
+          sandbox: Map.get(request, :sandbox),
+          runtime: Map.get(request, :runtime),
+          network: Map.get(request, :network),
+          session_id: sandbox_output_metadata(output, :session_id),
+          checkpoint_id: sandbox_output_metadata(output, :checkpoint_id),
+          service_id: sandbox_output_metadata(output, :service_id),
+          proxy_id: sandbox_output_metadata(output, :proxy_id),
+          capability: get_in(request, [:metadata, :capability])
+        }
+      )
+
+    event_sink.(event)
+  rescue
+    _exception -> :ok
+  end
+
+  defp emit_sandbox_event(_event_sink, _kind, _status, _workspace, _request, _output), do: :ok
+
+  defp sandbox_output_metadata(output, key) when is_map(output) do
+    metadata = Map.get(output, :metadata, Map.get(output, "metadata", %{}))
+    Map.get(metadata, key, Map.get(metadata, Atom.to_string(key)))
+  end
+
+  defp sandbox_output_metadata(_output, _key), do: nil
+
+  defp sandbox_request_summary(request) when is_map(request) do
+    %{
+      sandbox: Map.get(request, :sandbox),
+      runtime: Map.get(request, :runtime),
+      mode: Map.get(request, :mode),
+      cwd: Map.get(request, :cwd),
+      timeout_ms: Map.get(request, :timeout_ms),
+      max_output_bytes: Map.get(request, :max_output_bytes),
+      network: Map.get(request, :network),
+      file_paths: request |> Map.get(:files, %{}) |> Map.keys() |> Enum.sort(),
+      source_bytes: request |> Map.get(:source, "") |> to_string() |> byte_size()
+    }
+  end
+
+  defp summarize_sandbox_opts(opts) when is_list(opts) do
+    profile = Keyword.get(opts, :profile, [])
+
+    %{
+      server?: not is_nil(Keyword.get(opts, :server)),
+      profile: summarize_sandbox_profile(profile)
+    }
+  end
+
+  defp summarize_sandbox_opts(_opts), do: %{}
+
+  defp summarize_sandbox_profile(profile) when is_list(profile) or is_map(profile) do
+    profile = if is_map(profile), do: profile, else: Map.new(profile)
+
+    profile
+    |> Map.take([:name, :backend, :image, :runtimes, :network, :stateful?, :workspace, :metadata])
+    |> Map.merge(
+      profile
+      |> Map.take([
+        "name",
+        "backend",
+        "image",
+        "runtimes",
+        "network",
+        "stateful?",
+        "workspace",
+        "metadata"
+      ])
+      |> Map.new(fn {key, value} -> {String.to_atom(key), value} end)
+    )
+  end
+
+  defp summarize_sandbox_profile(_profile), do: %{}
+
+  defp artifact_summaries(artifacts) when is_list(artifacts) do
+    Enum.map(artifacts, fn artifact ->
+      %{
+        ref: Map.get(artifact, :ref, Map.get(artifact, "ref")),
+        path: Map.get(artifact, :path, Map.get(artifact, "path")),
+        bytes: Map.get(artifact, :bytes, Map.get(artifact, "bytes")),
+        sha256: Map.get(artifact, :sha256, Map.get(artifact, "sha256")),
+        truncated?: Map.get(artifact, :truncated?, Map.get(artifact, "truncated?", false))
+      }
+    end)
+  end
+
+  defp artifact_summaries(_artifacts), do: []
+
+  defp sandbox_status_output(%_struct{} = value),
+    do: value |> Map.from_struct() |> sandbox_status_output()
+
+  defp sandbox_status_output(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {key, sandbox_status_output(nested)} end)
+  end
+
+  defp sandbox_status_output(value) when is_list(value),
+    do: Enum.map(value, &sandbox_status_output/1)
+
+  defp sandbox_status_output(value), do: value
+
+  defp sandbox_definition_summary(sandbox_opts) do
+    profile = sandbox_opts |> Keyword.get(:profile, []) |> Map.new()
+    backend = normalize_atom(Map.get(profile, :backend, Map.get(profile, "backend", :just_bash)))
+    metadata = Map.get(profile, :metadata, Map.get(profile, "metadata", %{})) |> normalize_map()
+    default_state_model = default_sandbox_state_model(backend, profile)
+
+    state_model =
+      normalize_atom(Map.get(metadata, :state_model, Map.get(metadata, "state_model"))) ||
+        default_state_model
+
+    %{
+      sandbox: normalize_atom(Map.get(profile, :name, Map.get(profile, "name", :local_code))),
+      backend: backend,
+      isolation_level:
+        normalize_atom(
+          Map.get(profile, :isolation_level, Map.get(profile, "isolation_level")) ||
+            default_sandbox_isolation_level(backend)
+        ),
+      runtimes:
+        normalize_runtime_list(Map.get(profile, :runtimes, Map.get(profile, "runtimes", [:bash]))),
+      network:
+        normalize_sandbox_network(
+          Map.get(profile, :network, Map.get(profile, "network", :disabled))
+        ),
+      state_model: state_model,
+      transport_model:
+        normalize_atom(Map.get(metadata, :transport_model, Map.get(metadata, "transport_model"))) ||
+          default_sandbox_transport_model(backend),
+      session:
+        normalize_atom(Map.get(metadata, :session, Map.get(metadata, "session"))) ||
+          default_sandbox_session(state_model),
+      checkpoint_policy:
+        Map.get(metadata, :checkpoint_policy, Map.get(metadata, "checkpoint_policy")),
+      service_policy: Map.get(metadata, :service_policy, Map.get(metadata, "service_policy"))
+    }
+  end
+
+  defp default_sandbox_isolation_level(:lua), do: :in_process
+  defp default_sandbox_isolation_level(:docker), do: :container
+  defp default_sandbox_isolation_level(:gvisor), do: :gvisor
+  defp default_sandbox_isolation_level(:vmsan), do: :microvm
+  defp default_sandbox_isolation_level(:firecracker), do: :microvm
+  defp default_sandbox_isolation_level(:sprites), do: :remote_microvm
+  defp default_sandbox_isolation_level(:remote), do: :remote_microvm
+  defp default_sandbox_isolation_level(_backend), do: :in_process_virtual
+
+  defp default_sandbox_state_model(:vmsan, _profile), do: :checkpointable
+  defp default_sandbox_state_model(:firecracker, _profile), do: :checkpointable
+  defp default_sandbox_state_model(:sprites, _profile), do: :service_actor
+  defp default_sandbox_state_model(:remote, _profile), do: :service_actor
+
+  defp default_sandbox_state_model(backend, profile) when backend in [:docker, :gvisor] do
+    if truthy?(Map.get(profile, :stateful?, Map.get(profile, "stateful?", false))) do
+      :persistent_workspace
+    else
+      :one_shot
+    end
+  end
+
+  defp default_sandbox_state_model(_backend, _profile), do: :one_shot
+
+  defp default_sandbox_transport_model(:docker), do: :docker_cli
+  defp default_sandbox_transport_model(:gvisor), do: :docker_cli
+  defp default_sandbox_transport_model(:vmsan), do: :local_microvm
+  defp default_sandbox_transport_model(:firecracker), do: :local_microvm
+  defp default_sandbox_transport_model(:sprites), do: :remote_microvm
+  defp default_sandbox_transport_model(:remote), do: :provider_cli
+  defp default_sandbox_transport_model(_backend), do: :in_process
+
+  defp default_sandbox_session(:checkpointable), do: :workspace
+  defp default_sandbox_session(:persistent_workspace), do: :workspace
+  defp default_sandbox_session(:service_actor), do: :run
+  defp default_sandbox_session(_state_model), do: :one_shot
+
+  defp truthy?(value), do: value in [true, "true", 1, "1", "yes", "on"]
+
+  defp normalize_runtime_list(runtimes) when is_list(runtimes),
+    do: Enum.map(runtimes, &normalize_atom/1)
+
+  defp normalize_runtime_list(runtimes) when is_binary(runtimes) do
+    runtimes
+    |> String.split([",", "\n"], trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> normalize_runtime_list()
+  end
+
+  defp normalize_runtime_list(runtime) when is_atom(runtime), do: [runtime]
+  defp normalize_runtime_list(_runtime), do: [:bash]
+
   defp normalize_map(value) when is_map(value), do: value
   defp normalize_map(value) when is_list(value), do: Map.new(value)
   defp normalize_map(_value), do: %{}
+
+  defp sandbox_error_to_runic_ai_error(%SandboxError{} = error) do
+    Error.new(error.kind, error.message,
+      details: error.details,
+      source: error.source,
+      retryable?: error.retryable?,
+      metadata: error.metadata
+    )
+  end
+
+  defp sandbox_error_to_runic_ai_error(%Error{} = error), do: error
+
+  defp sandbox_error_to_runic_ai_error(error) do
+    Error.from_reason(error,
+      kind: :unexpected,
+      message: "sandbox execution failed"
+    )
+  end
+
+  defp normalize_sandbox_network(value) when value in [:disabled, :host, :restricted], do: value
+  defp normalize_sandbox_network("disabled"), do: :disabled
+  defp normalize_sandbox_network("host"), do: :host
+  defp normalize_sandbox_network("restricted"), do: :restricted
+  defp normalize_sandbox_network(%{enabled: false}), do: :disabled
+  defp normalize_sandbox_network(%{"enabled" => false}), do: :disabled
+  defp normalize_sandbox_network(%{enabled: true}), do: :host
+  defp normalize_sandbox_network(%{"enabled" => true}), do: :host
+  defp normalize_sandbox_network(_value), do: :disabled
+
+  defp normalize_keyword(value) when is_list(value), do: value
+  defp normalize_keyword(_value), do: []
+
+  defp normalize_atom(value) when is_atom(value), do: value
+
+  defp normalize_atom(value) when is_binary(value) and value != "" do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> value
+  end
+
+  defp normalize_atom(value), do: value
+
+  defp default_sandbox_session_registry do
+    case Process.whereis(SandboxSessionRegistry) do
+      nil -> nil
+      pid -> pid
+    end
+  end
+
+  defp require_sandbox_session_registry(nil) do
+    {:error,
+     Error.validation("stateful sandbox tools require a sandbox session registry",
+       source: __MODULE__,
+       details: %{registry: nil}
+     )}
+  end
+
+  defp require_sandbox_session_registry(registry), do: {:ok, registry}
+
+  defp sandbox_session_id(args) do
+    args
+    |> arg(:session_id, arg(args, :id, nil))
+    |> non_empty_string(:session_id)
+  end
+
+  defp sandbox_checkpoint(args) do
+    cond do
+      is_binary(arg(args, :checkpoint_ref, nil)) ->
+        {:ok, arg(args, :checkpoint_ref, nil)}
+
+      is_binary(arg(args, :checkpoint_id, nil)) ->
+        {:ok, arg(args, :checkpoint_id, nil)}
+
+      is_map(arg(args, :checkpoint, nil)) ->
+        checkpoint = arg(args, :checkpoint, nil)
+        {:ok, Map.get(checkpoint, :ref, Map.get(checkpoint, "ref", checkpoint))}
+
+      true ->
+        {:error,
+         Error.validation("restore_sandbox requires checkpoint_ref or checkpoint",
+           source: __MODULE__,
+           details: %{args: args}
+         )}
+    end
+  end
+
+  defp command_result_status(:error), do: :fail
+  defp command_result_status(status), do: status
 
   defp put_tool_event_sink(opts, nil), do: opts
 

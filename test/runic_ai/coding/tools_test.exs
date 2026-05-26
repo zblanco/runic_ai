@@ -3,6 +3,7 @@ defmodule RunicAI.Coding.ToolsTest do
 
   alias RunicAI.Coding.Persistence
   alias RunicAI.Coding.Persistence.InMemory
+  alias RunicAI.Coding.SandboxSessionRegistry
   alias RunicAI.Coding.Tools
   alias RunicAI.Coding.Workspace
   alias RunicAI.Memory.LocalStore, as: MemoryLocalStore
@@ -464,13 +465,20 @@ defmodule RunicAI.Coding.ToolsTest do
 
   test "execute_code and sandbox_status expose just_bash sandbox metadata" do
     workspace = sample_workspace()
+    parent = self()
+    event_sink = fn event -> send(parent, {:sandbox_event, event}) end
 
     assert {:ok, result} =
-             Tools.execute_code(workspace, %{
-               runtime: "bash",
-               code: "echo tool-sandbox",
-               max_output_bytes: 1_024
-             })
+             Tools.execute_code(
+               workspace,
+               %{
+                 runtime: "bash",
+                 code: "echo tool-sandbox",
+                 max_output_bytes: 1_024
+               },
+               nil,
+               event_sink: event_sink
+             )
 
     assert result.status == :pass
     assert result.output == "tool-sandbox\n"
@@ -478,15 +486,150 @@ defmodule RunicAI.Coding.ToolsTest do
     assert result.metadata.runtime == :bash
     assert result.metadata.sandbox_backend == :just_bash
     assert result.metadata.isolation_level == :in_process_virtual
-    assert result.metadata.network == %{enabled: false}
+    assert result.metadata.network == :disabled
     assert result.metadata.host_cwd == workspace.root
     assert result.metadata.sandbox_cwd == "/workspace"
     assert result.metadata.output_cap_bytes == 1_024
     assert result.metadata.changed_artifact_refs == []
+    assert result.metadata.sandbox_capability.state_model == :one_shot
+    assert result.metadata.sandbox_capability.transport_model == :in_process
+    assert result.metadata.sandbox_capability.session == :one_shot
+
+    assert_receive {:sandbox_event, started}
+    assert started.kind == :coding_sandbox_started
+    assert started.status == :running
+    assert started.metadata.sandbox?
+    assert started.metadata.runtime == :bash
+    assert started.metadata.capability.state_model == :one_shot
+    assert started.input.file_paths == []
+    assert started.output.code_preview == "echo tool-sandbox"
+
+    assert_receive {:sandbox_event, completed}
+    assert completed.kind == :coding_sandbox_completed
+    assert completed.status == :pass
+    assert completed.output.backend == :just_bash
+    assert completed.output.isolation_level == :in_process_virtual
+    assert completed.output.output_preview == "tool-sandbox\n"
+    assert completed.metadata.capability.state_model == :one_shot
 
     assert {:ok, status} = Tools.sandbox_status(workspace, %{})
     assert status.default_backend == :just_bash
     assert [%{name: :just_bash, runtimes: [:bash], security_boundary?: false}] = status.backends
+  end
+
+  test "stateful sandbox tools open execute and close managed sessions" do
+    workspace = sample_workspace()
+    {:ok, registry} = SandboxSessionRegistry.start_link()
+
+    assert {:ok, opened} = Tools.open_sandbox_session(workspace, %{}, registry)
+    assert opened.id =~ "sandbox_session_"
+    assert opened.session_id
+    assert opened.backend == :just_bash
+    assert opened.capabilities.exec?
+
+    assert {:ok, result} =
+             Tools.sandbox_exec(
+               workspace,
+               %{session_id: opened.id, runtime: "bash", code: "echo managed-session"},
+               registry
+             )
+
+    assert result.status == :pass
+    assert result.stdout == "managed-session\n"
+    assert result.session.id == opened.id
+
+    assert {:ok, closed} =
+             Tools.close_sandbox_session(workspace, %{session_id: opened.id}, registry)
+
+    assert closed == %{id: opened.id, status: :closed}
+
+    assert {:error, error} =
+             Tools.sandbox_exec(
+               workspace,
+               %{session_id: opened.id, runtime: "bash", code: "echo stale"},
+               registry
+             )
+
+    assert error.message == "unknown sandbox session id"
+  end
+
+  test "execute_code metadata carries configured stateful sandbox capability shape" do
+    workspace = sample_workspace()
+
+    sandbox_opts = [
+      profile: [
+        backend: :vmsan,
+        runtimes: [:bash, :python],
+        network: :disabled,
+        metadata: %{
+          state_model: :checkpointable,
+          transport_model: :local_microvm,
+          session: :workspace,
+          checkpoint_policy: %{mode: :manual}
+        }
+      ]
+    ]
+
+    registry = Tools.default_registry(workspace, sandbox_opts: sandbox_opts)
+    tool = RunicAI.Tool.Registry.fetch!(registry, "execute_code")
+
+    assert tool.metadata.sandbox_backend == :vmsan
+    assert tool.metadata.isolation_level == :microvm
+    assert tool.metadata.state_model == :checkpointable
+    assert tool.metadata.transport_model == :local_microvm
+    assert tool.metadata.session == :workspace
+    assert tool.metadata.checkpoint_policy == %{mode: :manual}
+  end
+
+  test "execute_code normalizes explicit sandbox network policy values" do
+    workspace = sample_workspace()
+
+    assert {:ok, result} =
+             Tools.execute_code(
+               workspace,
+               %{runtime: "bash", code: "echo network-policy", network: "host"},
+               nil,
+               sandbox_opts: [profile: [network: :host]]
+             )
+
+    assert result.status == :pass
+    assert result.metadata.network == :host
+  end
+
+  test "execute_code selects non-bash runtimes from sandbox profile config" do
+    workspace = sample_workspace()
+
+    assert {:ok, result} =
+             Tools.execute_code(
+               workspace,
+               %{runtime: "lua", code: "return 42"},
+               nil,
+               sandbox_opts: [profile: [backend: :lua, runtimes: [:lua]]]
+             )
+
+    assert result.status == :pass
+    assert result.output == "42\n"
+    assert result.metadata.runtime == :lua
+    assert result.metadata.sandbox_backend == :lua
+    assert result.metadata.isolation_level == :in_process
+  end
+
+  test "execute_code converts sandbox errors into blocked command results" do
+    workspace = sample_workspace()
+
+    assert {:ok, result} =
+             Tools.execute_code(
+               workspace,
+               %{runtime: "python", code: "print('blocked')"},
+               nil
+             )
+
+    assert result.status == :blocked
+    assert [%{message: "sandbox runtime is not enabled by profile"}] = result.diagnostics
+    assert result.metadata.error_kind == :validation
+    assert result.metadata.tool == :execute_code
+    assert result.metadata.sandbox_capability.backend == :just_bash
+    assert result.metadata.sandbox_capability.state_model == :one_shot
   end
 
   test "memory tools write and recall local entries through a store adapter" do

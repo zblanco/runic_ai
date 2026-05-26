@@ -125,7 +125,7 @@ defmodule RunicAI.Coding.CommandResult do
       output_preview: "",
       output_bytes: 0,
       diagnostics: [%{message: error.message, details: error.details}],
-      metadata: %{error_kind: error.kind}
+      metadata: Map.put(Keyword.get(opts, :metadata, %{}), :error_kind, error.kind)
     )
   end
 

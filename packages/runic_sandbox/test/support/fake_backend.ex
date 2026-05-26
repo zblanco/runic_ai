@@ -1,0 +1,175 @@
+defmodule RunicSandbox.Test.FakeBackend do
+  @moduledoc false
+
+  @behaviour RunicSandbox.Backend
+
+  alias RunicSandbox.Capabilities
+  alias RunicSandbox.Checkpoint
+  alias RunicSandbox.Error
+  alias RunicSandbox.ExecutionRequest
+  alias RunicSandbox.ExecutionResult
+  alias RunicSandbox.FileRef
+  alias RunicSandbox.Instance
+  alias RunicSandbox.Profile
+  alias RunicSandbox.Proxy
+  alias RunicSandbox.Service
+  alias RunicSandbox.Session
+
+  @impl true
+  def provision(%Profile{} = profile, _opts), do: {:ok, Instance.from_profile(profile)}
+
+  @impl true
+  def exec(%Instance{} = instance, %ExecutionRequest{} = request, _opts) do
+    ExecutionResult.new(
+      status: :pass,
+      stdout: request.source || Enum.join(request.argv, " "),
+      stderr: "",
+      exit_status: 0,
+      duration_ms: 1,
+      backend: instance.backend,
+      isolation_level: instance.isolation_level
+    )
+  end
+
+  @impl true
+  def upload(%Instance{}, _files, _opts), do: {:ok, []}
+
+  @impl true
+  def download(%Instance{}, _paths, _opts), do: {:ok, []}
+
+  @impl true
+  def snapshot(%Instance{} = instance, _opts), do: {:ok, %{instance_id: instance.id}}
+
+  @impl true
+  def reset(%Instance{}, _opts), do: :ok
+
+  @impl true
+  def destroy(%Instance{}, _opts), do: :ok
+
+  @impl true
+  def health(_opts), do: {:ok, %{available?: true}}
+
+  @impl true
+  def open_session(%Profile{} = profile, _opts) do
+    instance = Instance.from_profile(profile)
+
+    Session.from_instance(instance,
+      capabilities:
+        Capabilities.new!(
+          exec?: true,
+          files?: true,
+          checkpoints?: true,
+          services?: true,
+          proxy?: true,
+          leases?: true,
+          network_policy?: true,
+          persistent_identity?: true
+        ),
+      policy: profile.policy,
+      state_model: :checkpointable,
+      transport_model: :local_microvm,
+      persistent_identity?: true,
+      workspace_ref: "workspace://fake"
+    )
+  end
+
+  @impl true
+  def close_session(%Session{}, _opts), do: :ok
+
+  @impl true
+  def exec_session(%Session{} = session, %ExecutionRequest{} = request, _opts) do
+    ExecutionResult.new(
+      status: :pass,
+      stdout: request.source,
+      stderr: "",
+      exit_status: 0,
+      duration_ms: 1,
+      backend: session.backend,
+      isolation_level: session.isolation_level
+    )
+  end
+
+  @impl true
+  def write_file(%Session{}, path, contents, _opts) do
+    FileRef.new(path: path, bytes: IO.iodata_length(contents), sha256: "fake")
+  end
+
+  @impl true
+  def read_file(%Session{}, path, _opts), do: {:ok, "fake:#{path}"}
+
+  @impl true
+  def list_files(%Session{}, path, _opts), do: {:ok, [FileRef.new!(path: path)]}
+
+  @impl true
+  def delete_file(%Session{}, _path, _opts), do: :ok
+
+  @impl true
+  def checkpoint(%Session{} = session, _spec, _opts) do
+    Checkpoint.new(
+      id: "checkpoint-1",
+      session_id: session.id,
+      backend: session.backend,
+      ref: "checkpoint://fake/1"
+    )
+  end
+
+  @impl true
+  def restore(%Session{} = session, %Checkpoint{}, _opts), do: {:ok, session}
+  def restore(%Session{} = session, _checkpoint_ref, _opts), do: {:ok, session}
+
+  @impl true
+  def start_service(%Session{} = session, spec, _opts) do
+    Service.new(
+      id: "service-1",
+      session_id: session.id,
+      name: to_string(Map.get(Map.new(spec), :name, "fake")),
+      status: :running
+    )
+  end
+
+  @impl true
+  def stop_service(%Session{}, _service, _opts), do: :ok
+
+  @impl true
+  def list_services(%Session{} = session, _opts) do
+    {:ok, [Service.new!(id: "service-1", session_id: session.id, name: "fake", status: :running)]}
+  end
+
+  @impl true
+  def open_proxy(%Session{} = session, service, _opts) do
+    service_id = if is_binary(service), do: service, else: service.id
+
+    Proxy.new(
+      id: "proxy-1",
+      session_id: session.id,
+      backend: session.backend,
+      service_id: service_id,
+      status: :open,
+      url: "http://127.0.0.1:9999",
+      local_port: 9999
+    )
+  end
+
+  @impl true
+  def close_proxy(_proxy, _opts), do: :ok
+
+  @impl true
+  def acquire_lease(%Session{} = session, resource, _opts) do
+    RunicSandbox.Lease.new(
+      id: "lease-1",
+      session_id: session.id,
+      backend: session.backend,
+      resource: resource,
+      mode: :exclusive,
+      status: :active
+    )
+  end
+
+  @impl true
+  def release_lease(_lease, _opts), do: :ok
+
+  def unsupported_for_test(operation, subject),
+    do: RunicSandbox.Backend.unsupported(operation, subject)
+
+  def error_for_test(message), do: Error.validation(message, source: __MODULE__)
+end

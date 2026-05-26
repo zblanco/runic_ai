@@ -277,14 +277,14 @@ defmodule RunicAI.Assistant.RLM.BlueprintGraph do
         |> Multigraph.in_edges(spec, by: :flow)
         |> Enum.map(& &1.v1)
 
-      if Enum.any?(parents, &(&1.type == :source_splitter)) do
+      if Enum.any?(parents, &(&1.type in [:source_splitter, :lambda_split])) do
         []
       else
         [
           diagnostic(
             :error,
             :missing_source_splitter,
-            "source_materializer requires source_splitter output, not raw discovery or arbitrary transformed values",
+            "source_materializer requires source_splitter or lambda_split output, not raw discovery or arbitrary transformed values",
             %{
               component_id: spec.id,
               parent_component_ids: Enum.map(parents, & &1.id),

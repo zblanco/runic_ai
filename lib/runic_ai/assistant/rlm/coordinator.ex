@@ -16,10 +16,21 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   alias RunicAI.Error
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
+  alias RunicAI.RLM.StrategyRouter
+  alias RunicAI.RLM.SubagentAssignment
+  alias RunicAI.Sandbox.GeneratedComponentWorkflow
 
   @default_split_bytes 8_000
   @default_model "openai:gpt-5.4-mini"
   @default_generation_mode :json_text
+  @component_builder_tools [
+    "open_sandbox_session",
+    "sandbox_write_file",
+    "sandbox_exec",
+    "sandbox_read_file",
+    "sandbox_list_files",
+    "close_sandbox_session"
+  ]
 
   @spec propose(Workspace.t(), String.t(), keyword()) ::
           {:ok, WorkflowBlueprint.t()} | {:error, Error.t()}
@@ -29,8 +40,28 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       Keyword.has_key?(opts, :blueprint) ->
         WorkflowBlueprint.from_input(Keyword.fetch!(opts, :blueprint))
 
+      Keyword.has_key?(opts, :generated_components) ->
+        GeneratedComponentWorkflow.compose(
+          objective,
+          Keyword.fetch!(opts, :generated_components),
+          generated_component_workflow_opts(opts)
+        )
+
+      Keyword.has_key?(opts, :generated_component) ->
+        GeneratedComponentWorkflow.compose(
+          objective,
+          Keyword.fetch!(opts, :generated_component),
+          generated_component_workflow_opts(opts)
+        )
+
+      dynamic_strategy?(opts) ->
+        dynamic_blueprint(workspace, objective, opts)
+
       fallback_strategy?(opts) ->
         fallback_blueprint(workspace, objective, opts)
+
+      routed_strategy?(opts) ->
+        routed_blueprint(workspace, objective, opts)
 
       match?({:ok, _shape}, curated_recipe_shape(workspace, objective, opts)) ->
         {:ok, shape} = curated_recipe_shape(workspace, objective, opts)
@@ -39,11 +70,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
         |> fallback_blueprint(objective, Keyword.put(opts, :fallback_shape, shape))
         |> tag_curated_recipe(shape)
 
+      evidence_first_default?(opts) ->
+        routed_blueprint(workspace, objective, opts)
+
       true ->
-        case generated_blueprint(workspace, objective, opts) do
-          {:ok, blueprint} -> {:ok, blueprint}
-          {:error, %Error{} = error} -> maybe_fallback(workspace, objective, opts, error)
-        end
+        dynamic_blueprint(workspace, objective, opts)
     end
   end
 
@@ -104,6 +135,37 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   @spec schema() :: keyword()
   def schema, do: BlueprintProposalPrompt.schema()
 
+  @spec route(Workspace.t(), String.t(), keyword()) :: StrategyRouter.t()
+  def route(%Workspace{} = workspace, objective, opts \\ [])
+      when is_binary(objective) and objective != "" and is_list(opts) do
+    StrategyRouter.route(objective, workspace, opts)
+  end
+
+  @spec component_builder_assignment(Workspace.t(), String.t(), keyword()) ::
+          {:ok, SubagentAssignment.t()} | {:error, Error.t()}
+  def component_builder_assignment(%Workspace{} = workspace, objective, opts \\ [])
+      when is_binary(objective) and objective != "" and is_list(opts) do
+    decision = route(workspace, objective, Keyword.put(opts, :repeated_transform?, true))
+    id = Keyword.get(opts, :id, "component_builder:#{System.unique_integer([:positive])}")
+
+    SubagentAssignment.new(
+      id: id,
+      role: Keyword.get(opts, :role, "component_builder"),
+      objective: objective,
+      prompt: component_builder_prompt(objective, opts),
+      strategy: :generated_sandbox_component,
+      agent_kind: :workflow,
+      context_slice: Keyword.get(opts, :context_slice),
+      capability_profile: Keyword.get(opts, :capability_profile, :local_workbench),
+      visible_tools: Keyword.get(opts, :visible_tools, @component_builder_tools),
+      budgets: component_builder_budgets(decision, opts),
+      output_schema: component_builder_output_schema(),
+      review_policy: component_builder_review_policy(opts),
+      parent: component_builder_parent(decision, opts),
+      metadata: component_builder_metadata(decision, opts)
+    )
+  end
+
   @spec enforce_runtime_scorecard_params(WorkflowBlueprint.t(), keyword()) ::
           WorkflowBlueprint.t()
   def enforce_runtime_scorecard_params(%WorkflowBlueprint{} = blueprint, opts) do
@@ -148,6 +210,13 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     end
   end
 
+  defp dynamic_blueprint(%Workspace{} = workspace, objective, opts) do
+    case generated_blueprint(workspace, objective, opts) do
+      {:ok, blueprint} -> {:ok, blueprint}
+      {:error, %Error{} = error} -> maybe_fallback(workspace, objective, opts, error)
+    end
+  end
+
   defp maybe_repair_generated(
          {:ok, blueprint},
          _workspace,
@@ -159,7 +228,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
        do: {:ok, blueprint}
 
   defp maybe_repair_generated({:error, error}, workspace, objective, manifest, object, opts) do
-    RepairLoop.repair_blueprint_object(workspace, objective, manifest, object, error, opts)
+    if strategy_change_repair?(opts) do
+      strategy_change_repair_blueprint(workspace, objective, error, opts)
+    else
+      RepairLoop.repair_blueprint_object(workspace, objective, manifest, object, error, opts)
+    end
   end
 
   defp validate_generated_candidate(object, opts, stage) do
@@ -261,6 +334,198 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       Keyword.get(opts, :dynamic_blueprint?, true) in [false, "false"]
   end
 
+  defp dynamic_strategy?(opts) do
+    Keyword.get(opts, :proposal_strategy) in [
+      :dynamic,
+      "dynamic",
+      :full_graph,
+      "full_graph",
+      "full-graph",
+      :generated_blueprint,
+      "generated_blueprint",
+      "generated-blueprint"
+    ]
+  end
+
+  defp routed_strategy?(opts) do
+    Keyword.get(opts, :proposal_strategy) in [
+      :routed,
+      "routed",
+      :evidence_first,
+      "evidence_first",
+      "evidence-first",
+      :least_powerful,
+      "least_powerful",
+      "least-powerful"
+    ] or
+      Keyword.get(opts, :strategy_router?, false) in [true, "true"]
+  end
+
+  defp evidence_first_default?(opts) do
+    Keyword.get(opts, :proposal_strategy) in [nil, ""] and
+      Keyword.get(opts, :dynamic_blueprint?) in [nil, true, "true"]
+  end
+
+  defp routed_blueprint(%Workspace{} = workspace, objective, opts) do
+    decision = route(workspace, objective, opts)
+
+    opts =
+      opts
+      |> Keyword.put_new(:fallback_shape, routed_fallback_shape(decision.strategy))
+      |> Keyword.put(:dynamic_blueprint?, false)
+
+    with {:ok, blueprint} <- fallback_blueprint(workspace, objective, opts) do
+      {:ok,
+       %{
+         blueprint
+         | metadata:
+             blueprint.metadata
+             |> Map.put(:proposal_kind, :routed_strategy)
+             |> Map.put(:strategy_route, StrategyRouter.metadata(decision))
+       }}
+    end
+  end
+
+  defp strategy_change_repair?(opts) do
+    Keyword.get(opts, :strategy_change_repair?, false) in [true, "true"] or
+      repair_attempts(opts) >= Keyword.get(opts, :max_same_shape_repairs, 2)
+  end
+
+  defp repair_attempts(opts) do
+    case Keyword.get(opts, :repair_attempts, Keyword.get(opts, :same_shape_repair_attempts, 0)) do
+      value when is_integer(value) and value >= 0 -> value
+      value when is_binary(value) -> parse_non_negative_integer(value)
+      _other -> 0
+    end
+  end
+
+  defp parse_non_negative_integer(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer >= 0 -> integer
+      _other -> 0
+    end
+  end
+
+  defp strategy_change_repair_blueprint(
+         %Workspace{} = workspace,
+         objective,
+         %Error{} = error,
+         opts
+       ) do
+    decision = route(workspace, objective, opts)
+
+    opts =
+      opts
+      |> Keyword.put(:fallback_shape, routed_fallback_shape(decision.fallback))
+      |> Keyword.put(:dynamic_blueprint?, false)
+
+    with {:ok, blueprint} <- fallback_blueprint(workspace, objective, opts) do
+      {:ok,
+       %{
+         blueprint
+         | metadata:
+             blueprint.metadata
+             |> Map.put(:proposal_kind, :strategy_change_repair)
+             |> Map.put(:strategy_route, StrategyRouter.metadata(decision))
+             |> Map.put(:rerouted_to, decision.fallback)
+             |> Map.put(:repair_failure, %{message: error.message, details: error.details})
+       }}
+    end
+  end
+
+  defp routed_fallback_shape(:direct_standard_agent), do: :direct_response
+  defp routed_fallback_shape(:sandbox_repl), do: :direct_response
+  defp routed_fallback_shape(:host_edit_workflow), do: :direct_response
+  defp routed_fallback_shape(:subagent_delegation), do: :split_map_reduce_report
+  defp routed_fallback_shape(:lambda_workflow), do: :split_map_reduce_report
+  defp routed_fallback_shape(:generated_sandbox_component), do: :parse_normalize_report
+
+  defp component_builder_prompt(objective, opts) do
+    """
+    Build and verify one sandbox-generated component for this objective.
+
+    Objective:
+    #{objective}
+
+    Requirements:
+    - Propose the component contract before writing code.
+    - Write source and tests only inside the sandbox session.
+    - Keep sandbox networking disabled unless the assignment review policy allows escalation.
+    - Return a verified GeneratedComponent contract, source/test artifact refs, verification diagnostics, and any reviewer notes.
+    - Do not materialize code into the host repository.
+    #{Keyword.get(opts, :prompt_suffix, "")}
+    """
+    |> String.trim()
+  end
+
+  defp component_builder_budgets(%StrategyRouter{} = decision, opts) do
+    decision.budgets
+    |> Map.merge(%{
+      max_sandbox_executions: Keyword.get(opts, :max_sandbox_executions, 6),
+      max_repair_attempts: Keyword.get(opts, :max_repair_attempts, 2)
+    })
+    |> Map.merge(Keyword.get(opts, :budgets, %{}))
+  end
+
+  defp component_builder_output_schema do
+    %{
+      required: [
+        "generated_component",
+        "source_artifacts",
+        "test_artifacts",
+        "verification",
+        "claims"
+      ],
+      claims: %{
+        required: ["claim", "evidence_refs", "confidence", "reviewer_notes"]
+      }
+    }
+  end
+
+  defp component_builder_review_policy(opts) do
+    %{
+      review_gates: ["sandbox_exec", "sandbox_write_file", "generated_component_promotion"],
+      network: :disabled,
+      host_materialization: :requires_review
+    }
+    |> Map.merge(Keyword.get(opts, :review_policy, %{}))
+  end
+
+  defp component_builder_parent(%StrategyRouter{} = decision, opts) do
+    cond do
+      Keyword.has_key?(opts, :parent) ->
+        Keyword.get(opts, :parent)
+
+      Keyword.get(opts, :run_id) ->
+        %{
+          run_id: Keyword.get(opts, :run_id),
+          strategy: decision.strategy,
+          fallback: decision.fallback,
+          depth: Keyword.get(opts, :depth, 0),
+          remaining_budgets: decision.budgets
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp component_builder_metadata(%StrategyRouter{} = decision, opts) do
+    %{
+      assignment_kind: :component_builder,
+      coordinator: __MODULE__,
+      strategy_route: StrategyRouter.metadata(decision),
+      promotion_target: Keyword.get(opts, :promotion_target, :ephemeral),
+      generated_component_policy: %{
+        require_contract_first?: true,
+        require_tests?: true,
+        network: :disabled,
+        host_materialization: :requires_review
+      }
+    }
+    |> Map.merge(Keyword.get(opts, :metadata, %{}))
+  end
+
   defp curated_recipe_shape(_workspace, objective, opts) do
     if Keyword.get(opts, :curated_recipes?, true) do
       sources = normalize_sources(Keyword.get(opts, :input_paths, Keyword.get(opts, :inputs, [])))
@@ -321,6 +586,31 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       max_nodes: Keyword.get(opts, :max_nodes)
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp generated_component_workflow_opts(opts) do
+    opts
+    |> Keyword.take([
+      :id,
+      :sources,
+      :component_ids,
+      :component_params,
+      :component_policy,
+      :scorecard_id,
+      :scorecard_params,
+      :edge_strategy,
+      :stop_conditions,
+      :policies,
+      :metadata,
+      :validate?,
+      :profile,
+      :toolsets,
+      :disabled_tools,
+      :max_generated_function_tier,
+      :max_nodes,
+      :sandbox_session_registry
+    ])
+    |> Keyword.put_new(:metadata, %{proposal_kind: :generated_component_composition})
   end
 
   defp normalize_sources([]), do: []

@@ -14,6 +14,7 @@ defmodule RunicAI.Agent.CapabilityResolver do
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
   alias RunicAI.Tool.Registry
+  alias RunicSandbox.Error, as: SandboxError
 
   @known_toolsets [
     :file,
@@ -132,6 +133,7 @@ defmodule RunicAI.Agent.CapabilityResolver do
          {:ok, configured_toolsets} <- configured_toolsets(preset, opts),
          {:ok, disabled_tools} <- normalize_tool_names(Keyword.get(opts, :disabled_tools, [])),
          {:ok, command_policy} <- command_policy(preset, configured_toolsets, opts),
+         :ok <- validate_sandbox_config(opts),
          registry <- coding_registry(workspace, command_policy, opts),
          tools_by_toolset <- tools_by_toolset(registry),
          {:ok, disabled_available_tools} <- validate_disabled_tools(disabled_tools, registry),
@@ -226,9 +228,48 @@ defmodule RunicAI.Agent.CapabilityResolver do
           Map.fetch!(@preset_toolsets, preset) ++ explicit_toolsets
         end
 
-      {:ok, Enum.uniq(toolsets)}
+      {:ok, toolsets |> Enum.uniq() |> maybe_disable_code_execution(explicit_toolsets, opts)}
     end
   end
+
+  defp maybe_disable_code_execution(toolsets, explicit_toolsets, opts) do
+    if code_execution_enabled?(explicit_toolsets, opts) do
+      toolsets
+    else
+      Enum.reject(toolsets, &(&1 == :code_execution))
+    end
+  end
+
+  defp code_execution_enabled?(explicit_toolsets, opts) do
+    :code_execution in explicit_toolsets or
+      truthy?(Keyword.get(opts, :enable_code_execution?)) or
+      truthy?(Keyword.get(opts, :code_execution_enabled?)) or
+      truthy?(get_in_config(Keyword.get(opts, :tool_config, %{}), [:code_execution, :enabled])) or
+      application_code_execution_enabled?()
+  end
+
+  defp application_code_execution_enabled? do
+    :runic_ai
+    |> Application.get_env(:sandbox, [])
+    |> case do
+      config when is_list(config) ->
+        truthy?(Keyword.get(config, :enable_code_execution?)) or
+          truthy?(Keyword.get(config, :code_execution_enabled?))
+
+      config when is_map(config) ->
+        truthy?(
+          Map.get(config, :enable_code_execution?, Map.get(config, "enable_code_execution?"))
+        ) or
+          truthy?(
+            Map.get(config, :code_execution_enabled?, Map.get(config, "code_execution_enabled?"))
+          )
+
+      _other ->
+        false
+    end
+  end
+
+  defp truthy?(value), do: value in [true, "true", 1, "1", true, "yes", "on"]
 
   defp coding_registry(%Workspace{} = workspace, %CommandPolicy{} = command_policy, opts) do
     Tools.default_registry(workspace,
@@ -241,7 +282,9 @@ defmodule RunicAI.Agent.CapabilityResolver do
       web_opts: Keyword.get(opts, :web_opts, web_opts(opts)),
       media_opts: Keyword.get(opts, :media_opts, media_opts(opts)),
       browser_opts: Keyword.get(opts, :browser_opts, browser_opts(opts)),
-      delegate_opts: Keyword.get(opts, :delegate_opts, delegate_opts(opts))
+      delegate_opts: Keyword.get(opts, :delegate_opts, delegate_opts(opts)),
+      sandbox_opts: Keyword.get(opts, :sandbox_opts, sandbox_opts(opts)),
+      sandbox_session_registry: Keyword.get(opts, :sandbox_session_registry)
     )
   end
 
@@ -416,6 +459,91 @@ defmodule RunicAI.Agent.CapabilityResolver do
     end
   end
 
+  defp sandbox_opts(opts) do
+    opts
+    |> Keyword.get(:tool_config, %{})
+    |> get_in_config([:code_execution])
+    |> case do
+      config when is_map(config) ->
+        sandbox = config |> config_value(:sandbox, :local_code) |> sandbox_atom(:local_code)
+
+        backend =
+          config
+          |> config_value(:backend, config_value(config, :default_backend, :just_bash))
+          |> sandbox_backend()
+
+        runtimes =
+          config
+          |> config_value(:allowed_runtimes, config_value(config, :runtimes, [:bash]))
+          |> sandbox_runtime_list()
+
+        [
+          profile: [
+            name: sandbox,
+            backend: backend,
+            runtimes: runtimes,
+            isolation_level: config_value(config, :isolation_level, nil),
+            policy: sandbox_policy(config),
+            network: config_value(config, :network, :disabled),
+            stateful?: config_value(config, :stateful?, false),
+            pool: config_value(config, :pool, %{warm: 0, max: 1}),
+            workspace: config_value(config, :workspace, %{mode: :copy_in, persist?: false}),
+            backend_options: sandbox_backend_options(config),
+            metadata: sandbox_metadata(config)
+          ]
+        ]
+
+      _other ->
+        []
+    end
+  end
+
+  defp sandbox_policy(config) do
+    case config_value(config, :isolation_minimum, nil) do
+      nil -> []
+      isolation_minimum -> [isolation_minimum: isolation_minimum]
+    end
+  end
+
+  defp validate_sandbox_config(opts) do
+    case sandbox_opts(opts) do
+      [profile: profile] ->
+        case RunicSandbox.Profile.new(profile) do
+          {:ok, _profile} -> :ok
+          {:error, error} -> {:error, sandbox_error_to_runic_ai_error(error)}
+        end
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp sandbox_backend_options(config) do
+    config = normalize_map(config)
+
+    nested =
+      config_value(config, :backend_options, %{})
+      |> normalize_map()
+      |> Map.new(fn {key, value} -> {normalize_config_key(key), value} end)
+
+    config
+    |> Map.take([:image, "image", :executable, "executable", :sudo?, "sudo?"])
+    |> Map.new(fn {key, value} -> {normalize_config_key(key), value} end)
+    |> Map.merge(nested)
+  end
+
+  defp sandbox_metadata(config) do
+    config = normalize_map(config)
+
+    [:state_model, :transport_model, :session, :checkpoint_policy, :service_policy]
+    |> Enum.reduce(%{}, fn key, acc ->
+      case config_value(config, key, nil) do
+        nil -> acc
+        value -> Map.put(acc, key, value)
+      end
+    end)
+  end
+
   defp browser_backend(nil), do: nil
   defp browser_backend(:agent_browser), do: RunicAI.Browser.Backends.AgentBrowser
   defp browser_backend("agent_browser"), do: RunicAI.Browser.Backends.AgentBrowser
@@ -470,9 +598,14 @@ defmodule RunicAI.Agent.CapabilityResolver do
         timeout_ms: terminal_timeout(opts, 120_000)
       },
       code_execution: %{
-        backends: [:just_bash],
-        runtimes: [:bash],
+        sandbox: :local_code,
+        default_backend: :just_bash,
+        allowed_runtimes: [:bash],
         isolation_level: :in_process_virtual,
+        network: :disabled,
+        stateful?: false,
+        pool: %{warm: 0, max: 1},
+        workspace: %{mode: :copy_in, persist?: false},
         review: :unsafe_actions
       },
       computing: %{components: [:enum, :stream, :string, :json, :file, :calendar, :io]},
@@ -515,6 +648,70 @@ defmodule RunicAI.Agent.CapabilityResolver do
       write_policy: Keyword.get(opts, :write_policy, :docs_only),
       network: :disabled_by_default
     }
+  end
+
+  defp config_value(config, key, default) do
+    Map.get(config, key, Map.get(config, Atom.to_string(key), default))
+  end
+
+  defp normalize_map(value) when is_map(value), do: value
+  defp normalize_map(value) when is_list(value), do: Map.new(value)
+  defp normalize_map(_value), do: %{}
+
+  defp normalize_config_key("image"), do: :image
+  defp normalize_config_key("executable"), do: :executable
+  defp normalize_config_key("sudo?"), do: :sudo?
+  defp normalize_config_key(key), do: key
+
+  defp sandbox_runtime_list(runtimes) when is_list(runtimes), do: runtimes
+
+  defp sandbox_runtime_list(runtimes) when is_binary(runtimes) do
+    runtimes
+    |> String.split([",", "\n"], trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp sandbox_runtime_list(runtime) when is_atom(runtime), do: [runtime]
+  defp sandbox_runtime_list(_runtime), do: [:bash]
+
+  defp sandbox_atom(value, _fallback) when is_atom(value), do: value
+
+  defp sandbox_atom(value, fallback) when is_binary(value) and value != "" do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> fallback
+  end
+
+  defp sandbox_atom(_value, fallback), do: fallback
+
+  defp sandbox_backend(value) when is_atom(value), do: value
+
+  defp sandbox_backend(value) when is_binary(value) and value != "" do
+    case value do
+      "just_bash" -> :just_bash
+      "lua" -> :lua
+      "wasmtime" -> :wasmtime
+      "docker" -> :docker
+      "podman" -> :podman
+      "gvisor" -> :gvisor
+      "vmsan" -> :vmsan
+      "firecracker" -> :firecracker
+      "sprites" -> :sprites
+      "remote" -> :remote
+      _other -> value
+    end
+  end
+
+  defp sandbox_backend(value), do: value
+
+  defp sandbox_error_to_runic_ai_error(%SandboxError{} = error) do
+    Error.new(error.kind, error.message,
+      details: error.details,
+      source: error.source,
+      retryable?: error.retryable?,
+      metadata: error.metadata
+    )
   end
 
   defp tools_by_toolset(%Registry{tools: tools}) do
@@ -588,7 +785,23 @@ defmodule RunicAI.Agent.CapabilityResolver do
       name in ["run_command"] ->
         :terminal
 
-      name in ["execute_code", "sandbox_status"] ->
+      name in [
+        "execute_code",
+        "sandbox_status",
+        "open_sandbox_session",
+        "close_sandbox_session",
+        "sandbox_exec",
+        "sandbox_write_file",
+        "sandbox_read_file",
+        "sandbox_list_files",
+        "checkpoint_sandbox",
+        "restore_sandbox",
+        "start_sandbox_service",
+        "stop_sandbox_service",
+        "list_sandbox_services",
+        "open_sandbox_proxy",
+        "close_sandbox_proxy"
+      ] ->
         :code_execution
 
       name in ["memory_write", "memory_recall"] ->
@@ -639,7 +852,23 @@ defmodule RunicAI.Agent.CapabilityResolver do
       ],
       verify: ["source_assert", "changed_file_inventory"],
       process: ["start_process", "process_poll", "process_log", "process_write", "process_kill"],
-      code_execution: ["execute_code", "sandbox_status"],
+      code_execution: [
+        "execute_code",
+        "sandbox_status",
+        "open_sandbox_session",
+        "close_sandbox_session",
+        "sandbox_exec",
+        "sandbox_write_file",
+        "sandbox_read_file",
+        "sandbox_list_files",
+        "checkpoint_sandbox",
+        "restore_sandbox",
+        "start_sandbox_service",
+        "stop_sandbox_service",
+        "list_sandbox_services",
+        "open_sandbox_proxy",
+        "close_sandbox_proxy"
+      ],
       memory: ["memory_write", "memory_recall"],
       session_search: ["session_search"],
       web: ["web_search", "web_extract"],
@@ -830,10 +1059,25 @@ defmodule RunicAI.Agent.CapabilityResolver do
   end
 
   defp deep_merge(left, right) when is_map(left) and is_map(right) do
-    Map.merge(left, right, fn _key, left_value, right_value ->
-      deep_merge(left_value, right_value)
+    Enum.reduce(right, left, fn {key, right_value}, acc ->
+      key = equivalent_existing_key(acc, key)
+      Map.update(acc, key, right_value, &deep_merge(&1, right_value))
     end)
   end
 
   defp deep_merge(_left, right), do: right
+
+  defp equivalent_existing_key(map, key) when is_map(map) and is_binary(key) do
+    Enum.find(Map.keys(map), key, fn
+      existing when is_atom(existing) -> Atom.to_string(existing) == key
+      existing -> existing == key
+    end)
+  end
+
+  defp equivalent_existing_key(map, key) when is_map(map) and is_atom(key) do
+    string_key = Atom.to_string(key)
+    Enum.find(Map.keys(map), key, &(&1 == string_key or &1 == key))
+  end
+
+  defp equivalent_existing_key(_map, key), do: key
 end

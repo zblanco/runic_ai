@@ -22,6 +22,30 @@ defmodule RunicAI.RLM.ComponentCatalog do
     :artifact_compute,
     :time_compute,
     :score_compute,
+    :artifact_materializer,
+    :sandbox_status,
+    :sandbox_execute,
+    :sandbox_open_session,
+    :sandbox_session_exec,
+    :sandbox_write_file,
+    :sandbox_read_file,
+    :sandbox_list_files,
+    :sandbox_checkpoint,
+    :sandbox_restore,
+    :sandbox_close_session,
+    :sandbox_start_service,
+    :sandbox_stop_service,
+    :sandbox_list_services,
+    :sandbox_open_proxy,
+    :sandbox_close_proxy,
+    :lambda_plan,
+    :lambda_split,
+    :lambda_map,
+    :lambda_filter,
+    :lambda_reduce,
+    :lambda_cross,
+    :lambda_review,
+    :lambda_generate,
     :tool_leaf,
     :llm_leaf,
     :report_composer,
@@ -194,6 +218,157 @@ defmodule RunicAI.RLM.ComponentCatalog do
   defp entry!(:time_compute), do: computing_entry(:time_compute, "Time/calendar result")
   defp entry!(:score_compute), do: computing_entry(:score_compute, "Scoring/ranking result")
 
+  defp entry!(:artifact_materializer) do
+    %{
+      type: :artifact_materializer,
+      execution_shape: :step,
+      inputs: ValueContract.input([:tool_result, :artifact, :computed, :any], "Artifact refs"),
+      outputs: ValueContract.output(:materialized_slices, "Bounded artifact previews")
+    }
+  end
+
+  defp entry!(:sandbox_status) do
+    %{
+      type: :sandbox_status,
+      execution_shape: :side_effect_step,
+      inputs: ValueContract.input(:any, "Optional sandbox status selector"),
+      outputs: ValueContract.output(:tool_result, "Sandbox backend and capability status")
+    }
+  end
+
+  defp entry!(:sandbox_execute) do
+    %{
+      type: :sandbox_execute,
+      execution_shape: :side_effect_step,
+      inputs: ValueContract.input(:any, "Sandbox code execution input"),
+      outputs: ValueContract.output(:tool_result, "Sandbox execution result with diagnostics")
+    }
+  end
+
+  defp entry!(:lambda_plan) do
+    %{
+      type: :lambda_plan,
+      execution_shape: :step,
+      inputs:
+        ValueContract.input(
+          [:assistant_input, :source_request, :source_set, :any],
+          "Objective and external context refs for Lambda planning"
+        ),
+      outputs: ValueContract.output(:lambda_plan, "Validated Lambda decomposition plan")
+    }
+  end
+
+  defp entry!(:lambda_split) do
+    %{
+      type: :lambda_split,
+      execution_shape: :step,
+      inputs: ValueContract.input([:lambda_plan, :source_set, :source_request], "Lambda plan"),
+      outputs: ValueContract.output(:source_slices, "Bounded Lambda context slices")
+    }
+  end
+
+  defp entry!(:lambda_map) do
+    %{
+      type: :lambda_map,
+      execution_shape: :map,
+      inputs:
+        ValueContract.input(
+          [:source_slices, :materialized_slices, :records],
+          "Lambda leaf inputs"
+        ),
+      outputs: ValueContract.output(:llm_items, "Lambda leaf outputs")
+    }
+  end
+
+  defp entry!(:lambda_filter) do
+    %{
+      type: :lambda_filter,
+      execution_shape: :step,
+      inputs:
+        ValueContract.input(
+          [:source_slices, :records, :llm_items],
+          "Lambda items to filter before reduction"
+        ),
+      outputs: ValueContract.output(:any, "Filtered Lambda items")
+    }
+  end
+
+  defp entry!(:lambda_reduce) do
+    %{
+      type: :lambda_reduce,
+      execution_shape: :reduce,
+      inputs:
+        ValueContract.input(
+          [:llm_items, :records, :record_items, :record_groups],
+          "Lambda outputs to reduce"
+        ),
+      outputs: ValueContract.output(:synthesis, "Reduced Lambda synthesis")
+    }
+  end
+
+  defp entry!(:lambda_cross) do
+    %{
+      type: :lambda_cross,
+      execution_shape: :step,
+      inputs:
+        ValueContract.input(
+          [:source_slices, :materialized_slices, :records, :llm_items],
+          "Lambda items to compare pairwise or across sections"
+        ),
+      outputs: ValueContract.output(:comparisons, "Lambda cross-comparison outputs")
+    }
+  end
+
+  defp entry!(:lambda_review) do
+    %{
+      type: :lambda_review,
+      execution_shape: :step,
+      inputs:
+        ValueContract.input(
+          [:llm_items, :records, :record_groups, :synthesis, :report],
+          "Lambda intermediate output to review"
+        ),
+      outputs: ValueContract.output(:scorecard, "Lambda review scorecard")
+    }
+  end
+
+  defp entry!(:lambda_generate) do
+    %{
+      type: :lambda_generate,
+      execution_shape: :step,
+      inputs:
+        ValueContract.input(
+          [:scorecard, :synthesis, :record_groups, :llm_items, :comparisons],
+          "Reviewed Lambda intermediates"
+        ),
+      outputs: ValueContract.output(:report, "Generated Lambda final output")
+    }
+  end
+
+  defp entry!(type)
+       when type in [
+              :sandbox_open_session,
+              :sandbox_session_exec,
+              :sandbox_write_file,
+              :sandbox_read_file,
+              :sandbox_list_files,
+              :sandbox_checkpoint,
+              :sandbox_restore,
+              :sandbox_close_session,
+              :sandbox_start_service,
+              :sandbox_stop_service,
+              :sandbox_list_services,
+              :sandbox_open_proxy,
+              :sandbox_close_proxy
+            ] do
+    %{
+      type: type,
+      execution_shape: :side_effect_step,
+      inputs: ValueContract.input(:any, "Sandbox session operation input"),
+      outputs: ValueContract.output(:tool_result, "Sandbox session operation result")
+    }
+  end
+
   defp entry!(:llm_leaf) do
     %{
       type: :llm_leaf,
@@ -344,6 +519,32 @@ defmodule RunicAI.RLM.ComponentCatalog do
     end
   end
 
+  defp normalize_params(:sandbox_execute, params) do
+    with {:ok, params} <- ensure_map(params),
+         :ok <- validate_optional_positive_integer(params, :timeout_ms),
+         :ok <- validate_optional_positive_integer(params, :max_output_bytes) do
+      {:ok, params}
+    end
+  end
+
+  defp normalize_params(:artifact_materializer, params) do
+    with {:ok, params} <- ensure_map(params),
+         :ok <- validate_optional_positive_integer(params, :max_bytes),
+         :ok <- validate_optional_positive_integer(params, :max_artifacts) do
+      {:ok, params}
+    end
+  end
+
+  defp normalize_params(:lambda_plan, params) do
+    with {:ok, params} <- ensure_map(params),
+         :ok <- validate_optional_positive_integer(params, :leaf_window),
+         :ok <- validate_optional_positive_integer(params, :max_depth),
+         :ok <- validate_optional_positive_integer(params, :max_leaf_calls),
+         :ok <- validate_optional_positive_integer(params, :max_concurrency) do
+      {:ok, params}
+    end
+  end
+
   defp normalize_params(_type, params), do: ensure_map(params)
 
   defp normalize_ports([], default, _field), do: {:ok, default}
@@ -457,10 +658,20 @@ defmodule RunicAI.RLM.ComponentCatalog do
         if(native_runic?(params) or native_runic?(policy), do: default_native_shape(type))
 
     case {type, requested} do
-      {type, :map} when type in [:llm_map, :record_map, :blueprint_transform] -> :map
-      {:blueprint_reduce, :reduce} -> :reduce
-      {:record_group, :reduce} -> :reduce
-      _other -> entry.execution_shape
+      {type, :map} when type in [:llm_map, :record_map, :blueprint_transform, :lambda_map] ->
+        :map
+
+      {:blueprint_reduce, :reduce} ->
+        :reduce
+
+      {:lambda_reduce, :reduce} ->
+        :reduce
+
+      {:record_group, :reduce} ->
+        :reduce
+
+      _other ->
+        entry.execution_shape
     end
   end
 
@@ -472,10 +683,13 @@ defmodule RunicAI.RLM.ComponentCatalog do
 
   defp native_execution_shape(_map), do: nil
 
-  defp default_native_shape(type) when type in [:llm_map, :record_map, :blueprint_transform],
-    do: :map
+  defp default_native_shape(type)
+       when type in [:llm_map, :record_map, :blueprint_transform, :lambda_map],
+       do: :map
 
-  defp default_native_shape(type) when type in [:blueprint_reduce, :record_group], do: :reduce
+  defp default_native_shape(type) when type in [:blueprint_reduce, :record_group, :lambda_reduce],
+    do: :reduce
+
   defp default_native_shape(_type), do: nil
 
   defp native_runic?(map) when is_map(map) do

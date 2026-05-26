@@ -77,7 +77,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     File.rm_rf(root)
   end
 
-  test "optional deterministic command checks are review-grade skipped unless their env is enabled" do
+  test "optional deterministic command checks stay visible without blocking required pass status" do
     root =
       Path.join(
         System.tmp_dir!(),
@@ -108,8 +108,10 @@ defmodule RunicAI.RLM.RobustnessTest do
       )
 
     skipped = DeterministicChecks.evaluate(scenario, root)
-    assert skipped.status == :review
+    assert skipped.status == :pass
     assert skipped.skipped == 1
+    assert skipped.optional_skipped == 1
+    assert skipped.required_skipped == 0
     assert [%{status: :skipped, details: %{skipped?: true, optional?: true}}] = skipped.checks
 
     System.put_env(env, "1")
@@ -1015,8 +1017,13 @@ defmodule RunicAI.RLM.RobustnessTest do
 
     assert [
              %{
-               status: :review,
-               deterministic: %{status: :review, skipped: 2},
+               status: :pass,
+               deterministic: %{
+                 status: :pass,
+                 skipped: 2,
+                 optional_skipped: 2,
+                 required_skipped: 0
+               },
                evidence: %{
                  objective_loop: %{
                    status: :review_approved_and_resumed,
@@ -1043,7 +1050,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "Objective review approval required"
 
     assert File.read!(result.matrix_path) =~
-             "| opslogic_objective_loop_approval_resume | rlm | review"
+             "| opslogic_objective_loop_approval_resume | rlm | pass"
   end
 
   test "live OpsLogic objective-loop lane requests budget, resumes, and verifies" do
@@ -1059,8 +1066,13 @@ defmodule RunicAI.RLM.RobustnessTest do
 
     assert [
              %{
-               status: :review,
-               deterministic: %{status: :review, skipped: 2},
+               status: :pass,
+               deterministic: %{
+                 status: :pass,
+                 skipped: 2,
+                 optional_skipped: 2,
+                 required_skipped: 0
+               },
                evidence: %{
                  objective_loop: %{
                    status: :budget_approved_and_resumed,
@@ -1088,7 +1100,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "Objective budget approval required"
 
     assert File.read!(result.matrix_path) =~
-             "| opslogic_objective_loop_budget_resume | rlm | review"
+             "| opslogic_objective_loop_budget_resume | rlm | pass"
   end
 
   test "live lane errors fail with explicit lane blocking evidence" do

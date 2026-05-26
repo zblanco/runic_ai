@@ -13,6 +13,7 @@ defmodule RunicAI.Coding.Recipe do
   @git_read_tools ~w(git_status git_diff git_log git_show git_branch)
   @patch_tools ~w(apply_patch)
   @verification_tools ~w(compile_project run_tests run_formatter project_command runtime_smoke source_assert changed_file_inventory)
+  @code_execution_tools ~w(execute_code sandbox_status)
 
   @valid_modes [:read_only, :patch, :verify]
 
@@ -59,6 +60,9 @@ defmodule RunicAI.Coding.Recipe do
 
   @spec verification_tools() :: [String.t()]
   def verification_tools, do: @verification_tools
+
+  @spec code_execution_tools() :: [String.t()]
+  def code_execution_tools, do: @code_execution_tools
 
   @spec named(atom(), keyword()) :: t()
   def named(name, opts \\ [])
@@ -140,6 +144,42 @@ defmodule RunicAI.Coding.Recipe do
     )
   end
 
+  def named(:sandboxed_verify, opts) do
+    new!(
+      Keyword.merge(
+        [
+          name: :sandboxed_verify,
+          mode: :verify,
+          visible_tools:
+            @read_tools ++
+              @git_read_tools ++
+              @patch_tools ++
+              @verification_tools ++
+              @code_execution_tools,
+          max_turns: 12,
+          verification_policy: :targeted_first,
+          metadata: %{command: "/sandboxed-verify", focus: :sandboxed_verification}
+        ],
+        opts
+      )
+    )
+  end
+
+  def named(:polyglot_experiment, opts) do
+    new!(
+      Keyword.merge(
+        [
+          name: :polyglot_experiment,
+          mode: :read_only,
+          visible_tools: @read_tools ++ @git_read_tools ++ @code_execution_tools,
+          max_turns: 8,
+          metadata: %{command: "/polyglot-experiment", focus: :sandboxed_experiment}
+        ],
+        opts
+      )
+    )
+  end
+
   def named(:read_only, opts), do: new!(Keyword.merge([mode: :read_only], opts))
   def named(:patch, opts), do: new!(Keyword.merge([mode: :patch], opts))
   def named(:verify, opts), do: new!(Keyword.merge([mode: :verify], opts))
@@ -208,6 +248,8 @@ defmodule RunicAI.Coding.Recipe do
              :triage_bug,
              :write_tests,
              :fix_ci,
+             :sandboxed_verify,
+             :polyglot_experiment,
              :read_only,
              :patch,
              :verify,

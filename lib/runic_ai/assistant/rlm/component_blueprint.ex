@@ -34,6 +34,30 @@ defmodule RunicAI.Assistant.RLM.ComponentBlueprint do
           | :artifact_compute
           | :time_compute
           | :score_compute
+          | :artifact_materializer
+          | :sandbox_status
+          | :sandbox_execute
+          | :sandbox_open_session
+          | :sandbox_session_exec
+          | :sandbox_write_file
+          | :sandbox_read_file
+          | :sandbox_list_files
+          | :sandbox_checkpoint
+          | :sandbox_restore
+          | :sandbox_close_session
+          | :sandbox_start_service
+          | :sandbox_stop_service
+          | :sandbox_list_services
+          | :sandbox_open_proxy
+          | :sandbox_close_proxy
+          | :lambda_plan
+          | :lambda_split
+          | :lambda_map
+          | :lambda_filter
+          | :lambda_reduce
+          | :lambda_cross
+          | :lambda_review
+          | :lambda_generate
           | :tool_leaf
           | :llm_leaf
           | :report_composer
