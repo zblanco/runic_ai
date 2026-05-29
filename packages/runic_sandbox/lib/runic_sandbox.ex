@@ -8,6 +8,7 @@ defmodule RunicSandbox do
   """
 
   alias RunicSandbox.Error
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Backend
   alias RunicSandbox.Backends.Docker
   alias RunicSandbox.Backends.JustBash
@@ -63,6 +64,34 @@ defmodule RunicSandbox do
       |> backend_module()
       |> Backend.exec_session(session, request, opts)
     end
+  end
+
+  @spec attach(Session.t(), ExecutionRequest.t() | keyword() | map(), keyword()) ::
+          {:ok, AttachHandle.t()} | {:error, Error.t()}
+  def attach(%Session{} = session, request_input, opts \\ []) do
+    with :ok <- verify_session(session),
+         :ok <- require_ready_session(session, :attach),
+         :ok <- require_streaming_session(session),
+         {:ok, request} <- request_for_session(session, request_input),
+         :ok <- authorize_session_request(session, request) do
+      session.backend
+      |> backend_module()
+      |> Backend.attach_session(session, request, opts)
+    end
+  end
+
+  @spec write_stdin(AttachHandle.t(), iodata(), keyword()) :: :ok | {:error, Error.t()}
+  def write_stdin(%AttachHandle{} = handle, input, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.write_stdin(handle, input, opts)
+  end
+
+  @spec close_attach(AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def close_attach(%AttachHandle{} = handle, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.close_attach(handle, opts)
   end
 
   @spec status(keyword()) :: {:ok, map()} | {:error, Error.t()}
@@ -539,6 +568,16 @@ defmodule RunicSandbox do
   defp authorize_session_exec(%Session{} = session) do
     {:error,
      Error.validation("sandbox session does not support execution",
+       source: __MODULE__,
+       details: %{session_id: session.id, backend: session.backend}
+     )}
+  end
+
+  defp require_streaming_session(%Session{capabilities: %{streaming?: true}}), do: :ok
+
+  defp require_streaming_session(%Session{} = session) do
+    {:error,
+     Error.validation("sandbox session does not support streaming attach",
        source: __MODULE__,
        details: %{session_id: session.id, backend: session.backend}
      )}

@@ -143,7 +143,8 @@ defmodule RunicSandbox.BackendHealth do
       session_files?: false,
       checkpoints?: false,
       services?: false,
-      proxy?: false
+      proxy?: false,
+      streaming?: false
     }
 
   defp capabilities(:lua, _health),
@@ -155,7 +156,8 @@ defmodule RunicSandbox.BackendHealth do
       session_files?: false,
       checkpoints?: false,
       services?: false,
-      proxy?: false
+      proxy?: false,
+      streaming?: false
     }
 
   defp capabilities(backend, health) when backend in [:docker, :gvisor] do
@@ -168,6 +170,7 @@ defmodule RunicSandbox.BackendHealth do
       checkpoints?: false,
       services?: false,
       proxy?: false,
+      streaming?: false,
       network_policy?: true,
       persistent_identity?: truthy?(Map.get(health, :stateful?, false))
     }
@@ -183,6 +186,7 @@ defmodule RunicSandbox.BackendHealth do
       checkpoints?: true,
       services?: false,
       proxy?: false,
+      streaming?: false,
       network_policy?: true,
       persistent_identity?: true
     }
@@ -198,6 +202,7 @@ defmodule RunicSandbox.BackendHealth do
       checkpoints?: false,
       services?: false,
       proxy?: false,
+      streaming?: false,
       network_policy?: true,
       persistent_identity?: true
     }
@@ -213,6 +218,7 @@ defmodule RunicSandbox.BackendHealth do
       checkpoints?: true,
       services?: true,
       proxy?: true,
+      streaming?: false,
       network_policy?: true,
       persistent_identity?: true
     }

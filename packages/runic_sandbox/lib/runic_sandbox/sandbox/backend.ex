@@ -4,6 +4,7 @@ defmodule RunicSandbox.Backend do
   """
 
   alias RunicSandbox.Error
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.ExecutionRequest
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
@@ -25,6 +26,10 @@ defmodule RunicSandbox.Backend do
   @callback close_session(Session.t(), keyword()) :: :ok | {:error, Error.t()}
   @callback exec_session(Session.t(), ExecutionRequest.t(), keyword()) ::
               {:ok, ExecutionResult.t()} | {:error, Error.t()}
+  @callback attach_session(Session.t(), ExecutionRequest.t(), keyword()) ::
+              {:ok, AttachHandle.t()} | {:error, Error.t()}
+  @callback write_stdin(AttachHandle.t(), iodata(), keyword()) :: :ok | {:error, Error.t()}
+  @callback close_attach(AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
   @callback write_file(Session.t(), Path.t(), iodata(), keyword()) ::
               {:ok, FileRef.t()} | {:error, Error.t()}
   @callback read_file(Session.t(), Path.t(), keyword()) :: {:ok, binary()} | {:error, Error.t()}
@@ -53,6 +58,9 @@ defmodule RunicSandbox.Backend do
   @optional_callbacks open_session: 2,
                       close_session: 2,
                       exec_session: 3,
+                      attach_session: 3,
+                      write_stdin: 3,
+                      close_attach: 2,
                       write_file: 4,
                       read_file: 3,
                       list_files: 3,
@@ -115,6 +123,30 @@ defmodule RunicSandbox.Backend do
       true ->
         unsupported(:exec_session, session)
     end
+  end
+
+  @spec attach_session(module(), Session.t(), ExecutionRequest.t(), keyword()) ::
+          {:ok, AttachHandle.t()} | {:error, Error.t()}
+  def attach_session(module, %Session{} = session, %ExecutionRequest{} = request, opts) do
+    Code.ensure_loaded?(module)
+
+    cond do
+      function_exported?(module, :attach_session, 3) ->
+        module.attach_session(session, request, opts)
+
+      true ->
+        unsupported(:attach_session, session)
+    end
+  end
+
+  @spec write_stdin(module(), AttachHandle.t(), iodata(), keyword()) :: :ok | {:error, Error.t()}
+  def write_stdin(module, %AttachHandle{} = handle, input, opts) do
+    dispatch_or_unsupported(module, :write_stdin, [handle, input, opts], handle)
+  end
+
+  @spec close_attach(module(), AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def close_attach(module, %AttachHandle{} = handle, opts) do
+    dispatch_or_unsupported(module, :close_attach, [handle, opts], handle)
   end
 
   def write_file(module, session, path, contents, opts),

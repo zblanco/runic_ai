@@ -10,12 +10,15 @@ defmodule RunicSandbox.Backends.Remote do
 
   @behaviour RunicSandbox.Backend
 
+  alias RunicSandbox.AttachEvents
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Error
   alias RunicSandbox.ExecutionRequest
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.Instance
   alias RunicSandbox.Profile
+  alias RunicSandbox.Session
 
   @default_provider :fly_machines
   @default_token_env "FLY_API_TOKEN"
@@ -184,6 +187,7 @@ defmodule RunicSandbox.Backends.Remote do
             services?: false,
             proxy?: false,
             leases?: false,
+            streaming?: true,
             network_policy?: true,
             persistent_identity?: true
           )
@@ -193,6 +197,44 @@ defmodule RunicSandbox.Backends.Remote do
       diagnostics: health_diagnostics(provider, fly_cli_available?, configured?, auth_ready?)
     }
   end
+
+  @impl true
+  def open_session(%Profile{backend: :remote} = profile, opts) do
+    with {:ok, instance} <- provision(profile, opts) do
+      Session.from_instance(instance,
+        capabilities: session_capabilities(),
+        policy: profile.policy,
+        state_model: :persistent_workspace,
+        transport_model: :provider_cli,
+        persistent_identity?: true,
+        workspace_ref: "remote://#{instance.id}"
+      )
+    end
+  end
+
+  @impl true
+  def exec_session(
+        %Session{instance: %Instance{} = instance},
+        %ExecutionRequest{} = request,
+        opts
+      ) do
+    exec(instance, request, opts)
+  end
+
+  @impl true
+  def attach_session(%Session{} = session, %ExecutionRequest{} = request, opts) do
+    with {:ok, result} <- exec_session(session, request, opts) do
+      AttachEvents.terminal_handle(session, request, result,
+        metadata: %{provider_transport: :fly_machine_exec}
+      )
+    end
+  end
+
+  @impl true
+  def write_stdin(%AttachHandle{}, _input, _opts), do: terminal_attach_stdin_error()
+
+  @impl true
+  def close_attach(%AttachHandle{}, _opts), do: :ok
 
   defp ensure_remote_available(%Instance{} = instance) do
     cond do
@@ -263,10 +305,47 @@ defmodule RunicSandbox.Backends.Remote do
         "--json",
         "--timeout",
         timeout_seconds(request.timeout_ms),
-        provider_config.machine_id
-      ] ++ command
+        provider_config.machine_id,
+        fly_command(command)
+      ]
 
     invoke_fly(executable, args, provider_config, request.timeout_ms || @default_timeout_ms)
+  end
+
+  defp session_capabilities do
+    Capabilities.new!(
+      exec?: true,
+      files?: false,
+      inline_files?: false,
+      artifacts?: false,
+      session_files?: false,
+      checkpoints?: false,
+      services?: false,
+      proxy?: false,
+      leases?: false,
+      streaming?: true,
+      network_policy?: true,
+      persistent_identity?: true
+    )
+  end
+
+  defp fly_command(command), do: command |> Enum.map(&shell_escape/1) |> Enum.join(" ")
+
+  defp shell_escape(value) do
+    value = to_string(value)
+
+    if value =~ ~r|^[A-Za-z0-9_@%+=:,./-]+$| do
+      value
+    else
+      "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+    end
+  end
+
+  defp terminal_attach_stdin_error do
+    {:error,
+     Error.validation("terminal attach result does not accept stdin after execution",
+       source: __MODULE__
+     )}
   end
 
   defp invoke_fly(executable, args, provider_config, :infinity) do

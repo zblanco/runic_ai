@@ -15,6 +15,7 @@ defmodule RunicSandbox.Capabilities do
     :services?,
     :proxy?,
     :leases?,
+    :streaming?,
     :network_policy?,
     :persistent_identity?,
     :metadata
@@ -28,6 +29,7 @@ defmodule RunicSandbox.Capabilities do
             services?: false,
             proxy?: false,
             leases?: false,
+            streaming?: false,
             network_policy?: false,
             persistent_identity?: false,
             metadata: %{}
@@ -42,6 +44,7 @@ defmodule RunicSandbox.Capabilities do
           services?: boolean(),
           proxy?: boolean(),
           leases?: boolean(),
+          streaming?: boolean(),
           network_policy?: boolean(),
           persistent_identity?: boolean(),
           metadata: map()
@@ -62,6 +65,7 @@ defmodule RunicSandbox.Capabilities do
       services?: get(input, :services?, false),
       proxy?: get(input, :proxy?, false),
       leases?: get(input, :leases?, false),
+      streaming?: get(input, :streaming?, false),
       network_policy?: get(input, :network_policy?, false),
       persistent_identity?: get(input, :persistent_identity?, false),
       metadata: get(input, :metadata, %{})
@@ -92,6 +96,7 @@ defmodule RunicSandbox.Capabilities do
       services?: false,
       proxy?: false,
       leases?: false,
+      streaming?: get(input, :streaming?, false),
       network_policy?: get(input, :network_policy?, false),
       persistent_identity?: get(input, :persistent_identity?, false),
       metadata: get(input, :metadata, %{})
@@ -110,6 +115,7 @@ defmodule RunicSandbox.Capabilities do
          :ok <- validate_boolean(capabilities.services?, :services?),
          :ok <- validate_boolean(capabilities.proxy?, :proxy?),
          :ok <- validate_boolean(capabilities.leases?, :leases?),
+         :ok <- validate_boolean(capabilities.streaming?, :streaming?),
          :ok <- validate_boolean(capabilities.network_policy?, :network_policy?),
          :ok <- validate_boolean(capabilities.persistent_identity?, :persistent_identity?),
          :ok <- validate_map(capabilities.metadata, :metadata) do

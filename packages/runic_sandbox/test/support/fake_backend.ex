@@ -4,6 +4,7 @@ defmodule RunicSandbox.Test.FakeBackend do
   @behaviour RunicSandbox.Backend
 
   alias RunicSandbox.Capabilities
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Checkpoint
   alias RunicSandbox.Error
   alias RunicSandbox.ExecutionRequest
@@ -62,6 +63,7 @@ defmodule RunicSandbox.Test.FakeBackend do
           services?: true,
           proxy?: true,
           leases?: true,
+          streaming?: true,
           network_policy?: true,
           persistent_identity?: true
         ),
@@ -88,6 +90,27 @@ defmodule RunicSandbox.Test.FakeBackend do
       isolation_level: session.isolation_level
     )
   end
+
+  @impl true
+  def attach_session(%Session{} = session, %ExecutionRequest{} = request, _opts) do
+    AttachHandle.new(
+      id: "attach-1",
+      session_id: session.id,
+      backend: session.backend,
+      events: [
+        session_event(session, :exec_started, %{argv: request.argv}),
+        session_event(session, :stdout_chunk, %{chunk: request.source || "", stream: :stdout}),
+        session_event(session, :exec_finished, %{exit_status: 0})
+      ],
+      metadata: %{fake?: true}
+    )
+  end
+
+  @impl true
+  def write_stdin(%AttachHandle{}, input, _opts) when is_binary(input) or is_list(input), do: :ok
+
+  @impl true
+  def close_attach(%AttachHandle{}, _opts), do: :ok
 
   @impl true
   def write_file(%Session{}, path, contents, _opts) do
@@ -172,4 +195,13 @@ defmodule RunicSandbox.Test.FakeBackend do
     do: RunicSandbox.Backend.unsupported(operation, subject)
 
   def error_for_test(message), do: Error.validation(message, source: __MODULE__)
+
+  defp session_event(%Session{} = session, type, payload) do
+    RunicSandbox.SessionEvent.new!(
+      id: "#{type}-#{System.unique_integer([:positive])}",
+      session_id: session.id,
+      type: type,
+      payload: payload
+    )
+  end
 end

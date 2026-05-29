@@ -8,12 +8,15 @@ defmodule RunicSandbox.Backends.JustBash do
 
   @behaviour RunicSandbox.Backend
 
+  alias RunicSandbox.AttachEvents
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Error
   alias RunicSandbox.ExecutionRequest
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.Instance
   alias RunicSandbox.Profile
+  alias RunicSandbox.Session
 
   @impl true
   def provision(%Profile{backend: :just_bash} = profile, opts) do
@@ -123,10 +126,49 @@ defmodule RunicSandbox.Backends.JustBash do
        security_boundary?: false,
        capabilities:
          Capabilities.to_map(
-           Capabilities.one_shot_exec(network_policy?: false, persistent_identity?: false)
+           Capabilities.one_shot_exec(
+             network_policy?: false,
+             persistent_identity?: false,
+             streaming?: true
+           )
          )
      }}
   end
+
+  @impl true
+  def open_session(%Profile{backend: :just_bash} = profile, opts) do
+    with {:ok, instance} <- provision(profile, opts) do
+      Session.from_instance(instance,
+        capabilities:
+          Capabilities.one_shot_exec(
+            network_policy?: false,
+            persistent_identity?: false,
+            streaming?: true
+          ),
+        policy: profile.policy,
+        state_model: :one_shot,
+        transport_model: :in_process,
+        persistent_identity?: false
+      )
+    end
+  end
+
+  @impl true
+  def attach_session(
+        %Session{instance: %Instance{} = instance} = session,
+        %ExecutionRequest{} = request,
+        opts
+      ) do
+    with {:ok, result} <- exec(instance, request, opts) do
+      AttachEvents.terminal_handle(session, request, result)
+    end
+  end
+
+  @impl true
+  def write_stdin(%AttachHandle{}, _input, _opts), do: terminal_attach_stdin_error()
+
+  @impl true
+  def close_attach(%AttachHandle{}, _opts), do: :ok
 
   defp ensure_available do
     if available?() do
@@ -166,5 +208,12 @@ defmodule RunicSandbox.Backends.JustBash do
     else
       []
     end
+  end
+
+  defp terminal_attach_stdin_error do
+    {:error,
+     Error.validation("terminal attach result does not accept stdin after execution",
+       source: __MODULE__
+     )}
   end
 end

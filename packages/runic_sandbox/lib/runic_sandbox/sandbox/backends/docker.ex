@@ -9,6 +9,8 @@ defmodule RunicSandbox.Backends.Docker do
 
   @behaviour RunicSandbox.Backend
 
+  alias RunicSandbox.AttachEvents
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Checkpoint
   alias RunicSandbox.Error
@@ -193,6 +195,7 @@ defmodule RunicSandbox.Backends.Docker do
              services?: false,
              proxy?: false,
              leases?: false,
+             streaming?: true,
              network_policy?: true,
              persistent_identity?: if(profile, do: stateful?(profile), else: false)
            )
@@ -236,6 +239,7 @@ defmodule RunicSandbox.Backends.Docker do
             services?: false,
             proxy?: false,
             leases?: false,
+            streaming?: true,
             network_policy?: true,
             persistent_identity?: true
           ),
@@ -268,6 +272,56 @@ defmodule RunicSandbox.Backends.Docker do
         opts
       ) do
     exec(instance, request, opts)
+  end
+
+  @impl true
+  def attach_session(
+        %Session{instance: %Instance{} = instance} = session,
+        %ExecutionRequest{} = request,
+        _opts
+      ) do
+    with :ok <- ensure_container_available(instance),
+         {:ok, command} <- runtime_command(request),
+         :ok <- ensure_workspace_supported(instance),
+         {:ok, workspace_root, cleanup?} <- prepare_workspace(instance, request),
+         {:ok, before_files} <- snapshot_files(workspace_root),
+         {:ok, handle} <-
+           open_container_attach(
+             session,
+             instance,
+             request,
+             command,
+             workspace_root,
+             cleanup?,
+             before_files
+           ) do
+      {:ok, handle}
+    end
+  end
+
+  @impl true
+  def write_stdin(%AttachHandle{metadata: metadata}, input, _opts) do
+    case Map.get(metadata, :port) do
+      port when is_port(port) ->
+        Port.command(port, IO.iodata_to_binary(input))
+        :ok
+
+      _other ->
+        {:error,
+         Error.validation("docker attach handle is not writable",
+           source: __MODULE__,
+           details: %{backend: :docker}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def close_attach(%AttachHandle{metadata: metadata}, _opts) do
+    cleanup_attach(metadata)
+    :ok
   end
 
   @impl true
@@ -662,6 +716,222 @@ defmodule RunicSandbox.Backends.Docker do
 
     invoke_docker(args, request.timeout_ms || @default_timeout_ms, container_name)
   end
+
+  defp open_container_attach(
+         %Session{} = session,
+         %Instance{} = instance,
+         %ExecutionRequest{} = request,
+         command,
+         workspace_root,
+         cleanup?,
+         before_files
+       ) do
+    container_name = "runic-sandbox-attach-#{System.unique_integer([:positive])}"
+    started_mono = System.monotonic_time(:millisecond)
+
+    args =
+      [
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "-i",
+        "--name",
+        container_name,
+        "--workdir",
+        request.cwd,
+        "--network",
+        docker_network(request.network),
+        "--mount",
+        "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
+      ] ++ runtime_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
+
+    with {:ok, port} <- open_docker_port(args) do
+      if request.stdin != "", do: Port.command(port, request.stdin)
+
+      events =
+        Stream.resource(
+          fn ->
+            timer_ref = attach_timer(request.timeout_ms, port, container_name)
+
+            %{
+              session: session,
+              request: request,
+              port: port,
+              timer_ref: timer_ref,
+              container_name: container_name,
+              workspace_root: workspace_root,
+              cleanup?: cleanup?,
+              before_files: before_files,
+              started?: false,
+              finished?: false,
+              started_mono: started_mono
+            }
+          end,
+          &next_attach_event/1,
+          &cleanup_attach_stream/1
+        )
+
+      AttachHandle.new(
+        id: AttachEvents.attach_id(),
+        session_id: session.id,
+        backend: session.backend,
+        events: events,
+        metadata: %{
+          streaming_live?: true,
+          terminal_result?: false,
+          port: port,
+          container_name: container_name,
+          workspace_root: workspace_root,
+          cleanup?: cleanup?
+        }
+      )
+    end
+  end
+
+  defp open_docker_port(args) do
+    executable = System.find_executable("docker") || "docker"
+
+    port =
+      Port.open({:spawn_executable, executable}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        {:args, args}
+      ])
+
+    {:ok, port}
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp attach_timer(:infinity, _port, _container_name), do: nil
+
+  defp attach_timer(nil, port, container_name),
+    do: attach_timer(@default_timeout_ms, port, container_name)
+
+  defp attach_timer(timeout_ms, port, container_name) when is_integer(timeout_ms) do
+    Process.send_after(self(), {:runic_sandbox_attach_timeout, port, container_name}, timeout_ms)
+  end
+
+  defp next_attach_event(%{started?: false} = state) do
+    event =
+      AttachEvents.event(state.session, :exec_started, %{
+        runtime: state.request.runtime,
+        mode: state.request.mode,
+        argv: state.request.argv,
+        cwd: state.request.cwd,
+        network: state.request.network,
+        streaming_live?: true,
+        container_name: state.container_name
+      })
+
+    {[event], %{state | started?: true}}
+  end
+
+  defp next_attach_event(%{port: port} = state) do
+    receive do
+      {^port, {:data, data}} ->
+        event =
+          AttachEvents.chunk_event(
+            state.session,
+            :stdout_chunk,
+            cap(data, state.request.max_output_bytes)
+          )
+
+        {[event], state}
+
+      {^port, {:exit_status, exit_status}} ->
+        state = %{state | finished?: true}
+        cancel_attach_timer(state.timer_ref)
+        event = docker_attach_finished_event(state, exit_status, false)
+        cleanup_attach_stream(state)
+        {[event], :halt}
+
+      {:runic_sandbox_attach_timeout, ^port, container_name} ->
+        System.cmd("docker", ["rm", "-f", container_name], stderr_to_stdout: true)
+        state = %{state | finished?: true}
+        event = docker_attach_finished_event(state, nil, true)
+        cleanup_attach_stream(state)
+        {[event], :halt}
+    end
+  end
+
+  defp next_attach_event(:halt), do: {:halt, :halt}
+
+  defp docker_attach_finished_event(state, exit_status, timed_out?) do
+    duration_ms = System.monotonic_time(:millisecond) - state.started_mono
+
+    {files_changed, artifacts, diagnostics} =
+      case snapshot_files(state.workspace_root) do
+        {:ok, after_files} ->
+          case workspace_delta(
+                 state.workspace_root,
+                 state.before_files,
+                 after_files,
+                 state.request.max_output_bytes
+               ) do
+            {:ok, files_changed, artifacts} -> {files_changed, artifacts, []}
+            {:error, error} -> {[], [], [%{message: error.message, details: error.details}]}
+          end
+
+        {:error, error} ->
+          {[], [], [%{message: error.message, details: error.details}]}
+      end
+
+    AttachEvents.event(state.session, :exec_finished, %{
+      status: status(exit_status, timed_out?),
+      exit_status: exit_status,
+      duration_ms: duration_ms,
+      files_changed: files_changed,
+      artifacts: artifacts,
+      diagnostics: diagnostics,
+      resource_usage: %{},
+      metadata: %{
+        sandbox: state.request.sandbox,
+        runtime: state.request.runtime,
+        mode: state.request.mode,
+        network: state.request.network,
+        image: image(state.session.instance),
+        container_name: state.container_name,
+        streaming_live?: true,
+        timed_out?: timed_out?,
+        security_boundary?: true
+      }
+    })
+  end
+
+  defp cleanup_attach_stream(:halt), do: :ok
+
+  defp cleanup_attach_stream(%{finished?: finished?} = state) do
+    cancel_attach_timer(state.timer_ref)
+
+    unless finished? do
+      cleanup_attach(state)
+    end
+
+    if state.cleanup?, do: File.rm_rf(state.workspace_root)
+    :ok
+  end
+
+  defp cleanup_attach(%{port: port, container_name: container_name}) do
+    if is_port(port), do: Port.close(port)
+    System.cmd("docker", ["rm", "-f", container_name], stderr_to_stdout: true)
+    :ok
+  rescue
+    _exception -> :ok
+  end
+
+  defp cleanup_attach(metadata) when is_map(metadata) do
+    cleanup_attach(%{
+      port: Map.get(metadata, :port),
+      container_name: Map.get(metadata, :container_name)
+    })
+  end
+
+  defp cancel_attach_timer(nil), do: :ok
+  defp cancel_attach_timer(ref), do: Process.cancel_timer(ref)
 
   defp invoke_docker(args, :infinity, _container_name) do
     case docker_cmd(args) do

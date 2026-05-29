@@ -9,6 +9,8 @@ defmodule RunicSandbox.Backends.Sprites do
 
   @behaviour RunicSandbox.Backend
 
+  alias RunicSandbox.AttachEvents
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Checkpoint
   alias RunicSandbox.Error
@@ -210,6 +212,21 @@ defmodule RunicSandbox.Backends.Sprites do
       )
     end
   end
+
+  @impl true
+  def attach_session(%Session{} = session, %ExecutionRequest{} = request, opts) do
+    with {:ok, result} <- exec_session(session, request, opts) do
+      AttachEvents.terminal_handle(session, request, result,
+        metadata: %{provider_transport: :sprites_http_exec}
+      )
+    end
+  end
+
+  @impl true
+  def write_stdin(%AttachHandle{}, _input, _opts), do: terminal_attach_stdin_error()
+
+  @impl true
+  def close_attach(%AttachHandle{}, _opts), do: :ok
 
   @impl true
   def write_file(%Session{} = session, path, contents, opts) do
@@ -756,9 +773,17 @@ defmodule RunicSandbox.Backends.Sprites do
       services?: true,
       proxy?: true,
       leases?: false,
+      streaming?: true,
       network_policy?: true,
       persistent_identity?: true
     )
+  end
+
+  defp terminal_attach_stdin_error do
+    {:error,
+     Error.validation("terminal attach result does not accept stdin after execution",
+       source: __MODULE__
+     )}
   end
 
   defp request_policy(%ExecutionRequest{} = request) do

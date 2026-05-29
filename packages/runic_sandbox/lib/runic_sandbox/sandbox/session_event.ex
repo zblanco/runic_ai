@@ -9,6 +9,9 @@ defmodule RunicSandbox.SessionEvent do
     :opened,
     :closed,
     :exec_started,
+    :stdout_chunk,
+    :stderr_chunk,
+    :stdin_ack,
     :exec_finished,
     :file_written,
     :file_read,
@@ -30,6 +33,9 @@ defmodule RunicSandbox.SessionEvent do
           :opened
           | :closed
           | :exec_started
+          | :stdout_chunk
+          | :stderr_chunk
+          | :stdin_ack
           | :exec_finished
           | :file_written
           | :file_read

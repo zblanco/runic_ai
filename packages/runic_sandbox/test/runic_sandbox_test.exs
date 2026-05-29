@@ -2,6 +2,7 @@ defmodule RunicSandboxTest do
   use ExUnit.Case, async: false
 
   alias RunicSandbox.Backend
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Checkpoint
   alias RunicSandbox.ConsumerProfiles
@@ -16,6 +17,7 @@ defmodule RunicSandboxTest do
   alias RunicSandbox.Session
   alias RunicSandbox.SessionEvent
   alias RunicSandbox.Test.FakeBackend
+  alias RunicSandbox.Test.NoAttachBackend
   alias RunicSandbox.VmsanCLI
 
   test "validates request and result contracts" do
@@ -542,12 +544,14 @@ defmodule RunicSandboxTest do
                services?: false,
                proxy?: false,
                leases?: true,
+               streaming?: true,
                network_policy?: true,
                persistent_identity?: true
              )
 
     assert capabilities.exec?
     refute capabilities.checkpoints?
+    assert capabilities.streaming?
 
     assert {:ok, session} =
              Session.new(
@@ -615,6 +619,22 @@ defmodule RunicSandboxTest do
 
     assert event.type == :checkpoint_created
 
+    assert {:ok, stdout_event} =
+             SessionEvent.new(id: "stdout", session_id: session.id, type: "stdout_chunk")
+
+    assert stdout_event.type == :stdout_chunk
+
+    assert {:ok, handle} =
+             AttachHandle.new(
+               id: "attach",
+               session_id: session.id,
+               backend: session.backend,
+               events: [stdout_event]
+             )
+
+    assert handle.status == :open
+    assert Enum.to_list(AttachHandle.events(handle)) == [stdout_event]
+
     assert {:error, error} = Capabilities.new(exec?: :yes)
     assert error.message =~ "exec?"
     assert {:error, error} = Session.new(id: "", sandbox: :local_code, backend: :docker)
@@ -670,6 +690,7 @@ defmodule RunicSandboxTest do
     assert session.transport_model == :local_microvm
     assert session.capabilities.files?
     assert session.capabilities.services?
+    assert session.capabilities.streaming?
 
     assert {:ok, file} = Backend.write_file(FakeBackend, session, "/workspace/a.txt", "abc", [])
     assert file.bytes == 3
@@ -690,6 +711,22 @@ defmodule RunicSandboxTest do
 
     assert result.stdout == "ok"
 
+    assert {:ok, handle} =
+             Backend.attach_session(
+               FakeBackend,
+               session,
+               ExecutionRequest.new!(sandbox: :local_code, runtime: :bash, source: "stream-ok"),
+               []
+             )
+
+    assert %AttachHandle{id: "attach-1", backend: :docker} = handle
+
+    assert [:exec_started, :stdout_chunk, :exec_finished] =
+             handle.events |> Enum.map(& &1.type)
+
+    assert :ok = Backend.write_stdin(FakeBackend, handle, "hello\n", [])
+    assert :ok = Backend.close_attach(FakeBackend, handle, [])
+
     assert {:ok, checkpoint} = Backend.checkpoint(FakeBackend, session, [], [])
     assert checkpoint.session_id == session.id
     assert {:ok, ^session} = Backend.restore(FakeBackend, session, checkpoint, [])
@@ -705,6 +742,27 @@ defmodule RunicSandboxTest do
     assert {:error, error} = RunicSandbox.close_proxy("proxy-1")
     assert error.message =~ "requires a backend"
     assert :ok = Backend.close_session(FakeBackend, session, [])
+  end
+
+  test "backend attach dispatcher fails closed when callback is unsupported" do
+    assert {:ok, session} =
+             RunicSandbox.open_session(:local_code, [],
+               profile: [
+                 name: :local_code,
+                 backend: :just_bash,
+                 runtimes: [:bash],
+                 network: :disabled
+               ]
+             )
+
+    request = ExecutionRequest.new!(sandbox: :local_code, runtime: :bash, source: "echo fallback")
+
+    assert {:error, error} = Backend.attach_session(NoAttachBackend, session, request, [])
+
+    assert error.message == "sandbox backend does not support attach_session"
+    assert error.details.operation == :attach_session
+
+    assert :ok = RunicSandbox.close_session(session)
   end
 
   test "session authority rejects mutated handles before backend execution" do
@@ -802,7 +860,58 @@ defmodule RunicSandboxTest do
       assert is_boolean(health.capabilities.session_files?)
       assert is_boolean(health.capabilities.services?)
       assert is_boolean(health.capabilities.proxy?)
+      assert is_boolean(health.capabilities.streaming?)
+      assert health.capabilities.streaming?
       assert is_boolean(health.capabilities.persistent_identity?)
+    end
+  end
+
+  test "in-process backends expose terminal attach streams through the facade" do
+    assert {:ok, bash_session} =
+             RunicSandbox.open_session(:local_code, [],
+               profile: [
+                 name: :local_code,
+                 backend: :just_bash,
+                 runtimes: [:bash],
+                 network: :disabled
+               ]
+             )
+
+    assert bash_session.capabilities.streaming?
+
+    assert {:ok, bash_handle} =
+             RunicSandbox.attach(bash_session, runtime: :bash, source: "echo attach-bash")
+
+    assert bash_handle.status == :closed
+    assert bash_handle.metadata.streaming_live? == false
+    assert attach_event_types(bash_handle) == [:exec_started, :stdout_chunk, :exec_finished]
+    assert attach_stdout(bash_handle) == "attach-bash\n"
+
+    assert {:error, error} = RunicSandbox.write_stdin(bash_handle, "ignored\n")
+    assert error.message == "terminal attach result does not accept stdin after execution"
+    assert :ok = RunicSandbox.close_attach(bash_handle)
+    assert :ok = RunicSandbox.close_session(bash_session)
+
+    if Code.ensure_loaded?(Lua) do
+      assert {:ok, lua_session} =
+               RunicSandbox.open_session(:lua_code, [],
+                 profile: [
+                   name: :lua_code,
+                   backend: :lua,
+                   runtimes: [:lua],
+                   network: :disabled
+                 ]
+               )
+
+      assert lua_session.capabilities.streaming?
+
+      assert {:ok, lua_handle} =
+               RunicSandbox.attach(lua_session, runtime: :lua, source: "return 'attach-lua'")
+
+      assert lua_handle.metadata.streaming_live? == false
+      assert attach_event_types(lua_handle) == [:exec_started, :stdout_chunk, :exec_finished]
+      assert attach_stdout(lua_handle) == ~s("attach-lua"\n)
+      assert :ok = RunicSandbox.close_session(lua_session)
     end
   end
 
@@ -903,6 +1012,61 @@ defmodule RunicSandboxTest do
              )
 
     assert error.message == "remote sandbox provider is not available for execution"
+  end
+
+  test "remote backend adapts provider exec output into terminal attach events" do
+    script_path =
+      Path.join(
+        System.tmp_dir!(),
+        "runic_sandbox_remote_#{System.unique_integer([:positive])}.sh"
+      )
+
+    output = Jason.encode!(%{stdout: "remote-attach\n", stderr: "", exit_status: 0})
+
+    File.write!(script_path, """
+    #!/bin/sh
+    case "$*" in
+      *"machine exec --app runic-sandbox-test --json --timeout 30 machine-test-id sh -lc"*)
+        printf '%s\\n' '#{output}'
+        ;;
+      *)
+        printf '%s\\n' '{"stdout":"","stderr":"bad argv","exit_status":64}'
+        ;;
+    esac
+    """)
+
+    File.chmod!(script_path, 0o755)
+
+    try do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :remote_code,
+                 backend: :remote,
+                 runtimes: [:bash],
+                 network: :restricted,
+                 backend_options: [
+                   provider: :fly_machines,
+                   app: "runic-sandbox-test",
+                   machine_id: "machine-test-id",
+                   credential_policy: :ambient_cli_allowed,
+                   executable: script_path
+                 ]
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:remote_code, [], profile: profile)
+      assert session.capabilities.streaming?
+
+      assert {:ok, handle} =
+               RunicSandbox.attach(session, runtime: :bash, source: "echo remote-attach")
+
+      assert handle.metadata.streaming_live? == false
+      assert handle.metadata.provider_transport == :fly_machine_exec
+      assert attach_event_types(handle) == [:exec_started, :stdout_chunk, :exec_finished]
+      assert attach_stdout(handle) == "remote-attach\n"
+      assert :ok = RunicSandbox.close_session(session)
+    after
+      File.rm(script_path)
+    end
   end
 
   test "docker one-shot workspace is cleaned when file preparation fails" do
@@ -1144,6 +1308,43 @@ defmodule RunicSandboxTest do
     end
   end
 
+  test "docker session exposes live attach stream when local image exists" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+      assert session.capabilities.streaming?
+
+      assert {:ok, handle} =
+               RunicSandbox.attach(session,
+                 runtime: :bash,
+                 source: "read line; printf \"$line\"; printf changed > attach.txt"
+               )
+
+      assert handle.metadata.streaming_live?
+      assert :ok = RunicSandbox.write_stdin(handle, "live-docker\n")
+
+      events = Enum.to_list(handle.events)
+      assert [:exec_started, :stdout_chunk, :exec_finished] = Enum.map(events, & &1.type)
+      assert events |> stdout_from_events() == "live-docker"
+
+      finished = List.last(events)
+      assert finished.payload.status == :pass
+      assert Enum.any?(finished.payload.files_changed, &(&1.path == "attach.txt"))
+      assert {:ok, "changed"} = RunicSandbox.read_file(session, "attach.txt")
+
+      assert :ok = RunicSandbox.close_attach(handle)
+      assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
   test "vmsan CLI builds argv and parses JSON events" do
     assert VmsanCLI.command(["exec", "vm-1", "echo", "ok"], executable: "/usr/bin/vmsan") ==
              {"/usr/bin/vmsan", ["--json", "exec", "vm-1", "echo", "ok"]}
@@ -1343,6 +1544,27 @@ defmodule RunicSandboxTest do
     assert result.stdout == "hello\n"
     assert_receive {:vmsan_upload, local_path}
     assert File.read!(local_path) == "hello"
+    assert_receive :vmsan_exec
+
+    assert session.capabilities.streaming?
+
+    assert {:ok, handle} =
+             RunicSandbox.attach(
+               session,
+               [
+                 runtime: :bash,
+                 source: "cat /workspace/in.txt",
+                 files: %{"in.txt" => "hello"}
+               ],
+               commands: commands,
+               runner: commands
+             )
+
+    assert handle.metadata.streaming_live? == false
+    assert handle.metadata.provider_transport == :vmsan_cli
+    assert attach_event_types(handle) == [:exec_started, :stdout_chunk, :exec_finished]
+    assert attach_stdout(handle) == "hello\n"
+    assert_receive {:vmsan_upload, _local_path}
     assert_receive :vmsan_exec
 
     assert {:error, escape_error} =
@@ -1616,6 +1838,27 @@ defmodule RunicSandboxTest do
     assert result.status == :pass
     assert result.stdout == "sprite-ok\n"
     assert result.metadata.provider == :sprites
+    assert_receive {:sprites_request, :write, %{path: "/workspace/in.txt"}, "sprite-file"}
+    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat /workspace/in.txt"]}, ""}
+
+    assert session.capabilities.streaming?
+
+    assert {:ok, handle} =
+             RunicSandbox.attach(
+               session,
+               [
+                 runtime: :bash,
+                 source: "cat /workspace/in.txt",
+                 files: %{"in.txt" => "sprite-file"}
+               ],
+               env: env,
+               requester: requester
+             )
+
+    assert handle.metadata.streaming_live? == false
+    assert handle.metadata.provider_transport == :sprites_http_exec
+    assert attach_event_types(handle) == [:exec_started, :stdout_chunk, :exec_finished]
+    assert attach_stdout(handle) == "sprite-ok\n"
     assert_receive {:sprites_request, :write, %{path: "/workspace/in.txt"}, "sprite-file"}
     assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat /workspace/in.txt"]}, ""}
 
@@ -2036,6 +2279,16 @@ defmodule RunicSandboxTest do
     end
   rescue
     _exception -> false
+  end
+
+  defp attach_event_types(%AttachHandle{} = handle), do: handle.events |> Enum.map(& &1.type)
+
+  defp attach_stdout(%AttachHandle{} = handle), do: handle.events |> stdout_from_events()
+
+  defp stdout_from_events(events) do
+    events
+    |> Enum.filter(&(&1.type == :stdout_chunk))
+    |> Enum.map_join("", & &1.payload.chunk)
   end
 
   defp wait_until(fun, timeout_ms \\ 500) do
