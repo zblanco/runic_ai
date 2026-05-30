@@ -19,6 +19,8 @@ defmodule RunicSandbox do
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.Instance
   alias RunicSandbox.Manager
+  alias RunicSandbox.Capabilities
+  alias RunicSandbox.Policy
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
   alias RunicSandbox.SessionRegistry
@@ -69,14 +71,20 @@ defmodule RunicSandbox do
   @spec attach(Session.t(), ExecutionRequest.t() | keyword() | map(), keyword()) ::
           {:ok, AttachHandle.t()} | {:error, Error.t()}
   def attach(%Session{} = session, request_input, opts \\ []) do
-    with :ok <- verify_session(session),
-         :ok <- require_ready_session(session, :attach),
-         :ok <- require_streaming_session(session),
-         {:ok, request} <- request_for_session(session, request_input),
-         :ok <- authorize_session_request(session, request) do
-      session.backend
-      |> backend_module()
-      |> Backend.attach_session(session, request, opts)
+    case Keyword.get(opts, :server) do
+      nil ->
+        with :ok <- verify_session(session),
+             :ok <- require_ready_session(session, :attach),
+             :ok <- require_streaming_session(session),
+             {:ok, request} <- request_for_session(session, request_input),
+             :ok <- authorize_session_request(session, request) do
+          session.backend
+          |> backend_module()
+          |> Backend.attach_session(session, request, opts)
+        end
+
+      server ->
+        Manager.attach(server, session, request_input, opts)
     end
   end
 
@@ -89,9 +97,15 @@ defmodule RunicSandbox do
 
   @spec close_attach(AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
   def close_attach(%AttachHandle{} = handle, opts \\ []) do
-    handle.backend
-    |> backend_module()
-    |> Backend.close_attach(handle, opts)
+    case Keyword.get(opts, :server) do
+      nil ->
+        handle.backend
+        |> backend_module()
+        |> Backend.close_attach(handle, opts)
+
+      server ->
+        Manager.close_attach(server, handle, opts)
+    end
   end
 
   @spec status(keyword()) :: {:ok, map()} | {:error, Error.t()}
@@ -120,6 +134,8 @@ defmodule RunicSandbox do
     with :ok <- authorize_enabled(profile),
          :ok <- authorize_runtime(profile, request),
          :ok <- authorize_network(profile, request),
+         :ok <- authorize_restricted_egress(profile),
+         :ok <- authorize_mcp_boundary(profile),
          :ok <- authorize_persistence(profile, request),
          :ok <- authorize_isolation(profile) do
       :ok
@@ -493,6 +509,8 @@ defmodule RunicSandbox do
 
   defp authorize_session_profile(%Profile{} = profile) do
     with :ok <- authorize_enabled(profile),
+         :ok <- authorize_restricted_egress(profile),
+         :ok <- authorize_mcp_boundary(profile),
          :ok <- authorize_isolation(profile) do
       :ok
     end
@@ -558,6 +576,7 @@ defmodule RunicSandbox do
          :ok <- authorize_session_isolation(session),
          :ok <- authorize_session_runtime(session, request),
          :ok <- authorize_session_network(session, request),
+         :ok <- authorize_session_mcp_boundary(session, request),
          :ok <- authorize_session_persistence(session, request) do
       :ok
     end
@@ -613,6 +632,9 @@ defmodule RunicSandbox do
 
   defp authorize_session_network(%Session{policy: policy}, %ExecutionRequest{} = request) do
     cond do
+      Policy.restricted_egress_requested?(policy) ->
+        authorize_restricted_egress(policy, request)
+
       request.network == :disabled ->
         :ok
 
@@ -629,6 +651,101 @@ defmodule RunicSandbox do
            details: %{requested_network: request.network, policy_network: policy.network}
          )}
     end
+  end
+
+  defp authorize_restricted_egress(%Profile{policy: policy} = profile) do
+    if Policy.restricted_egress_requested?(policy) and
+         not backend_restricted_egress_supported?(profile.backend) do
+      restricted_egress_error(profile.backend, policy)
+    else
+      :ok
+    end
+  end
+
+  defp authorize_restricted_egress(%Policy{} = policy, %ExecutionRequest{} = request) do
+    cond do
+      request.network == :disabled ->
+        :ok
+
+      not Policy.restricted_egress_requested?(policy) ->
+        :ok
+
+      true ->
+        {:error,
+         Error.validation("sandbox restricted egress allow-list is not supported by session",
+           source: __MODULE__,
+           details: %{
+             requested_network: request.network,
+             policy: Policy.effective_network(policy)
+           }
+         )}
+    end
+  end
+
+  defp backend_restricted_egress_supported?(_backend), do: false
+
+  defp restricted_egress_error(backend, policy) do
+    {:error,
+     Error.validation("sandbox restricted egress allow-list is not supported by backend",
+       source: __MODULE__,
+       details: %{
+         backend: backend,
+         policy: Policy.effective_network(policy),
+         restricted_egress_supported?: false
+       }
+     )}
+  end
+
+  defp authorize_mcp_boundary(%Profile{policy: policy} = profile) do
+    if Policy.mcp_boundary_requested?(policy) and
+         not backend_mcp_boundary_supported?(profile.backend) do
+      mcp_boundary_error(profile.backend, policy)
+    else
+      :ok
+    end
+  end
+
+  defp authorize_session_mcp_boundary(
+         %Session{policy: policy} = session,
+         %ExecutionRequest{} = request
+       ) do
+    cond do
+      request.network == :disabled ->
+        :ok
+
+      not Policy.mcp_boundary_requested?(policy) ->
+        :ok
+
+      Capabilities.mcp_boundary_supported?(session.capabilities) ->
+        :ok
+
+      true ->
+        {:error,
+         Error.validation("sandbox MCP boundary is not supported by session",
+           source: __MODULE__,
+           details: %{
+             session_id: session.id,
+             backend: session.backend,
+             requested_network: request.network,
+             policy: Policy.effective_network(policy),
+             mcp_boundary_supported?: false
+           }
+         )}
+    end
+  end
+
+  defp backend_mcp_boundary_supported?(_backend), do: false
+
+  defp mcp_boundary_error(backend, policy) do
+    {:error,
+     Error.validation("sandbox MCP boundary is not supported by backend",
+       source: __MODULE__,
+       details: %{
+         backend: backend,
+         policy: Policy.effective_network(policy),
+         mcp_boundary_supported?: false
+       }
+     )}
   end
 
   defp authorize_session_persistence(%Session{} = session, %ExecutionRequest{
@@ -657,13 +774,50 @@ defmodule RunicSandbox do
   defp request_for_session(%Session{} = session, input) when is_map(input) do
     input
     |> Map.put_new(:sandbox, session.sandbox)
+    |> put_session_default_cwd(session)
     |> ExecutionRequest.new()
   end
 
   defp request_for_session(%Session{} = session, input) when is_list(input) do
     input
     |> Keyword.put_new(:sandbox, session.sandbox)
+    |> put_session_default_cwd(session)
     |> ExecutionRequest.new()
+  end
+
+  defp put_session_default_cwd(input, %Session{} = session) when is_map(input) do
+    cond do
+      Map.has_key?(input, :cwd) or Map.has_key?(input, "cwd") ->
+        input
+
+      Map.has_key?(input, :sandbox_cwd) or Map.has_key?(input, "sandbox_cwd") ->
+        input
+
+      default_cwd = session_default_cwd(session) ->
+        Map.put(input, :cwd, default_cwd)
+
+      true ->
+        input
+    end
+  end
+
+  defp put_session_default_cwd(input, %Session{} = session) when is_list(input) do
+    cond do
+      Keyword.has_key?(input, :cwd) or Keyword.has_key?(input, :sandbox_cwd) ->
+        input
+
+      default_cwd = session_default_cwd(session) ->
+        Keyword.put(input, :cwd, default_cwd)
+
+      true ->
+        input
+    end
+  end
+
+  defp session_default_cwd(%Session{} = session) do
+    Map.get(session.metadata, :default_cwd) ||
+      Map.get(session.metadata, "default_cwd") ||
+      Capabilities.default_cwd(session.capabilities)
   end
 
   defp backend_option(opts, operation) do
@@ -792,12 +946,33 @@ defmodule RunicSandbox do
 
     case :persistent_term.get(key, nil) do
       nil ->
-        secret = :crypto.strong_rand_bytes(32)
-        :persistent_term.put(key, secret)
-        secret
+        initialize_session_authority_secret(key)
 
       secret ->
         secret
+    end
+  end
+
+  defp initialize_session_authority_secret(key) do
+    lock = {key, self()}
+
+    if :global.set_lock(lock, [node()], 0) do
+      try do
+        case :persistent_term.get(key, nil) do
+          nil ->
+            secret = :crypto.strong_rand_bytes(32)
+            :persistent_term.put(key, secret)
+            secret
+
+          secret ->
+            secret
+        end
+      after
+        :global.del_lock(lock, [node()])
+      end
+    else
+      Process.sleep(1)
+      session_authority_secret()
     end
   end
 

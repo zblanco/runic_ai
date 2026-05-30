@@ -72,7 +72,7 @@ defmodule RunicSandbox.VmsanCLI do
     |> maybe_arg("--workdir", get(opts, :workdir))
     |> env_args(get(opts, :env))
     |> maybe_bool("--sudo", get(opts, :sudo?))
-    |> Kernel.++([vm_id | Enum.map(argv, &to_string/1)])
+    |> Kernel.++([vm_id, "--" | Enum.map(argv, &to_string/1)])
   end
 
   @spec upload_args(String.t(), [Path.t()], keyword() | map()) :: [String.t()]
@@ -109,12 +109,15 @@ defmodule RunicSandbox.VmsanCLI do
   end
 
   @spec remove_args(String.t()) :: [String.t()]
-  def remove_args(vm_id), do: ["remove", to_string(vm_id)]
+  def remove_args(vm_id), do: ["remove", "--force", to_string(vm_id)]
 
   defp handle_output(command, argv, output, exit_status) do
     {event, stream_output} = parse_output(output)
 
     cond do
+      sudo_password_required?(command, output) ->
+        {:error, sudo_password_error(command, argv, output, exit_status)}
+
       is_map(event) and Map.has_key?(event, "error") ->
         {:error, event_error(command, argv, output, exit_status, event)}
 
@@ -165,6 +168,27 @@ defmodule RunicSandbox.VmsanCLI do
         exit_status: exit_status,
         code: Map.get(error, "code"),
         fix: Map.get(error, "fix") || get_in(error, ["data", "fix"]),
+        output_preview: String.slice(output, 0, 1_000)
+      }
+    )
+  end
+
+  defp sudo_password_required?("sudo", output) do
+    String.contains?(output, "sudo: a password is required") or
+      String.contains?(output, "sudo: a terminal is required")
+  end
+
+  defp sudo_password_required?(_command, _output), do: false
+
+  defp sudo_password_error(command, argv, output, exit_status) do
+    Error.provider("vmsan command requires passwordless sudo",
+      source: __MODULE__,
+      details: %{
+        command: command,
+        args: argv,
+        exit_status: exit_status,
+        fix:
+          "Configure passwordless sudo for vmsan create/remove or run the VM lifecycle from a privileged wrapper.",
         output_preview: String.slice(output, 0, 1_000)
       }
     )

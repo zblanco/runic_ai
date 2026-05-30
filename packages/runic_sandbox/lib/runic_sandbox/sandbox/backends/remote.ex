@@ -189,7 +189,8 @@ defmodule RunicSandbox.Backends.Remote do
             leases?: false,
             streaming?: true,
             network_policy?: true,
-            persistent_identity?: true
+            persistent_identity?: true,
+            metadata: remote_attach_metadata()
           )
         ),
       missing_requirements:
@@ -325,7 +326,15 @@ defmodule RunicSandbox.Backends.Remote do
       leases?: false,
       streaming?: true,
       network_policy?: true,
-      persistent_identity?: true
+      persistent_identity?: true,
+      metadata: remote_attach_metadata()
+    )
+  end
+
+  defp remote_attach_metadata do
+    Capabilities.attach_metadata(:terminal_adapter,
+      provider_transport: :fly_machine_exec,
+      restricted_egress_supported?: false
     )
   end
 

@@ -129,7 +129,8 @@ defmodule RunicSandbox.Backends.JustBash do
            Capabilities.one_shot_exec(
              network_policy?: false,
              persistent_identity?: false,
-             streaming?: true
+             streaming?: true,
+             metadata: Capabilities.attach_metadata(:terminal_adapter)
            )
          )
      }}
@@ -143,7 +144,8 @@ defmodule RunicSandbox.Backends.JustBash do
           Capabilities.one_shot_exec(
             network_policy?: false,
             persistent_identity?: false,
-            streaming?: true
+            streaming?: true,
+            metadata: Capabilities.attach_metadata(:terminal_adapter)
           ),
         policy: profile.policy,
         state_model: :one_shot,

@@ -3,6 +3,7 @@ defmodule RunicSandbox.Manager do
 
   use GenServer
 
+  alias RunicSandbox.AttachHandle
   alias RunicSandbox.Error
   alias RunicSandbox.ExecutionRequest
   alias RunicSandbox.Lease
@@ -33,6 +34,35 @@ defmodule RunicSandbox.Manager do
   @spec release_session(GenServer.server(), Session.t(), keyword()) :: :ok | {:error, Error.t()}
   def release_session(server, %Session{} = session, opts),
     do: GenServer.call(server, {:release_session, session, opts}, :infinity)
+
+  @spec attach(
+          GenServer.server(),
+          Session.t(),
+          ExecutionRequest.t() | keyword() | map(),
+          keyword()
+        ) ::
+          {:ok, AttachHandle.t()} | {:error, Error.t()}
+  def attach(server, %Session{} = session, request, opts) do
+    with {:ok, managed_session} <- prepare_attach(server, session),
+         {:ok, handle} <-
+           RunicSandbox.attach(managed_session, request, Keyword.delete(opts, :server)) do
+      register_attach(server, managed_session, handle)
+    end
+  end
+
+  @spec prepare_attach(GenServer.server(), Session.t()) ::
+          {:ok, Session.t()} | {:error, Error.t()}
+  def prepare_attach(server, %Session{} = session),
+    do: GenServer.call(server, {:prepare_attach, session}, :infinity)
+
+  @spec register_attach(GenServer.server(), Session.t(), AttachHandle.t()) ::
+          {:ok, AttachHandle.t()} | {:error, Error.t()}
+  def register_attach(server, %Session{} = session, %AttachHandle{} = handle),
+    do: GenServer.call(server, {:register_attach, session, handle}, :infinity)
+
+  @spec close_attach(GenServer.server(), AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def close_attach(server, %AttachHandle{} = handle, opts),
+    do: GenServer.call(server, {:close_attach, handle, opts}, :infinity)
 
   @spec close_session(GenServer.server(), Session.t(), keyword()) :: :ok | {:error, Error.t()}
   def close_session(server, %Session{} = session, opts),
@@ -105,10 +135,45 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  def handle_call({:prepare_attach, session}, _from, state) do
+    with {:ok, _id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session) do
+      {:reply, {:ok, entry.session}, state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:register_attach, session, handle}, _from, state) do
+    with {:ok, id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session),
+         :ok <- validate_attach_handle(entry, handle) do
+      managed_handle = managed_attach_handle(handle, self())
+      state = put_active_attach(state, id, entry, managed_handle)
+      {:reply, {:ok, managed_handle}, state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:close_attach, handle, opts}, _from, state) do
+    case fetch_active_attach(state, handle) do
+      {:ok, id, entry} ->
+        result = RunicSandbox.close_attach(handle, Keyword.delete(opts, :server))
+        state = delete_active_attach(state, id, entry, handle)
+        {:reply, result, state}
+
+      :not_found ->
+        {:reply, RunicSandbox.close_attach(handle, Keyword.delete(opts, :server)), state}
+    end
+  end
+
   def handle_call({:close_session, session, opts}, _from, state) do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
          :ok <- validate_no_active_leases(state, session),
+         {close_results, state} <- close_entry_attaches(state, id, entry, opts),
+         :ok <- active_attach_close_result(close_results),
          :ok <- RunicSandbox.close_session(entry.session, Keyword.delete(opts, :server)) do
       {:reply, :ok, delete_entry(state, id, entry)}
     else
@@ -281,7 +346,8 @@ defmodule RunicSandbox.Manager do
   defp checkin_session(%__MODULE__{} = state, %Session{} = session, %Profile{} = profile, opts) do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
-         :ok <- validate_no_active_leases(state, session) do
+         :ok <- validate_no_active_leases(state, session),
+         :ok <- validate_no_active_attaches(entry, session) do
       if Keyword.get(opts, :reset?, profile.pool.reset_on_checkin?) do
         case reset_entry(state, entry.session, profile, opts) do
           {:ok, _session, state} -> {:ok, state}
@@ -297,7 +363,8 @@ defmodule RunicSandbox.Manager do
   defp reset_entry(%__MODULE__{} = state, %Session{} = session, %Profile{} = profile, opts) do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
-         :ok <- validate_no_active_leases(state, session) do
+         :ok <- validate_no_active_leases(state, session),
+         :ok <- validate_no_active_attaches(entry, session) do
       case RunicSandbox.close_session(entry.session, Keyword.delete(opts, :server)) do
         :ok ->
           state = delete_entry(state, id, entry)
@@ -350,7 +417,8 @@ defmodule RunicSandbox.Manager do
         lifecycle: lifecycle,
         created_at_ms: now,
         last_used_at_ms: now,
-        checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil)
+        checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil),
+        active_attaches: %{}
       }
       |> Map.merge(owner_fields(lifecycle, owner_pid))
 
@@ -366,7 +434,8 @@ defmodule RunicSandbox.Manager do
       |> Map.merge(%{
         lifecycle: lifecycle,
         last_used_at_ms: now,
-        checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil)
+        checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil),
+        active_attaches: Map.get(entry, :active_attaches, %{})
       })
       |> Map.merge(owner_fields(lifecycle, owner_pid))
 
@@ -421,6 +490,23 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  defp validate_attach_handle(%{session: %Session{} = session}, %AttachHandle{} = handle) do
+    if handle.session_id == session.id and handle.backend == session.backend do
+      :ok
+    else
+      {:error,
+       Error.validation("sandbox attach handle does not match managed session",
+         source: __MODULE__,
+         details: %{
+           session_id: session.id,
+           attach_session_id: handle.session_id,
+           backend: session.backend,
+           attach_backend: handle.backend
+         }
+       )}
+    end
+  end
+
   defp validate_no_conflicting_lease(%__MODULE__{} = state, %Session{} = session, resource, opts) do
     mode = Keyword.get(opts, :mode, :exclusive)
     resource = to_string(resource)
@@ -460,6 +546,94 @@ defmodule RunicSandbox.Manager do
            details: %{session_id: session.id, lease_ids: Enum.map(leases, & &1.id)}
          )}
     end
+  end
+
+  defp validate_no_active_attaches(entry, %Session{} = session) do
+    active_attaches =
+      entry
+      |> Map.get(:active_attaches, %{})
+      |> Map.values()
+
+    case active_attaches do
+      [] ->
+        :ok
+
+      attaches ->
+        {:error,
+         Error.validation("sandbox session has active attaches",
+           source: __MODULE__,
+           details: %{session_id: session.id, attach_ids: Enum.map(attaches, & &1.id)}
+         )}
+    end
+  end
+
+  defp put_active_attach(%__MODULE__{} = state, id, entry, %AttachHandle{} = handle) do
+    attach = attach_snapshot(handle)
+    active_attaches = entry |> Map.get(:active_attaches, %{}) |> Map.put(handle.id, attach)
+    entry = Map.put(entry, :active_attaches, active_attaches)
+    %{state | sessions: Map.put(state.sessions, id, entry)}
+  end
+
+  defp delete_active_attach(%__MODULE__{} = state, id, entry, %AttachHandle{} = handle) do
+    active_attaches = entry |> Map.get(:active_attaches, %{}) |> Map.delete(handle.id)
+    entry = Map.put(entry, :active_attaches, active_attaches)
+    %{state | sessions: Map.put(state.sessions, id, entry)}
+  end
+
+  defp fetch_active_attach(%__MODULE__{} = state, %AttachHandle{} = handle) do
+    Enum.find_value(state.sessions, :not_found, fn {id, entry} ->
+      active_attaches = Map.get(entry, :active_attaches, %{})
+
+      if Map.has_key?(active_attaches, handle.id) do
+        {:ok, id, entry}
+      else
+        false
+      end
+    end)
+  end
+
+  defp managed_attach_handle(%AttachHandle{} = handle, manager) do
+    events =
+      Stream.transform(
+        handle.events,
+        fn -> :ok end,
+        fn event, acc -> {[event], acc} end,
+        fn _acc ->
+          _ = close_attach(manager, handle, [])
+          :ok
+        end
+      )
+
+    %{handle | events: events}
+  end
+
+  defp close_entry_attaches(%__MODULE__{} = state, id, entry, opts) do
+    results =
+      entry
+      |> Map.get(:active_attaches, %{})
+      |> Map.values()
+      |> Enum.map(fn attach ->
+        RunicSandbox.close_attach(attach.handle, Keyword.delete(opts, :server))
+      end)
+
+    entry = Map.put(entry, :active_attaches, %{})
+    {results, %{state | sessions: Map.put(state.sessions, id, entry)}}
+  end
+
+  defp active_attach_close_result(results) do
+    Enum.find(results, &match?({:error, _error}, &1)) || :ok
+  end
+
+  defp attach_snapshot(%AttachHandle{} = handle) do
+    %{
+      id: handle.id,
+      session_id: handle.session_id,
+      backend: handle.backend,
+      status: handle.status,
+      metadata: handle.metadata,
+      opened_at_ms: now_ms(),
+      handle: handle
+    }
   end
 
   defp new_lease(%Session{} = session, resource, opts) do
@@ -586,7 +760,13 @@ defmodule RunicSandbox.Manager do
                    created_at_ms: entry.created_at_ms,
                    last_used_at_ms: entry.last_used_at_ms,
                    checked_out_at_ms: entry.checked_out_at_ms,
-                   owner_alive?: is_pid(entry.owner_pid) and Process.alive?(entry.owner_pid)
+                   owner_alive?: is_pid(entry.owner_pid) and Process.alive?(entry.owner_pid),
+                   active_attach_count: entry |> Map.get(:active_attaches, %{}) |> map_size(),
+                   active_attaches:
+                     entry
+                     |> Map.get(:active_attaches, %{})
+                     |> Map.values()
+                     |> Enum.map(&Map.drop(&1, [:handle]))
                  })
                end)
                |> Enum.map(fn session ->

@@ -197,7 +197,8 @@ defmodule RunicSandbox.Backends.Docker do
              leases?: false,
              streaming?: true,
              network_policy?: true,
-             persistent_identity?: if(profile, do: stateful?(profile), else: false)
+             persistent_identity?: if(profile, do: stateful?(profile), else: false),
+             metadata: docker_attach_metadata()
            )
          ),
        missing_requirements:
@@ -241,7 +242,8 @@ defmodule RunicSandbox.Backends.Docker do
             leases?: false,
             streaming?: true,
             network_policy?: true,
-            persistent_identity?: true
+            persistent_identity?: true,
+            metadata: docker_attach_metadata()
           ),
         policy: session_profile.policy,
         state_model: :persistent_workspace,
@@ -1200,6 +1202,15 @@ defmodule RunicSandbox.Backends.Docker do
   defp docker_network(:disabled), do: "none"
   defp docker_network(:host), do: "host"
   defp docker_network(:restricted), do: "none"
+
+  defp docker_attach_metadata do
+    Capabilities.attach_metadata(:live_stream,
+      stdin_supported?: true,
+      stdin_close_supported?: false,
+      stderr_separate?: false,
+      provider_transport: :docker_cli_port
+    )
+  end
 
   defp resource_args(%Instance{metadata: metadata}) do
     backend_options = Map.get(metadata, :backend_options, %{})

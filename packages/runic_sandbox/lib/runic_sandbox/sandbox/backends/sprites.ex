@@ -26,6 +26,7 @@ defmodule RunicSandbox.Backends.Sprites do
   @default_api_url "https://api.sprites.dev"
   @default_token_env "SPRITES_TOKEN"
   @default_timeout_ms 30_000
+  @default_cwd "/home/sprite"
   @runtime_commands %{
     bash: ["sh", "-lc"],
     sh: ["sh", "-lc"],
@@ -151,7 +152,8 @@ defmodule RunicSandbox.Backends.Sprites do
           status: get(sprite, :status, nil),
           api_url: api_url(profile),
           token_env: token_env(profile),
-          create_policy: create_policy(profile)
+          create_policy: create_policy(profile),
+          default_cwd: @default_cwd
         }
       )
     end
@@ -593,14 +595,18 @@ defmodule RunicSandbox.Backends.Sprites do
     timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
 
     request_opts =
-      [
-        method: method,
-        url: url,
-        headers: headers,
-        receive_timeout: timeout,
-        decode_body: false
-      ]
-      |> maybe_put_req_body(method, body)
+      maybe_put_req_body(
+        [
+          method: method,
+          url: url,
+          headers: headers,
+          receive_timeout: timeout,
+          decode_body: false
+        ],
+        method,
+        path,
+        body
+      )
 
     case Req.request(request_opts) do
       {:ok, %Req.Response{status: status, body: response_body}} ->
@@ -611,21 +617,32 @@ defmodule RunicSandbox.Backends.Sprites do
     end
   end
 
-  defp maybe_put_req_body(opts, method, _body) when method in [:get, :delete], do: opts
+  defp maybe_put_req_body(opts, method, _path, _body) when method in [:get, :delete], do: opts
 
-  defp maybe_put_req_body(opts, _method, body) do
+  defp maybe_put_req_body(opts, :put, path, body) do
+    content_type =
+      if String.ends_with?(path, "/fs/write"),
+        do: "application/octet-stream",
+        else: "application/json"
+
     opts
     |> Keyword.put(:body, body)
-    |> Keyword.put(:headers, put_content_type(opts[:headers] || []))
+    |> Keyword.put(:headers, put_content_type(opts[:headers] || [], content_type))
   end
 
-  defp put_content_type(headers) do
+  defp maybe_put_req_body(opts, _method, _path, body) do
+    opts
+    |> Keyword.put(:body, body)
+    |> Keyword.put(:headers, put_content_type(opts[:headers] || [], "application/json"))
+  end
+
+  defp put_content_type(headers, content_type) do
     if Enum.any?(headers, fn {key, _value} ->
          String.downcase(to_string(key)) == "content-type"
        end) do
       headers
     else
-      [{"content-type", "application/json"} | headers]
+      [{"content-type", content_type} | headers]
     end
   end
 
@@ -687,22 +704,49 @@ defmodule RunicSandbox.Backends.Sprites do
 
   defp exec_output(_response), do: {:ok, {"", "", 0}}
 
-  defp binary_exec_output(<<3, exit_status>>), do: {:ok, {"", "", exit_status}}
+  defp binary_exec_output(response) when is_binary(response) do
+    decode_exec_frames(response, "", "", nil)
+  end
 
-  defp binary_exec_output(<<stream, payload_with_exit::binary>>) when stream in [1, 2] do
-    case payload_with_exit do
-      <<payload::binary-size(byte_size(payload_with_exit) - 2), 3, exit_status>> ->
+  defp decode_exec_frames(<<>>, stdout, stderr, exit_status) when is_integer(exit_status),
+    do: {:ok, {stdout, stderr, exit_status}}
+
+  defp decode_exec_frames(<<3, exit_status>>, stdout, stderr, _exit_status),
+    do: {:ok, {stdout, stderr, exit_status}}
+
+  defp decode_exec_frames(<<stream, rest::binary>>, stdout, stderr, exit_status)
+       when stream in [1, 2] do
+    case split_exec_payload(rest) do
+      {:ok, payload, rest} ->
         case stream do
-          1 -> {:ok, {payload, "", exit_status}}
-          2 -> {:ok, {"", payload, exit_status}}
+          1 -> decode_exec_frames(rest, stdout <> payload, stderr, exit_status)
+          2 -> decode_exec_frames(rest, stdout, stderr <> payload, exit_status)
         end
 
-      _other ->
+      :error ->
         :error
     end
   end
 
-  defp binary_exec_output(_response), do: :error
+  defp decode_exec_frames(_response, _stdout, _stderr, _exit_status), do: :error
+
+  defp split_exec_payload(binary) do
+    case next_exec_frame_offset(binary, 0) do
+      nil ->
+        :error
+
+      offset ->
+        <<payload::binary-size(offset), rest::binary>> = binary
+        {:ok, payload, rest}
+    end
+  end
+
+  defp next_exec_frame_offset(<<>>, _offset), do: nil
+  defp next_exec_frame_offset(<<marker, _rest::binary>>, offset) when marker in [1, 2], do: offset
+  defp next_exec_frame_offset(<<3, _exit_status>>, offset), do: offset
+
+  defp next_exec_frame_offset(<<_byte, rest::binary>>, offset),
+    do: next_exec_frame_offset(rest, offset + 1)
 
   defp request_argv(%ExecutionRequest{mode: :command, argv: argv}) when argv != [],
     do: {:ok, argv}
@@ -723,7 +767,8 @@ defmodule RunicSandbox.Backends.Sprites do
   defp write_request_files(%Session{} = session, %ExecutionRequest{} = request, files, opts) do
     Enum.reduce_while(files, :ok, fn {path, contents}, :ok ->
       with {:ok, path} <- request_file_path(request.cwd, path),
-           {:ok, _ref} <- write_file(session, path, contents, opts) do
+           {:ok, _ref} <-
+             write_file(session, path, contents, Keyword.put(opts, :working_dir, request.cwd)) do
         {:cont, :ok}
       else
         {:error, error} -> {:halt, {:error, error}}
@@ -751,7 +796,7 @@ defmodule RunicSandbox.Backends.Sprites do
         guest_path = Path.expand(path, cwd)
 
         if guest_path != cwd and String.starts_with?(guest_path, cwd <> "/") do
-          {:ok, guest_path}
+          {:ok, path}
         else
           {:error,
            Error.validation("sprites inline file path escapes the request cwd",
@@ -775,7 +820,13 @@ defmodule RunicSandbox.Backends.Sprites do
       leases?: false,
       streaming?: true,
       network_policy?: true,
-      persistent_identity?: true
+      persistent_identity?: true,
+      metadata:
+        Capabilities.attach_metadata(:terminal_adapter,
+          provider_transport: :sprites_http_exec,
+          restricted_egress_supported?: false,
+          default_cwd: @default_cwd
+        )
     )
   end
 
@@ -992,7 +1043,7 @@ defmodule RunicSandbox.Backends.Sprites do
 
   defp redacted_body(body), do: body
 
-  defp working_dir(opts), do: Keyword.get(opts, :working_dir, "/workspace")
+  defp working_dir(opts), do: Keyword.get(opts, :working_dir, @default_cwd)
   defp escape(value), do: URI.encode_www_form(to_string(value))
   defp normalize_exit_status(value) when is_integer(value), do: {:ok, value}
 

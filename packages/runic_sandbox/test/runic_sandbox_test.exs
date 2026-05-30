@@ -2,6 +2,7 @@ defmodule RunicSandboxTest do
   use ExUnit.Case, async: false
 
   alias RunicSandbox.Backend
+  alias RunicSandbox.AttachBridge
   alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Checkpoint
@@ -225,6 +226,99 @@ defmodule RunicSandboxTest do
     assert status.sandboxes.local_code.sessions == []
 
     assert {:ok, reopened} = RunicSandbox.open_session(:local_code, [], server: name)
+    assert reopened.id != session.id
+    assert :ok = RunicSandbox.close_session(reopened, server: name)
+  end
+
+  test "managed attach lifecycle blocks release until the attach stream terminates" do
+    name = :"runic_sandbox_attach_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+
+    assert {:ok, handle} =
+             RunicSandbox.attach(
+               session,
+               [runtime: :bash, source: "echo managed-attach"],
+               server: name
+             )
+
+    assert handle.status == :closed
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert [tracked] = status.sandboxes.local_code.sessions
+    assert tracked.active_attach_count == 1
+    assert [%{id: attach_id, session_id: session_id}] = tracked.active_attaches
+    assert attach_id == handle.id
+    assert session_id == session.id
+
+    assert {:error, error} = RunicSandbox.release_session(session, server: name)
+    assert error.message == "sandbox session has active attaches"
+    assert error.details.attach_ids == [handle.id]
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+
+    assert [%{lifecycle: :checked_out, active_attach_count: 1}] =
+             status.sandboxes.local_code.sessions
+
+    assert attach_stdout(handle) == "managed-attach\n"
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert [%{active_attach_count: 0, active_attaches: []}] = status.sandboxes.local_code.sessions
+
+    assert :ok = RunicSandbox.close_attach(handle, server: name)
+    assert :ok = RunicSandbox.close_attach(handle, server: name)
+
+    assert :ok = RunicSandbox.release_session(session, server: name)
+  end
+
+  test "managed close_session cleans active attaches and frees pool capacity" do
+    name = :"runic_sandbox_attach_close_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 0, max: 1],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+
+    assert {:ok, handle} =
+             RunicSandbox.attach(
+               session,
+               [runtime: :bash, source: "echo close-cleans-attach"],
+               server: name
+             )
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert [%{active_attach_count: 1}] = status.sandboxes.local_code.sessions
+
+    assert :ok = RunicSandbox.close_session(session, server: name)
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.local_code.sessions == []
+    assert attach_stdout(handle) == "close-cleans-attach\n"
+
+    assert {:ok, reopened} = RunicSandbox.acquire_session(:local_code, [], server: name)
     assert reopened.id != session.id
     assert :ok = RunicSandbox.close_session(reopened, server: name)
   end
@@ -515,6 +609,83 @@ defmodule RunicSandboxTest do
     assert {:error, error} = RunicSandbox.Policy.new(allowed_runtimes: [unknown_runtime])
     assert error.message =~ "known atom string"
 
+    assert {:ok, policy} =
+             RunicSandbox.Policy.new(
+               network: :restricted,
+               metadata: %{
+                 egress_allowlist: [
+                   %{scheme: "HTTP", host: "127.0.0.1", port: "4567", purpose: :mcp}
+                 ]
+               }
+             )
+
+    assert policy.network == :restricted
+    assert policy.metadata.deny_by_default?
+
+    assert RunicSandbox.Policy.egress_allowlist(policy) == [
+             %{scheme: "http", host: "127.0.0.1", port: 4567, purpose: "mcp"}
+           ]
+
+    assert RunicSandbox.Policy.restricted_egress_requested?(policy)
+
+    assert RunicSandbox.Policy.effective_network(policy) == %{
+             mode: :restricted,
+             deny_by_default?: true,
+             restricted_egress?: true,
+             mcp_boundary: nil,
+             egress_allowlist: [
+               %{scheme: "http", host: "127.0.0.1", port: 4567, purpose: "mcp"}
+             ]
+           }
+
+    assert {:ok, deny_all} = RunicSandbox.Policy.new(network: :restricted)
+    assert deny_all.metadata.deny_by_default?
+    assert deny_all.metadata.egress_allowlist == []
+    refute RunicSandbox.Policy.restricted_egress_requested?(deny_all)
+
+    assert {:error, error} =
+             RunicSandbox.Policy.new(
+               network: :host,
+               metadata: %{egress_allowlist: [%{scheme: "https", host: "hex.pm", port: 443}]}
+             )
+
+    assert error.message == "sandbox egress_allowlist requires restricted networking"
+
+    assert {:ok, mcp_policy} =
+             RunicSandbox.Policy.new(
+               network: :restricted,
+               metadata: %{
+                 mcp_boundary: %{transport: :host_forward, host: "127.0.0.1", port: "4567"}
+               }
+             )
+
+    assert RunicSandbox.Policy.mcp_boundary_requested?(mcp_policy)
+
+    assert RunicSandbox.Policy.mcp_boundary(mcp_policy) == %{
+             transport: "host_forward",
+             host: "127.0.0.1",
+             port: 4567
+           }
+
+    assert {:ok, socket_policy} =
+             RunicSandbox.Policy.new(
+               network: :restricted,
+               mcp_boundary: %{transport: "unix_socket", path: "/tmp/runic-mcp.sock"}
+             )
+
+    assert RunicSandbox.Policy.mcp_boundary(socket_policy) == %{
+             transport: "unix_socket",
+             path: "/tmp/runic-mcp.sock"
+           }
+
+    assert {:error, error} =
+             RunicSandbox.Policy.new(
+               network: :restricted,
+               mcp_boundary: %{transport: :egress_allowlist}
+             )
+
+    assert error.message == "sandbox MCP egress_allowlist boundary requires restricted egress"
+
     assert {:ok, profile} =
              Profile.new(name: :local_code, backend: "docker", isolation_level: "container")
 
@@ -546,12 +717,48 @@ defmodule RunicSandboxTest do
                leases?: true,
                streaming?: true,
                network_policy?: true,
-               persistent_identity?: true
+               persistent_identity?: true,
+               metadata:
+                 Capabilities.attach_metadata(:live_stream,
+                   stdin_supported?: true,
+                   stdin_close_supported?: true,
+                   stderr_separate?: true,
+                   provider_transport: :test
+                 )
              )
 
     assert capabilities.exec?
     refute capabilities.checkpoints?
     assert capabilities.streaming?
+    assert Capabilities.attach_mode(capabilities) == :live_stream
+    assert Capabilities.attach_supported?(capabilities)
+    assert Capabilities.streaming_live?(capabilities)
+    assert Capabilities.stdin_supported?(capabilities)
+    assert Capabilities.stdin_close_supported?(capabilities)
+    assert Capabilities.stderr_separate?(capabilities)
+    refute Capabilities.terminal_result_adapter?(capabilities)
+    refute Capabilities.mcp_boundary_supported?(capabilities)
+    refute Capabilities.restricted_egress_supported?(capabilities)
+    refute Capabilities.pty_supported?(capabilities)
+
+    terminal_capabilities =
+      Capabilities.one_shot_exec(
+        streaming?: true,
+        metadata: Capabilities.attach_metadata(:terminal_adapter)
+      )
+
+    assert Capabilities.attach_mode(terminal_capabilities) == :terminal_adapter
+    assert Capabilities.attach_supported?(terminal_capabilities)
+    assert Capabilities.terminal_result_adapter?(terminal_capabilities)
+    refute Capabilities.streaming_live?(terminal_capabilities)
+    refute Capabilities.stdin_supported?(terminal_capabilities)
+
+    assert Capabilities.attach_mode(%{streaming?: false, metadata: %{}}) == :none
+
+    assert {:error, error} =
+             Capabilities.new(exec?: true, metadata: %{attach_mode: :made_up})
+
+    assert error.message == "invalid sandbox attach capability mode"
 
     assert {:ok, session} =
              Session.new(
@@ -639,6 +846,91 @@ defmodule RunicSandboxTest do
     assert error.message =~ "exec?"
     assert {:error, error} = Session.new(id: "", sandbox: :local_code, backend: :docker)
     assert error.message =~ "id"
+  end
+
+  test "attach bridge summarizes ordered chunks and handle metadata" do
+    events = [
+      bridge_event(:exec_started, %{runtime: :bash}, "start"),
+      bridge_event(:stdout_chunk, %{stream: :stdout, chunk: "out-1"}, "out-1"),
+      bridge_event(:stderr_chunk, %{"stream" => "stderr", "chunk" => "err"}, "err"),
+      bridge_event(:stdout_chunk, %{chunk: ["out-", "2"]}, "out-2"),
+      bridge_event(:exec_finished, %{status: :pass, exit_status: 0}, "done")
+    ]
+
+    handle =
+      AttachHandle.new!(
+        id: "attach-bridge",
+        session_id: "session-bridge",
+        backend: :docker,
+        events: events,
+        metadata: %{attach_mode: :live_stream, streaming_live?: true}
+      )
+
+    summary = AttachBridge.summarize(handle)
+
+    assert summary.attach_id == "attach-bridge"
+    assert summary.session_id == "session-bridge"
+    assert summary.backend == :docker
+    assert summary.status == :pass
+    assert summary.exit_status == 0
+    assert summary.stdout == "out-1out-2"
+    assert summary.stderr == "err"
+    assert summary.combined == "out-1errout-2"
+    assert summary.chunk_counts == %{stdout: 2, stderr: 1}
+    assert summary.byte_counts == %{stdout: 10, stderr: 3, combined: 13}
+    assert summary.event_count == 5
+    assert summary.terminal_count == 1
+    refute summary.missing_terminal?
+    refute summary.synthetic_terminal?
+    assert summary.metadata == %{attach_mode: :live_stream, streaming_live?: true}
+    assert Enum.map(summary.chunks, & &1.stream) == [:stdout, :stderr, :stdout]
+  end
+
+  test "attach bridge fails closed when stream lacks exec_finished" do
+    summary =
+      AttachBridge.summarize(
+        [
+          bridge_event(:stdout_chunk, %{stream: :stdout, chunk: "partial"}, "partial")
+        ],
+        attach_id: "missing-terminal",
+        session_id: "session-bridge",
+        backend: :vmsan
+      )
+
+    assert summary.status == :fail
+    assert summary.exit_status == nil
+    assert summary.stdout == "partial"
+    assert summary.missing_terminal?
+    assert summary.synthetic_terminal?
+    assert summary.terminal_count == 0
+    assert summary.effective_terminal.payload.reason == :missing_exec_finished
+  end
+
+  test "attach bridge lets backend failure override earlier success terminal" do
+    summary =
+      AttachBridge.summarize([
+        bridge_event(:exec_finished, %{status: :pass, exit_status: 0}, "success"),
+        bridge_event(:exec_finished, %{status: :fail, exit_status: 42}, "failure")
+      ])
+
+    assert summary.status == :fail
+    assert summary.exit_status == 42
+    assert summary.terminal_count == 2
+    assert summary.effective_terminal.event_id == "failure"
+    assert summary.last_terminal.event_id == "failure"
+  end
+
+  test "attach bridge keeps first repeated success as effective terminal" do
+    summary =
+      AttachBridge.summarize([
+        bridge_event(:exec_finished, %{status: :pass, exit_status: 0}, "success-1"),
+        bridge_event(:exec_finished, %{status: :pass, exit_status: 0}, "success-2")
+      ])
+
+    assert summary.status == :pass
+    assert summary.terminal_count == 2
+    assert summary.effective_terminal.event_id == "success-1"
+    assert summary.last_terminal.event_id == "success-2"
   end
 
   test "backend default session adapter preserves one-shot execution and unsupported capabilities" do
@@ -765,6 +1057,83 @@ defmodule RunicSandboxTest do
     assert :ok = RunicSandbox.close_session(session)
   end
 
+  test "restricted egress allow-lists fail closed when backend cannot enforce them" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :docker,
+               runtimes: [:bash],
+               policy: [
+                 network: :restricted,
+                 metadata: %{
+                   egress_allowlist: [
+                     %{scheme: "http", host: "127.0.0.1", port: 4567, purpose: :mcp}
+                   ]
+                 }
+               ]
+             )
+
+    assert profile.policy.network == :restricted
+    assert RunicSandbox.Policy.restricted_egress_requested?(profile.policy)
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               %{
+                 sandbox: :local_code,
+                 runtime: :bash,
+                 source: "echo should-not-run",
+                 network: :restricted
+               },
+               profile: profile
+             )
+
+    assert error.message == "sandbox restricted egress allow-list is not supported by backend"
+    assert error.details.backend == :docker
+    refute error.details.restricted_egress_supported?
+    assert error.details.policy.restricted_egress?
+
+    assert {:error, error} = RunicSandbox.open_session(:local_code, [], profile: profile)
+    assert error.message == "sandbox restricted egress allow-list is not supported by backend"
+  end
+
+  test "MCP boundary requests fail closed when backend cannot provide the boundary" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :docker,
+               runtimes: [:bash],
+               policy: [
+                 network: :restricted,
+                 metadata: %{
+                   mcp_boundary: %{transport: :host_forward, host: "127.0.0.1", port: 4567}
+                 }
+               ]
+             )
+
+    assert profile.policy.network == :restricted
+    assert RunicSandbox.Policy.mcp_boundary_requested?(profile.policy)
+    refute RunicSandbox.Policy.restricted_egress_requested?(profile.policy)
+
+    assert {:error, error} =
+             RunicSandbox.exec(
+               %{
+                 sandbox: :local_code,
+                 runtime: :bash,
+                 source: "echo should-not-run",
+                 network: :restricted
+               },
+               profile: profile
+             )
+
+    assert error.message == "sandbox MCP boundary is not supported by backend"
+    assert error.details.backend == :docker
+    refute error.details.mcp_boundary_supported?
+    assert error.details.policy.mcp_boundary.transport == "host_forward"
+
+    assert {:error, error} = RunicSandbox.open_session(:local_code, [], profile: profile)
+    assert error.message == "sandbox MCP boundary is not supported by backend"
+  end
+
   test "session authority rejects mutated handles before backend execution" do
     assert {:ok, profile} =
              Profile.new(
@@ -795,6 +1164,56 @@ defmodule RunicSandboxTest do
     assert error.message == "sandbox session authority snapshot does not match the handle"
     refute function_exported?(RunicSandbox.Session, :reseal, 1)
     refute Code.ensure_loaded?(RunicSandbox.SessionAuthority)
+  end
+
+  test "session authority secret initialization is safe under concurrent opens" do
+    :persistent_term.erase({RunicSandbox, :session_authority_secret})
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :just_bash,
+               runtimes: [:bash],
+               network: :disabled
+             )
+
+    parent = self()
+
+    tasks =
+      for index <- 1..32 do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> :ok
+          end
+
+          with {:ok, session} <- RunicSandbox.open_session(:local_code, [], profile: profile),
+               {:ok, result} <-
+                 RunicSandbox.exec(session,
+                   runtime: :bash,
+                   source: "echo authority-#{index}"
+                 ),
+               :ok <- RunicSandbox.close_session(session) do
+            {:ok, result.stdout}
+          end
+        end)
+      end
+
+    pids =
+      for _ <- tasks do
+        assert_receive {:ready, pid}, 1_000
+        pid
+      end
+
+    Enum.each(pids, &send(&1, :go))
+
+    assert tasks
+           |> Task.await_many(5_000)
+           |> Enum.all?(fn
+             {:ok, stdout} -> String.starts_with?(stdout, "authority-")
+             _other -> false
+           end)
   end
 
   test "session operations enforce profile isolation and close revocation" do
@@ -863,6 +1282,21 @@ defmodule RunicSandboxTest do
       assert is_boolean(health.capabilities.streaming?)
       assert health.capabilities.streaming?
       assert is_boolean(health.capabilities.persistent_identity?)
+
+      expected_attach_mode =
+        if profile.backend in [:docker, :gvisor], do: :live_stream, else: :terminal_adapter
+
+      assert Capabilities.attach_mode(health.capabilities) == expected_attach_mode
+      assert Capabilities.attach_supported?(health.capabilities)
+
+      assert Capabilities.stdin_supported?(health.capabilities) ==
+               (expected_attach_mode == :live_stream)
+
+      assert Capabilities.streaming_live?(health.capabilities) ==
+               (expected_attach_mode == :live_stream)
+
+      assert Capabilities.terminal_result_adapter?(health.capabilities) ==
+               (expected_attach_mode == :terminal_adapter)
     end
   end
 
@@ -1373,7 +1807,7 @@ defmodule RunicSandboxTest do
            ]
 
     assert VmsanCLI.exec_args("vm-1", ["sh", "-lc", "echo ok"], workdir: "/workspace") ==
-             ["exec", "--workdir", "/workspace", "vm-1", "sh", "-lc", "echo ok"]
+             ["exec", "--workdir", "/workspace", "vm-1", "--", "sh", "-lc", "echo ok"]
 
     runner = fn "vmsan", ["--json", "exec", "vm-1", "echo", "ok"], _opts ->
       {"ok\n{\"path\":\"exec\",\"vmId\":\"vm-1\"}\n", 0}
@@ -1411,6 +1845,22 @@ defmodule RunicSandboxTest do
 
     assert nonzero_error.message == "vmsan command failed"
     assert nonzero_error.details.exit_status == 1
+
+    sudo_password_runner = fn
+      "sudo", ["-n", "env", "PATH=/bin", "vmsan", "--json", "create"], _opts ->
+        {"sudo: a password is required\n", 1}
+    end
+
+    assert {:error, sudo_error} =
+             VmsanCLI.run_json(["create"],
+               runner: sudo_password_runner,
+               sudo?: true,
+               path: "/bin"
+             )
+
+    assert sudo_error.kind == :provider
+    assert sudo_error.message == "vmsan command requires passwordless sudo"
+    assert sudo_error.details.exit_status == 1
   end
 
   test "vmsan backend reports doctor diagnostics and blocks execution when unavailable" do
@@ -1476,12 +1926,37 @@ defmodule RunicSandboxTest do
         send(agent_pid, {:vmsan_create, :sudo})
         {Jason.encode!(%{"path" => "create", "vmId" => "vm-a"}), 0}
 
+      "/usr/bin/vmsan",
+      [
+        "--json",
+        "exec",
+        "--sudo",
+        "vm-a",
+        "--",
+        "sh",
+        "-lc",
+        "mkdir -p -- '/workspace' && chown ubuntu:ubuntu -- '/workspace'"
+      ],
+      _opts ->
+        send(agent_pid, :vmsan_prepare_workspace)
+        {Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}), 0}
+
       "/usr/bin/vmsan", ["--json", "upload", "--dest", "/workspace", "vm-a", local_path], _opts ->
         send(agent_pid, {:vmsan_upload, local_path})
         {Jason.encode!(%{"path" => "upload", "vmId" => "vm-a"}), 0}
 
       "/usr/bin/vmsan",
-      ["--json", "exec", "--workdir", "/workspace", "vm-a", "sh", "-lc", "cat /workspace/in.txt"],
+      [
+        "--json",
+        "exec",
+        "--workdir",
+        "/workspace",
+        "vm-a",
+        "--",
+        "sh",
+        "-lc",
+        "cat /workspace/in.txt"
+      ],
       _opts ->
         send(agent_pid, :vmsan_exec)
         {"hello\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
@@ -1498,7 +1973,7 @@ defmodule RunicSandboxTest do
          }), 0}
 
       "sudo",
-      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "remove", "vm-a"],
+      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "remove", "--force", "vm-a"],
       _opts ->
         send(agent_pid, {:vmsan_remove, :sudo})
         {Jason.encode!(%{"path" => "remove", "vmId" => "vm-a"}), 0}
@@ -1524,6 +1999,7 @@ defmodule RunicSandboxTest do
              )
 
     assert_receive {:vmsan_create, :sudo}
+    assert_receive :vmsan_prepare_workspace
     assert session.metadata.sudo?
     assert File.dir?(session.metadata.transfer_root)
 
@@ -1626,12 +2102,45 @@ defmodule RunicSandboxTest do
         {Jason.encode!(%{"path" => "create", "vmId" => "vm-cleanup"}), 0}
 
       "/usr/bin/vmsan",
-      ["--json", "exec", "--workdir", "/workspace", "vm-cleanup", "sh", "-lc", "echo ok"],
+      [
+        "--json",
+        "exec",
+        "--sudo",
+        "vm-cleanup",
+        "--",
+        "sh",
+        "-lc",
+        "mkdir -p -- '/workspace' && chown ubuntu:ubuntu -- '/workspace'"
+      ],
+      _opts ->
+        {Jason.encode!(%{"path" => "exec", "vmId" => "vm-cleanup"}), 0}
+
+      "/usr/bin/vmsan",
+      [
+        "--json",
+        "exec",
+        "--workdir",
+        "/workspace",
+        "vm-cleanup",
+        "--",
+        "sh",
+        "-lc",
+        "echo ok"
+      ],
       _opts ->
         {"ok\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-cleanup"}) <> "\n", 0}
 
       "sudo",
-      ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "remove", "vm-cleanup"],
+      [
+        "-n",
+        "env",
+        "PATH=" <> _path,
+        "/usr/bin/vmsan",
+        "--json",
+        "remove",
+        "--force",
+        "vm-cleanup"
+      ],
       _opts ->
         send(agent_pid, :cleanup_attempted)
 
@@ -1698,8 +2207,8 @@ defmodule RunicSandboxTest do
              })
          }}
 
-      :put, _config, "/v1/sprites/runic-test-sprite/fs/write", query, contents, _opts ->
-        send(parent, {:sprites_request, :write, query, contents})
+      :put, _config, "/v1/sprites/runic-test-sprite/fs/write", query, contents, opts ->
+        send(parent, {:sprites_request, :write, query, contents, Keyword.get(opts, :headers)})
         {:ok, %{status: 200, body: Jason.encode!(%{path: query.path, size: byte_size(contents)})}}
 
       :post, _config, "/v1/sprites/runic-test-sprite/exec", query, stdin, _opts ->
@@ -1819,6 +2328,8 @@ defmodule RunicSandboxTest do
     assert session.state_model == :service_actor
     assert session.transport_model == :remote_microvm
     assert session.metadata.token_env == "SPRITES_TOKEN"
+    assert session.metadata.default_cwd == "/home/sprite"
+    assert Capabilities.default_cwd(session.capabilities) == "/home/sprite"
     refute inspect(session) =~ "secret-token"
     assert_receive {:sprites_request, :create, %{"name" => "runic-test-sprite"}, headers}
     assert inspect(headers) =~ "secret-token"
@@ -1828,7 +2339,7 @@ defmodule RunicSandboxTest do
                session,
                [
                  runtime: :bash,
-                 source: "cat /workspace/in.txt",
+                 source: "cat in.txt",
                  files: %{"in.txt" => "sprite-file"}
                ],
                env: env,
@@ -1838,8 +2349,11 @@ defmodule RunicSandboxTest do
     assert result.status == :pass
     assert result.stdout == "sprite-ok\n"
     assert result.metadata.provider == :sprites
-    assert_receive {:sprites_request, :write, %{path: "/workspace/in.txt"}, "sprite-file"}
-    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat /workspace/in.txt"]}, ""}
+
+    assert_receive {:sprites_request, :write, %{path: "in.txt", workingDir: "/home/sprite"},
+                    "sprite-file", _write_headers}
+
+    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat in.txt"]}, ""}
 
     assert session.capabilities.streaming?
 
@@ -1848,7 +2362,7 @@ defmodule RunicSandboxTest do
                session,
                [
                  runtime: :bash,
-                 source: "cat /workspace/in.txt",
+                 source: "cat in.txt",
                  files: %{"in.txt" => "sprite-file"}
                ],
                env: env,
@@ -1859,8 +2373,11 @@ defmodule RunicSandboxTest do
     assert handle.metadata.provider_transport == :sprites_http_exec
     assert attach_event_types(handle) == [:exec_started, :stdout_chunk, :exec_finished]
     assert attach_stdout(handle) == "sprite-ok\n"
-    assert_receive {:sprites_request, :write, %{path: "/workspace/in.txt"}, "sprite-file"}
-    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat /workspace/in.txt"]}, ""}
+
+    assert_receive {:sprites_request, :write, %{path: "in.txt", workingDir: "/home/sprite"},
+                    "sprite-file", _write_headers}
+
+    assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat in.txt"]}, ""}
 
     assert {:ok, "sprite-file"} =
              RunicSandbox.read_file(session, "/workspace/in.txt", env: env, requester: requester)
@@ -1963,6 +2480,55 @@ defmodule RunicSandboxTest do
     assert inspect(headers) =~ "secret-token"
     assert_receive {:sprites_direct, :exec, %{cmd: ["sh", "-lc", "echo direct-ok"]}}
     assert_receive {:sprites_direct, :delete}
+  end
+
+  test "sprites terminal adapter decodes multiple binary exec frames" do
+    requester = fn
+      :post, _config, "/v1/sprites/runic-binary/exec", query, "", _opts ->
+        send(self(), {:sprites_binary_exec, query})
+        {:ok, %{status: 200, body: <<1, "sprite-", 1, "binary", 2, "warn", 3, 0>>}}
+    end
+
+    env = fn
+      "SPRITES_TOKEN" -> "secret-token"
+      _name -> nil
+    end
+
+    assert {:ok, profile} =
+             Profile.new(
+               name: :sprites_code,
+               backend: :sprites,
+               runtimes: [:bash],
+               network: :restricted,
+               backend_options: %{sprite: "runic-binary", create_policy: :use_existing}
+             )
+
+    assert {:ok, session} =
+             RunicSandbox.open_session(:sprites_code, [],
+               profile: profile,
+               env: env,
+               requester: requester
+             )
+
+    assert {:ok, handle} =
+             RunicSandbox.attach(
+               session,
+               [runtime: :bash, source: "printf sprite-binary"],
+               env: env,
+               requester: requester
+             )
+
+    summary = AttachBridge.summarize(handle)
+    assert summary.status == :pass
+    assert summary.stdout == "sprite-binary"
+    assert summary.stderr == "warn"
+
+    assert attach_event_types(handle) == [
+             :exec_started,
+             :stdout_chunk,
+             :stderr_chunk,
+             :exec_finished
+           ]
   end
 
   test "sprites exec returns structured error for malformed provider exit status" do
@@ -2289,6 +2855,16 @@ defmodule RunicSandboxTest do
     events
     |> Enum.filter(&(&1.type == :stdout_chunk))
     |> Enum.map_join("", & &1.payload.chunk)
+  end
+
+  defp bridge_event(type, payload, id) do
+    SessionEvent.new!(
+      id: id,
+      session_id: "session-bridge",
+      type: type,
+      payload: payload,
+      metadata: %{source: :bridge_test}
+    )
   end
 
   defp wait_until(fun, timeout_ms \\ 500) do

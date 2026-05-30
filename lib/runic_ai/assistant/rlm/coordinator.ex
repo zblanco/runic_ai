@@ -18,6 +18,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   alias RunicAI.LLM.Result
   alias RunicAI.RLM.StrategyRouter
   alias RunicAI.RLM.SubagentAssignment
+  alias RunicAI.Sandbox.GeneratedComponentPromotionFlow
   alias RunicAI.Sandbox.GeneratedComponentWorkflow
 
   @default_split_bytes 8_000
@@ -39,6 +40,14 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     cond do
       Keyword.has_key?(opts, :blueprint) ->
         WorkflowBlueprint.from_input(Keyword.fetch!(opts, :blueprint))
+
+      Keyword.has_key?(opts, :generated_component_proposal) ->
+        opts
+        |> Keyword.fetch!(:generated_component_proposal)
+        |> GeneratedComponentPromotionFlow.run(
+          generated_component_promotion_flow_opts(objective, opts)
+        )
+        |> promotion_flow_blueprint()
 
       Keyword.has_key?(opts, :generated_components) ->
         GeneratedComponentWorkflow.compose(
@@ -612,6 +621,70 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     ])
     |> Keyword.put_new(:metadata, %{proposal_kind: :generated_component_composition})
   end
+
+  defp generated_component_promotion_flow_opts(objective, opts) do
+    workflow_opts =
+      generated_component_workflow_opts(opts)
+      |> Keyword.merge(Keyword.get(opts, :workflow_opts, []), fn
+        :metadata, left, right when is_map(left) and is_map(right) -> Map.merge(left, right)
+        _key, _left, right -> right
+      end)
+      |> Keyword.update(
+        :metadata,
+        %{proposal_kind: :generated_component_promotion_flow},
+        fn metadata ->
+          Map.merge(metadata, %{proposal_kind: :generated_component_promotion_flow})
+        end
+      )
+
+    opts
+    |> Keyword.take([
+      :id,
+      :source_files,
+      :test_files,
+      :test_command,
+      :test_runtime,
+      :proof_opts,
+      :sandbox,
+      :sandbox_spec,
+      :sandbox_cwd,
+      :session_opts,
+      :attach_opts,
+      :close_opts,
+      :profile,
+      :server,
+      :open_session,
+      :attach,
+      :close_attach,
+      :close_session,
+      :promotion_target,
+      :review_decision,
+      :resume_key,
+      :timeout_ms,
+      :max_output_bytes,
+      :network
+    ])
+    |> Keyword.put(:workflow_objective, objective)
+    |> Keyword.put(:workflow_opts, workflow_opts)
+  end
+
+  defp promotion_flow_blueprint({:ok, %{workflow: %WorkflowBlueprint{} = blueprint}}),
+    do: {:ok, blueprint}
+
+  defp promotion_flow_blueprint({:ok, result}) do
+    {:error,
+     Error.validation("generated component promotion flow did not produce a workflow",
+       source: __MODULE__,
+       details: %{
+         status: result.status,
+         component_id: result.component.id,
+         promotion_decision: result.promotion_decision,
+         repair_context: result.repair_context
+       }
+     )}
+  end
+
+  defp promotion_flow_blueprint({:error, %Error{} = error}), do: {:error, error}
 
   defp normalize_sources([]), do: []
 

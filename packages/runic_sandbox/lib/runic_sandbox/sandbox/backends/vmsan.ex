@@ -372,7 +372,12 @@ defmodule RunicSandbox.Backends.Vmsan do
   defp open_session_with_transfer_root(%Profile{} = profile, opts, transfer_root) do
     with :ok <- ensure_available(opts),
          {:ok, vm} <- create_vm(profile, opts) do
-      case session_from_vm(profile, opts, transfer_root, vm) do
+      result =
+        with :ok <- prepare_workspace(profile, opts, vm.vm_id) do
+          session_from_vm(profile, opts, transfer_root, vm)
+        end
+
+      case result do
         {:ok, session} ->
           {:ok, session}
 
@@ -386,6 +391,26 @@ defmodule RunicSandbox.Backends.Vmsan do
 
           result
       end
+    end
+  end
+
+  defp prepare_workspace(%Profile{} = profile, opts, vm_id) do
+    workspace_path = Map.get(profile.backend_options, :workspace_path, "/workspace")
+    escaped = shell_escape(workspace_path)
+
+    VmsanCLI.exec_args(
+      vm_id,
+      ["sh", "-lc", "mkdir -p -- #{escaped} && chown ubuntu:ubuntu -- #{escaped}"],
+      sudo?: true
+    )
+    |> run_vmsan(
+      opts
+      |> Keyword.put_new(:executable, profile_executable(profile, opts))
+      |> Keyword.put_new(:sudo?, false)
+    )
+    |> case do
+      {:ok, _result} -> :ok
+      {:error, _error} = error -> error
     end
   end
 
@@ -512,7 +537,12 @@ defmodule RunicSandbox.Backends.Vmsan do
       leases?: false,
       streaming?: true,
       network_policy?: true,
-      persistent_identity?: true
+      persistent_identity?: true,
+      metadata:
+        Capabilities.attach_metadata(:terminal_adapter,
+          provider_transport: :vmsan_cli,
+          restricted_egress_supported?: false
+        )
     )
   end
 

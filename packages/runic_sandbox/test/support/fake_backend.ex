@@ -65,7 +65,13 @@ defmodule RunicSandbox.Test.FakeBackend do
           leases?: true,
           streaming?: true,
           network_policy?: true,
-          persistent_identity?: true
+          persistent_identity?: true,
+          metadata:
+            Capabilities.attach_metadata(:live_stream,
+              stdin_supported?: true,
+              stderr_separate?: true,
+              provider_transport: :fake_stream
+            )
         ),
       policy: profile.policy,
       state_model: :checkpointable,

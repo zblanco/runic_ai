@@ -5,6 +5,20 @@ defmodule RunicSandbox.Capabilities do
 
   alias RunicSandbox.Error
 
+  @attach_modes [:none, :terminal_adapter, :live_stream]
+
+  @attach_metadata_keys [
+    :attach_mode,
+    :streaming_live?,
+    :terminal_result_adapter?,
+    :stdin_supported?,
+    :stdin_close_supported?,
+    :stderr_separate?,
+    :mcp_boundary_supported?,
+    :restricted_egress_supported?,
+    :pty_supported?
+  ]
+
   @enforce_keys [
     :exec?,
     :files?,
@@ -49,6 +63,8 @@ defmodule RunicSandbox.Capabilities do
           persistent_identity?: boolean(),
           metadata: map()
         }
+
+  @type attach_mode :: :none | :terminal_adapter | :live_stream
 
   @spec new(keyword() | map() | t()) :: {:ok, t()} | {:error, Error.t()}
   def new(%__MODULE__{} = capabilities), do: validate(capabilities)
@@ -104,6 +120,88 @@ defmodule RunicSandbox.Capabilities do
     |> new!()
   end
 
+  @spec attach_metadata(attach_mode(), keyword() | map()) :: map()
+  def attach_metadata(mode, input \\ []) when mode in @attach_modes do
+    input = input_map(input)
+
+    defaults = %{
+      attach_mode: mode,
+      streaming_live?: get(input, :streaming_live?, mode == :live_stream),
+      terminal_result_adapter?: get(input, :terminal_result_adapter?, mode == :terminal_adapter),
+      stdin_supported?: get(input, :stdin_supported?, mode == :live_stream),
+      stdin_close_supported?: get(input, :stdin_close_supported?, false),
+      stderr_separate?: get(input, :stderr_separate?, false),
+      mcp_boundary_supported?: get(input, :mcp_boundary_supported?, false),
+      restricted_egress_supported?: get(input, :restricted_egress_supported?, false),
+      pty_supported?: get(input, :pty_supported?, false)
+    }
+
+    input
+    |> drop_attach_metadata_keys()
+    |> Map.merge(defaults)
+  end
+
+  @spec attach_mode(t() | map()) :: attach_mode()
+  def attach_mode(capabilities) when is_map(capabilities) do
+    metadata = get(capabilities, :metadata, %{})
+
+    case normalize_attach_mode(get(metadata, :attach_mode, nil)) do
+      mode when mode in @attach_modes ->
+        mode
+
+      _other ->
+        if get(capabilities, :streaming?, false), do: :terminal_adapter, else: :none
+    end
+  end
+
+  @spec attach_supported?(t() | map()) :: boolean()
+  def attach_supported?(capabilities), do: attach_mode(capabilities) != :none
+
+  @spec streaming_live?(t() | map()) :: boolean()
+  def streaming_live?(capabilities) do
+    attach_mode(capabilities) == :live_stream or metadata_truthy?(capabilities, :streaming_live?)
+  end
+
+  @spec terminal_result_adapter?(t() | map()) :: boolean()
+  def terminal_result_adapter?(capabilities) do
+    attach_mode(capabilities) == :terminal_adapter or
+      metadata_truthy?(capabilities, :terminal_result_adapter?)
+  end
+
+  @spec stdin_supported?(t() | map()) :: boolean()
+  def stdin_supported?(capabilities) do
+    metadata_truthy?(capabilities, :stdin_supported?) or attach_mode(capabilities) == :live_stream
+  end
+
+  @spec stdin_close_supported?(t() | map()) :: boolean()
+  def stdin_close_supported?(capabilities),
+    do: metadata_truthy?(capabilities, :stdin_close_supported?)
+
+  @spec stderr_separate?(t() | map()) :: boolean()
+  def stderr_separate?(capabilities), do: metadata_truthy?(capabilities, :stderr_separate?)
+
+  @spec mcp_boundary_supported?(t() | map()) :: boolean()
+  def mcp_boundary_supported?(capabilities),
+    do: metadata_truthy?(capabilities, :mcp_boundary_supported?)
+
+  @spec restricted_egress_supported?(t() | map()) :: boolean()
+  def restricted_egress_supported?(capabilities),
+    do: metadata_truthy?(capabilities, :restricted_egress_supported?)
+
+  @spec pty_supported?(t() | map()) :: boolean()
+  def pty_supported?(capabilities), do: metadata_truthy?(capabilities, :pty_supported?)
+
+  @spec default_cwd(t() | map()) :: String.t() | nil
+  def default_cwd(capabilities) do
+    capabilities
+    |> get(:metadata, %{})
+    |> get(:default_cwd, nil)
+    |> case do
+      value when is_binary(value) and value != "" -> value
+      _other -> nil
+    end
+  end
+
   @spec validate(t()) :: {:ok, t()} | {:error, Error.t()}
   def validate(%__MODULE__{} = capabilities) do
     with :ok <- validate_boolean(capabilities.exec?, :exec?),
@@ -118,7 +216,9 @@ defmodule RunicSandbox.Capabilities do
          :ok <- validate_boolean(capabilities.streaming?, :streaming?),
          :ok <- validate_boolean(capabilities.network_policy?, :network_policy?),
          :ok <- validate_boolean(capabilities.persistent_identity?, :persistent_identity?),
-         :ok <- validate_map(capabilities.metadata, :metadata) do
+         :ok <- validate_map(capabilities.metadata, :metadata),
+         :ok <- validate_optional_string(capabilities.metadata, :default_cwd),
+         :ok <- validate_attach_metadata(capabilities.metadata) do
       {:ok, capabilities}
     end
   end
@@ -146,6 +246,73 @@ defmodule RunicSandbox.Capabilities do
        details: %{field: field, value: value}
      )}
   end
+
+  defp validate_optional_string(metadata, field) do
+    case get(metadata, field, nil) do
+      nil ->
+        :ok
+
+      value when is_binary(value) and value != "" ->
+        :ok
+
+      value ->
+        {:error,
+         Error.validation("sandbox capability #{field} must be a non-empty string",
+           source: __MODULE__,
+           details: %{field: field, value: value}
+         )}
+    end
+  end
+
+  defp validate_attach_metadata(metadata) do
+    case get(metadata, :attach_mode, nil) do
+      nil ->
+        :ok
+
+      value ->
+        case normalize_attach_mode(value) do
+          mode when mode in @attach_modes ->
+            :ok
+
+          _other ->
+            {:error,
+             Error.validation("invalid sandbox attach capability mode",
+               source: __MODULE__,
+               details: %{attach_mode: value, valid_attach_modes: @attach_modes}
+             )}
+        end
+    end
+  end
+
+  defp metadata_truthy?(capabilities, key) do
+    capabilities
+    |> get(:metadata, %{})
+    |> get(key, false)
+    |> truthy?()
+  end
+
+  defp truthy?(value) when value in [true, "true"], do: true
+  defp truthy?(_value), do: false
+
+  defp normalize_attach_mode(value) when value in @attach_modes, do: value
+
+  defp normalize_attach_mode(value) when is_binary(value) do
+    Enum.find(@attach_modes, &(Atom.to_string(&1) == value))
+  end
+
+  defp normalize_attach_mode(_value), do: nil
+
+  defp drop_attach_metadata_keys(input) do
+    Enum.reduce(@attach_metadata_keys, input, fn key, acc ->
+      acc
+      |> Map.delete(key)
+      |> Map.delete(Atom.to_string(key))
+    end)
+  end
+
+  defp input_map(value) when is_map(value), do: value
+  defp input_map(value) when is_list(value), do: Map.new(value)
+  defp input_map(_value), do: %{}
 
   defp get(map, key, default), do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
 end
