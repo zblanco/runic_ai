@@ -1061,13 +1061,13 @@ defmodule RunicSandboxTest do
     assert {:ok, profile} =
              Profile.new(
                name: :local_code,
-               backend: :docker,
+               backend: :vmsan,
                runtimes: [:bash],
                policy: [
                  network: :restricted,
                  metadata: %{
                    egress_allowlist: [
-                     %{scheme: "http", host: "127.0.0.1", port: 4567, purpose: :mcp}
+                     %{scheme: "http", host: "host.docker.internal", port: 4567, purpose: :mcp}
                    ]
                  }
                ]
@@ -1088,12 +1088,74 @@ defmodule RunicSandboxTest do
              )
 
     assert error.message == "sandbox restricted egress allow-list is not supported by backend"
-    assert error.details.backend == :docker
+    assert error.details.backend == :vmsan
     refute error.details.restricted_egress_supported?
     assert error.details.policy.restricted_egress?
 
     assert {:error, error} = RunicSandbox.open_session(:local_code, [], profile: profile)
     assert error.message == "sandbox restricted egress allow-list is not supported by backend"
+  end
+
+  test "docker accepts egress allow-list and MCP egress-boundary policy shape" do
+    assert {:ok, profile} =
+             Profile.new(
+               name: :local_code,
+               backend: :docker,
+               runtimes: [:bash],
+               network: :restricted,
+               egress_allowlist: [
+                 %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: :mcp}
+               ],
+               mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp}
+             )
+
+    assert profile.policy.network == :restricted
+    assert RunicSandbox.Policy.restricted_egress_requested?(profile.policy)
+    assert RunicSandbox.Policy.mcp_boundary_requested?(profile.policy)
+
+    assert RunicSandbox.Policy.egress_allowlist(profile.policy) == [
+             %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: "mcp"}
+           ]
+
+    request =
+      ExecutionRequest.new!(
+        sandbox: :local_code,
+        runtime: :bash,
+        source: "echo allowed",
+        network: :restricted
+      )
+
+    assert :ok = RunicSandbox.authorize_request(profile, request)
+  end
+
+  test "docker rejects restricted egress shapes outside the local MCP unblock" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :restricted,
+                 egress_allowlist: [
+                   %{scheme: "https", host: "example.com", port: 443, purpose: :model}
+                 ],
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:error, error} =
+               RunicSandbox.exec(
+                 [
+                   sandbox: :local_code,
+                   runtime: :bash,
+                   source: "echo blocked",
+                   network: :restricted
+                 ],
+                 profile: profile
+               )
+
+      assert error.message == "docker restricted egress allow-list entry is not supported"
+      assert error.details.reason == "host must be host.docker.internal"
+    end
   end
 
   test "MCP boundary requests fail closed when backend cannot provide the boundary" do
@@ -1776,6 +1838,105 @@ defmodule RunicSandboxTest do
 
       assert :ok = RunicSandbox.close_attach(handle)
       assert :ok = RunicSandbox.close_session(session)
+    end
+  end
+
+  test "docker restricted egress reaches only allow-listed host MCP port" do
+    if docker_image_available?() do
+      {:ok, server} = start_mcp_http_server("mcp-ok")
+      {:ok, port} = :inet.port(server)
+      {:ok, denied_server} = start_mcp_http_server("should-not-be-reachable")
+      {:ok, denied_port} = :inet.port(denied_server)
+
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:python],
+                 network: :restricted,
+                 egress_allowlist: [
+                   %{scheme: "http", host: "host.docker.internal", port: port, purpose: :mcp}
+                 ],
+                 mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp},
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      source = """
+      import urllib.request
+
+      allowed = urllib.request.urlopen("http://host.docker.internal:#{port}", timeout=5).read().decode()
+      print("allowed=" + allowed)
+
+      try:
+          urllib.request.urlopen("https://example.com", timeout=3).read()
+      except Exception:
+          print("public_denied=ok")
+      else:
+          print("public_denied=fail")
+
+      try:
+          urllib.request.urlopen("http://host.docker.internal:#{denied_port}", timeout=3).read()
+      except Exception:
+          print("host_port_denied=ok")
+      else:
+          print("host_port_denied=fail")
+      """
+
+      assert {:ok, result} =
+               RunicSandbox.exec(
+                 [sandbox: :local_code, runtime: :python, source: source, network: :restricted],
+                 profile: profile
+               )
+
+      assert result.status == :pass
+      assert result.stdout =~ "allowed=mcp-ok"
+      assert result.stdout =~ "public_denied=ok"
+      assert result.stdout =~ "host_port_denied=ok"
+      assert result.metadata.effective_network.restricted_egress?
+      refute docker_resource_names("runic-sandbox-egress-") |> Enum.any?()
+    end
+  end
+
+  test "docker restricted egress works for live attach and cleans sidecars" do
+    if docker_image_available?() do
+      {:ok, server} = start_mcp_http_server("attach-mcp-ok")
+      {:ok, port} = :inet.port(server)
+
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:python],
+                 network: :restricted,
+                 egress_allowlist: [
+                   %{scheme: "http", host: "host.docker.internal", port: port, purpose: :mcp}
+                 ],
+                 mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp},
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+
+      source = """
+      import urllib.request
+      print(urllib.request.urlopen("http://host.docker.internal:#{port}", timeout=5).read().decode(), end="")
+      """
+
+      assert {:ok, handle} =
+               RunicSandbox.attach(session,
+                 runtime: :python,
+                 source: source,
+                 network: :restricted
+               )
+
+      events = Enum.to_list(handle.events)
+      assert stdout_from_events(events) == "attach-mcp-ok"
+      assert List.last(events).payload.status == :pass
+      assert List.first(events).payload.effective_network.restricted_egress?
+
+      assert :ok = RunicSandbox.close_attach(handle)
+      assert :ok = RunicSandbox.close_session(session)
+      refute docker_resource_names("runic-sandbox-egress-") |> Enum.any?()
     end
   end
 
@@ -2845,6 +3006,81 @@ defmodule RunicSandboxTest do
     end
   rescue
     _exception -> false
+  end
+
+  defp start_mcp_http_server(body) do
+    with {:ok, listen} <-
+           :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true]) do
+      {:ok, _pid} = Task.start(fn -> mcp_http_accept_loop(listen, body) end)
+      {:ok, listen}
+    end
+  end
+
+  defp mcp_http_accept_loop(listen, body) do
+    case :gen_tcp.accept(listen) do
+      {:ok, socket} ->
+        _ = :gen_tcp.recv(socket, 0, 5_000)
+
+        response = [
+          "HTTP/1.1 200 OK\r\n",
+          "content-length: ",
+          Integer.to_string(byte_size(body)),
+          "\r\nconnection: close\r\n\r\n",
+          body
+        ]
+
+        :ok = :gen_tcp.send(socket, response)
+        :gen_tcp.close(socket)
+        mcp_http_accept_loop(listen, body)
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp docker_resource_names(prefix) do
+    containers =
+      case System.find_executable("docker") do
+        nil ->
+          []
+
+        docker ->
+          {output, _status} =
+            System.cmd(
+              docker,
+              ["ps", "-a", "--filter", "name=#{prefix}", "--format", "{{.Names}}"],
+              stderr_to_stdout: true
+            )
+
+          split_lines(output)
+      end
+
+    networks =
+      case System.find_executable("docker") do
+        nil ->
+          []
+
+        docker ->
+          {output, _status} =
+            System.cmd(
+              docker,
+              ["network", "ls", "--filter", "name=#{prefix}", "--format", "{{.Name}}"],
+              stderr_to_stdout: true
+            )
+
+          split_lines(output)
+      end
+
+    containers ++ networks
+  rescue
+    _exception -> []
+  end
+
+  defp split_lines(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
   end
 
   defp attach_event_types(%AttachHandle{} = handle), do: handle.events |> Enum.map(& &1.type)

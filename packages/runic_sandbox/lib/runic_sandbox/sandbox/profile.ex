@@ -92,6 +92,9 @@ defmodule RunicSandbox.Profile do
       isolation_level: get(input, :isolation_level, nil),
       policy: get(input, :policy, %{}),
       network: get(input, :network, nil),
+      egress_allowlist: get(input, :egress_allowlist, nil),
+      deny_by_default?: get(input, :deny_by_default?, nil),
+      mcp_boundary: get(input, :mcp_boundary, nil),
       image: get(input, :image, nil),
       workspace: get(input, :workspace, %{}),
       pool: get(input, :pool, %{warm: 0, max: 1}),
@@ -133,6 +136,9 @@ defmodule RunicSandbox.Profile do
       |> Map.put_new(:allowed_runtimes, runtimes)
       |> Map.put_new(:isolation_minimum, isolation_level)
       |> maybe_put_network(network)
+      |> maybe_put_policy_field(:egress_allowlist, Keyword.get(opts, :egress_allowlist))
+      |> maybe_put_policy_field(:deny_by_default?, Keyword.get(opts, :deny_by_default?))
+      |> maybe_put_policy_field(:mcp_boundary, Keyword.get(opts, :mcp_boundary))
 
     with :ok <- validate_name(name),
          :ok <- validate_backend(backend),
@@ -225,6 +231,9 @@ defmodule RunicSandbox.Profile do
 
   defp maybe_put_network(policy, nil), do: policy
   defp maybe_put_network(policy, network), do: Map.put_new(policy, :network, network)
+
+  defp maybe_put_policy_field(policy, _field, nil), do: policy
+  defp maybe_put_policy_field(policy, field, value), do: Map.put_new(policy, field, value)
 
   defp maybe_put_image(options, nil), do: options
   defp maybe_put_image(options, image), do: Map.put_new(options, :image, image)

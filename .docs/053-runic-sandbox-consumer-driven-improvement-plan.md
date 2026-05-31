@@ -74,6 +74,10 @@ Related docs and external consumers:
   preparation, sudo handling, and zero-leftover VM cleanup checks.
 - Session authority hardening under concurrent callers, with an atomic
   first-use authority-secret initializer and a concurrent-open regression test.
+- Docker restricted-egress enforcement for the local MCP unblock path, using a
+  per-execution internal Docker network plus a scoped egress proxy sidecar so
+  contained processes can reach `host.docker.internal:<allowed-port>` without
+  broad host or internet networking.
 
 ## Consumer Use Cases
 
@@ -140,6 +144,95 @@ Known limitations:
 - RunicAI now has a proof-first generated-component promotion flow; durable
   proof persistence remains a future hardening step.
 
+## Ariston Restricted-Egress Unblock
+
+Ariston's CLI-in-sandbox path is blocked on enforcement, not on the policy
+contract. The next substrate slice should therefore be Docker restricted egress
+enforcement for exactly the MCP shape Ariston needs:
+
+```elixir
+[
+  network: :restricted,
+  egress_allowlist: [
+    %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: :mcp}
+  ],
+  mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp}
+]
+```
+
+API decision:
+
+- `Policy.metadata.egress_allowlist` remains the canonical normalized storage
+  shape for this iteration.
+- Builders may set either top-level `egress_allowlist:` or
+  `metadata: %{egress_allowlist: ...}`; `Policy.new/1` normalizes both into
+  `policy.metadata.egress_allowlist`.
+- Consumers should read the policy through `RunicSandbox.Policy.egress_allowlist/1`
+  and `RunicSandbox.Policy.effective_network/1`, not by matching raw metadata.
+- Do not add a dedicated `%Policy{egress_allowlist: ...}` struct field yet. The
+  contract is still small, and metadata keeps the compatibility surface stable
+  while Docker enforcement is being proven.
+
+Near-term delivery answer:
+
+- Yes, real Docker `:restricted` egress allow-list enforcement should be the
+  next `runic_sandbox` slice before broader RunicAI promotion-flow hardening.
+- The first supported target should be one or more host-forwarded MCP entries,
+  starting with `host.docker.internal:4000`.
+- The first implementation can be intentionally narrow: support
+  `scheme in ["http", "tcp"]`, `purpose: "mcp"`, host
+  `host.docker.internal`, and an explicit port. Reject unsupported allow-list
+  shapes with the existing fail-closed policy error.
+
+Implementation plan:
+
+1. **Capability flip only after enforcement exists.**
+   Keep Docker reporting `restricted_egress_supported?: false` until a live
+   smoke proves a contained process can reach the allowed MCP endpoint and
+   cannot reach unrelated egress.
+2. **Per-execution isolated network topology.**
+   For scoped Docker restricted egress, create a per-execution internal Docker
+   network for the workload container and a per-execution egress proxy/forwarder
+   that is the only peer on that network. Give the proxy the internal-network
+   alias `host.docker.internal`, so Ariston's existing endpoint shape remains
+   stable.
+3. **Proxy enforces the allow-list.**
+   The workload container should not receive broad bridge or host networking.
+   It should only be able to connect to the proxy alias and allowed port. The
+   proxy forwards only configured allow-list entries to the real host endpoint
+   and rejects everything else by absence of a listener.
+4. **Run through both exec and attach paths.**
+   `run_container/4` and `open_container_attach/7` both currently call
+   `docker_network(request.network)`. Replace that with a small execution
+   network setup result that contributes Docker args and cleanup resources.
+5. **Cleanup must be first-class.**
+   Container, proxy, and network cleanup must happen for success, failure,
+   timeout, attach close, and stream-finalizer paths. Resource names should use
+   the existing `runic-sandbox-*` prefix so leak checks stay simple.
+6. **Tests before generalization.**
+   Add policy/unit tests for supported and unsupported allow-list shapes, then
+   live Docker smokes:
+   - allowed: sandbox command can `curl http://host.docker.internal:4000/...`;
+   - denied: sandbox command cannot reach `https://example.com` or another
+     host/port;
+   - disabled: `network: :disabled` remains MCP-deaf;
+   - host: `network: :host` remains explicit broad-network opt-in;
+   - cleanup: no leftover workload containers, proxy containers, or networks.
+
+Acceptance criteria for Ariston:
+
+- `RunicSandbox.open_session/3` with Docker and the allow-list above succeeds
+  instead of failing closed.
+- Docker health/session capabilities report `restricted_egress_supported?: true`
+  only for the implementation that passed the live smoke.
+- A contained CLI can reach the Ariston MCP endpoint at
+  `http://host.docker.internal:4000`.
+- The same contained CLI cannot reach unrelated public network targets or
+  non-allow-listed host ports.
+- The API shape Ariston should set from `SandboxProfile.build/1` is the
+  top-level `egress_allowlist:` form shown above, with `network: :restricted`
+  and `mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp}`.
+
 ## Implementation Slice Ledger
 
 This plan should be delivered in small substrate slices. Each slice must update
@@ -158,6 +251,7 @@ the result back into this document.
 | 7. Provider attach certification | Prove provider-backed attach behavior under real credentials and promote only native live streams. | Real-provider smoke matrix for Remote/Fly and Sprites, explicit terminal-vs-live metadata, provider transport evidence, and follow-up criteria for native stream promotion. | Provider-backed terminal adapters stay `streaming_live?: false`; `streaming_live?: true` is used only for a proven native live stream with live chunks/stdin; unsupported stdin fails consistently. | Package tests plus live Fly/Sprites smokes when credentials are present. | Completed 2026-05-30 |
 | 8. RunicAI promotion integration | Wire generated-component proof into the iterative promotion flow above the sandbox package. | Coordinator-facing proof invocation, promotion decision record, repair-loop evidence, and trace/read-model event surface. | Generated leaves are not composable/promotable until sandbox proof passes; failed proofs preserve attach evidence and can drive a repair turn. | Focused RunicAI tests plus Docker/Sprites proof smokes. | Completed 2026-05-30 |
 | 9. Completion audit and hardening | Audit the accumulated slices against the original objective and package boundary before declaring the goal complete. | Requirement-by-requirement checklist, broad validation set, docs consistency pass, and any final small fixes. | All explicitly requested sandbox/interface priorities are proven by current tests, live smokes, and plan evidence; remaining work is clearly out-of-scope future roadmap. | Full relevant test matrix plus current provider/resource cleanup checks. | Completed 2026-05-30 |
+| 10. Docker restricted egress enforcement | Unblock Ariston CLI-in-sandbox by making Docker `network: :restricted` with an MCP allow-list enforce real scoped egress. | Per-execution Docker network/proxy topology, Docker capability flip after enforcement, exec+attach support, fail-closed unsupported shapes, and cleanup diagnostics. | A Docker sandbox can reach only `host.docker.internal:<allowed-port>` for MCP and cannot reach public egress or non-allow-listed host ports; `:disabled` and `:host` keep current semantics. | Package tests plus live Docker MCP endpoint smoke, denial smoke, attach smoke, and no-leftover container/network checks. | Completed 2026-05-31 |
 
 ### Slice 1 Notes
 
@@ -747,11 +841,86 @@ Slice 9 implementation result:
     returned no containers.
   - `/home/doops/bin/runic-vmsan list --json` returned `count: 0`.
 
-Completion decision: the active goal is complete. The remaining items in
-Improvement Themes are future backend upgrades, not blockers for the current
-streaming/attach model: real scoped-egress enforcement, a selected MCP
-transport, provider-native live streams for Remote/Sprites, and durable proof
+Completion decision: the original active goal is complete. The remaining items
+in Improvement Themes are future backend upgrades, not blockers for the current
+streaming/attach model: broader scoped-egress enforcement beyond the Docker MCP
+unblock, provider-native live streams for Remote/Sprites, and durable proof
 persistence/workbench presentation.
+
+### Slice 10 Notes
+
+Slice 10 responds to Ariston's concrete consumer feedback: the contract was
+usable, but Docker enforcement was the blocker. The first implementation stays
+local-dev scoped and intentionally narrow. It does not try to become a hosted
+Tensorlake-style control plane.
+
+Implemented behavior:
+
+- `Profile.new/1` now accepts top-level `egress_allowlist:`,
+  `deny_by_default?:`, and `mcp_boundary:` convenience fields and normalizes
+  them through `Policy.new/1`.
+- Docker and GVisor pass the facade readiness gate for scoped restricted
+  egress and MCP boundaries only when the boundary transport is
+  `:egress_allowlist` and the policy has a non-empty allow-list.
+- Docker instances carry `Policy.effective_network/1` metadata so the backend
+  can enforce profile policy during direct exec and session exec/attach.
+- Docker restricted egress now creates a per-execution internal Docker network
+  for the workload container.
+- A per-execution egress proxy sidecar is started from the selected
+  `:egress_proxy_image` backend option or, by default, the sandbox image. The
+  image must provide `python3`.
+- The proxy joins the internal network with alias `host.docker.internal` and
+  forwards only supported allow-list entries to the real host gateway.
+- The first supported allow-list shape is deliberately small:
+  `scheme in ["http", "tcp"]`, host `host.docker.internal`, an explicit port,
+  and `purpose: "mcp"`.
+- Unsupported allow-list shapes fail closed inside the Docker backend before
+  the workload command runs.
+- Both `RunicSandbox.exec/2` and `RunicSandbox.attach/3` use the same network
+  setup path.
+- Docker attach/result metadata now includes effective network details.
+- Docker capability metadata now advertises the supported MCP boundary
+  transport (`:egress_allowlist`) and restricted-egress host scope
+  (`host.docker.internal`).
+- Docker cleanup removes workload containers, egress proxy containers, and
+  per-execution networks on success, failure, timeout, explicit close, and
+  stream finalization.
+- Docker run defaults now include `--security-opt no-new-privileges`.
+  `--cap-drop=ALL` remains opt-in through `backend_options:
+  %{cap_drop_all?: true}` because dropping all capabilities broke writes into
+  the current bind-mounted workspace for the existing local image.
+
+Validated behavior:
+
+- Top-level `egress_allowlist:` plus `mcp_boundary:` is accepted by
+  `Profile.new/1` and authorized by `RunicSandbox.authorize_request/2`.
+- Non-Docker backends still fail closed for scoped restricted egress.
+- Docker still fails closed for unsupported allow-list shapes such as public
+  `https://example.com:443`.
+- Live Docker exec smoke reached a local HTTP endpoint through
+  `http://host.docker.internal:<allowed-port>` and failed to reach
+  `https://example.com` plus a non-allow-listed local host port.
+- Live Docker attach smoke reached the same local MCP-shaped endpoint through
+  attach events.
+- Cleanup checks found no leftover `runic-sandbox-egress-*` containers or
+  networks after the smokes.
+
+Validation:
+
+- `cd packages/runic_sandbox && mix test test/runic_sandbox_test.exs` passed:
+  `56 tests, 0 failures`.
+- `cd packages/runic_sandbox && mix test` passed:
+  `56 tests, 0 failures`.
+- `mix test test/runic_ai/sandbox test/runic_ai/assistant/rlm_blueprint_test.exs`
+  passed: `61 tests, 0 failures`.
+- `mix test` passed: `936 tests, 0 failures, 2 skipped`.
+- `mix format --check-formatted`, `cd packages/runic_sandbox &&
+  mix format --check-formatted`, `mix compile`, and `git diff --check`
+  passed.
+- `docker ps -a --filter 'name=runic-sandbox-egress-' --format '{{.Names}}'`
+  returned no containers.
+- `docker network ls --filter 'name=runic-sandbox-egress-' --format '{{.Name}}'`
+  returned no networks.
 
 ## Improvement Themes
 
@@ -1042,8 +1211,11 @@ Phase D: interactive containment
 
 ## Open Decisions
 
-- Should allow-list entries live directly in `Policy.metadata`, or should
-  `Policy` grow typed fields such as `egress_allowlist`?
+- Resolved for the Ariston unblock: allow-list entries live in
+  `Policy.metadata.egress_allowlist`, with top-level `egress_allowlist:` as a
+  builder convenience normalized by `Policy.new/1`. Do not add a dedicated
+  `%Policy{egress_allowlist: ...}` field before the policy surface needs to
+  grow beyond the Docker MCP unblock shape.
 - Should the shared event bridge live in `runic_sandbox` as consumer-neutral
   utilities, or in `runic_ai` as the first concrete consumer?
 - Should `Capabilities.streaming?` remain broad, or should it be deprecated in

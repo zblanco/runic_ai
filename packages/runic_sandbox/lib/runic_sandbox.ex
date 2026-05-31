@@ -633,7 +633,7 @@ defmodule RunicSandbox do
   defp authorize_session_network(%Session{policy: policy}, %ExecutionRequest{} = request) do
     cond do
       Policy.restricted_egress_requested?(policy) ->
-        authorize_restricted_egress(policy, request)
+        authorize_session_restricted_egress(policy, request)
 
       request.network == :disabled ->
         :ok
@@ -653,6 +653,23 @@ defmodule RunicSandbox do
     end
   end
 
+  defp authorize_session_restricted_egress(%Policy{} = _policy, %ExecutionRequest{
+         network: :disabled
+       }),
+       do: :ok
+
+  defp authorize_session_restricted_egress(%Policy{} = policy, %ExecutionRequest{} = request) do
+    if request.network == policy.network do
+      :ok
+    else
+      {:error,
+       Error.validation("sandbox network request exceeds session policy",
+         source: __MODULE__,
+         details: %{requested_network: request.network, policy_network: policy.network}
+       )}
+    end
+  end
+
   defp authorize_restricted_egress(%Profile{policy: policy} = profile) do
     if Policy.restricted_egress_requested?(policy) and
          not backend_restricted_egress_supported?(profile.backend) do
@@ -662,26 +679,7 @@ defmodule RunicSandbox do
     end
   end
 
-  defp authorize_restricted_egress(%Policy{} = policy, %ExecutionRequest{} = request) do
-    cond do
-      request.network == :disabled ->
-        :ok
-
-      not Policy.restricted_egress_requested?(policy) ->
-        :ok
-
-      true ->
-        {:error,
-         Error.validation("sandbox restricted egress allow-list is not supported by session",
-           source: __MODULE__,
-           details: %{
-             requested_network: request.network,
-             policy: Policy.effective_network(policy)
-           }
-         )}
-    end
-  end
-
+  defp backend_restricted_egress_supported?(backend) when backend in [:docker, :gvisor], do: true
   defp backend_restricted_egress_supported?(_backend), do: false
 
   defp restricted_egress_error(backend, policy) do
@@ -698,7 +696,7 @@ defmodule RunicSandbox do
 
   defp authorize_mcp_boundary(%Profile{policy: policy} = profile) do
     if Policy.mcp_boundary_requested?(policy) and
-         not backend_mcp_boundary_supported?(profile.backend) do
+         not backend_mcp_boundary_supported?(profile.backend, policy) do
       mcp_boundary_error(profile.backend, policy)
     else
       :ok
@@ -716,7 +714,8 @@ defmodule RunicSandbox do
       not Policy.mcp_boundary_requested?(policy) ->
         :ok
 
-      Capabilities.mcp_boundary_supported?(session.capabilities) ->
+      Capabilities.mcp_boundary_supported?(session.capabilities) and
+          session_mcp_boundary_supported?(policy) ->
         :ok
 
       true ->
@@ -734,7 +733,17 @@ defmodule RunicSandbox do
     end
   end
 
-  defp backend_mcp_boundary_supported?(_backend), do: false
+  defp backend_mcp_boundary_supported?(backend, policy) when backend in [:docker, :gvisor],
+    do: session_mcp_boundary_supported?(policy)
+
+  defp backend_mcp_boundary_supported?(_backend, _policy), do: false
+
+  defp session_mcp_boundary_supported?(%Policy{} = policy) do
+    case Policy.mcp_boundary(policy) do
+      %{transport: "egress_allowlist"} -> Policy.restricted_egress_requested?(policy)
+      _other -> false
+    end
+  end
 
   defp mcp_boundary_error(backend, policy) do
     {:error,

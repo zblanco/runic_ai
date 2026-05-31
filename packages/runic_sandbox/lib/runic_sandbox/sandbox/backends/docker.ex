@@ -18,6 +18,7 @@ defmodule RunicSandbox.Backends.Docker do
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
   alias RunicSandbox.Instance
+  alias RunicSandbox.Policy
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
 
@@ -44,6 +45,7 @@ defmodule RunicSandbox.Backends.Docker do
         image: image(profile),
         container_runtime: container_runtime(profile),
         backend_options: profile.backend_options,
+        policy: Policy.effective_network(profile.policy),
         stateful?: stateful?(profile)
       }
       |> maybe_put_stateful_workspace(profile)
@@ -105,6 +107,7 @@ defmodule RunicSandbox.Backends.Docker do
             runtime: request.runtime,
             mode: request.mode,
             network: request.network,
+            effective_network: effective_network_metadata(instance, request),
             image: image(instance),
             workspace_mode: instance.workspace.mode,
             workspace_mount: instance.workspace.mount,
@@ -700,23 +703,32 @@ defmodule RunicSandbox.Backends.Docker do
        ) do
     container_name = "runic-sandbox-#{System.unique_integer([:positive])}"
 
-    args =
-      [
-        "run",
-        "--rm",
-        "--pull",
-        "never",
-        "--name",
-        container_name,
-        "--workdir",
-        request.cwd,
-        "--network",
-        docker_network(request.network),
-        "--mount",
-        "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
-      ] ++ runtime_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
+    with {:ok, network} <- docker_network_setup(instance, request) do
+      args =
+        [
+          "run",
+          "--rm",
+          "--pull",
+          "never",
+          "--name",
+          container_name,
+          "--workdir",
+          request.cwd
+        ] ++
+          network.args ++
+          [
+            "--mount",
+            "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
+          ] ++
+          runtime_args(instance) ++
+          security_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
 
-    invoke_docker(args, request.timeout_ms || @default_timeout_ms, container_name)
+      try do
+        invoke_docker(args, request.timeout_ms || @default_timeout_ms, container_name)
+      after
+        cleanup_egress_resources(network.resources)
+      end
+    end
   end
 
   defp open_container_attach(
@@ -731,64 +743,102 @@ defmodule RunicSandbox.Backends.Docker do
     container_name = "runic-sandbox-attach-#{System.unique_integer([:positive])}"
     started_mono = System.monotonic_time(:millisecond)
 
-    args =
-      [
-        "run",
-        "--rm",
-        "--pull",
-        "never",
-        "-i",
-        "--name",
-        container_name,
-        "--workdir",
-        request.cwd,
-        "--network",
-        docker_network(request.network),
-        "--mount",
-        "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
-      ] ++ runtime_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
+    with {:ok, network} <- docker_network_setup(instance, request) do
+      args =
+        [
+          "run",
+          "--rm",
+          "--pull",
+          "never",
+          "-i",
+          "--name",
+          container_name,
+          "--workdir",
+          request.cwd
+        ] ++
+          network.args ++
+          [
+            "--mount",
+            "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
+          ] ++
+          runtime_args(instance) ++
+          security_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
 
-    with {:ok, port} <- open_docker_port(args) do
-      if request.stdin != "", do: Port.command(port, request.stdin)
+      case open_docker_port(args) do
+        {:ok, port} ->
+          container_attach_handle(
+            session,
+            request,
+            port,
+            container_name,
+            workspace_root,
+            cleanup?,
+            before_files,
+            started_mono,
+            network
+          )
 
-      events =
-        Stream.resource(
-          fn ->
-            timer_ref = attach_timer(request.timeout_ms, port, container_name)
-
-            %{
-              session: session,
-              request: request,
-              port: port,
-              timer_ref: timer_ref,
-              container_name: container_name,
-              workspace_root: workspace_root,
-              cleanup?: cleanup?,
-              before_files: before_files,
-              started?: false,
-              finished?: false,
-              started_mono: started_mono
-            }
-          end,
-          &next_attach_event/1,
-          &cleanup_attach_stream/1
-        )
-
-      AttachHandle.new(
-        id: AttachEvents.attach_id(),
-        session_id: session.id,
-        backend: session.backend,
-        events: events,
-        metadata: %{
-          streaming_live?: true,
-          terminal_result?: false,
-          port: port,
-          container_name: container_name,
-          workspace_root: workspace_root,
-          cleanup?: cleanup?
-        }
-      )
+        {:error, error} ->
+          cleanup_egress_resources(network.resources)
+          {:error, error}
+      end
     end
+  end
+
+  defp container_attach_handle(
+         %Session{} = session,
+         %ExecutionRequest{} = request,
+         port,
+         container_name,
+         workspace_root,
+         cleanup?,
+         before_files,
+         started_mono,
+         network
+       ) do
+    if request.stdin != "", do: Port.command(port, request.stdin)
+
+    events =
+      Stream.resource(
+        fn ->
+          timer_ref = attach_timer(request.timeout_ms, port, container_name)
+
+          %{
+            session: session,
+            request: request,
+            port: port,
+            timer_ref: timer_ref,
+            container_name: container_name,
+            workspace_root: workspace_root,
+            cleanup?: cleanup?,
+            before_files: before_files,
+            egress_resources: network.resources,
+            network_metadata: network.metadata,
+            started?: false,
+            finished?: false,
+            started_mono: started_mono
+          }
+        end,
+        &next_attach_event/1,
+        &cleanup_attach_stream/1
+      )
+
+    AttachHandle.new(
+      id: AttachEvents.attach_id(),
+      session_id: session.id,
+      backend: session.backend,
+      events: events,
+      metadata: %{
+        streaming_live?: true,
+        terminal_result?: false,
+        port: port,
+        container_name: container_name,
+        workspace_root: workspace_root,
+        cleanup?: cleanup?,
+        egress_resources: network.resources,
+        network: network.metadata
+      }
+    )
   end
 
   defp open_docker_port(args) do
@@ -825,6 +875,7 @@ defmodule RunicSandbox.Backends.Docker do
         argv: state.request.argv,
         cwd: state.request.cwd,
         network: state.request.network,
+        effective_network: Map.get(state, :network_metadata),
         streaming_live?: true,
         container_name: state.container_name
       })
@@ -895,6 +946,7 @@ defmodule RunicSandbox.Backends.Docker do
         runtime: state.request.runtime,
         mode: state.request.mode,
         network: state.request.network,
+        effective_network: Map.get(state, :network_metadata),
         image: image(state.session.instance),
         container_name: state.container_name,
         streaming_live?: true,
@@ -913,13 +965,15 @@ defmodule RunicSandbox.Backends.Docker do
       cleanup_attach(state)
     end
 
+    cleanup_egress_resources(Map.get(state, :egress_resources, []))
     if state.cleanup?, do: File.rm_rf(state.workspace_root)
     :ok
   end
 
-  defp cleanup_attach(%{port: port, container_name: container_name}) do
+  defp cleanup_attach(%{port: port, container_name: container_name} = state) do
     if is_port(port), do: Port.close(port)
     System.cmd("docker", ["rm", "-f", container_name], stderr_to_stdout: true)
+    cleanup_egress_resources(Map.get(state, :egress_resources, []))
     :ok
   rescue
     _exception -> :ok
@@ -928,7 +982,8 @@ defmodule RunicSandbox.Backends.Docker do
   defp cleanup_attach(metadata) when is_map(metadata) do
     cleanup_attach(%{
       port: Map.get(metadata, :port),
-      container_name: Map.get(metadata, :container_name)
+      container_name: Map.get(metadata, :container_name),
+      egress_resources: Map.get(metadata, :egress_resources, [])
     })
   end
 
@@ -1199,18 +1254,282 @@ defmodule RunicSandbox.Backends.Docker do
   defp maybe_prepend(list, nil), do: list
   defp maybe_prepend(list, value), do: [value | list]
 
-  defp docker_network(:disabled), do: "none"
-  defp docker_network(:host), do: "host"
-  defp docker_network(:restricted), do: "none"
+  defp docker_network_setup(%Instance{} = instance, %ExecutionRequest{} = request) do
+    policy = option(instance.metadata, :policy) || %{}
+    allowlist = Map.get(policy, :egress_allowlist, [])
+
+    cond do
+      request.network == :restricted and allowlist != [] ->
+        setup_restricted_egress(instance, request, allowlist, policy)
+
+      request.network == :disabled ->
+        {:ok, %{args: ["--network", "none"], resources: [], metadata: %{mode: :disabled}}}
+
+      request.network == :host ->
+        {:ok, %{args: ["--network", "host"], resources: [], metadata: %{mode: :host}}}
+
+      request.network == :restricted ->
+        {:ok,
+         %{
+           args: ["--network", "none"],
+           resources: [],
+           metadata: %{mode: :restricted, deny_by_default?: true, egress_allowlist: []}
+         }}
+    end
+  end
+
+  defp setup_restricted_egress(
+         %Instance{} = instance,
+         %ExecutionRequest{} = _request,
+         allowlist,
+         policy
+       ) do
+    with {:ok, entries} <- docker_restricted_egress_entries(allowlist),
+         {:ok, allowlist_json} <- Jason.encode(entries) do
+      id = System.unique_integer([:positive])
+      network_name = "runic-sandbox-egress-#{id}"
+      proxy_name = "runic-sandbox-egress-proxy-#{id}"
+      proxy_image = egress_proxy_image(instance)
+
+      resources = [
+        %{kind: :container, id: proxy_name},
+        %{kind: :network, id: network_name}
+      ]
+
+      with {:ok, _output, 0} <-
+             docker_cmd(["network", "create", "--internal", network_name]),
+           {:ok, _output, 0} <-
+             docker_cmd(
+               [
+                 "run",
+                 "-d",
+                 "--rm",
+                 "--pull",
+                 "never",
+                 "--name",
+                 proxy_name,
+                 "--add-host",
+                 "runic-host.internal:host-gateway",
+                 "-e",
+                 "RUNIC_EGRESS_ALLOWLIST=#{allowlist_json}",
+                 proxy_image,
+                 "python3",
+                 "-u",
+                 "-c",
+                 egress_proxy_script()
+               ],
+               resources
+             ),
+           {:ok, _output, 0} <-
+             docker_cmd(
+               [
+                 "network",
+                 "connect",
+                 "--alias",
+                 "host.docker.internal",
+                 network_name,
+                 proxy_name
+               ],
+               resources
+             ) do
+        {:ok,
+         %{
+           args: ["--network", network_name],
+           resources: resources,
+           metadata: %{
+             mode: :restricted,
+             deny_by_default?: Map.get(policy, :deny_by_default?, true),
+             restricted_egress?: true,
+             egress_allowlist: entries,
+             proxy_container: proxy_name,
+             network: network_name,
+             proxy_image: proxy_image
+           }
+         }}
+      end
+    end
+  end
+
+  defp docker_cmd(args, cleanup_resources) do
+    case docker_cmd(args) do
+      {:ok, _output, 0} = ok ->
+        ok
+
+      {:ok, output, exit_status} ->
+        cleanup_egress_resources(cleanup_resources)
+
+        {:error,
+         Error.validation("docker restricted egress setup failed",
+           source: __MODULE__,
+           details: %{args: redact_docker_args(args), exit_status: exit_status, output: output}
+         )}
+
+      {:error, error} ->
+        cleanup_egress_resources(cleanup_resources)
+        {:error, error}
+    end
+  end
+
+  defp docker_restricted_egress_entries(entries) do
+    entries
+    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
+      case docker_restricted_egress_entry(entry) do
+        {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp docker_restricted_egress_entry(%{host: "host.docker.internal", port: port} = entry)
+       when is_integer(port) do
+    scheme = Map.get(entry, :scheme)
+    purpose = Map.get(entry, :purpose)
+
+    cond do
+      scheme not in ["http", "tcp"] ->
+        unsupported_docker_egress_entry(entry, "scheme must be http or tcp")
+
+      purpose not in [nil, "mcp"] ->
+        unsupported_docker_egress_entry(entry, "purpose must be mcp")
+
+      true ->
+        {:ok,
+         %{scheme: scheme, host: "host.docker.internal", port: port, purpose: purpose || "mcp"}}
+    end
+  end
+
+  defp docker_restricted_egress_entry(entry),
+    do: unsupported_docker_egress_entry(entry, "host must be host.docker.internal")
+
+  defp unsupported_docker_egress_entry(entry, reason) do
+    {:error,
+     Error.validation("docker restricted egress allow-list entry is not supported",
+       source: __MODULE__,
+       details: %{entry: entry, reason: reason}
+     )}
+  end
+
+  defp effective_network_metadata(%Instance{} = instance, %ExecutionRequest{} = request) do
+    policy = option(instance.metadata, :policy) || %{}
+
+    %{
+      mode: request.network,
+      deny_by_default?: Map.get(policy, :deny_by_default?, request.network == :restricted),
+      restricted_egress?:
+        request.network == :restricted and Map.get(policy, :egress_allowlist, []) != [],
+      egress_allowlist:
+        if(request.network == :restricted, do: Map.get(policy, :egress_allowlist, []), else: []),
+      mcp_boundary: Map.get(policy, :mcp_boundary)
+    }
+  end
+
+  defp cleanup_egress_resources(resources) when is_list(resources) do
+    Enum.each(resources, fn
+      %{kind: :container, id: id} ->
+        System.cmd("docker", ["rm", "-f", id], stderr_to_stdout: true)
+
+      %{kind: :network, id: id} ->
+        System.cmd("docker", ["network", "rm", id], stderr_to_stdout: true)
+
+      _other ->
+        :ok
+    end)
+  rescue
+    _exception -> :ok
+  end
+
+  defp cleanup_egress_resources(_resources), do: :ok
+
+  defp redact_docker_args(args) do
+    Enum.map(args, fn
+      "RUNIC_EGRESS_ALLOWLIST=" <> _json -> "RUNIC_EGRESS_ALLOWLIST=<redacted>"
+      arg -> arg
+    end)
+  end
+
+  defp egress_proxy_image(%Instance{} = instance) do
+    backend_options = Map.get(instance.metadata, :backend_options, %{})
+    option(backend_options, :egress_proxy_image) || image(instance)
+  end
+
+  defp egress_proxy_script do
+    """
+    import json, os, select, socket, threading
+
+    entries = json.loads(os.environ.get("RUNIC_EGRESS_ALLOWLIST", "[]"))
+    listeners = []
+
+    def pump(left, right):
+        sockets = [left, right]
+        try:
+            while True:
+                readable, _, _ = select.select(sockets, [], [])
+                for sock in readable:
+                    data = sock.recv(65536)
+                    if not data:
+                        return
+                    target = right if sock is left else left
+                    target.sendall(data)
+        finally:
+            for sock in sockets:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def serve(entry):
+        listen_port = int(entry["port"])
+        upstream_host = "runic-host.internal"
+        upstream_port = listen_port
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", listen_port))
+        server.listen(64)
+        listeners.append(server)
+        while True:
+            client, _addr = server.accept()
+            upstream = socket.create_connection((upstream_host, upstream_port), timeout=10)
+            threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+
+    for entry in entries:
+        threading.Thread(target=serve, args=(entry,), daemon=True).start()
+
+    threading.Event().wait()
+    """
+  end
 
   defp docker_attach_metadata do
     Capabilities.attach_metadata(:live_stream,
       stdin_supported?: true,
       stdin_close_supported?: false,
       stderr_separate?: false,
+      restricted_egress_supported?: true,
+      mcp_boundary_supported?: true,
+      mcp_boundary_transports: [:egress_allowlist],
+      restricted_egress_hosts: ["host.docker.internal"],
       provider_transport: :docker_cli_port
     )
   end
+
+  defp security_args(%Instance{metadata: metadata}) do
+    backend_options = Map.get(metadata, :backend_options, %{})
+
+    if option(backend_options, :disable_security_defaults?) do
+      []
+    else
+      []
+      |> maybe_security_arg("--security-opt", "no-new-privileges")
+      |> maybe_cap_drop_all(option(backend_options, :cap_drop_all?))
+    end
+  end
+
+  defp maybe_security_arg(args, flag, value), do: args ++ [flag, value]
+  defp maybe_cap_drop_all(args, true), do: args ++ ["--cap-drop", "ALL"]
+  defp maybe_cap_drop_all(args, _other), do: args
 
   defp resource_args(%Instance{metadata: metadata}) do
     backend_options = Map.get(metadata, :backend_options, %{})
