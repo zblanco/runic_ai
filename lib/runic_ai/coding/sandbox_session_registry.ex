@@ -15,11 +15,13 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
   alias RunicSandbox.Checkpoint
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
+  alias RunicSandbox.ProcessHandle, as: SandboxProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Proxy
   alias RunicSandbox.Service
   alias RunicSandbox.Session
 
-  defstruct sessions: %{}, proxies: %{}
+  defstruct sessions: %{}, processes: %{}, proxies: %{}
 
   @type server :: GenServer.server()
 
@@ -72,6 +74,54 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
   @spec close_session(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
   def close_session(server, id, opts \\ []) do
     GenServer.call(server, {:close_session, id, opts}, :infinity)
+  end
+
+  @spec start_process(server(), String.t(), keyword() | map(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def start_process(server, id, request, opts \\ []) do
+    GenServer.call(server, {:start_process, id, request, opts}, :infinity)
+  end
+
+  @spec list_processes(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def list_processes(server, id, opts \\ []) do
+    GenServer.call(server, {:list_processes, id, opts}, :infinity)
+  end
+
+  @spec process_status(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def process_status(server, process_id, opts \\ []) do
+    GenServer.call(server, {:process_status, process_id, opts}, :infinity)
+  end
+
+  @spec process_events(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def process_events(server, process_id, opts \\ []) do
+    GenServer.call(server, {:process_events, process_id, opts}, :infinity)
+  end
+
+  @spec write_process_stdin(server(), String.t(), iodata(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def write_process_stdin(server, process_id, input, opts \\ []) do
+    GenServer.call(server, {:write_process_stdin, process_id, input, opts}, :infinity)
+  end
+
+  @spec close_process_stdin(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def close_process_stdin(server, process_id, opts \\ []) do
+    GenServer.call(server, {:close_process_stdin, process_id, opts}, :infinity)
+  end
+
+  @spec signal_process(server(), String.t(), atom() | String.t(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def signal_process(server, process_id, signal, opts \\ []) do
+    GenServer.call(server, {:signal_process, process_id, signal, opts}, :infinity)
+  end
+
+  @spec kill_process(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def kill_process(server, process_id, opts \\ []) do
+    GenServer.call(server, {:kill_process, process_id, opts}, :infinity)
+  end
+
+  @spec wait_process(server(), String.t(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def wait_process(server, process_id, opts \\ []) do
+    GenServer.call(server, {:wait_process, process_id, opts}, :infinity)
   end
 
   @spec start_service(server(), String.t(), keyword() | map(), keyword()) ::
@@ -203,15 +253,192 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
       case Sandbox.close_session(entry.session, Keyword.merge(entry.opts, opts))
            |> normalize_sandbox_result() do
         :ok ->
-          {:reply, {:ok, %{id: id, status: :closed}}, delete_session(state, id)}
+          {:reply, {:ok, %{id: id, status: :closed}}, delete_session_with_processes(state, id)}
 
         {:error, %Error{} = error} ->
           if stale_authority_error?(error) do
-            {:reply, {:ok, %{id: id, status: :closed, stale?: true}}, delete_session(state, id)}
+            {:reply, {:ok, %{id: id, status: :closed, stale?: true}},
+             delete_session_with_processes(state, id)}
           else
             {:reply, {:error, error}, state}
           end
       end
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:start_process, id, request, opts}, _from, state) do
+    with {:ok, entry} <- fetch_session(state, id),
+         {:ok, handle} <-
+           Sandbox.start_process(entry.session, request, opts) |> normalize_sandbox_result() do
+      process_id = "sandbox_process_#{System.unique_integer([:positive])}"
+
+      process = %{
+        id: process_id,
+        session_id: id,
+        handle: handle,
+        opened_at: DateTime.utc_now()
+      }
+
+      state =
+        state
+        |> touch_session(entry)
+        |> put_process(process)
+
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(handle, process)
+        }}, state}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:list_processes, id, opts}, _from, state) do
+    with {:ok, entry} <- fetch_session(state, id),
+         {:ok, statuses} <-
+           Sandbox.list_processes(entry.session, opts) |> normalize_sandbox_result() do
+      processes = Enum.map(statuses, &process_status_snapshot_for_session(&1, state, id))
+
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          processes: processes,
+          count: length(processes)
+        }}, touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:process_status, process_id, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         {:ok, status} <-
+           Sandbox.process_status(entry.session, process.handle, opts)
+           |> normalize_sandbox_result() do
+      {:reply,
+       {:ok,
+        %{session: session_snapshot(entry), process: process_status_snapshot(status, process)}},
+       touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:process_events, process_id, opts}, _from, state) do
+    max_events = Keyword.get(opts, :max_events, 100)
+    max_chunk_bytes = Keyword.get(opts, :max_chunk_bytes, 4_096)
+
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         {:ok, events} <-
+           Sandbox.process_events(process.handle, opts) |> normalize_sandbox_result() do
+      snapshots =
+        events
+        |> Enum.take(max_events)
+        |> Enum.map(&session_event_snapshot(&1, max_chunk_bytes))
+
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(process.handle, process),
+          events: snapshots,
+          count: length(snapshots)
+        }}, touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:write_process_stdin, process_id, input, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         :ok <-
+           Sandbox.write_process_stdin(process.handle, input, opts) |> normalize_sandbox_result() do
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(process.handle, process),
+          input_bytes: IO.iodata_length(input),
+          status: :written
+        }}, touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:close_process_stdin, process_id, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         :ok <- Sandbox.close_process_stdin(process.handle, opts) |> normalize_sandbox_result() do
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(process.handle, process),
+          status: :stdin_closed
+        }}, touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:signal_process, process_id, signal, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         :ok <-
+           Sandbox.signal_process(process.handle, signal, opts) |> normalize_sandbox_result() do
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(process.handle, process),
+          signal: signal,
+          status: :signaled
+        }}, touch_session(state, entry)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:kill_process, process_id, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         :ok <- Sandbox.kill_process(process.handle, opts) |> normalize_sandbox_result() do
+      {:reply,
+       {:ok,
+        %{
+          session: session_snapshot(entry),
+          process: process_handle_snapshot(process.handle, process),
+          status: :killed
+        }}, state |> touch_session(entry) |> delete_process(process_id)}
+    else
+      {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:wait_process, process_id, opts}, _from, state) do
+    with {:ok, process} <- fetch_process(state, process_id),
+         {:ok, entry} <- fetch_session(state, process.session_id),
+         {:ok, status} <- Sandbox.wait_process(process.handle, opts) |> normalize_sandbox_result() do
+      process = %{process | handle: %{process.handle | status: status.status}}
+
+      state =
+        state
+        |> touch_session(entry)
+        |> put_process(process)
+
+      {:reply,
+       {:ok,
+        %{session: session_snapshot(entry), process: process_status_snapshot(status, process)}},
+       state}
     else
       {:error, %Error{} = error} -> {:reply, {:error, error}, state}
     end
@@ -322,14 +549,46 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
     end
   end
 
+  defp fetch_process(%__MODULE__{processes: processes}, id) when is_binary(id) do
+    case Map.fetch(processes, id) do
+      {:ok, process} ->
+        {:ok, process}
+
+      :error ->
+        {:error,
+         Error.validation("unknown sandbox process id",
+           source: __MODULE__,
+           details: %{process_id: id}
+         )}
+    end
+  end
+
+  defp fetch_process(_state, id) do
+    {:error,
+     Error.validation("sandbox process id must be a non-empty string",
+       source: __MODULE__,
+       details: %{process_id: id}
+     )}
+  end
+
   defp put_session(%__MODULE__{} = state, entry),
     do: %{state | sessions: Map.put(state.sessions, entry.id, entry)}
 
   defp touch_session(%__MODULE__{} = state, entry),
     do: put_session(state, Map.put(entry, :last_used_at, DateTime.utc_now()))
 
-  defp delete_session(%__MODULE__{} = state, id),
-    do: %{state | sessions: Map.delete(state.sessions, id)}
+  defp delete_session_with_processes(%__MODULE__{} = state, id) do
+    processes =
+      Map.reject(state.processes, fn {_process_id, process} -> process.session_id == id end)
+
+    %{state | sessions: Map.delete(state.sessions, id), processes: processes}
+  end
+
+  defp put_process(%__MODULE__{} = state, process),
+    do: %{state | processes: Map.put(state.processes, process.id, process)}
+
+  defp delete_process(%__MODULE__{} = state, id),
+    do: %{state | processes: Map.delete(state.processes, id)}
 
   defp put_proxy(%__MODULE__{} = state, %Proxy{} = proxy),
     do: %{state | proxies: Map.put(state.proxies, proxy.id, proxy)}
@@ -407,6 +666,77 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
       metadata: service.metadata
     }
   end
+
+  defp process_handle_snapshot(%SandboxProcessHandle{} = handle, process) do
+    %{
+      id: process.id,
+      session_id: process.session_id,
+      backend: handle.backend,
+      status: handle.status,
+      command: handle.command,
+      metadata: handle.metadata,
+      opened_at: Map.get(process, :opened_at)
+    }
+  end
+
+  defp process_status_snapshot_for_session(
+         %ProcessStatus{} = status,
+         %__MODULE__{} = state,
+         session_id
+       ) do
+    case find_process_by_backend_id(state, session_id, status.id) do
+      nil -> process_status_snapshot(status, %{id: nil, session_id: session_id}, false)
+      process -> process_status_snapshot(status, process)
+    end
+  end
+
+  defp process_status_snapshot(%ProcessStatus{} = status, process),
+    do: process_status_snapshot(status, process, true)
+
+  defp process_status_snapshot(%ProcessStatus{} = status, process, managed?) do
+    %{
+      id: process.id,
+      session_id: process.session_id,
+      backend: status.backend,
+      status: status.status,
+      pid: status.pid,
+      exit_status: status.exit_status,
+      started_at_ms: status.started_at_ms,
+      finished_at_ms: status.finished_at_ms,
+      metadata: status.metadata,
+      managed?: managed?
+    }
+  end
+
+  defp find_process_by_backend_id(%__MODULE__{} = state, session_id, backend_id) do
+    Enum.find_value(state.processes, fn {_id, process} ->
+      if process.session_id == session_id and process.handle.id == backend_id, do: process
+    end)
+  end
+
+  defp session_event_snapshot(%RunicSandbox.SessionEvent{} = event, max_chunk_bytes) do
+    %{
+      id: event.id,
+      session_id: event.session_id,
+      type: event.type,
+      at: event.at,
+      payload: truncate_event_payload(event.payload, max_chunk_bytes),
+      metadata: event.metadata
+    }
+  end
+
+  defp truncate_event_payload(payload, max_chunk_bytes) when is_map(payload) do
+    Map.new(payload, fn
+      {key, value} when key in [:chunk, "chunk"] and is_binary(value) ->
+        preview = binary_part(value, 0, min(byte_size(value), max_chunk_bytes))
+        {key, preview}
+
+      pair ->
+        pair
+    end)
+  end
+
+  defp truncate_event_payload(payload, _max_chunk_bytes), do: payload
 
   defp proxy_snapshot(%Proxy{} = proxy) do
     %{

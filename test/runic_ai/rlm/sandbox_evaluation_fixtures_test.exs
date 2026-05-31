@@ -16,6 +16,7 @@ defmodule RunicAI.RLM.SandboxEvaluationFixturesTest do
              "repl_unknown_schema",
              "repl_context_discovery",
              "generated_component_promotion_denied",
+             "generated_component_promotion_flywheel",
              "sandbox_proxy_service_smoke",
              "checkpoint_restore_after_failure",
              "strategy_family_report"
@@ -181,6 +182,44 @@ defmodule RunicAI.RLM.SandboxEvaluationFixturesTest do
 
     assert fixtures.rejected_component.metadata.promotion_rejection.reason ==
              :host_materialization_requires_review
+  end
+
+  test "generated component flywheel fixture records promotion, reuse, and salience metrics" do
+    scenario = SandboxEvaluationFixtures.get!("generated_component_promotion_flywheel")
+    fixtures = scenario.fixtures
+
+    assert scenario.expected_strategy == :generated_sandbox_component
+    assert fixtures.run_a.decision == :generate_leaf
+    assert fixtures.run_a.capability_gap.selected_action == :generate_leaf
+    assert fixtures.run_a.proof_status == :pass
+    assert fixtures.run_a.promotion_target == :artifact
+
+    assert fixtures.run_b.decision == :reuse_exact
+    assert fixtures.run_b.catalog_entry_id == fixtures.catalog_entry.id
+    assert :intent_tags_exact in fixtures.run_b.match_reasons
+    assert fixtures.run_b.workflow_completed?
+
+    assert fixtures.reused_entry.salience.reuse_count == 1
+    assert fixtures.reused_entry.salience.successful_reuse_count == 1
+    assert fixtures.summary.reuse_rate == 0.5
+    assert fixtures.summary.proof_pass_rate == 1.0
+
+    [record] = SandboxEvaluationFixtures.comparison_records(scenario)
+    assert record.actual.catalog_hits == 1
+    assert record.actual.reused_components == 1
+    assert record.actual.repair_count == 0
+    assert record.actual.promotion_decisions.artifact == 1
+    assert record.quality.status == :passing
+
+    markdown =
+      scenario
+      |> SandboxEvaluationFixtures.evaluation_run()
+      |> SandboxEvaluationFixtures.markdown()
+
+    assert markdown =~ "Generated Component Flywheel"
+    assert markdown =~ "reuse_rate: 0.5"
+    assert markdown =~ "proof_pass_rate: 1.0"
+    assert markdown =~ "repair_count: 0"
   end
 
   test "strategy family fixture compares the same objective across harnesses" do

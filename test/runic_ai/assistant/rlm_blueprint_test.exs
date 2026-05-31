@@ -13,6 +13,8 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
   alias RunicAI.LLM.TestClient
   alias RunicAI.RLM.ComponentRuntime
   alias RunicAI.ReviewDecision
+  alias RunicAI.Sandbox.GeneratedComponent
+  alias RunicAI.Sandbox.GeneratedComponentCatalog
 
   test "constructs and validates a workflow blueprint" do
     split = ComponentBlueprint.new!("split", :source_splitter)
@@ -30,6 +32,62 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert [%{path: "tmp/source.md"}] = blueprint.sources
     assert {:ok, report} = BlueprintValidator.validate(blueprint)
     assert report.status == :accepted
+  end
+
+  test "prompt includes generated component catalog candidates when provided" do
+    workspace = Workspace.new!(root: tmp_dir())
+    store = generated_component_catalog_store()
+
+    prompt =
+      Coordinator.prompt("Normalize invoice rows", workspace,
+        generated_component_catalog: store,
+        generated_component_intent_tags: [:parse, :normalize],
+        generated_component_inputs: [%{name: "rows"}],
+        generated_component_outputs: [%{name: "invoice_facts"}],
+        generated_component_kind: :sandbox_execute,
+        generated_component_runtime: :python,
+        generated_component_policy: %{network: :disabled}
+      )
+
+    assert prompt =~ "Generated component catalog context"
+    assert prompt =~ "generated:invoice-normalizer"
+    assert prompt =~ "Prefer an exact catalog candidate"
+    assert prompt =~ "capability gap decision"
+  end
+
+  test "notifies caller when coordinator selects a generated component catalog entry" do
+    workspace = Workspace.new!(root: tmp_dir())
+    store = generated_component_catalog_store()
+    parent = self()
+
+    assert {:ok, blueprint} =
+             Coordinator.propose(workspace, "Normalize invoice rows",
+               generated_component_catalog: store,
+               generated_component_intent_tags: [:parse, :normalize],
+               generated_component_inputs: [%{name: "rows"}],
+               generated_component_outputs: [%{name: "invoice_facts"}],
+               generated_component_kind: :sandbox_execute,
+               generated_component_runtime: :python,
+               generated_component_policy: %{network: :disabled},
+               generated_component_catalog_reuse_callback: fn event ->
+                 send(parent, {:catalog_reuse, event})
+                 :ok
+               end,
+               validate?: false
+             )
+
+    assert blueprint.metadata.proposal_kind == :generated_component_catalog_reuse
+
+    assert_receive {:catalog_reuse,
+                    %{
+                      type: :generated_component_catalog_reuse_selected,
+                      entry_id: "generated:invoice-normalizer",
+                      score: score,
+                      reasons: reasons
+                    }}
+
+    assert score > 0
+    assert :intent_tags_exact in reasons
   end
 
   test "rejects duplicate ids, unknown edges, and missing stop conditions" do
@@ -723,5 +781,28 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     File.mkdir_p!(path)
     on_exit(fn -> File.rm_rf!(path) end)
     path
+  end
+
+  defp generated_component_catalog_store do
+    component =
+      GeneratedComponent.new!(
+        id: "generated:invoice-normalizer",
+        name: "Invoice normalizer",
+        language: :python,
+        runtime: :python,
+        entrypoint: "component.py:run",
+        source_artifacts: [%{path: "component.py", ref: "source:invoice"}],
+        test_artifacts: [%{path: "test_component.py", ref: "test:invoice"}],
+        interface: %{
+          inputs: [%{name: "rows", type: "list<object>"}],
+          outputs: [%{name: "invoice_facts", type: "list<object>"}]
+        },
+        verification: %{status: :pass, command: "python -m pytest"},
+        promotion_status: :verified,
+        metadata: %{intent_tags: [:parse, :normalize], network: :disabled}
+      )
+
+    {:ok, entry} = GeneratedComponentCatalog.entry_from_component(component)
+    GeneratedComponentCatalog.new_store!(entries: [entry])
   end
 end

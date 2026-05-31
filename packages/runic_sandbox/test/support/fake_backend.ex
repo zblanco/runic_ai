@@ -11,6 +11,8 @@ defmodule RunicSandbox.Test.FakeBackend do
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
   alias RunicSandbox.Instance
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Proxy
   alias RunicSandbox.Service
@@ -70,6 +72,12 @@ defmodule RunicSandbox.Test.FakeBackend do
             Capabilities.attach_metadata(:live_stream,
               stdin_supported?: true,
               stderr_separate?: true,
+              state_tier: :persistent_process_host,
+              process_host?: true,
+              workspace_persistent?: true,
+              live_process_stream?: true,
+              service_host?: true,
+              snapshot_modes: [:microvm_snapshot],
               provider_transport: :fake_stream
             )
         ),
@@ -119,6 +127,71 @@ defmodule RunicSandbox.Test.FakeBackend do
   def close_attach(%AttachHandle{}, _opts), do: :ok
 
   @impl true
+  def start_process(%Session{} = session, %ExecutionRequest{} = request, _opts) do
+    ProcessHandle.new(
+      id: "process-1",
+      session_id: session.id,
+      backend: session.backend,
+      status: :running,
+      command: request.argv,
+      events: [
+        session_event(session, :process_started, %{process_id: "process-1", argv: request.argv}),
+        session_event(session, :stdout_chunk, %{chunk: request.source || "", stream: :stdout})
+      ],
+      metadata: %{fake?: true}
+    )
+  end
+
+  @impl true
+  def list_processes(%Session{} = session, _opts) do
+    {:ok,
+     [
+       ProcessStatus.new!(
+         id: "process-1",
+         session_id: session.id,
+         backend: session.backend,
+         status: :running
+       )
+     ]}
+  end
+
+  @impl true
+  def process_status(%Session{} = session, %ProcessHandle{} = handle, _opts) do
+    ProcessStatus.from_handle(handle, session_id: session.id, status: :running)
+  end
+
+  def process_status(%Session{} = session, process_id, _opts) when is_binary(process_id) do
+    ProcessStatus.new(
+      id: process_id,
+      session_id: session.id,
+      backend: session.backend,
+      status: :running
+    )
+  end
+
+  @impl true
+  def process_events(%ProcessHandle{} = handle, _opts), do: {:ok, ProcessHandle.events(handle)}
+
+  @impl true
+  def write_process_stdin(%ProcessHandle{}, input, _opts) when is_binary(input) or is_list(input),
+    do: :ok
+
+  @impl true
+  def close_process_stdin(%ProcessHandle{}, _opts), do: :ok
+
+  @impl true
+  def signal_process(%ProcessHandle{}, signal, _opts) when is_atom(signal) or is_binary(signal),
+    do: :ok
+
+  @impl true
+  def kill_process(%ProcessHandle{}, _opts), do: :ok
+
+  @impl true
+  def wait_process(%ProcessHandle{} = handle, _opts) do
+    ProcessStatus.from_handle(handle, status: :exited, exit_status: 0)
+  end
+
+  @impl true
   def write_file(%Session{}, path, contents, _opts) do
     FileRef.new(path: path, bytes: IO.iodata_length(contents), sha256: "fake")
   end
@@ -138,7 +211,12 @@ defmodule RunicSandbox.Test.FakeBackend do
       id: "checkpoint-1",
       session_id: session.id,
       backend: session.backend,
-      ref: "checkpoint://fake/1"
+      ref: "checkpoint://fake/1",
+      metadata: %{
+        kind: :microvm_snapshot,
+        preserves: Checkpoint.preserves(:microvm_snapshot),
+        caveats: ["Fake backend models a full microVM snapshot for contract tests."]
+      }
     )
   end
 

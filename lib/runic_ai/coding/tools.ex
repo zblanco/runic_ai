@@ -551,7 +551,7 @@ defmodule RunicAI.Coding.Tools do
     with {:ok, registry} <- require_sandbox_session_registry(registry) do
       sandbox_opts = Keyword.get(opts, :sandbox_opts, [])
       sandbox = normalize_atom(arg(args, :sandbox, :local_code))
-      spec = arg(args, :spec, %{})
+      spec = sandbox_session_spec(args)
 
       SandboxSessionRegistry.open_session(registry, sandbox, spec, sandbox_opts)
     end
@@ -641,6 +641,100 @@ defmodule RunicAI.Coding.Tools do
     with {:ok, registry} <- require_sandbox_session_registry(registry),
          {:ok, session_id} <- sandbox_session_id(args) do
       SandboxSessionRegistry.close_session(registry, session_id)
+    end
+  end
+
+  def start_sandbox_process(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args),
+         {:ok, runtime} <- code_runtime(arg(args, :runtime, "bash")),
+         {:ok, code} <- non_empty_string(arg(args, :code, arg(args, :source, nil)), :code) do
+      request = %{
+        runtime: runtime,
+        mode: normalize_atom(arg(args, :mode, :script)),
+        source: code,
+        argv: arg(args, :argv, []),
+        cwd: arg(args, :sandbox_cwd, "/workspace"),
+        timeout_ms: arg(args, :timeout_ms, nil),
+        max_output_bytes: arg(args, :max_output_bytes, 16_384),
+        network: normalize_sandbox_network(arg(args, :network, :disabled)),
+        files: normalize_map(arg(args, :files, %{})),
+        metadata: normalize_map(arg(args, :metadata, %{}))
+      }
+
+      SandboxSessionRegistry.start_process(registry, session_id, request)
+    end
+  end
+
+  def list_sandbox_processes(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, session_id} <- sandbox_session_id(args) do
+      SandboxSessionRegistry.list_processes(registry, session_id)
+    end
+  end
+
+  def sandbox_process_status(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args) do
+      SandboxSessionRegistry.process_status(registry, process_id)
+    end
+  end
+
+  def sandbox_process_events(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args) do
+      SandboxSessionRegistry.process_events(registry, process_id,
+        max_events: arg(args, :max_events, 100),
+        max_chunk_bytes: arg(args, :max_chunk_bytes, 4_096)
+      )
+    end
+  end
+
+  def write_sandbox_process(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args),
+         {:ok, input} <- non_empty_string(arg(args, :input, nil), :input) do
+      SandboxSessionRegistry.write_process_stdin(registry, process_id, input)
+    end
+  end
+
+  def close_sandbox_process_stdin(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args) do
+      SandboxSessionRegistry.close_process_stdin(registry, process_id)
+    end
+  end
+
+  def signal_sandbox_process(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args),
+         {:ok, signal} <- non_empty_string(arg(args, :signal, "TERM"), :signal) do
+      SandboxSessionRegistry.signal_process(registry, process_id, signal)
+    end
+  end
+
+  def kill_sandbox_process(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args) do
+      SandboxSessionRegistry.kill_process(registry, process_id)
+    end
+  end
+
+  def wait_sandbox_process(%Workspace{} = _workspace, args, registry, _opts \\ [])
+      when is_map(args) do
+    with {:ok, registry} <- require_sandbox_session_registry(registry),
+         {:ok, process_id} <- sandbox_process_id(args) do
+      SandboxSessionRegistry.wait_process(registry, process_id,
+        timeout_ms: arg(args, :timeout_ms, nil)
+      )
     end
   end
 
@@ -1484,7 +1578,12 @@ defmodule RunicAI.Coding.Tools do
       definition(
         "open_sandbox_session",
         "Open a managed sandbox session and return an opaque session id.",
-        [sandbox: [type: :string], spec: [type: :any]],
+        [
+          sandbox: [type: :string],
+          role: [type: :string],
+          purpose: [type: :string],
+          spec: [type: :any]
+        ],
         fn args ->
           open_sandbox_session(workspace, args, sandbox_session_registry,
             sandbox_opts: sandbox_opts
@@ -1562,6 +1661,97 @@ defmodule RunicAI.Coding.Tools do
         [session_id: [type: :string, required: true]],
         fn args -> close_sandbox_session(workspace, args, sandbox_session_registry) end,
         Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "start_sandbox_process",
+        "Start a long-lived process inside an existing managed sandbox session and return an opaque process id.",
+        [
+          session_id: [type: :string, required: true],
+          runtime: [type: :string, default: "bash"],
+          code: [type: :string, required: true],
+          mode: [type: :string, default: "script"],
+          argv: [type: :any],
+          sandbox_cwd: [type: :string, default: "/workspace"],
+          max_output_bytes: [type: :pos_integer],
+          network: [type: :any],
+          files: [type: :any],
+          metadata: [type: :any]
+        ],
+        fn args -> start_sandbox_process(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true}),
+        timeout: :infinity,
+        stop_on_error: false
+      ),
+      definition(
+        "list_sandbox_processes",
+        "List processes known to an existing managed sandbox session.",
+        [session_id: [type: :string, required: true]],
+        fn args -> list_sandbox_processes(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "sandbox_process_status",
+        "Read the current status for one managed sandbox process.",
+        [process_id: [type: :string, required: true]],
+        fn args -> sandbox_process_status(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "sandbox_process_events",
+        "Read bounded lifecycle and output events for one managed sandbox process.",
+        [
+          process_id: [type: :string, required: true],
+          max_events: [type: :pos_integer],
+          max_chunk_bytes: [type: :pos_integer]
+        ],
+        fn args -> sandbox_process_events(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false})
+      ),
+      definition(
+        "write_sandbox_process",
+        "Write stdin to a managed sandbox process.",
+        [
+          process_id: [type: :string, required: true],
+          input: [type: :string, required: true]
+        ],
+        fn args -> write_sandbox_process(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "close_sandbox_process_stdin",
+        "Close stdin for a managed sandbox process.",
+        [process_id: [type: :string, required: true]],
+        fn args -> close_sandbox_process_stdin(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "signal_sandbox_process",
+        "Send a signal to a managed sandbox process.",
+        [
+          process_id: [type: :string, required: true],
+          signal: [type: :string, default: "TERM"]
+        ],
+        fn args -> signal_sandbox_process(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "kill_sandbox_process",
+        "Kill a managed sandbox process and forget its private backend handle.",
+        [process_id: [type: :string, required: true]],
+        fn args -> kill_sandbox_process(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: true, requires_review?: true})
+      ),
+      definition(
+        "wait_sandbox_process",
+        "Wait for a managed sandbox process to exit and return its status.",
+        [
+          process_id: [type: :string, required: true],
+          timeout_ms: [type: :pos_integer]
+        ],
+        fn args -> wait_sandbox_process(workspace, args, sandbox_session_registry) end,
+        Map.merge(metadata, %{mutates?: false, requires_review?: false}),
+        timeout: :infinity,
+        stop_on_error: false
       ),
       definition(
         "start_sandbox_service",
@@ -4287,6 +4477,28 @@ defmodule RunicAI.Coding.Tools do
     args
     |> arg(:session_id, arg(args, :id, nil))
     |> non_empty_string(:session_id)
+  end
+
+  defp sandbox_session_spec(args) do
+    args
+    |> arg(:spec, %{})
+    |> normalize_map()
+    |> maybe_put_spec_arg(args, :role)
+    |> maybe_put_spec_arg(args, :purpose)
+  end
+
+  defp maybe_put_spec_arg(map, args, key) do
+    case arg(args, key, nil) do
+      nil -> map
+      "" -> map
+      value -> Map.put_new(map, key, normalize_atom(value))
+    end
+  end
+
+  defp sandbox_process_id(args) do
+    args
+    |> arg(:process_id, arg(args, :id, nil))
+    |> non_empty_string(:process_id)
   end
 
   defp sandbox_checkpoint(args) do

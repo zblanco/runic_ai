@@ -19,6 +19,8 @@ defmodule RunicSandbox.Backends.Vmsan do
   alias RunicSandbox.FileRef
   alias RunicSandbox.HostProbe
   alias RunicSandbox.Instance
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
   alias RunicSandbox.VmsanCLI
@@ -196,6 +198,163 @@ defmodule RunicSandbox.Backends.Vmsan do
   def close_attach(%AttachHandle{}, _opts), do: :ok
 
   @impl true
+  def start_process(%Session{} = session, %ExecutionRequest{} = request, opts) do
+    started_mono = System.monotonic_time(:millisecond)
+
+    with :ok <- ensure_available(opts),
+         {:ok, argv} <- request_argv(request),
+         {:ok, handle} <- open_session_process(session, request, argv, started_mono, opts) do
+      {:ok, handle}
+    end
+  end
+
+  @impl true
+  def list_processes(%Session{} = session, opts) do
+    with {:ok, output} <- vmsan_ps(session.id, nil, session_cli_opts(session, opts)) do
+      statuses =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.reduce([], fn line, acc ->
+          case vmsan_process_status(session, line) do
+            {:ok, status} -> [status | acc]
+            {:error, _error} -> acc
+          end
+        end)
+        |> Enum.reverse()
+
+      {:ok, statuses}
+    end
+  end
+
+  @impl true
+  def process_status(%Session{} = session, %ProcessHandle{} = handle, opts) do
+    pidfile = Map.get(handle.metadata, :pidfile)
+
+    with {:ok, pid} <- vmsan_process_pid(session.id, pidfile, session_cli_opts(session, opts)),
+         {:ok, output} <- vmsan_ps(session.id, pid, session_cli_opts(session, opts)) do
+      case output |> String.split("\n", trim: true) |> List.first() do
+        nil ->
+          ProcessStatus.from_handle(handle, status: :unknown, pid: parse_pid(pid))
+
+        line ->
+          {:ok, status} = vmsan_process_status(session, line)
+
+          ProcessStatus.from_handle(handle,
+            status: status.status,
+            pid: status.pid,
+            metadata: Map.merge(handle.metadata, status.metadata)
+          )
+      end
+    else
+      {:error, _error} ->
+        ProcessStatus.from_handle(handle)
+    end
+  end
+
+  def process_status(%Session{} = session, process_id, _opts) when is_binary(process_id) do
+    ProcessStatus.new(
+      id: process_id,
+      session_id: session.id,
+      backend: session.backend,
+      status: :unknown,
+      metadata: %{provider_transport: :vmsan_cli}
+    )
+  end
+
+  @impl true
+  def process_events(%ProcessHandle{} = handle, _opts), do: {:ok, ProcessHandle.events(handle)}
+
+  @impl true
+  def write_process_stdin(%ProcessHandle{metadata: metadata}, input, _opts) do
+    case Map.get(metadata, :port) do
+      port when is_port(port) ->
+        Port.command(port, IO.iodata_to_binary(input))
+        :ok
+
+      _other ->
+        {:error,
+         Error.validation("vmsan process handle is not writable",
+           source: __MODULE__,
+           details: %{backend: :vmsan}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def close_process_stdin(%ProcessHandle{metadata: metadata}, _opts) do
+    case Map.get(metadata, :port) do
+      port when is_port(port) ->
+        Port.command(port, <<4>>)
+        :ok
+
+      _other ->
+        {:error,
+         Error.validation("vmsan process handle is not writable",
+           source: __MODULE__,
+           details: %{backend: :vmsan}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def signal_process(%ProcessHandle{metadata: metadata}, signal, opts) do
+    vm_id = Map.get(metadata, :vm_id)
+    pidfile = Map.get(metadata, :pidfile)
+
+    with vm_id when is_binary(vm_id) <- vm_id,
+         {:ok, pid} <- vmsan_process_pid(vm_id, pidfile, handle_cli_opts(metadata, opts)),
+         {:ok, _output} <-
+           vmsan_process_shell(
+             vm_id,
+             "kill -s #{shell_escape(to_string(signal))} #{shell_escape(pid)}",
+             handle_cli_opts(metadata, opts)
+           ) do
+      :ok
+    else
+      _other ->
+        {:error,
+         Error.validation("vmsan process handle does not expose a signal target",
+           source: __MODULE__,
+           details: %{backend: :vmsan}
+         )}
+    end
+  end
+
+  @impl true
+  def kill_process(%ProcessHandle{} = handle, opts) do
+    case signal_process(handle, "TERM", opts) do
+      :ok -> cleanup_process_handle(handle.metadata)
+      {:error, _error} -> cleanup_process_handle(handle.metadata)
+    end
+  end
+
+  @impl true
+  def wait_process(%ProcessHandle{} = handle, _opts) do
+    handle
+    |> ProcessHandle.events()
+    |> Enum.reduce(nil, fn
+      %{type: :process_finished} = event, _acc -> event
+      _event, acc -> acc
+    end)
+    |> case do
+      %{payload: payload} ->
+        ProcessStatus.from_handle(handle,
+          status: Map.get(payload, :status, :exited),
+          exit_status: Map.get(payload, :exit_status)
+        )
+
+      nil ->
+        ProcessStatus.from_handle(handle)
+    end
+  end
+
+  @impl true
   def write_file(%Session{} = session, path, contents, opts) do
     with {:ok, tmp_root} <- tmp_root(session),
          {:ok, local_path} <- safe_tmp_path(tmp_root, local_transfer_path(path)),
@@ -277,6 +436,10 @@ defmodule RunicSandbox.Backends.Vmsan do
         created_at: DateTime.utc_now(),
         metadata: %{
           kind: :microvm_snapshot,
+          preserves: Checkpoint.preserves(:microvm_snapshot),
+          caveats: [
+            "Vmsan microVM snapshots preserve VM filesystem and memory state; external network connections should be treated as broken after restore."
+          ],
           snapshot_path: Map.get(event, "snapshotPath"),
           mem_path: Map.get(event, "memPath")
         }
@@ -306,6 +469,260 @@ defmodule RunicSandbox.Backends.Vmsan do
   def restore(%Session{}, _checkpoint, _opts),
     do:
       {:error, Error.validation("vmsan restore requires a vmsan checkpoint", source: __MODULE__)}
+
+  defp open_session_process(
+         %Session{} = session,
+         %ExecutionRequest{} = request,
+         argv,
+         started_mono,
+         opts
+       ) do
+    process_id = "process-#{System.unique_integer([:positive])}"
+    pidfile = "/tmp/runic-sandbox-#{process_id}.pid"
+
+    command =
+      [
+        "sh",
+        "-lc",
+        "printf '%s' \"$$\" > \"$1\"; shift; exec \"$@\"",
+        "runic-process",
+        pidfile
+      ] ++ argv
+
+    args =
+      VmsanCLI.exec_interactive_args(session.id, command,
+        workdir: request.cwd,
+        env: request_env(request)
+      )
+
+    with {:ok, port} <- open_vmsan_process_port(args, session_cli_opts(session, opts)) do
+      if request.stdin not in [nil, ""], do: Port.command(port, request.stdin)
+
+      events =
+        Stream.resource(
+          fn ->
+            %{
+              session: session,
+              request: request,
+              port: port,
+              process_id: process_id,
+              pidfile: pidfile,
+              started?: false,
+              finished?: false,
+              started_mono: started_mono
+            }
+          end,
+          &next_process_event/1,
+          &cleanup_process_stream/1
+        )
+
+      ProcessHandle.new(
+        id: process_id,
+        session_id: session.id,
+        backend: session.backend,
+        status: :running,
+        command: argv,
+        events: events,
+        metadata: %{
+          streaming_live?: true,
+          provider_transport: :vmsan_cli,
+          port: port,
+          vm_id: session.id,
+          executable: session_executable(session),
+          process_id: process_id,
+          pidfile: pidfile
+        }
+      )
+    end
+  end
+
+  defp next_process_event(%{started?: false} = state) do
+    event =
+      AttachEvents.event(state.session, :process_started, %{
+        process_id: state.process_id,
+        runtime: state.request.runtime,
+        mode: state.request.mode,
+        argv: state.request.argv,
+        cwd: state.request.cwd,
+        vm_id: state.session.id
+      })
+
+    {[event], %{state | started?: true}}
+  end
+
+  defp next_process_event(%{port: port} = state) do
+    receive do
+      {^port, {:data, data}} ->
+        event =
+          AttachEvents.chunk_event(
+            state.session,
+            :stdout_chunk,
+            cap(data, state.request.max_output_bytes)
+          )
+
+        {[event], state}
+
+      {^port, {:exit_status, exit_status}} ->
+        state = %{state | finished?: true}
+        event = vmsan_process_finished_event(state, exit_status)
+        cleanup_process_stream(state)
+        {[event], :halt}
+    end
+  end
+
+  defp next_process_event(:halt), do: {:halt, :halt}
+
+  defp vmsan_process_finished_event(state, exit_status) do
+    duration_ms = System.monotonic_time(:millisecond) - state.started_mono
+
+    AttachEvents.event(state.session, :process_finished, %{
+      process_id: state.process_id,
+      status: if(exit_status == 0, do: :exited, else: :failed),
+      exit_status: exit_status,
+      duration_ms: duration_ms,
+      vm_id: state.session.id
+    })
+  end
+
+  defp cleanup_process_stream(:halt), do: :ok
+
+  defp cleanup_process_stream(%{finished?: finished?} = state) do
+    unless finished? do
+      cleanup_process_handle(%{port: state.port})
+    end
+
+    :ok
+  end
+
+  defp cleanup_process_handle(%{port: port}) when is_port(port) do
+    Port.close(port)
+    :ok
+  rescue
+    _exception -> :ok
+  end
+
+  defp cleanup_process_handle(_metadata), do: :ok
+
+  defp open_vmsan_process_port(args, opts) do
+    port_open = Keyword.get(opts, :port_open, &open_vmsan_port/2)
+    port_open.(args, opts)
+  rescue
+    exception -> {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp open_vmsan_port(args, opts) do
+    {command, argv} =
+      VmsanCLI.command(args,
+        executable: executable(opts),
+        sudo?: false,
+        json?: false
+      )
+
+    case System.find_executable(command) do
+      nil ->
+        {:error,
+         Error.validation("vmsan executable is not available",
+           source: __MODULE__,
+           details: %{command: command}
+         )}
+
+      executable ->
+        port =
+          Port.open({:spawn_executable, executable}, [
+            :binary,
+            :exit_status,
+            args: argv
+          ])
+
+        {:ok, port}
+    end
+  end
+
+  defp vmsan_process_pid(_vm_id, pidfile, _opts) when pidfile in [nil, ""],
+    do:
+      {:error,
+       Error.validation("vmsan process handle does not expose a pidfile", source: __MODULE__)}
+
+  defp vmsan_process_pid(vm_id, pidfile, opts) do
+    with {:ok, output} <- vmsan_process_shell(vm_id, "cat #{shell_escape(pidfile)}", opts),
+         pid when pid != "" <- String.trim(output) do
+      {:ok, pid}
+    else
+      _other ->
+        {:error,
+         Error.validation("vmsan process pid lookup failed",
+           source: __MODULE__,
+           details: %{vm_id: vm_id, pidfile: pidfile}
+         )}
+    end
+  end
+
+  defp vmsan_ps(vm_id, nil, opts),
+    do: vmsan_process_shell(vm_id, "ps -eo pid=,stat=,comm= 2>/dev/null || true", opts)
+
+  defp vmsan_ps(vm_id, pid, opts),
+    do:
+      vmsan_process_shell(
+        vm_id,
+        "ps -p #{shell_escape(pid)} -o pid=,stat=,comm= 2>/dev/null || true",
+        opts
+      )
+
+  defp vmsan_process_shell(vm_id, source, opts) do
+    VmsanCLI.exec_args(vm_id, ["sh", "-lc", source])
+    |> run_vmsan(opts)
+    |> case do
+      {:ok, result} -> {:ok, result.stream_output}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp vmsan_process_status(%Session{} = session, line) do
+    case Regex.run(~r/^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/, line) do
+      [_line, pid, stat, command] ->
+        ProcessStatus.new(
+          id: "pid-#{pid}",
+          session_id: session.id,
+          backend: session.backend,
+          status: process_status_from_stat(stat),
+          pid: parse_pid(pid),
+          metadata: %{
+            provider_transport: :vmsan_cli,
+            vm_id: session.id,
+            stat: stat,
+            command: command
+          }
+        )
+
+      _other ->
+        ProcessStatus.new(
+          id: "unknown-#{System.unique_integer([:positive])}",
+          session_id: session.id,
+          backend: session.backend,
+          status: :unknown,
+          metadata: %{provider_transport: :vmsan_cli, raw: line}
+        )
+    end
+  end
+
+  defp process_status_from_stat("Z" <> _rest), do: :exited
+  defp process_status_from_stat("T" <> _rest), do: :running
+  defp process_status_from_stat(_stat), do: :running
+
+  defp parse_pid(pid) when is_binary(pid) do
+    case Integer.parse(pid) do
+      {value, ""} -> value
+      _other -> nil
+    end
+  end
+
+  defp parse_pid(_pid), do: nil
+
+  defp handle_cli_opts(metadata, opts) do
+    opts
+    |> Keyword.put_new(:executable, Map.get(metadata, :executable, "vmsan"))
+    |> Keyword.put_new(:sudo?, false)
+  end
 
   defp create_vm(%Profile{} = profile, opts) do
     backend_options = profile.backend_options
@@ -541,7 +958,13 @@ defmodule RunicSandbox.Backends.Vmsan do
       metadata:
         Capabilities.attach_metadata(:terminal_adapter,
           provider_transport: :vmsan_cli,
-          restricted_egress_supported?: false
+          restricted_egress_supported?: false,
+          state_tier: :persistent_process_host,
+          process_host?: true,
+          workspace_persistent?: true,
+          live_process_stream?: true,
+          service_host?: false,
+          snapshot_modes: [:microvm_snapshot]
         )
     )
   end

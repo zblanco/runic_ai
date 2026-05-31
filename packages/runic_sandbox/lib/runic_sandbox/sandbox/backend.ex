@@ -9,6 +9,8 @@ defmodule RunicSandbox.Backend do
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
   alias RunicSandbox.Instance
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
 
@@ -30,6 +32,22 @@ defmodule RunicSandbox.Backend do
               {:ok, AttachHandle.t()} | {:error, Error.t()}
   @callback write_stdin(AttachHandle.t(), iodata(), keyword()) :: :ok | {:error, Error.t()}
   @callback close_attach(AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  @callback start_process(Session.t(), ExecutionRequest.t(), keyword()) ::
+              {:ok, ProcessHandle.t()} | {:error, Error.t()}
+  @callback list_processes(Session.t(), keyword()) ::
+              {:ok, [ProcessStatus.t()]} | {:error, Error.t()}
+  @callback process_status(Session.t(), ProcessHandle.t() | String.t(), keyword()) ::
+              {:ok, ProcessStatus.t()} | {:error, Error.t()}
+  @callback process_events(ProcessHandle.t(), keyword()) ::
+              {:ok, Enumerable.t()} | {:error, Error.t()}
+  @callback write_process_stdin(ProcessHandle.t(), iodata(), keyword()) ::
+              :ok | {:error, Error.t()}
+  @callback close_process_stdin(ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  @callback signal_process(ProcessHandle.t(), atom() | String.t(), keyword()) ::
+              :ok | {:error, Error.t()}
+  @callback kill_process(ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  @callback wait_process(ProcessHandle.t(), keyword()) ::
+              {:ok, ProcessStatus.t()} | {:error, Error.t()}
   @callback write_file(Session.t(), Path.t(), iodata(), keyword()) ::
               {:ok, FileRef.t()} | {:error, Error.t()}
   @callback read_file(Session.t(), Path.t(), keyword()) :: {:ok, binary()} | {:error, Error.t()}
@@ -61,6 +79,15 @@ defmodule RunicSandbox.Backend do
                       attach_session: 3,
                       write_stdin: 3,
                       close_attach: 2,
+                      start_process: 3,
+                      list_processes: 2,
+                      process_status: 3,
+                      process_events: 2,
+                      write_process_stdin: 3,
+                      close_process_stdin: 2,
+                      signal_process: 3,
+                      kill_process: 2,
+                      wait_process: 2,
                       write_file: 4,
                       read_file: 3,
                       list_files: 3,
@@ -147,6 +174,64 @@ defmodule RunicSandbox.Backend do
   @spec close_attach(module(), AttachHandle.t(), keyword()) :: :ok | {:error, Error.t()}
   def close_attach(module, %AttachHandle{} = handle, opts) do
     dispatch_or_unsupported(module, :close_attach, [handle, opts], handle)
+  end
+
+  @spec start_process(module(), Session.t(), ExecutionRequest.t(), keyword()) ::
+          {:ok, ProcessHandle.t()} | {:error, Error.t()}
+  def start_process(module, %Session{} = session, %ExecutionRequest{} = request, opts) do
+    dispatch_or_unsupported(module, :start_process, [session, request, opts], session)
+  end
+
+  @spec list_processes(module(), Session.t(), keyword()) ::
+          {:ok, [ProcessStatus.t()]} | {:error, Error.t()}
+  def list_processes(module, %Session{} = session, opts) do
+    dispatch_or_unsupported(module, :list_processes, [session, opts], session)
+  end
+
+  @spec process_status(module(), Session.t(), ProcessHandle.t() | String.t(), keyword()) ::
+          {:ok, ProcessStatus.t()} | {:error, Error.t()}
+  def process_status(module, %Session{} = session, process, opts) do
+    dispatch_or_unsupported(module, :process_status, [session, process, opts], session)
+  end
+
+  @spec process_events(module(), ProcessHandle.t(), keyword()) ::
+          {:ok, Enumerable.t()} | {:error, Error.t()}
+  def process_events(module, %ProcessHandle{} = handle, opts) do
+    Code.ensure_loaded?(module)
+
+    if function_exported?(module, :process_events, 2) do
+      module.process_events(handle, opts)
+    else
+      {:ok, ProcessHandle.events(handle)}
+    end
+  end
+
+  @spec write_process_stdin(module(), ProcessHandle.t(), iodata(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def write_process_stdin(module, %ProcessHandle{} = handle, input, opts) do
+    dispatch_or_unsupported(module, :write_process_stdin, [handle, input, opts], handle)
+  end
+
+  @spec close_process_stdin(module(), ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def close_process_stdin(module, %ProcessHandle{} = handle, opts) do
+    dispatch_or_unsupported(module, :close_process_stdin, [handle, opts], handle)
+  end
+
+  @spec signal_process(module(), ProcessHandle.t(), atom() | String.t(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def signal_process(module, %ProcessHandle{} = handle, signal, opts) do
+    dispatch_or_unsupported(module, :signal_process, [handle, signal, opts], handle)
+  end
+
+  @spec kill_process(module(), ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def kill_process(module, %ProcessHandle{} = handle, opts) do
+    dispatch_or_unsupported(module, :kill_process, [handle, opts], handle)
+  end
+
+  @spec wait_process(module(), ProcessHandle.t(), keyword()) ::
+          {:ok, ProcessStatus.t()} | {:error, Error.t()}
+  def wait_process(module, %ProcessHandle{} = handle, opts) do
+    dispatch_or_unsupported(module, :wait_process, [handle, opts], handle)
   end
 
   def write_file(module, session, path, contents, opts),

@@ -21,6 +21,8 @@ defmodule RunicSandbox do
   alias RunicSandbox.Manager
   alias RunicSandbox.Capabilities
   alias RunicSandbox.Policy
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
   alias RunicSandbox.SessionRegistry
@@ -106,6 +108,112 @@ defmodule RunicSandbox do
       server ->
         Manager.close_attach(server, handle, opts)
     end
+  end
+
+  @spec start_process(Session.t(), ExecutionRequest.t() | keyword() | map(), keyword()) ::
+          {:ok, ProcessHandle.t()} | {:error, Error.t()}
+  def start_process(%Session{} = session, request_input, opts \\ []) do
+    case Keyword.get(opts, :server) do
+      nil ->
+        with :ok <- verify_session(session),
+             :ok <- require_ready_session(session, :start_process),
+             :ok <- require_process_host_session(session),
+             {:ok, request} <- request_for_session(session, request_input),
+             :ok <- authorize_session_request(session, request) do
+          session.backend
+          |> backend_module()
+          |> Backend.start_process(session, request, opts)
+        end
+
+      server ->
+        Manager.start_process(server, session, request_input, opts)
+    end
+  end
+
+  @spec list_processes(Session.t(), keyword()) :: {:ok, [ProcessStatus.t()]} | {:error, Error.t()}
+  def list_processes(%Session{} = session, opts \\ []) do
+    case Keyword.get(opts, :server) do
+      nil ->
+        with :ok <- verify_session(session),
+             :ok <- require_ready_session(session, :list_processes),
+             :ok <- require_process_host_session(session) do
+          session.backend
+          |> backend_module()
+          |> Backend.list_processes(session, opts)
+        end
+
+      server ->
+        Manager.list_processes(server, session, opts)
+    end
+  end
+
+  @spec process_status(Session.t(), ProcessHandle.t() | String.t(), keyword()) ::
+          {:ok, ProcessStatus.t()} | {:error, Error.t()}
+  def process_status(%Session{} = session, process, opts \\ []) do
+    case Keyword.get(opts, :server) do
+      nil ->
+        with :ok <- verify_session(session),
+             :ok <- require_ready_session(session, :process_status),
+             :ok <- require_process_host_session(session) do
+          session.backend
+          |> backend_module()
+          |> Backend.process_status(session, process, opts)
+        end
+
+      server ->
+        Manager.process_status(server, session, process, opts)
+    end
+  end
+
+  @spec process_events(ProcessHandle.t(), keyword()) ::
+          {:ok, Enumerable.t()} | {:error, Error.t()}
+  def process_events(%ProcessHandle{} = handle, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.process_events(handle, opts)
+  end
+
+  @spec write_process_stdin(ProcessHandle.t(), iodata(), keyword()) :: :ok | {:error, Error.t()}
+  def write_process_stdin(%ProcessHandle{} = handle, input, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.write_process_stdin(handle, input, opts)
+  end
+
+  @spec close_process_stdin(ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def close_process_stdin(%ProcessHandle{} = handle, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.close_process_stdin(handle, opts)
+  end
+
+  @spec signal_process(ProcessHandle.t(), atom() | String.t(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def signal_process(%ProcessHandle{} = handle, signal, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.signal_process(handle, signal, opts)
+  end
+
+  @spec kill_process(ProcessHandle.t(), keyword()) :: :ok | {:error, Error.t()}
+  def kill_process(%ProcessHandle{} = handle, opts \\ []) do
+    case Keyword.get(opts, :server) do
+      nil ->
+        handle.backend
+        |> backend_module()
+        |> Backend.kill_process(handle, opts)
+
+      server ->
+        Manager.kill_process(server, handle, opts)
+    end
+  end
+
+  @spec wait_process(ProcessHandle.t(), keyword()) ::
+          {:ok, ProcessStatus.t()} | {:error, Error.t()}
+  def wait_process(%ProcessHandle{} = handle, opts \\ []) do
+    handle.backend
+    |> backend_module()
+    |> Backend.wait_process(handle, opts)
   end
 
   @spec status(keyword()) :: {:ok, map()} | {:error, Error.t()}
@@ -600,6 +708,18 @@ defmodule RunicSandbox do
        source: __MODULE__,
        details: %{session_id: session.id, backend: session.backend}
      )}
+  end
+
+  defp require_process_host_session(%Session{} = session) do
+    if Capabilities.process_host?(session.capabilities) do
+      :ok
+    else
+      {:error,
+       Error.validation("sandbox session does not support process hosting",
+         source: __MODULE__,
+         details: %{session_id: session.id, backend: session.backend}
+       )}
+    end
   end
 
   defp authorize_session_isolation(%Session{} = session) do

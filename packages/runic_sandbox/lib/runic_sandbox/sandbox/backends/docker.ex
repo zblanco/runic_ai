@@ -19,7 +19,11 @@ defmodule RunicSandbox.Backends.Docker do
   alias RunicSandbox.FileRef
   alias RunicSandbox.Instance
   alias RunicSandbox.Policy
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
+  alias RunicSandbox.Proxy
+  alias RunicSandbox.Service
   alias RunicSandbox.Session
 
   @default_image "runic-ai/sandbox:elixir-python-node"
@@ -167,6 +171,7 @@ defmodule RunicSandbox.Backends.Docker do
     host_available? = container_available?(profile)
     image_available? = image_available?(configured_image)
     exec_ready? = host_available? and image_available?
+    stateful? = if(profile, do: stateful?(profile), else: false)
 
     {:ok,
      %{
@@ -184,7 +189,7 @@ defmodule RunicSandbox.Backends.Docker do
        runtimes: [:bash, :sh, :python, :node, :elixir, :lua],
        isolation_level: isolation_level(backend),
        network: %{default: :disabled},
-       stateful?: if(profile, do: stateful?(profile), else: false),
+       stateful?: stateful?,
        security_boundary?: true,
        capabilities:
          Capabilities.to_map(
@@ -195,13 +200,20 @@ defmodule RunicSandbox.Backends.Docker do
              artifacts?: true,
              session_files?: true,
              checkpoints?: true,
-             services?: false,
-             proxy?: false,
+             services?: stateful?,
+             proxy?: stateful?,
              leases?: false,
              streaming?: true,
              network_policy?: true,
-             persistent_identity?: if(profile, do: stateful?(profile), else: false),
-             metadata: docker_attach_metadata()
+             persistent_identity?: stateful?,
+             metadata:
+               docker_attach_metadata(
+                 state_tier: if(stateful?, do: :persistent_process_host, else: :one_shot_exec),
+                 process_host?: stateful?,
+                 workspace_persistent?: stateful?,
+                 service_host?: stateful?,
+                 snapshot_modes: if(stateful?, do: [:filesystem], else: [])
+               )
            )
          ),
        missing_requirements:
@@ -230,7 +242,8 @@ defmodule RunicSandbox.Backends.Docker do
     with {:ok, instance} <- provision(session_profile, opts),
          :ok <- ensure_container_available(instance),
          {:ok, workspace_root} <- session_workspace_root(instance),
-         :ok <- File.mkdir_p(workspace_root) do
+         :ok <- File.mkdir_p(workspace_root),
+         {:ok, container} <- start_session_container(instance, workspace_root) do
       Session.from_instance(instance,
         capabilities:
           Capabilities.new!(
@@ -240,26 +253,40 @@ defmodule RunicSandbox.Backends.Docker do
             artifacts?: true,
             session_files?: true,
             checkpoints?: true,
-            services?: false,
-            proxy?: false,
+            services?: true,
+            proxy?: true,
             leases?: false,
             streaming?: true,
             network_policy?: true,
             persistent_identity?: true,
-            metadata: docker_attach_metadata()
+            metadata:
+              docker_attach_metadata(
+                state_tier: :persistent_process_host,
+                process_host?: true,
+                workspace_persistent?: true,
+                service_host?: true,
+                snapshot_modes: [:filesystem]
+              )
           ),
         policy: session_profile.policy,
         state_model: :persistent_workspace,
         transport_model: if(backend == :gvisor, do: :docker_cli, else: :docker_cli),
         persistent_identity?: true,
         workspace_ref: "workspace://#{instance.id}",
-        metadata: %{workspace_root: workspace_root}
+        metadata: %{
+          workspace_root: workspace_root,
+          container_name: container.name,
+          egress_resources: container.egress_resources,
+          network: container.network
+        }
       )
     end
   end
 
   @impl true
   def close_session(%Session{} = session, _opts) do
+    cleanup_session_container(session)
+
     case session_workspace_root(session) do
       {:ok, workspace_root} ->
         File.rm_rf(workspace_root)
@@ -272,11 +299,17 @@ defmodule RunicSandbox.Backends.Docker do
 
   @impl true
   def exec_session(
-        %Session{instance: %Instance{} = instance},
+        %Session{instance: %Instance{} = instance} = session,
         %ExecutionRequest{} = request,
         opts
       ) do
-    exec(instance, request, opts)
+    case session_container_name(session) do
+      {:ok, _container_name} ->
+        exec_in_session_container(session, request)
+
+      {:error, _error} ->
+        exec(instance, request, opts)
+    end
   end
 
   @impl true
@@ -328,6 +361,297 @@ defmodule RunicSandbox.Backends.Docker do
     cleanup_attach(metadata)
     :ok
   end
+
+  @impl true
+  def start_process(%Session{} = session, %ExecutionRequest{} = request, _opts) do
+    started_mono = System.monotonic_time(:millisecond)
+
+    with {:ok, container_name} <- session_container_name(session),
+         {:ok, command} <- runtime_command(request),
+         {:ok, handle} <-
+           open_session_process(session, request, container_name, command, started_mono) do
+      {:ok, handle}
+    end
+  end
+
+  @impl true
+  def list_processes(%Session{} = session, _opts) do
+    with {:ok, container_name} <- session_container_name(session),
+         {:ok, output, 0} <-
+           docker_cmd([
+             "exec",
+             container_name,
+             "sh",
+             "-lc",
+             "ps -eo pid=,stat=,comm= 2>/dev/null || true"
+           ]) do
+      statuses =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.map(&docker_process_status(session, &1))
+
+      {:ok, statuses}
+    else
+      {:ok, output, exit_status} ->
+        {:error,
+         Error.validation("docker process listing failed",
+           source: __MODULE__,
+           details: %{exit_status: exit_status, output: output}
+         )}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @impl true
+  def process_status(%Session{}, %ProcessHandle{} = handle, _opts) do
+    case ProcessStatus.from_handle(handle) do
+      {:ok, status} -> {:ok, status}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  def process_status(%Session{} = session, process_id, _opts) when is_binary(process_id) do
+    ProcessStatus.new(
+      id: process_id,
+      session_id: session.id,
+      backend: session.backend,
+      status: :unknown
+    )
+  end
+
+  @impl true
+  def process_events(%ProcessHandle{} = handle, _opts), do: {:ok, ProcessHandle.events(handle)}
+
+  @impl true
+  def write_process_stdin(%ProcessHandle{metadata: metadata}, input, _opts) do
+    case Map.get(metadata, :port) do
+      port when is_port(port) ->
+        Port.command(port, IO.iodata_to_binary(input))
+        :ok
+
+      _other ->
+        {:error,
+         Error.validation("docker process handle is not writable",
+           source: __MODULE__,
+           details: %{backend: :docker}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def close_process_stdin(%ProcessHandle{}, _opts) do
+    {:error,
+     Error.validation("docker process stdin close is not supported without a sidecar",
+       source: __MODULE__,
+       details: %{backend: :docker}
+     )}
+  end
+
+  @impl true
+  def signal_process(%ProcessHandle{metadata: metadata}, signal, _opts) do
+    with container_name when is_binary(container_name) <- Map.get(metadata, :container_name),
+         {:ok, pid} <- docker_process_pid(metadata),
+         {:ok, _output, 0} <-
+           docker_cmd(["exec", container_name, "kill", "-s", to_string(signal), pid]) do
+      :ok
+    else
+      {:ok, output, exit_status} ->
+        {:error,
+         Error.validation("docker process signal failed",
+           source: __MODULE__,
+           details: %{exit_status: exit_status, output: output}
+         )}
+
+      _other ->
+        {:error,
+         Error.validation("docker process handle does not expose a signal target",
+           source: __MODULE__,
+           details: %{backend: :docker}
+         )}
+    end
+  end
+
+  @impl true
+  def kill_process(%ProcessHandle{} = handle, opts) do
+    case signal_process(handle, "TERM", opts) do
+      :ok -> :ok
+      {:error, _error} -> cleanup_process_handle(handle.metadata)
+    end
+  end
+
+  @impl true
+  def wait_process(%ProcessHandle{} = handle, _opts) do
+    handle
+    |> ProcessHandle.events()
+    |> Enum.reduce(nil, fn
+      %{type: :process_finished} = event, _acc -> event
+      _event, acc -> acc
+    end)
+    |> case do
+      %{payload: payload} ->
+        ProcessStatus.from_handle(handle,
+          status: docker_process_terminal_status(payload),
+          exit_status: Map.get(payload, :exit_status)
+        )
+
+      nil ->
+        ProcessStatus.from_handle(handle)
+    end
+  end
+
+  @impl true
+  def start_service(%Session{} = session, spec, _opts) do
+    spec = spec_map(spec)
+    name = option(spec, :name) || "service-#{System.unique_integer([:positive])}"
+    id = "service-#{host_path_id(name)}-#{System.unique_integer([:positive])}"
+    port = service_spec_port(spec)
+
+    with {:ok, container_name} <- session_container_name(session),
+         {:ok, workspace_root} <- session_workspace_root(session),
+         {:ok, command} <- service_shell_command(spec),
+         :ok <- File.mkdir_p(service_registry_dir(workspace_root)) do
+      pidfile = "/tmp/runic-sandbox-services/#{id}.pid"
+      logfile = "/tmp/runic-sandbox-services/#{id}.log"
+
+      script =
+        "mkdir -p /tmp/runic-sandbox-services; " <>
+          "(#{command}) > #{shell_escape(logfile)} 2>&1 & echo $! > #{shell_escape(pidfile)}"
+
+      with {:ok, _output, 0} <- docker_cmd(["exec", container_name, "sh", "-lc", script]),
+           {:ok, service} <-
+             Service.new(
+               id: id,
+               session_id: session.id,
+               name: to_string(name),
+               status: :running,
+               ports: service_ports(port),
+               metadata: %{
+                 container_name: container_name,
+                 pidfile: pidfile,
+                 logfile: logfile,
+                 command: command,
+                 port: port
+               }
+             ),
+           :ok <- write_service_record(workspace_root, service),
+           :ok <- wait_service_ready(session, service, spec) do
+        {:ok, service}
+      else
+        {:ok, output, exit_status} ->
+          {:error,
+           Error.validation("docker service start failed",
+             source: __MODULE__,
+             details: %{exit_status: exit_status, output: output}
+           )}
+
+        {:error, error} ->
+          {:error, error}
+      end
+    end
+  end
+
+  @impl true
+  def stop_service(%Session{} = session, %Service{} = service, opts),
+    do: stop_service(session, service.id, opts)
+
+  def stop_service(%Session{} = session, service_id, _opts) do
+    with {:ok, workspace_root} <- session_workspace_root(session),
+         {:ok, service} <- read_service_record(workspace_root, to_string(service_id)),
+         container_name when is_binary(container_name) <-
+           Map.get(service.metadata, :container_name),
+         pidfile when is_binary(pidfile) <- Map.get(service.metadata, :pidfile) do
+      _ =
+        docker_cmd([
+          "exec",
+          container_name,
+          "sh",
+          "-lc",
+          "if [ -s #{shell_escape(pidfile)} ]; then kill $(cat #{shell_escape(pidfile)}) 2>/dev/null || true; fi"
+        ])
+
+      File.rm(service_record_path(workspace_root, service.id))
+      :ok
+    else
+      {:error, error} -> {:error, error}
+      _other -> :ok
+    end
+  end
+
+  @impl true
+  def list_services(%Session{} = session, _opts) do
+    with {:ok, workspace_root} <- session_workspace_root(session) do
+      services =
+        workspace_root
+        |> read_service_records()
+        |> Enum.map(&refresh_service_status/1)
+
+      {:ok, services}
+    end
+  end
+
+  @impl true
+  def open_proxy(%Session{} = session, %Service{} = service, opts),
+    do: open_proxy(session, service.id, Keyword.put_new(opts, :port, service_port(service)))
+
+  def open_proxy(%Session{} = session, service_id, opts) do
+    target_port = Keyword.get(opts, :port) || 80
+    local_port = Keyword.get(opts, :local_port, 0)
+
+    with {:ok, container_name} <- session_container_name(session),
+         {:ok, listen} <-
+           :gen_tcp.listen(local_port, [
+             :binary,
+             active: false,
+             packet: :raw,
+             reuseaddr: true,
+             ip: {127, 0, 0, 1}
+           ]),
+         {:ok, actual_port} <- :inet.port(listen) do
+      id = "docker-proxy-#{session.id}-#{service_id}-#{actual_port}"
+      pid = spawn(fn -> docker_proxy_accept_loop(listen, container_name, target_port) end)
+      put_proxy_record(id, %{session_id: session.id, listener: listen, pid: pid})
+
+      Proxy.new(
+        id: id,
+        session_id: session.id,
+        backend: session.backend,
+        service_id: to_string(service_id),
+        status: :open,
+        url: "http://127.0.0.1:#{actual_port}",
+        local_port: actual_port,
+        metadata: %{
+          provider: :docker,
+          host: "127.0.0.1",
+          port: target_port,
+          local_only?: true,
+          container_name: container_name
+        }
+      )
+    else
+      {:error, reason} when is_atom(reason) ->
+        {:error,
+         Error.from_reason(reason,
+           source: __MODULE__,
+           message: "failed to open docker service proxy"
+         )}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @impl true
+  def close_proxy(%Proxy{} = proxy, _opts) do
+    close_proxy_record(proxy.id)
+    :ok
+  end
+
+  def close_proxy(_proxy, _opts), do: :ok
 
   @impl true
   def write_file(%Session{} = session, path, contents, _opts) do
@@ -428,7 +752,15 @@ defmodule RunicSandbox.Backends.Docker do
          :ok <- copy_directory_contents(workspace_root, checkpoint_root) do
       checkpoint_id = Path.basename(checkpoint_root)
       ref = "checkpoint://#{session.id}/#{checkpoint_id}"
-      metadata = %{kind: :filesystem, path: checkpoint_root}
+
+      metadata = %{
+        kind: :filesystem,
+        path: checkpoint_root,
+        preserves: Checkpoint.preserves(:filesystem),
+        caveats: [
+          "Docker filesystem checkpoints preserve files only; running processes, service runtime state, and open TCP connections are not restored."
+        ]
+      }
 
       Checkpoint.new(
         id: checkpoint_id,
@@ -502,6 +834,446 @@ defmodule RunicSandbox.Backends.Docker do
        source: __MODULE__
      )}
   end
+
+  defp session_container_name(%Session{} = session) do
+    case option(session.metadata, :container_name) do
+      container_name when is_binary(container_name) and container_name != "" ->
+        {:ok, container_name}
+
+      _other ->
+        {:error,
+         Error.validation("docker session does not have a managed container",
+           source: __MODULE__,
+           details: %{session_id: session.id, backend: session.backend}
+         )}
+    end
+  end
+
+  defp start_session_container(%Instance{} = instance, workspace_root) do
+    container_name = "runic-sandbox-session-#{System.unique_integer([:positive])}"
+
+    with {:ok, network} <- docker_session_network_setup(instance),
+         {:ok, _output, 0} <-
+           docker_cmd(
+             [
+               "run",
+               "-d",
+               "--pull",
+               "never",
+               "--name",
+               container_name,
+               "--workdir",
+               instance.workspace.mount
+             ] ++
+               network.args ++
+               [
+                 "--mount",
+                 "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
+               ] ++
+               env_args(instance) ++
+               runtime_args(instance) ++
+               security_args(instance) ++
+               resource_args(instance) ++
+               [
+                 image(instance),
+                 "sh",
+                 "-lc",
+                 "trap 'exit 0' TERM INT; while true; do sleep 3600; done"
+               ],
+             network.resources
+           ) do
+      {:ok,
+       %{name: container_name, egress_resources: network.resources, network: network.metadata}}
+    else
+      {:ok, output, exit_status} ->
+        cleanup_egress_resources(network_resources_from_error(output))
+
+        {:error,
+         Error.validation("failed to start docker session container",
+           source: __MODULE__,
+           details: %{exit_status: exit_status, output: output}
+         )}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp cleanup_session_container(%Session{} = session) do
+    cleanup_session_proxies(session.id)
+
+    case option(session.metadata, :container_name) do
+      container_name when is_binary(container_name) ->
+        System.cmd("docker", ["rm", "-f", container_name], stderr_to_stdout: true)
+
+      _other ->
+        :ok
+    end
+
+    cleanup_egress_resources(option(session.metadata, :egress_resources) || [])
+
+    case session_workspace_root(session) do
+      {:ok, workspace_root} -> File.rm_rf(service_registry_dir(workspace_root))
+      {:error, _error} -> :ok
+    end
+
+    :ok
+  rescue
+    _exception -> :ok
+  end
+
+  defp network_resources_from_error(_output), do: []
+
+  defp service_registry_dir(workspace_root),
+    do: Path.join(workspace_root, ".runic_sandbox/services")
+
+  defp service_record_path(workspace_root, service_id) do
+    Path.join(service_registry_dir(workspace_root), "#{host_path_id(service_id)}.json")
+  end
+
+  defp write_service_record(workspace_root, %Service{} = service) do
+    record = %{
+      id: service.id,
+      session_id: service.session_id,
+      name: service.name,
+      status: Atom.to_string(service.status),
+      ports: service.ports,
+      metadata: service.metadata
+    }
+
+    with {:ok, json} <- Jason.encode(record),
+         :ok <- File.write(service_record_path(workspace_root, service.id), json) do
+      :ok
+    else
+      {:error, reason} ->
+        {:error,
+         Error.from_reason(reason,
+           source: __MODULE__,
+           message: "failed to write docker service record"
+         )}
+    end
+  end
+
+  defp read_service_record(workspace_root, service_id) do
+    with {:ok, json} <- File.read(service_record_path(workspace_root, service_id)),
+         {:ok, record} <- Jason.decode(json) do
+      Service.new(
+        id: option(record, :id, nil),
+        session_id: option(record, :session_id, nil),
+        name: option(record, :name, nil),
+        status: option(record, :status, :running),
+        ports: option(record, :ports, []),
+        metadata: atomize_known_service_metadata(option(record, :metadata, %{}))
+      )
+    else
+      {:error, %Jason.DecodeError{} = error} ->
+        {:error, Error.from_exception(error, source: __MODULE__)}
+
+      {:error, reason} ->
+        {:error,
+         Error.from_reason(reason,
+           source: __MODULE__,
+           message: "failed to read docker service record"
+         )}
+    end
+  end
+
+  defp read_service_records(workspace_root) do
+    dir = service_registry_dir(workspace_root)
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.filter(&String.ends_with?(&1, ".json"))
+        |> Enum.flat_map(fn name ->
+          path = Path.join(dir, name)
+
+          case File.read(path) do
+            {:ok, json} ->
+              case Jason.decode(json) do
+                {:ok, record} ->
+                  case Service.new(
+                         id: option(record, :id, nil),
+                         session_id: option(record, :session_id, nil),
+                         name: option(record, :name, nil),
+                         status: option(record, :status, :running),
+                         ports: option(record, :ports, []),
+                         metadata: atomize_known_service_metadata(option(record, :metadata, %{}))
+                       ) do
+                    {:ok, service} -> [service]
+                    {:error, _error} -> []
+                  end
+
+                {:error, _error} ->
+                  []
+              end
+
+            {:error, _reason} ->
+              []
+          end
+        end)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp atomize_known_service_metadata(metadata) when is_map(metadata) do
+    %{
+      container_name: option(metadata, :container_name, nil),
+      pidfile: option(metadata, :pidfile, nil),
+      logfile: option(metadata, :logfile, nil),
+      command: option(metadata, :command, nil),
+      port: option(metadata, :port, nil)
+    }
+  end
+
+  defp refresh_service_status(%Service{} = service) do
+    container_name = service.metadata.container_name
+    pidfile = service.metadata.pidfile
+
+    status =
+      case docker_cmd([
+             "exec",
+             container_name,
+             "sh",
+             "-lc",
+             "test -s #{shell_escape(pidfile)} && kill -0 $(cat #{shell_escape(pidfile)})"
+           ]) do
+        {:ok, _output, 0} -> :running
+        _other -> :stopped
+      end
+
+    %{service | status: status}
+  end
+
+  defp service_shell_command(spec) do
+    cond do
+      command = option(spec, :command) ->
+        shell_command(command, option(spec, :args) || [])
+
+      cmd = option(spec, :cmd) ->
+        shell_command(cmd, option(spec, :args) || [])
+
+      true ->
+        {:error,
+         Error.validation("docker service requires command or cmd",
+           source: __MODULE__,
+           details: %{spec: Map.drop(spec, [:env])}
+         )}
+    end
+  end
+
+  defp shell_command(command, args) when is_list(command) and args == [] do
+    {:ok, Enum.map_join(command, " ", &shell_escape/1)}
+  end
+
+  defp shell_command(command, args) when is_binary(command) and is_list(args) do
+    {:ok, Enum.map_join([command | args], " ", &shell_escape/1)}
+  end
+
+  defp shell_command(command, _args) when is_binary(command), do: {:ok, command}
+
+  defp shell_command(command, args) do
+    {:error,
+     Error.validation("docker service command must be a string or argv list",
+       source: __MODULE__,
+       details: %{command: command, args: args}
+     )}
+  end
+
+  defp service_spec_port(spec), do: option(spec, :port) || option(spec, :http_port)
+
+  defp service_ports(nil), do: []
+  defp service_ports(port), do: [%{port: port, protocol: "tcp"}]
+
+  defp service_port(%Service{ports: [%{port: port} | _]}), do: port
+  defp service_port(%Service{ports: [%{"port" => port} | _]}), do: port
+  defp service_port(%Service{metadata: metadata}), do: option(metadata, :port) || 80
+
+  defp wait_service_ready(%Session{} = session, %Service{} = service, spec) do
+    case option(spec, :readiness) || option(spec, :readiness_probe) do
+      nil ->
+        :ok
+
+      readiness ->
+        readiness = spec_map(readiness)
+        timeout_ms = option(readiness, :timeout_ms) || 5_000
+        deadline = System.monotonic_time(:millisecond) + timeout_ms
+        wait_service_ready(session, service, readiness, deadline)
+    end
+  end
+
+  defp wait_service_ready(%Session{} = session, %Service{} = service, readiness, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:error,
+       Error.validation("docker service readiness probe timed out",
+         source: __MODULE__,
+         details: %{service_id: service.id, readiness: readiness}
+       )}
+    else
+      case service_ready?(session, service, readiness) do
+        true ->
+          :ok
+
+        false ->
+          Process.sleep(option(readiness, :interval_ms) || 100)
+          wait_service_ready(session, service, readiness, deadline)
+      end
+    end
+  end
+
+  defp service_ready?(%Session{} = session, %Service{} = service, readiness) do
+    with {:ok, container_name} <- session_container_name(session) do
+      port = option(readiness, :port) || service_port(service)
+      path = option(readiness, :path) || "/"
+
+      script =
+        case option(readiness, :type) || :tcp do
+          type when type in [:http, "http"] ->
+            "python3 - <<'PY'\n" <>
+              "import urllib.request\n" <>
+              "urllib.request.urlopen('http://127.0.0.1:#{port}#{path}', timeout=1).read()\n" <>
+              "PY"
+
+          _tcp ->
+            "python3 - <<'PY'\n" <>
+              "import socket\n" <>
+              "socket.create_connection(('127.0.0.1', #{port}), timeout=1).close()\n" <>
+              "PY"
+        end
+
+      case docker_cmd(["exec", container_name, "sh", "-lc", script]) do
+        {:ok, _output, 0} -> true
+        _other -> false
+      end
+    else
+      _other -> false
+    end
+  end
+
+  defp docker_proxy_accept_loop(listen, container_name, target_port) do
+    case :gen_tcp.accept(listen) do
+      {:ok, socket} ->
+        spawn(fn -> docker_proxy_connection(socket, container_name, target_port) end)
+        docker_proxy_accept_loop(listen, container_name, target_port)
+
+      {:error, :closed} ->
+        :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp docker_proxy_connection(socket, container_name, target_port) do
+    with {:ok, request} <- recv_http_proxy_request(socket, ""),
+         {:ok, method, path} <- parse_http_proxy_request(request),
+         {:ok, response, 0} <-
+           docker_cmd([
+             "exec",
+             container_name,
+             "python3",
+             "-u",
+             "-c",
+             docker_http_proxy_client_script(),
+             to_string(target_port),
+             method,
+             path
+           ]) do
+      :gen_tcp.send(socket, response)
+      :gen_tcp.close(socket)
+    else
+      _error ->
+        :gen_tcp.close(socket)
+    end
+  end
+
+  defp recv_http_proxy_request(_socket, acc) when byte_size(acc) > 65_536,
+    do: {:error, :request_too_large}
+
+  defp recv_http_proxy_request(socket, acc) do
+    if String.contains?(acc, "\r\n\r\n") do
+      {:ok, acc}
+    else
+      case :gen_tcp.recv(socket, 0, 1_000) do
+        {:ok, chunk} -> recv_http_proxy_request(socket, acc <> chunk)
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp parse_http_proxy_request(request) do
+    request
+    |> String.split("\r\n", parts: 2)
+    |> hd()
+    |> String.split(" ", parts: 3)
+    |> case do
+      [method, path, "HTTP/" <> _version] -> {:ok, method, path}
+      _other -> {:error, :invalid_http_request}
+    end
+  end
+
+  defp docker_http_proxy_client_script do
+    """
+    import socket
+    import sys
+
+    port = int(sys.argv[1])
+    method = sys.argv[2]
+    path = sys.argv[3]
+    request = f"{method} {path} HTTP/1.1\\r\\nhost: 127.0.0.1\\r\\nconnection: close\\r\\n\\r\\n".encode()
+    upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+    upstream.sendall(request)
+
+    while True:
+        data = upstream.recv(65536)
+        if not data:
+            break
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    """
+  end
+
+  defp proxy_table do
+    table = :runic_sandbox_docker_proxies
+
+    case :ets.whereis(table) do
+      :undefined ->
+        :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
+
+      _tid ->
+        table
+    end
+  end
+
+  defp put_proxy_record(id, record) do
+    :ets.insert(proxy_table(), {id, record})
+    :ok
+  end
+
+  defp close_proxy_record(id) do
+    case :ets.lookup(proxy_table(), id) do
+      [{^id, %{listener: listener, pid: pid}}] ->
+        :gen_tcp.close(listener)
+        if is_pid(pid), do: Process.exit(pid, :normal)
+        :ets.delete(proxy_table(), id)
+        :ok
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp cleanup_session_proxies(session_id) do
+    proxy_table()
+    |> :ets.match_object({:_, %{session_id: session_id, listener: :_, pid: :_}})
+    |> Enum.each(fn {id, _record} -> close_proxy_record(id) end)
+  end
+
+  defp spec_map(value) when is_map(value), do: value
+  defp spec_map(value) when is_list(value), do: Map.new(value)
+  defp spec_map(_value), do: %{}
 
   defp file_ref!(workspace_root, full_path) do
     {:ok, ref} = file_ref(workspace_root, full_path)
@@ -720,6 +1492,7 @@ defmodule RunicSandbox.Backends.Docker do
             "--mount",
             "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
           ] ++
+          env_args(instance) ++
           runtime_args(instance) ++
           security_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
 
@@ -729,6 +1502,56 @@ defmodule RunicSandbox.Backends.Docker do
         cleanup_egress_resources(network.resources)
       end
     end
+  end
+
+  defp exec_in_session_container(%Session{} = session, %ExecutionRequest{} = request) do
+    started_mono = System.monotonic_time(:millisecond)
+
+    with {:ok, container_name} <- session_container_name(session),
+         {:ok, command} <- runtime_command(request),
+         {:ok, workspace_root} <- session_workspace_root(session),
+         {:ok, before_files} <- snapshot_files(workspace_root),
+         {:ok, output, exit_status, timed_out?} <-
+           invoke_docker_session_exec(container_name, request, command),
+         {:ok, after_files} <- snapshot_files(workspace_root),
+         {:ok, files_changed, artifacts} <-
+           workspace_delta(workspace_root, before_files, after_files, request.max_output_bytes) do
+      duration_ms = System.monotonic_time(:millisecond) - started_mono
+      {stdout, stderr} = split_output(output)
+
+      ExecutionResult.new(
+        status: status(exit_status, timed_out?),
+        stdout: cap(stdout, request.max_output_bytes),
+        stderr: cap(stderr, request.max_output_bytes),
+        exit_status: exit_status,
+        duration_ms: duration_ms,
+        files_changed: files_changed,
+        artifacts: artifacts,
+        backend: session.backend,
+        isolation_level: session.isolation_level,
+        diagnostics: diagnostics(output, request.max_output_bytes, timed_out?),
+        resource_usage: %{},
+        metadata: %{
+          sandbox: request.sandbox,
+          runtime: request.runtime,
+          mode: request.mode,
+          network: request.network,
+          effective_network: Map.get(session.metadata, :network),
+          image: image(session.instance),
+          workspace_mode: session.instance.workspace.mode,
+          workspace_mount: session.instance.workspace.mount,
+          stateful?: true,
+          container_name: container_name,
+          container_runtime: option(session.instance.metadata, :container_runtime),
+          security_boundary?: true
+        }
+      )
+    end
+  end
+
+  defp invoke_docker_session_exec(container_name, %ExecutionRequest{} = request, command) do
+    args = ["exec", "--workdir", request.cwd, container_name] ++ command
+    invoke_docker_exec(args, request.timeout_ms || @default_timeout_ms)
   end
 
   defp open_container_attach(
@@ -761,6 +1584,7 @@ defmodule RunicSandbox.Backends.Docker do
             "--mount",
             "type=bind,src=#{workspace_root},dst=#{instance.workspace.mount}"
           ] ++
+          env_args(instance) ++
           runtime_args(instance) ++
           security_args(instance) ++ resource_args(instance) ++ [image(instance) | command]
 
@@ -782,6 +1606,161 @@ defmodule RunicSandbox.Backends.Docker do
           cleanup_egress_resources(network.resources)
           {:error, error}
       end
+    end
+  end
+
+  defp open_session_process(
+         %Session{} = session,
+         %ExecutionRequest{} = request,
+         container_name,
+         command,
+         started_mono
+       ) do
+    process_id = "process-#{System.unique_integer([:positive])}"
+    pidfile = "/tmp/runic-sandbox-#{process_id}.pid"
+
+    args =
+      ["exec", "-i", "--workdir", request.cwd] ++
+        env_args(session.instance) ++
+        [container_name] ++
+        [
+          "sh",
+          "-lc",
+          "printf '%s' \"$$\" > \"$1\"; shift; exec \"$@\"",
+          "runic-process",
+          pidfile
+        ] ++ command
+
+    case open_docker_port(args) do
+      {:ok, port} ->
+        if request.stdin != "", do: Port.command(port, request.stdin)
+
+        events =
+          Stream.resource(
+            fn ->
+              %{
+                session: session,
+                request: request,
+                port: port,
+                process_id: process_id,
+                container_name: container_name,
+                started?: false,
+                finished?: false,
+                started_mono: started_mono
+              }
+            end,
+            &next_process_event/1,
+            &cleanup_process_stream/1
+          )
+
+        ProcessHandle.new(
+          id: process_id,
+          session_id: session.id,
+          backend: session.backend,
+          status: :running,
+          command: command,
+          events: events,
+          metadata: %{
+            streaming_live?: true,
+            port: port,
+            container_name: container_name,
+            process_id: process_id,
+            pidfile: pidfile
+          }
+        )
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp next_process_event(%{started?: false} = state) do
+    event =
+      AttachEvents.event(state.session, :process_started, %{
+        process_id: state.process_id,
+        runtime: state.request.runtime,
+        mode: state.request.mode,
+        argv: state.request.argv,
+        cwd: state.request.cwd,
+        container_name: state.container_name
+      })
+
+    {[event], %{state | started?: true}}
+  end
+
+  defp next_process_event(%{port: port} = state) do
+    receive do
+      {^port, {:data, data}} ->
+        event =
+          AttachEvents.chunk_event(
+            state.session,
+            :stdout_chunk,
+            cap(data, state.request.max_output_bytes)
+          )
+
+        {[event], state}
+
+      {^port, {:exit_status, exit_status}} ->
+        state = %{state | finished?: true}
+        event = docker_process_finished_event(state, exit_status)
+        cleanup_process_stream(state)
+        {[event], :halt}
+    end
+  end
+
+  defp next_process_event(:halt), do: {:halt, :halt}
+
+  defp docker_process_finished_event(state, exit_status) do
+    duration_ms = System.monotonic_time(:millisecond) - state.started_mono
+
+    AttachEvents.event(state.session, :process_finished, %{
+      process_id: state.process_id,
+      status: status(exit_status, false),
+      exit_status: exit_status,
+      duration_ms: duration_ms,
+      container_name: state.container_name
+    })
+  end
+
+  defp cleanup_process_stream(:halt), do: :ok
+
+  defp cleanup_process_stream(%{finished?: finished?} = state) do
+    unless finished? do
+      cleanup_process_handle(%{port: state.port})
+    end
+
+    :ok
+  end
+
+  defp cleanup_process_handle(%{port: port}) when is_port(port) do
+    Port.close(port)
+    :ok
+  rescue
+    _exception -> :ok
+  end
+
+  defp cleanup_process_handle(_metadata), do: :ok
+
+  defp docker_process_pid(metadata) do
+    with container_name when is_binary(container_name) <- Map.get(metadata, :container_name),
+         pidfile when is_binary(pidfile) <- Map.get(metadata, :pidfile),
+         {:ok, output, 0} <- docker_cmd(["exec", container_name, "cat", pidfile]),
+         pid when pid != "" <- String.trim(output) do
+      {:ok, pid}
+    else
+      {:ok, output, exit_status} ->
+        {:error,
+         Error.validation("docker process pid lookup failed",
+           source: __MODULE__,
+           details: %{exit_status: exit_status, output: output}
+         )}
+
+      _other ->
+        {:error,
+         Error.validation("docker process handle does not expose a pidfile",
+           source: __MODULE__,
+           details: %{backend: :docker}
+         )}
     end
   end
 
@@ -1010,6 +1989,23 @@ defmodule RunicSandbox.Backends.Docker do
       nil ->
         System.cmd("docker", ["rm", "-f", container_name], stderr_to_stdout: true)
         {:ok, "", nil, true}
+    end
+  end
+
+  defp invoke_docker_exec(args, :infinity) do
+    case docker_cmd(args) do
+      {:ok, output, exit_status} -> {:ok, output, exit_status, false}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp invoke_docker_exec(args, timeout_ms) when is_integer(timeout_ms) do
+    task = Task.async(fn -> docker_cmd(args) end)
+
+    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, output, exit_status}} -> {:ok, output, exit_status, false}
+      {:ok, {:error, error}} -> {:error, error}
+      nil -> {:ok, "", nil, true}
     end
   end
 
@@ -1278,9 +2274,34 @@ defmodule RunicSandbox.Backends.Docker do
     end
   end
 
+  defp docker_session_network_setup(%Instance{} = instance) do
+    policy = option(instance.metadata, :policy) || %{}
+    mode = Map.get(policy, :mode, :disabled)
+    allowlist = Map.get(policy, :egress_allowlist, [])
+
+    cond do
+      mode == :restricted and allowlist != [] ->
+        setup_restricted_egress(instance, nil, allowlist, policy)
+
+      mode == :disabled ->
+        {:ok, %{args: ["--network", "none"], resources: [], metadata: %{mode: :disabled}}}
+
+      mode == :host ->
+        {:ok, %{args: ["--network", "host"], resources: [], metadata: %{mode: :host}}}
+
+      mode == :restricted ->
+        {:ok,
+         %{
+           args: ["--network", "none"],
+           resources: [],
+           metadata: %{mode: :restricted, deny_by_default?: true, egress_allowlist: []}
+         }}
+    end
+  end
+
   defp setup_restricted_egress(
          %Instance{} = instance,
-         %ExecutionRequest{} = _request,
+         _request,
          allowlist,
          policy
        ) do
@@ -1393,8 +2414,8 @@ defmodule RunicSandbox.Backends.Docker do
       scheme not in ["http", "tcp"] ->
         unsupported_docker_egress_entry(entry, "scheme must be http or tcp")
 
-      purpose not in [nil, "mcp"] ->
-        unsupported_docker_egress_entry(entry, "purpose must be mcp")
+      purpose not in [nil, "mcp", "model"] ->
+        unsupported_docker_egress_entry(entry, "purpose must be mcp or model")
 
       true ->
         {:ok,
@@ -1502,16 +2523,27 @@ defmodule RunicSandbox.Backends.Docker do
     """
   end
 
-  defp docker_attach_metadata do
+  defp docker_attach_metadata(input) do
     Capabilities.attach_metadata(:live_stream,
       stdin_supported?: true,
       stdin_close_supported?: false,
       stderr_separate?: false,
       restricted_egress_supported?: true,
       mcp_boundary_supported?: true,
+      process_host?: false,
+      service_host?: false,
       mcp_boundary_transports: [:egress_allowlist],
       restricted_egress_hosts: ["host.docker.internal"],
       provider_transport: :docker_cli_port
+    )
+    |> Map.merge(
+      Map.take(Map.new(input), [
+        :state_tier,
+        :process_host?,
+        :workspace_persistent?,
+        :service_host?,
+        :snapshot_modes
+      ])
     )
   end
 
@@ -1543,9 +2575,89 @@ defmodule RunicSandbox.Backends.Docker do
   defp maybe_resource_arg(args, _flag, nil), do: args
   defp maybe_resource_arg(args, flag, value), do: args ++ [flag, to_string(value)]
 
+  defp env_args(%Instance{metadata: metadata}) do
+    backend_options = Map.get(metadata, :backend_options, %{})
+
+    (option(backend_options, :environment) || option(backend_options, :env) || %{})
+    |> normalize_env()
+    |> Enum.flat_map(fn {key, value} -> ["--env", "#{key}=#{value}"] end)
+  end
+
+  defp env_args(_other), do: []
+
+  defp normalize_env(env) when is_map(env) do
+    env
+    |> Enum.flat_map(&normalize_env_pair/1)
+    |> Map.new()
+  end
+
+  defp normalize_env(env) when is_list(env) do
+    env
+    |> Enum.flat_map(&normalize_env_pair/1)
+    |> Map.new()
+  end
+
+  defp normalize_env(_env), do: %{}
+
+  defp normalize_env_pair({key, nil}), do: normalize_env_name(key) |> Enum.map(&{&1, ""})
+
+  defp normalize_env_pair({key, value}),
+    do: normalize_env_name(key) |> Enum.map(&{&1, to_string(value)})
+
+  defp normalize_env_pair(_pair), do: []
+
+  defp normalize_env_name(key) when is_atom(key), do: normalize_env_name(Atom.to_string(key))
+
+  defp normalize_env_name(key) when is_binary(key) do
+    if key =~ ~r/^[A-Za-z_][A-Za-z0-9_]*$/ do
+      [key]
+    else
+      []
+    end
+  end
+
+  defp normalize_env_name(_key), do: []
+
+  defp shell_escape(value) do
+    value = to_string(value)
+
+    if value =~ ~r|^[A-Za-z0-9_@%+=:,./-]+$| do
+      value
+    else
+      "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+    end
+  end
+
   defp status(_exit_status, true), do: :timeout
   defp status(0, false), do: :pass
   defp status(_exit_status, false), do: :fail
+
+  defp docker_process_terminal_status(%{status: :pass}), do: :exited
+  defp docker_process_terminal_status(%{status: "pass"}), do: :exited
+  defp docker_process_terminal_status(%{status: :timeout}), do: :failed
+  defp docker_process_terminal_status(%{status: "timeout"}), do: :failed
+  defp docker_process_terminal_status(_payload), do: :failed
+
+  defp docker_process_status(%Session{} = session, line) do
+    [pid | rest] = String.split(line, ~r/\s+/, trim: true)
+    command = Enum.at(rest, 1) || Enum.at(rest, 0) || "process"
+
+    ProcessStatus.new!(
+      id: pid,
+      session_id: session.id,
+      backend: session.backend,
+      status: :running,
+      pid: parse_pid(pid),
+      metadata: %{command: command}
+    )
+  end
+
+  defp parse_pid(pid) do
+    case Integer.parse(pid) do
+      {int, ""} -> int
+      _other -> nil
+    end
+  end
 
   defp diagnostics(output, max_output_bytes, timed_out?) do
     []
@@ -1861,6 +2973,11 @@ defmodule RunicSandbox.Backends.Docker do
 
   defp option(map, key) when is_map(map), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
   defp option(_map, _key), do: nil
+
+  defp option(map, key, default) when is_map(map),
+    do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+
+  defp option(_map, _key, default), do: default
 
   defp secure_equal?(left, right) when is_binary(left) and is_binary(right) do
     byte_size(left) == byte_size(right) and :crypto.hash_equals(left, right)

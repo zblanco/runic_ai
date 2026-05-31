@@ -10,6 +10,9 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Error
   alias RunicAI.Sandbox.GeneratedComponent
+  alias RunicAI.Sandbox.GeneratedComponentCatalog
+  alias RunicAI.Sandbox.GeneratedComponentCatalog.CapabilityGap
+  alias RunicAI.Sandbox.GeneratedComponentCatalog.NegativeEvidence
   alias RunicAI.Sandbox.GeneratedComponentProof
   alias RunicAI.Sandbox.GeneratedComponentPromotionPolicy
   alias RunicAI.Sandbox.GeneratedComponentWorkflow
@@ -22,9 +25,13 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
           required(:id) => String.t(),
           required(:status) => status(),
           required(:component) => GeneratedComponent.t(),
+          required(:capability_gap) => CapabilityGap.t(),
           required(:proof) => GeneratedComponentProof.result(),
           required(:promotion_decision) => GeneratedComponentPromotionPolicy.decision(),
           required(:workflow) => WorkflowBlueprint.t() | nil,
+          required(:catalog) => GeneratedComponentCatalog.Store.t() | nil,
+          required(:catalog_entry) => GeneratedComponentCatalog.Entry.t() | nil,
+          required(:negative_evidence) => NegativeEvidence.t() | nil,
           required(:events) => [map()],
           required(:repair_context) => map() | nil
         }
@@ -40,21 +47,75 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
       )
 
     with {:ok, proposal} <- GeneratedComponent.from_input(component_input),
+         {:ok, capability_gap} <- capability_gap(opts),
+         :ok <- validate_generation_gap(capability_gap),
          {:ok, proof} <- proof_component(proposal, flow_id, opts),
          {:ok, decision} <- promotion_decision(proof.component, opts),
          {:ok, component, status} <- apply_decision(proof, decision, opts),
+         {:ok, catalog_result} <-
+           maybe_write_catalog(component, proof, capability_gap, decision, status, opts),
          {:ok, workflow} <- maybe_compose_workflow(component, status, opts) do
       {:ok,
        %{
          id: flow_id,
          status: status,
          component: component,
+         capability_gap: capability_gap,
          proof: proof,
          promotion_decision: decision,
          workflow: workflow,
-         events: events(flow_id, proposal, proof, decision, component, status, workflow),
-         repair_context: repair_context(proof, decision, status)
+         catalog: catalog_result.catalog,
+         catalog_entry: catalog_result.entry,
+         negative_evidence: catalog_result.negative_evidence,
+         events:
+           events(
+             flow_id,
+             proposal,
+             capability_gap,
+             proof,
+             decision,
+             component,
+             status,
+             workflow,
+             catalog_result
+           ),
+         repair_context: repair_context(proof, decision, status, capability_gap)
        }}
+    end
+  end
+
+  defp capability_gap(opts) do
+    case Keyword.get(opts, :capability_gap) do
+      nil ->
+        {:error,
+         Error.validation("generated component promotion flow requires a capability gap decision",
+           source: __MODULE__,
+           details: %{required_option: :capability_gap}
+         )}
+
+      gap ->
+        if match?(%CapabilityGap{}, gap) do
+          CapabilityGap.validate(gap)
+        else
+          CapabilityGap.new(gap)
+        end
+    end
+  end
+
+  defp validate_generation_gap(%CapabilityGap{} = gap) do
+    if CapabilityGap.generation_allowed?(gap) do
+      :ok
+    else
+      {:error,
+       Error.validation(
+         "generated component promotion flow requires a generation capability gap",
+         source: __MODULE__,
+         details: %{
+           gap_id: gap.id,
+           selected_action: gap.selected_action,
+           selected_component_id: gap.selected_component_id
+         }
+       )}
     end
   end
 
@@ -70,7 +131,9 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
           :review_decision,
           :resume_key,
           :workflow_objective,
-          :workflow_opts
+          :workflow_opts,
+          :capability_gap,
+          :generated_component_catalog
         ])
       )
       |> Keyword.put_new(:id, "#{flow_id}:proof")
@@ -139,10 +202,111 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
     end
   end
 
-  defp events(flow_id, proposal, proof, decision, component, status, workflow) do
-    [
+  defp maybe_write_catalog(component, _proof, _capability_gap, decision, :promoted, opts) do
+    case Keyword.get(opts, :generated_component_catalog) do
+      nil ->
+        {:ok,
+         %{
+           status: :skipped,
+           reason: :no_catalog,
+           catalog: nil,
+           entry: nil,
+           negative_evidence: nil
+         }}
+
+      %GeneratedComponentCatalog.Store{} = catalog ->
+        case get_in(decision, [:details, :target]) do
+          :artifact ->
+            with {:ok, entry} <-
+                   GeneratedComponentCatalog.entry_from_component(component,
+                     promotion_decision: decision
+                   ),
+                 {:ok, catalog} <- GeneratedComponentCatalog.insert(catalog, entry) do
+              {:ok,
+               %{
+                 status: :inserted,
+                 reason: :artifact_promoted,
+                 catalog: catalog,
+                 entry: entry,
+                 negative_evidence: nil
+               }}
+            end
+
+          target ->
+            {:ok,
+             %{
+               status: :skipped,
+               reason: :promotion_target_not_cataloged,
+               target: target,
+               catalog: catalog,
+               entry: nil,
+               negative_evidence: nil
+             }}
+        end
+    end
+  end
+
+  defp maybe_write_catalog(_component, proof, capability_gap, decision, :proof_failed, opts) do
+    case Keyword.get(opts, :generated_component_catalog) do
+      %GeneratedComponentCatalog.Store{} = catalog ->
+        with {:ok, evidence} <-
+               NegativeEvidence.from_failed_proof(proof, capability_gap, decision),
+             {:ok, catalog} <-
+               GeneratedComponentCatalog.record_negative_evidence(catalog, evidence) do
+          {:ok,
+           %{
+             status: :negative_evidence_recorded,
+             reason: :proof_failed,
+             catalog: catalog,
+             entry: nil,
+             negative_evidence: evidence
+           }}
+        end
+
+      _other ->
+        {:ok,
+         %{
+           status: :skipped,
+           reason: :component_not_promoted,
+           catalog: Keyword.get(opts, :generated_component_catalog),
+           entry: nil,
+           negative_evidence: nil
+         }}
+    end
+  end
+
+  defp maybe_write_catalog(_component, _proof, _capability_gap, _decision, _status, opts) do
+    {:ok,
+     %{
+       status: :skipped,
+       reason: :component_not_promoted,
+       catalog: Keyword.get(opts, :generated_component_catalog),
+       entry: nil,
+       negative_evidence: nil
+     }}
+  end
+
+  defp events(
+         flow_id,
+         proposal,
+         capability_gap,
+         proof,
+         decision,
+         component,
+         status,
+         workflow,
+         catalog_result
+       ) do
+    base_events = [
       event(:generated_component_proposed, flow_id, proposal, %{
         promotion_status: proposal.promotion_status
+      }),
+      event(:generated_component_capability_gap_decided, flow_id, proposal, %{
+        gap_id: capability_gap.id,
+        selected_action: capability_gap.selected_action,
+        selected_component_id: capability_gap.selected_component_id,
+        candidate_ids: CapabilityGap.candidate_ids(capability_gap),
+        reason: capability_gap.reason
       }),
       event(:generated_component_proof_finished, flow_id, proof.component, %{
         proof_id: proof.id,
@@ -156,12 +320,41 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
         reason: decision.reason,
         target: get_in(decision, [:details, :target]),
         required_decision: get_in(decision, [:details, :required_decision])
-      }),
-      event(:generated_component_flow_finished, flow_id, component, %{
-        status: status,
-        workflow_id: if(workflow, do: workflow.id)
       })
     ]
+
+    catalog_events =
+      case catalog_result do
+        %{status: :inserted, entry: entry} ->
+          [
+            event(:generated_component_catalog_written, flow_id, component, %{
+              catalog_entry_id: entry.id,
+              promotion_target: entry.promotion_target,
+              component_kind: entry.component_kind
+            })
+          ]
+
+        %{status: :negative_evidence_recorded, negative_evidence: evidence} ->
+          [
+            event(:generated_component_negative_evidence_recorded, flow_id, component, %{
+              negative_evidence_id: evidence.id,
+              proof_id: evidence.proof_id,
+              reason: evidence.reason
+            })
+          ]
+
+        _other ->
+          []
+      end
+
+    base_events ++
+      catalog_events ++
+      [
+        event(:generated_component_flow_finished, flow_id, component, %{
+          status: status,
+          workflow_id: if(workflow, do: workflow.id)
+        })
+      ]
   end
 
   defp event(type, flow_id, %GeneratedComponent{} = component, payload) do
@@ -174,10 +367,16 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
     }
   end
 
-  defp repair_context(%{status: :failed} = proof, decision, status) do
+  defp repair_context(%{status: :failed} = proof, decision, status, capability_gap) do
     %{
       status: status,
       reason: decision.reason,
+      capability_gap: %{
+        id: capability_gap.id,
+        selected_action: capability_gap.selected_action,
+        candidate_ids: CapabilityGap.candidate_ids(capability_gap),
+        reason: capability_gap.reason
+      },
       component_id: proof.component.id,
       command: proof.command,
       stdout: proof.attach_summary.stdout,
@@ -189,7 +388,7 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
     }
   end
 
-  defp repair_context(_proof, _decision, _status), do: nil
+  defp repair_context(_proof, _decision, _status, _capability_gap), do: nil
 
   defp maybe_put(opts, _key, nil), do: opts
   defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)

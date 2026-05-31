@@ -6,7 +6,13 @@ defmodule RunicSandbox.VmsanCLI do
   @spec command([String.t()], keyword()) :: {String.t(), [String.t()]}
   def command(args, opts \\ []) when is_list(args) do
     executable = opts |> Keyword.get(:executable, "vmsan") |> to_string()
-    argv = ["--json" | Enum.map(args, &to_string/1)]
+
+    argv =
+      if Keyword.get(opts, :json?, true) do
+        ["--json" | Enum.map(args, &to_string/1)]
+      else
+        Enum.map(args, &to_string/1)
+      end
 
     if Keyword.get(opts, :sudo?, false) do
       path = Keyword.get(opts, :path, System.get_env("PATH") || "")
@@ -69,6 +75,19 @@ defmodule RunicSandbox.VmsanCLI do
     opts = input_map(opts)
 
     ["exec"]
+    |> maybe_arg("--workdir", get(opts, :workdir))
+    |> env_args(get(opts, :env))
+    |> maybe_bool("--sudo", get(opts, :sudo?))
+    |> Kernel.++([vm_id, "--" | Enum.map(argv, &to_string/1)])
+  end
+
+  @spec exec_interactive_args(String.t(), [String.t()], keyword() | map()) :: [String.t()]
+  def exec_interactive_args(vm_id, argv, opts \\ []) when is_binary(vm_id) and is_list(argv) do
+    opts = input_map(opts)
+
+    ["exec", "--interactive"]
+    |> maybe_bool("--tty", get(opts, :tty?))
+    |> maybe_bool("--no-extend-timeout", get(opts, :extend_timeout?) == false)
     |> maybe_arg("--workdir", get(opts, :workdir))
     |> env_args(get(opts, :env))
     |> maybe_bool("--sudo", get(opts, :sudo?))

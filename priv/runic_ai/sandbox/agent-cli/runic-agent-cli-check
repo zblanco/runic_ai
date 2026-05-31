@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -u
+
+if [ "$#" -eq 0 ]; then
+  set -- claude codex
+fi
+
+for cli in "$@"; do
+  if command -v "$cli" >/dev/null 2>&1; then
+    version="$("$cli" --version </dev/null 2>&1 | head -n 1 || true)"
+    printf '%s\tfound\t%s\t%s\n' "$cli" "$(command -v "$cli")" "$version"
+  else
+    printf '%s\tskipped\tnot installed\n' "$cli"
+  fi
+done

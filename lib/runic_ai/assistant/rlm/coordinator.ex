@@ -18,6 +18,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   alias RunicAI.LLM.Result
   alias RunicAI.RLM.StrategyRouter
   alias RunicAI.RLM.SubagentAssignment
+  alias RunicAI.Sandbox.GeneratedComponentCatalog
   alias RunicAI.Sandbox.GeneratedComponentPromotionFlow
   alias RunicAI.Sandbox.GeneratedComponentWorkflow
 
@@ -42,11 +43,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
         WorkflowBlueprint.from_input(Keyword.fetch!(opts, :blueprint))
 
       Keyword.has_key?(opts, :generated_component_proposal) ->
+        generated_component_proposal = Keyword.fetch!(opts, :generated_component_proposal)
+
         opts
-        |> Keyword.fetch!(:generated_component_proposal)
-        |> GeneratedComponentPromotionFlow.run(
-          generated_component_promotion_flow_opts(objective, opts)
-        )
+        |> generated_component_promotion_flow_opts(objective, generated_component_proposal)
+        |> then(&GeneratedComponentPromotionFlow.run(generated_component_proposal, &1))
         |> promotion_flow_blueprint()
 
       Keyword.has_key?(opts, :generated_components) ->
@@ -62,6 +63,13 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
           Keyword.fetch!(opts, :generated_component),
           generated_component_workflow_opts(opts)
         )
+
+      generated_component_catalog_reuse?(opts) ->
+        case generated_component_catalog_blueprint(objective, opts) do
+          {:ok, blueprint} -> {:ok, blueprint}
+          :not_found -> continue_without_catalog_reuse(workspace, objective, opts)
+          {:error, %Error{} = error} -> {:error, error}
+        end
 
       dynamic_strategy?(opts) ->
         dynamic_blueprint(workspace, objective, opts)
@@ -138,7 +146,11 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
 
   @spec prompt(String.t(), Workspace.t(), keyword()) :: String.t()
   def prompt(objective, %Workspace{} = _workspace, opts \\ []) do
-    BlueprintProposalPrompt.prompt(objective, capability_manifest(opts), opts)
+    BlueprintProposalPrompt.prompt(
+      objective,
+      capability_manifest(opts),
+      prompt_opts(objective, opts)
+    )
   end
 
   @spec schema() :: keyword()
@@ -198,6 +210,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     model = Keyword.get(opts, :model, @default_model)
     llm_opts = llm_opts(opts)
     manifest = capability_manifest(opts)
+    opts = prompt_opts(objective, opts)
 
     case generate_blueprint_object(
            model,
@@ -622,7 +635,125 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     |> Keyword.put_new(:metadata, %{proposal_kind: :generated_component_composition})
   end
 
-  defp generated_component_promotion_flow_opts(objective, opts) do
+  defp generated_component_catalog_reuse?(opts) do
+    Keyword.has_key?(opts, :generated_component_catalog) and
+      Keyword.get(opts, :generated_component_catalog_reuse?, true) in [true, "true"]
+  end
+
+  defp generated_component_catalog_blueprint(objective, opts) do
+    with {:ok, result} <- GeneratedComponentCatalog.best_match(objective, opts) do
+      case result do
+        nil ->
+          :not_found
+
+        result ->
+          metadata =
+            Map.merge(Keyword.get(opts, :metadata, %{}), %{
+              proposal_kind: :generated_component_catalog_reuse,
+              generated_component_catalog: %{
+                selected_entry_id: result.entry.id,
+                score: result.score,
+                match_reasons: result.reasons
+              }
+            })
+
+          workflow_opts =
+            opts
+            |> generated_component_workflow_opts()
+            |> Keyword.put(:metadata, metadata)
+
+          with {:ok, blueprint} <-
+                 GeneratedComponentWorkflow.compose(
+                   objective,
+                   result.entry.component,
+                   workflow_opts
+                 ),
+               :ok <- notify_generated_component_catalog_reuse(objective, result, blueprint, opts) do
+            {:ok, blueprint}
+          end
+      end
+    end
+  end
+
+  defp notify_generated_component_catalog_reuse(objective, result, blueprint, opts) do
+    case Keyword.get(opts, :generated_component_catalog_reuse_callback) do
+      nil ->
+        :ok
+
+      callback when is_function(callback, 1) ->
+        event = %{
+          type: :generated_component_catalog_reuse_selected,
+          objective: objective,
+          entry_id: result.entry.id,
+          score: result.score,
+          reasons: result.reasons,
+          blueprint_id: blueprint.id
+        }
+
+        case callback.(event) do
+          :ok ->
+            :ok
+
+          {:ok, _value} ->
+            :ok
+
+          {:error, %Error{} = error} ->
+            {:error, error}
+
+          {:error, reason} ->
+            {:error,
+             Error.validation("generated component catalog reuse callback failed",
+               source: __MODULE__,
+               details: %{reason: reason}
+             )}
+
+          other ->
+            {:error,
+             Error.validation(
+               "generated component catalog reuse callback returned invalid result",
+               source: __MODULE__,
+               details: %{result: other}
+             )}
+        end
+
+      callback ->
+        {:error,
+         Error.validation("generated component catalog reuse callback must be a unary function",
+           source: __MODULE__,
+           details: %{callback: inspect(callback)}
+         )}
+    end
+  end
+
+  defp continue_without_catalog_reuse(workspace, objective, opts) do
+    opts = Keyword.put(opts, :generated_component_catalog_reuse?, false)
+
+    cond do
+      dynamic_strategy?(opts) ->
+        dynamic_blueprint(workspace, objective, opts)
+
+      fallback_strategy?(opts) ->
+        fallback_blueprint(workspace, objective, opts)
+
+      routed_strategy?(opts) ->
+        routed_blueprint(workspace, objective, opts)
+
+      match?({:ok, _shape}, curated_recipe_shape(workspace, objective, opts)) ->
+        {:ok, shape} = curated_recipe_shape(workspace, objective, opts)
+
+        workspace
+        |> fallback_blueprint(objective, Keyword.put(opts, :fallback_shape, shape))
+        |> tag_curated_recipe(shape)
+
+      evidence_first_default?(opts) ->
+        routed_blueprint(workspace, objective, opts)
+
+      true ->
+        dynamic_blueprint(workspace, objective, opts)
+    end
+  end
+
+  defp generated_component_promotion_flow_opts(opts, objective, generated_component_proposal) do
     workflow_opts =
       generated_component_workflow_opts(opts)
       |> Keyword.merge(Keyword.get(opts, :workflow_opts, []), fn
@@ -662,10 +793,42 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       :resume_key,
       :timeout_ms,
       :max_output_bytes,
-      :network
+      :network,
+      :capability_gap,
+      :generated_component_catalog
     ])
+    |> maybe_put_generated_component_gap(objective, generated_component_proposal, opts)
     |> Keyword.put(:workflow_objective, objective)
     |> Keyword.put(:workflow_opts, workflow_opts)
+  end
+
+  defp prompt_opts(objective, opts) do
+    case GeneratedComponentCatalog.prompt_context(objective, opts) do
+      {:ok, context} ->
+        Keyword.put(opts, :generated_component_catalog_context, context)
+
+      {:error, %Error{} = error} ->
+        Keyword.put(opts, :generated_component_catalog_error, %{
+          message: error.message,
+          details: error.details
+        })
+    end
+  end
+
+  defp maybe_put_generated_component_gap(flow_opts, objective, proposal, opts) do
+    cond do
+      Keyword.has_key?(opts, :capability_gap) ->
+        flow_opts
+
+      Keyword.has_key?(opts, :generated_component_catalog) ->
+        case GeneratedComponentCatalog.gap_for_proposal(objective, proposal, opts) do
+          {:ok, gap} -> Keyword.put(flow_opts, :capability_gap, gap)
+          {:error, _error} -> flow_opts
+        end
+
+      true ->
+        flow_opts
+    end
   end
 
   defp promotion_flow_blueprint({:ok, %{workflow: %WorkflowBlueprint{} = blueprint}}),

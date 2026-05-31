@@ -149,7 +149,7 @@ defmodule RunicSandbox.Backends.Lua do
              network_policy?: false,
              persistent_identity?: false,
              streaming?: true,
-             metadata: Capabilities.attach_metadata(:terminal_adapter)
+             metadata: one_shot_attach_metadata()
            )
          )
      }}
@@ -164,7 +164,7 @@ defmodule RunicSandbox.Backends.Lua do
             network_policy?: false,
             persistent_identity?: false,
             streaming?: true,
-            metadata: Capabilities.attach_metadata(:terminal_adapter)
+            metadata: one_shot_attach_metadata()
           ),
         policy: profile.policy,
         state_model: :one_shot,
@@ -172,6 +172,17 @@ defmodule RunicSandbox.Backends.Lua do
         persistent_identity?: false
       )
     end
+  end
+
+  defp one_shot_attach_metadata do
+    Capabilities.attach_metadata(:terminal_adapter,
+      state_tier: :one_shot_exec,
+      process_host?: false,
+      workspace_persistent?: false,
+      live_process_stream?: false,
+      service_host?: false,
+      snapshot_modes: []
+    )
   end
 
   @impl true

@@ -51,6 +51,9 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
     Capability manifest:
     #{Jason.encode!(manifest)}
 
+    Generated component catalog context:
+    #{Jason.encode!(Keyword.get(opts, :generated_component_catalog_context, %{available?: false, candidates: []}))}
+
     Return one workflow blueprint JSON object. The blueprint describes ordinary
     Runic workflow components as data; it must not contain generated Elixir
     modules or files. Always return a workflow blueprint. Do not answer the
@@ -121,6 +124,11 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       artifact/section/schema/source evidence, not by a model completion claim.
     - pass `required_source_cues` and `require_artifact_quality?` through to
       the scorecard whenever they are present in the manifest.
+    - when generated component catalog candidates are available, prefer a
+      candidate whose contract and policy fit the objective. Generate a new
+      sandbox-backed component only for a narrow, testable capability gap, and
+      preserve the considered candidate ids and rejection reasons in the
+      generated-component capability gap decision.
 
     Generic valid component examples:
     #{Jason.encode!(component_examples(opts))}

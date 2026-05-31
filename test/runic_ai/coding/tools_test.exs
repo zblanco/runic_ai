@@ -553,6 +553,41 @@ defmodule RunicAI.Coding.ToolsTest do
     assert error.message == "unknown sandbox session id"
   end
 
+  test "sandbox process tools are exposed through opaque ids and reject limited backends" do
+    workspace = sample_workspace()
+    {:ok, registry} = SandboxSessionRegistry.start_link()
+
+    tool_registry = Tools.default_registry(workspace, sandbox_session_registry: registry)
+    names = Registry.names(tool_registry)
+
+    assert "start_sandbox_process" in names
+    assert "sandbox_process_events" in names
+    assert "write_sandbox_process" in names
+    assert "kill_sandbox_process" in names
+
+    start_tool = Registry.fetch!(tool_registry, "start_sandbox_process")
+    write_tool = Registry.fetch!(tool_registry, "write_sandbox_process")
+    events_tool = Registry.fetch!(tool_registry, "sandbox_process_events")
+    wait_tool = Registry.fetch!(tool_registry, "wait_sandbox_process")
+
+    assert start_tool.metadata.requires_review?
+    assert write_tool.metadata.requires_review?
+    refute events_tool.metadata.requires_review?
+    refute wait_tool.metadata.requires_review?
+
+    assert {:ok, opened} = Tools.open_sandbox_session(workspace, %{}, registry)
+
+    assert {:error, error} =
+             Tools.start_sandbox_process(
+               workspace,
+               %{session_id: opened.id, runtime: "bash", code: "cat"},
+               registry
+             )
+
+    assert error.message == "sandbox session does not support process hosting"
+    assert error.details.backend == :just_bash
+  end
+
   test "execute_code metadata carries configured stateful sandbox capability shape" do
     workspace = sample_workspace()
 

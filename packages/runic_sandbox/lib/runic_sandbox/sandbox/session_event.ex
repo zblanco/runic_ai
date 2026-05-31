@@ -13,6 +13,10 @@ defmodule RunicSandbox.SessionEvent do
     :stderr_chunk,
     :stdin_ack,
     :exec_finished,
+    :process_started,
+    :process_signaled,
+    :process_killed,
+    :process_finished,
     :file_written,
     :file_read,
     :checkpoint_created,
@@ -37,6 +41,10 @@ defmodule RunicSandbox.SessionEvent do
           | :stderr_chunk
           | :stdin_ack
           | :exec_finished
+          | :process_started
+          | :process_signaled
+          | :process_killed
+          | :process_finished
           | :file_written
           | :file_read
           | :checkpoint_created

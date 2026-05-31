@@ -22,6 +22,7 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
   alias RunicAI.Evaluation.Run
   alias RunicAI.ReviewDecision
   alias RunicAI.Sandbox.GeneratedComponent
+  alias RunicAI.Sandbox.GeneratedComponentCatalog
   alias RunicAI.Sandbox.GeneratedComponentPromotionPolicy
 
   @scenario_ids [
@@ -33,6 +34,7 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
     "repl_unknown_schema",
     "repl_context_discovery",
     "generated_component_promotion_denied",
+    "generated_component_promotion_flywheel",
     "sandbox_proxy_service_smoke",
     "checkpoint_restore_after_failure",
     "strategy_family_report"
@@ -96,6 +98,7 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
       "repl_unknown_schema" -> {:ok, repl_unknown_schema()}
       "repl_context_discovery" -> {:ok, repl_context_discovery()}
       "generated_component_promotion_denied" -> {:ok, generated_component_promotion_denied()}
+      "generated_component_promotion_flywheel" -> {:ok, generated_component_promotion_flywheel()}
       "sandbox_proxy_service_smoke" -> {:ok, sandbox_proxy_service_smoke()}
       "checkpoint_restore_after_failure" -> {:ok, checkpoint_restore_after_failure()}
       "strategy_family_report" -> {:ok, strategy_family_report()}
@@ -273,7 +276,37 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
     - review_pauses: #{run.aggregate.review_pauses}
     - strategy_changes: #{run.aggregate.strategy_changes}
     - host_mutations_avoided: #{run.aggregate.host_mutations_avoided}
+    #{generated_component_flywheel_section(run)}
     """
+  end
+
+  defp generated_component_flywheel_section(%Run{} = run) do
+    run.results
+    |> Enum.map(& &1.metrics)
+    |> Enum.find(&Map.has_key?(&1, :reuse_rate))
+    |> case do
+      nil ->
+        ""
+
+      metrics ->
+        promotion_decisions = Map.get(metrics, :promotion_decisions, %{})
+
+        """
+
+        ## Generated Component Flywheel
+
+        - runs: #{Map.get(metrics, :runs, 0)}
+        - generated_components: #{Map.get(metrics, :generated_components, 0)}
+        - promoted_components: #{Map.get(metrics, :promoted_components, 0)}
+        - catalog_hits: #{Map.get(metrics, :catalog_hits, 0)}
+        - reused_components: #{Map.get(metrics, :reused_components, 0)}
+        - proof_pass_rate: #{Map.get(metrics, :proof_pass_rate, 0.0)}
+        - reuse_rate: #{Map.get(metrics, :reuse_rate, 0.0)}
+        - repair_count: #{Map.get(metrics, :repair_count, 0)}
+        - workflow_completion_rate: #{Map.get(metrics, :workflow_completion_rate, 0.0)}
+        - promotion_decisions: #{inspect(promotion_decisions)}
+        """
+    end
   end
 
   @spec lambda_report_plan() :: LambdaPlan.t()
@@ -687,6 +720,132 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
     }
   end
 
+  @spec generated_component_promotion_flywheel_fixture() :: map()
+  def generated_component_promotion_flywheel_fixture do
+    objective_a = "Normalize semi-structured invoice rows into invoice facts"
+    objective_b = "Parse new invoice rows into normalized invoice facts"
+
+    component =
+      GeneratedComponent.new!(
+        id: "generated-component:invoice-row-normalizer",
+        name: "InvoiceRowNormalizer",
+        language: :python,
+        runtime: :python,
+        entrypoint: "component.py:run",
+        capability_profile: :local_workbench,
+        sandbox_profile: :local_code,
+        source_artifacts: [%{path: "component.py", sha256: "fixture-invoice-source"}],
+        test_artifacts: [%{path: "test_component.py", sha256: "fixture-invoice-test"}],
+        interface: %{
+          inputs: [%{name: "rows", type: "list<object>"}],
+          outputs: [%{name: "invoice_facts", type: "list<object>"}],
+          examples: [
+            %{
+              input_ref: "fixtures/invoice_rows_a.json",
+              output_ref: "fixtures/invoice_facts_a.json"
+            }
+          ]
+        },
+        verification: %{
+          status: :pass,
+          command: "python -m pytest",
+          tests: 4,
+          sandbox_backend: :just_bash
+        },
+        promotion_status: :verified,
+        metadata: %{
+          fixture_id: "generated_component_promotion_flywheel",
+          intent_tags: [:parse, :normalize, :tabular],
+          network: :disabled,
+          policy: %{network: :disabled, filesystem: :sandbox_only}
+        }
+      )
+
+    gap =
+      GeneratedComponentCatalog.capability_gap!(
+        id: "gap:invoice-row-normalizer",
+        objective: objective_a,
+        required_contract: %{
+          intent_tags: [:parse, :normalize, :tabular],
+          inputs: [%{name: "rows", type: "list<object>"}],
+          outputs: [%{name: "invoice_facts", type: "list<object>"}],
+          runtime: :python,
+          policy: %{network: :disabled}
+        },
+        candidates: [],
+        selected_action: :generate_leaf,
+        selected_component_id: nil,
+        reason: "no existing catalog entry normalizes invoice rows with this output contract"
+      )
+
+    {:ok, entry} =
+      GeneratedComponentCatalog.entry_from_component(component,
+        promotion_decision: %{
+          action: :promote,
+          reason: :component_promotable,
+          details: %{target: :artifact}
+        }
+      )
+
+    {:ok, store_after_promotion} = GeneratedComponentCatalog.new_store(entries: [entry])
+
+    {:ok, [catalog_hit | _rest]} =
+      GeneratedComponentCatalog.search(store_after_promotion,
+        objective: objective_b,
+        intent_tags: [:parse, :normalize, :tabular],
+        inputs: [%{name: "rows"}],
+        outputs: [%{name: "invoice_facts"}],
+        component_kind: :sandbox_execute,
+        runtime: :python,
+        policy: %{network: :disabled}
+      )
+
+    {:ok, store_after_reuse} =
+      GeneratedComponentCatalog.record_reuse(
+        store_after_promotion,
+        entry.id,
+        :success,
+        used_at: ~U[2026-05-31 14:00:00Z],
+        objective: objective_b,
+        workflow_id: "workflow:invoice-row-normalizer-reuse"
+      )
+
+    {:ok, reused_entry} = GeneratedComponentCatalog.get(store_after_reuse, entry.id)
+
+    %{
+      run_a: %{
+        objective: objective_a,
+        decision: :generate_leaf,
+        capability_gap: gap,
+        proof_status: :pass,
+        promotion_target: :artifact,
+        catalog_entry_id: entry.id
+      },
+      run_b: %{
+        objective: objective_b,
+        decision: :reuse_exact,
+        catalog_entry_id: catalog_hit.entry.id,
+        catalog_score: catalog_hit.score,
+        match_reasons: catalog_hit.reasons,
+        workflow_completed?: true
+      },
+      catalog_entry: entry,
+      reused_entry: reused_entry,
+      summary: %{
+        runs: 2,
+        generated_components: 1,
+        promoted_components: 1,
+        catalog_hits: 1,
+        reused_components: 1,
+        proof_pass_rate: 1.0,
+        reuse_rate: 0.5,
+        repair_count: 0,
+        workflow_completion_rate: 1.0,
+        host_mutations_avoided: 2
+      }
+    }
+  end
+
   defp bad_sandbox_code_repair do
     scenario(
       "bad_sandbox_code_repair",
@@ -920,6 +1079,50 @@ defmodule RunicAI.RLM.SandboxEvaluationFixtures do
           planned: metric(model_calls: 1, sandbox_calls: 2, review_pauses: 1),
           actual: metric(model_calls: 1, sandbox_calls: 2, review_pauses: 1),
           quality: quality(0.7, "component verified but host promotion rejected")
+        )
+    )
+  end
+
+  defp generated_component_promotion_flywheel do
+    fixtures = generated_component_promotion_flywheel_fixture()
+
+    planned =
+      metric(model_calls: 2, sandbox_calls: 3, review_pauses: 0, host_mutations_avoided: 2)
+      |> Map.merge(%{
+        generated_components: 1,
+        promoted_components: 1,
+        catalog_hits: 1,
+        reused_components: 1,
+        proof_pass_rate: 1.0,
+        reuse_rate: 0.5,
+        repair_count: 0,
+        workflow_completion_rate: 1.0
+      })
+
+    actual =
+      metric(model_calls: 2, sandbox_calls: 3, review_pauses: 0, host_mutations_avoided: 2)
+      |> Map.merge(fixtures.summary)
+      |> Map.put(:promotion_decisions, %{artifact: 1, host_repo: 0, rejected: 0})
+
+    scenario(
+      "generated_component_promotion_flywheel",
+      "Generated Component Promotion Flywheel",
+      "Generate, prove, promote, retrieve, and reuse a sandbox-backed invoice normalizer",
+      :generated_sandbox_component,
+      %{repeated_transform?: true, generated_component_catalog?: true},
+      fixtures: fixtures,
+      evidence_requirements: [
+        :capability_gap,
+        :sandbox_proof,
+        :catalog_write,
+        :catalog_reuse,
+        :salience_update
+      ],
+      harness_specs:
+        harness_specs(:generated_sandbox_component,
+          planned: planned,
+          actual: actual,
+          quality: quality(0.88, "second run reused the promoted component without repair")
         )
     )
   end

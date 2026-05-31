@@ -18,6 +18,8 @@ defmodule RunicSandbox.Backends.Sprites do
   alias RunicSandbox.ExecutionResult
   alias RunicSandbox.FileRef
   alias RunicSandbox.Instance
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Proxy
   alias RunicSandbox.Service
@@ -231,6 +233,136 @@ defmodule RunicSandbox.Backends.Sprites do
   def close_attach(%AttachHandle{}, _opts), do: :ok
 
   @impl true
+  def start_process(%Session{} = session, %ExecutionRequest{} = request, opts) do
+    with :ok <- ensure_session_configured(session, opts),
+         {:ok, argv} <- request_argv(request),
+         {:ok, handle} <- open_process_websocket(session, request, argv, opts) do
+      {:ok, handle}
+    end
+  end
+
+  @impl true
+  def list_processes(%Session{} = session, opts) do
+    with :ok <- ensure_session_configured(session, opts),
+         {:ok, response} <-
+           request(
+             session_config(session),
+             :get,
+             "/v1/sprites/#{escape(session.id)}/exec",
+             %{},
+             "",
+             opts
+           ) do
+      sessions = if is_list(response), do: response, else: get(response, :sessions, [])
+      {:ok, Enum.map(sessions, &process_status_from_session(session, &1))}
+    end
+  end
+
+  @impl true
+  def process_status(%Session{} = session, %ProcessHandle{} = handle, opts),
+    do: process_status(session, handle.id, opts)
+
+  def process_status(%Session{} = session, process_id, opts) when is_binary(process_id) do
+    with {:ok, statuses} <- list_processes(session, opts) do
+      {:ok,
+       Enum.find(
+         statuses,
+         ProcessStatus.new!(id: process_id, session_id: session.id, backend: :sprites),
+         fn
+           status -> status.id == process_id
+         end
+       )}
+    end
+  end
+
+  @impl true
+  def process_events(%ProcessHandle{} = handle, _opts), do: {:ok, ProcessHandle.events(handle)}
+
+  @impl true
+  def write_process_stdin(%ProcessHandle{metadata: metadata}, input, _opts) do
+    cond do
+      is_function(Map.get(metadata, :stdin), 1) ->
+        normalize_process_callback(Map.fetch!(metadata, :stdin).(IO.iodata_to_binary(input)))
+
+      is_function(Map.get(metadata, :writer), 1) ->
+        normalize_process_callback(Map.fetch!(metadata, :writer).(IO.iodata_to_binary(input)))
+
+      true ->
+        {:error,
+         Error.validation("sprites process handle is not writable",
+           source: __MODULE__,
+           details: %{backend: :sprites}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def close_process_stdin(%ProcessHandle{metadata: metadata}, _opts) do
+    cond do
+      is_function(Map.get(metadata, :stdin_eof), 0) ->
+        normalize_process_callback(Map.fetch!(metadata, :stdin_eof).())
+
+      is_function(Map.get(metadata, :stdin_eof), 1) ->
+        normalize_process_callback(Map.fetch!(metadata, :stdin_eof).(<<4>>))
+
+      is_function(Map.get(metadata, :writer), 1) ->
+        normalize_process_callback(Map.fetch!(metadata, :writer).(<<4>>))
+
+      true ->
+        {:error,
+         Error.validation("sprites process handle does not support stdin close",
+           source: __MODULE__,
+           details: %{backend: :sprites}
+         )}
+    end
+  rescue
+    exception ->
+      {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  @impl true
+  def signal_process(%ProcessHandle{metadata: metadata} = handle, signal, opts) do
+    session_id = Map.get(metadata, :sprite) || handle.session_id
+    provider_session_id = Map.get(metadata, :provider_session_id) || handle.id
+
+    with {:ok, _events} <-
+           kill_exec_session(session_id, provider_session_id, to_string(signal), metadata, opts) do
+      :ok
+    end
+  end
+
+  @impl true
+  def kill_process(%ProcessHandle{} = handle, opts) do
+    case signal_process(handle, "SIGTERM", opts) do
+      :ok -> close_process_handle(handle.metadata)
+      {:error, _error} -> close_process_handle(handle.metadata)
+    end
+  end
+
+  @impl true
+  def wait_process(%ProcessHandle{} = handle, _opts) do
+    handle
+    |> ProcessHandle.events()
+    |> Enum.reduce(nil, fn
+      %{type: :process_finished} = event, _acc -> event
+      _event, acc -> acc
+    end)
+    |> case do
+      %{payload: payload} ->
+        ProcessStatus.from_handle(handle,
+          status: Map.get(payload, :status, :exited),
+          exit_status: Map.get(payload, :exit_status)
+        )
+
+      nil ->
+        ProcessStatus.from_handle(handle)
+    end
+  end
+
+  @impl true
   def write_file(%Session{} = session, path, contents, opts) do
     with :ok <- ensure_session_configured(session, opts),
          {:ok, response} <-
@@ -339,7 +471,16 @@ defmodule RunicSandbox.Backends.Sprites do
         backend: :sprites,
         ref: "sprites://#{session.id}/checkpoints/#{checkpoint_id}",
         created_at: DateTime.utc_now(),
-        metadata: %{provider: :sprites, events: events, comment: comment}
+        metadata: %{
+          kind: :provider_checkpoint,
+          provider: :sprites,
+          preserves: Checkpoint.preserves(:provider_checkpoint),
+          caveats: [
+            "Sprites provider checkpoints may preserve provider-managed runtime state, but process, service, and connection preservation is provider-dependent."
+          ],
+          events: events,
+          comment: comment
+        }
       )
     end
   end
@@ -447,6 +588,264 @@ defmodule RunicSandbox.Backends.Sprites do
   def close_proxy(%Proxy{}, _opts), do: :ok
   def close_proxy(_proxy, _opts), do: :ok
 
+  defp open_process_websocket(%Session{} = session, %ExecutionRequest{} = request, argv, opts) do
+    websocket_open = Keyword.get(opts, :websocket_open, &open_websocket_exec/4)
+    config = session_config(session)
+    query = exec_websocket_query(argv, request, opts)
+    url = websocket_url(config.api_url, "/v1/sprites/#{escape(session.id)}/exec", query)
+
+    with {:ok, transport} <- websocket_open.(config, url, query, request_opts(config, opts)) do
+      provider_session_id = transport_session_id(transport)
+      process_id = provider_session_id || "sprites-process-#{System.unique_integer([:positive])}"
+
+      ProcessHandle.new(
+        id: process_id,
+        session_id: session.id,
+        backend: session.backend,
+        status: :running,
+        command: argv,
+        events: process_events_from_transport(session, request, process_id, transport),
+        metadata:
+          %{
+            streaming_live?: true,
+            provider_transport: :sprites_websocket_exec,
+            provider_session_id: provider_session_id,
+            sprite: session.id,
+            api_url: config.api_url,
+            token_env: config.token_env
+          }
+          |> maybe_put_callback(:stdin, get(transport, :stdin, nil))
+          |> maybe_put_callback(:stdin_eof, get(transport, :stdin_eof, nil))
+          |> maybe_put_callback(:writer, get(transport, :writer, nil))
+          |> maybe_put_callback(:closer, get(transport, :closer, nil))
+      )
+    end
+  end
+
+  defp open_websocket_exec(_config, url, _query, opts) do
+    case System.find_executable("websocat") do
+      nil ->
+        missing_websocket_open()
+
+      executable ->
+        args =
+          [url] ++
+            (opts
+             |> Keyword.get(:headers, [])
+             |> Enum.flat_map(fn {key, value} -> ["-H", "#{key}: #{value}"] end))
+
+        port = Port.open({:spawn_executable, executable}, [:binary, :exit_status, args: args])
+
+        {:ok,
+         %{
+           transport: :websocat,
+           events: websocket_port_events(port),
+           writer: fn input -> Port.command(port, <<0>> <> IO.iodata_to_binary(input)) end,
+           stdin_eof: fn -> Port.command(port, <<4>>) end,
+           closer: fn -> Port.close(port) end
+         }}
+    end
+  rescue
+    exception -> {:error, Error.from_exception(exception, source: __MODULE__)}
+  end
+
+  defp missing_websocket_open do
+    {:error,
+     Error.validation("sprites live process WebSocket adapter is not configured",
+       source: __MODULE__,
+       details: %{
+         backend: :sprites,
+         operation: :start_process,
+         provider_transport: :sprites_websocket_exec
+       }
+     )}
+  end
+
+  defp websocket_port_events(port) do
+    Stream.resource(
+      fn -> %{port: port, finished?: false} end,
+      &next_websocket_port_event/1,
+      fn state ->
+        unless state.finished?,
+          do: close_process_handle(%{closer: fn -> Port.close(state.port) end})
+      end
+    )
+  end
+
+  defp next_websocket_port_event(%{port: port} = state) do
+    receive do
+      {^port, {:data, data}} ->
+        {[data], state}
+
+      {^port, {:exit_status, status}} ->
+        {[<<3, normalize_exit_status_byte(status)>>], %{state | finished?: true}}
+    end
+  end
+
+  defp normalize_exit_status_byte(status) when is_integer(status) and status in 0..255, do: status
+  defp normalize_exit_status_byte(_status), do: 1
+
+  defp exec_websocket_query(argv, %ExecutionRequest{} = request, opts) do
+    %{
+      cmd: argv,
+      dir: request.cwd,
+      stdin: true,
+      tty: Keyword.get(opts, :tty?, false),
+      max_run_after_disconnect: Keyword.get(opts, :max_run_after_disconnect, "10s")
+    }
+  end
+
+  defp websocket_url(api_url, path, query) do
+    api_url
+    |> String.replace_prefix("https://", "wss://")
+    |> String.replace_prefix("http://", "ws://")
+    |> request_url(path, query)
+  end
+
+  defp transport_session_id(transport) do
+    case get(transport, :session_id, get(transport, :id, nil)) do
+      id when is_integer(id) -> Integer.to_string(id)
+      id when is_binary(id) and id != "" -> id
+      _other -> nil
+    end
+  end
+
+  defp process_events_from_transport(%Session{} = session, request, process_id, transport) do
+    started =
+      AttachEvents.event(session, :process_started, %{
+        process_id: process_id,
+        provider_session_id: transport_session_id(transport),
+        runtime: request.runtime,
+        mode: request.mode,
+        argv: request.argv,
+        cwd: request.cwd,
+        sprite: session.id
+      })
+
+    events =
+      transport
+      |> get(:events, [])
+      |> Stream.map(&normalize_process_event(session, process_id, &1))
+      |> Stream.reject(&is_nil/1)
+
+    Stream.concat([started], events)
+  end
+
+  defp normalize_process_event(_session, _process_id, %RunicSandbox.SessionEvent{} = event),
+    do: event
+
+  defp normalize_process_event(session, _process_id, <<1, chunk::binary>>),
+    do: AttachEvents.chunk_event(session, :stdout_chunk, chunk)
+
+  defp normalize_process_event(session, _process_id, <<2, chunk::binary>>),
+    do: AttachEvents.chunk_event(session, :stderr_chunk, chunk)
+
+  defp normalize_process_event(session, process_id, <<3, exit_status>>),
+    do: process_finished_event(session, process_id, exit_status)
+
+  defp normalize_process_event(session, _process_id, %{type: type, chunk: chunk})
+       when type in [:stdout, :stdout_chunk, "stdout", "stdout_chunk"],
+       do: AttachEvents.chunk_event(session, :stdout_chunk, to_string(chunk))
+
+  defp normalize_process_event(session, _process_id, %{type: type, chunk: chunk})
+       when type in [:stderr, :stderr_chunk, "stderr", "stderr_chunk"],
+       do: AttachEvents.chunk_event(session, :stderr_chunk, to_string(chunk))
+
+  defp normalize_process_event(session, process_id, %{type: type} = event)
+       when type in [:exit, :process_finished, "exit", "process_finished"] do
+    process_finished_event(
+      session,
+      process_id,
+      get(event, :exit_status, get(event, :exit_code, 0))
+    )
+  end
+
+  defp normalize_process_event(_session, _process_id, _event), do: nil
+
+  defp process_finished_event(session, process_id, exit_status) do
+    exit_status =
+      case normalize_exit_status(exit_status) do
+        {:ok, value} -> value
+        {:error, _error} -> 1
+      end
+
+    AttachEvents.event(session, :process_finished, %{
+      process_id: process_id,
+      status: if(exit_status == 0, do: :exited, else: :failed),
+      exit_status: exit_status,
+      provider: :sprites,
+      sprite: session.id
+    })
+  end
+
+  defp maybe_put_callback(metadata, _key, nil), do: metadata
+
+  defp maybe_put_callback(metadata, key, callback) when is_function(callback),
+    do: Map.put(metadata, key, callback)
+
+  defp maybe_put_callback(metadata, _key, _callback), do: metadata
+
+  defp normalize_process_callback(:ok), do: :ok
+  defp normalize_process_callback({:ok, _value}), do: :ok
+  defp normalize_process_callback({:error, %Error{} = error}), do: {:error, error}
+
+  defp normalize_process_callback({:error, reason}),
+    do: {:error, Error.from_reason(reason, source: __MODULE__)}
+
+  defp normalize_process_callback(_other), do: :ok
+
+  defp close_process_handle(metadata) do
+    case Map.get(metadata, :closer) do
+      closer when is_function(closer, 0) -> normalize_process_callback(closer.())
+      closer when is_function(closer, 1) -> normalize_process_callback(closer.(:close))
+      _other -> :ok
+    end
+  rescue
+    _exception -> :ok
+  end
+
+  defp kill_exec_session(sprite, provider_session_id, signal, metadata, opts) do
+    config = %{
+      api_url: Map.get(metadata, :api_url, @default_api_url),
+      token_env: Map.get(metadata, :token_env, @default_token_env)
+    }
+
+    with {:ok, response} <-
+           request(
+             config,
+             :post,
+             "/v1/sprites/#{escape(sprite)}/exec/#{escape(provider_session_id)}/kill",
+             %{signal: signal},
+             "",
+             opts
+           ) do
+      {:ok, ndjson_events(response)}
+    end
+  end
+
+  defp process_status_from_session(%Session{} = session, exec_session) do
+    id = get(exec_session, :id, "exec-#{System.unique_integer([:positive])}") |> to_string()
+
+    ProcessStatus.new!(
+      id: id,
+      session_id: session.id,
+      backend: :sprites,
+      status:
+        if(truthy?(get(exec_session, :is_active, get(exec_session, :isActive, false))),
+          do: :running,
+          else: :unknown
+        ),
+      pid: get(exec_session, :pid, nil),
+      metadata: %{
+        provider_transport: :sprites_websocket_exec,
+        command: get(exec_session, :command, nil),
+        tty: get(exec_session, :tty, nil),
+        created: get(exec_session, :created, nil),
+        last_activity: get(exec_session, :last_activity, get(exec_session, :lastActivity, nil))
+      }
+    )
+  end
+
   defp health_for(%Profile{} = profile, opts) do
     configured? = configured?(profile)
     token_present? = token_present?(profile, opts)
@@ -463,6 +862,11 @@ defmodule RunicSandbox.Backends.Sprites do
       token_env: token_env(profile),
       token_present?: token_present?,
       token_value: :redacted,
+      process_transport: %{
+        native: :sprites_websocket_exec,
+        default_adapter: :websocat,
+        default_adapter_available?: websocat_available?()
+      },
       runtimes: [:bash, :sh, :python, :node, :elixir, :lua],
       isolation_level: :remote_microvm,
       transport_model: :remote_microvm,
@@ -825,7 +1229,13 @@ defmodule RunicSandbox.Backends.Sprites do
         Capabilities.attach_metadata(:terminal_adapter,
           provider_transport: :sprites_http_exec,
           restricted_egress_supported?: false,
-          default_cwd: @default_cwd
+          default_cwd: @default_cwd,
+          state_tier: :service_actor,
+          process_host?: true,
+          workspace_persistent?: true,
+          live_process_stream?: true,
+          service_host?: true,
+          snapshot_modes: [:provider_checkpoint]
         )
     )
   end
@@ -878,6 +1288,8 @@ defmodule RunicSandbox.Backends.Sprites do
     token = env.(token_env(profile))
     is_binary(token) and token != ""
   end
+
+  defp websocat_available?, do: is_binary(System.find_executable("websocat"))
 
   defp missing_requirements(configured?, token_present?, profile) do
     []
@@ -982,6 +1394,9 @@ defmodule RunicSandbox.Backends.Sprites do
   defp normalize_service_status("stopped"), do: :stopped
   defp normalize_service_status("failed"), do: :failed
   defp normalize_service_status(_status), do: :running
+
+  defp truthy?(value) when value in [true, "true", "1", 1], do: true
+  defp truthy?(_value), do: false
 
   defp normalize_file_kind("dir"), do: :directory
   defp normalize_file_kind("directory"), do: :directory

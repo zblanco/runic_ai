@@ -12,6 +12,8 @@ defmodule RunicSandboxTest do
   alias RunicSandbox.FileRef
   alias RunicSandbox.HostProbe
   alias RunicSandbox.Lease
+  alias RunicSandbox.ProcessHandle
+  alias RunicSandbox.ProcessStatus
   alias RunicSandbox.Profile
   alias RunicSandbox.Proxy
   alias RunicSandbox.Service
@@ -168,9 +170,20 @@ defmodule RunicSandboxTest do
 
     assert {:ok, status} = RunicSandbox.status(server: name)
     assert [%{lifecycle: :idle} = warm] = status.sandboxes.local_code.sessions
+    assert status.sandboxes.local_code.pool_status.ready == 1
+    assert warm.readiness == :ready
 
     assert {:ok, first} = RunicSandbox.acquire_session(:local_code, [], server: name)
     assert first.id == warm.id
+
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.local_code.pool_status.busy == 1
+
+    assert [%{checkout_source: :warm, last_checkout_latency_ms: warm_latency}] =
+             status.sandboxes.local_code.sessions
+
+    assert is_integer(warm_latency)
+    assert warm_latency >= 0
 
     assert {:ok, lease} = RunicSandbox.acquire_lease(first, "workspace", server: name)
     assert lease.resource == "workspace"
@@ -187,6 +200,10 @@ defmodule RunicSandboxTest do
     assert {:ok, second} = RunicSandbox.acquire_session(:local_code, [], server: name)
     refute second.id == first.id
 
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.local_code.pool_status.busy == 2
+    assert Enum.any?(status.sandboxes.local_code.sessions, &(&1.checkout_source == :cold))
+
     assert {:error, error} = RunicSandbox.acquire_session(:local_code, [], server: name)
     assert error.message == "sandbox session pool is exhausted"
     assert error.retryable?
@@ -198,6 +215,31 @@ defmodule RunicSandboxTest do
 
     assert :ok = RunicSandbox.release_session(reacquired, server: name)
     assert :ok = RunicSandbox.release_session(second, server: name)
+  end
+
+  test "manager records checkpoint-on-checkout policy evidence" do
+    name = :"runic_sandbox_checkpoint_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 1, max: 1, checkpoint_on_checkout?: true],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert [%{checkout_checkpoint: checkpoint}] = status.sandboxes.local_code.sessions
+    assert checkpoint.status == :skipped
+    assert checkpoint.reason == :unsupported
+
+    assert :ok = RunicSandbox.release_session(session, server: name)
   end
 
   test "managed open_session respects pool max and close_session removes entries" do
@@ -365,6 +407,25 @@ defmodule RunicSandboxTest do
     assert {:ok, status} = RunicSandbox.status(server: reap_name)
     assert status.sandboxes.local_code.sessions == []
 
+    stale_name = :"runic_sandbox_stale_warm_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: stale_name,
+       sandboxes: [
+         local_code: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           pool: [warm: 1, max: 1, idle_ttl_ms: 0],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, status} = RunicSandbox.status(server: stale_name)
+    assert status.sandboxes.local_code.pool_status.stale == 1
+    assert [%{readiness: :stale}] = status.sandboxes.local_code.sessions
+
     reaper_name = :"runic_sandbox_reaper_pool_#{System.unique_integer([:positive])}"
 
     start_supervised!(
@@ -384,6 +445,36 @@ defmodule RunicSandboxTest do
     assert :ok = RunicSandbox.release_session(session, server: reaper_name)
     assert map_size(:sys.get_state(reaper_name).sessions) == 1
     assert wait_until(fn -> :sys.get_state(reaper_name).sessions == %{} end)
+  end
+
+  test "execution-role pool resets on checkin instead of reusing unsafe state" do
+    name = :"runic_sandbox_execution_pool_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {RunicSandbox,
+       name: name,
+       sandboxes: [
+         execution: [
+           backend: :just_bash,
+           runtimes: [:bash],
+           metadata: %{role: :execution},
+           pool: [warm: 0, max: 1, reset_on_checkin?: true],
+           network: :disabled
+         ]
+       ]}
+    )
+
+    assert {:ok, first} = RunicSandbox.acquire_session(:execution, [], server: name)
+    assert :ok = RunicSandbox.release_session(first, server: name)
+    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert status.sandboxes.execution.metadata.role == :execution
+    assert [%{lifecycle: :idle, readiness: :ready} = reset] = status.sandboxes.execution.sessions
+    refute reset.id == first.id
+
+    assert {:ok, second} = RunicSandbox.acquire_session(:execution, [], server: name)
+    assert second.id == reset.id
+    refute second.id == first.id
+    assert :ok = RunicSandbox.release_session(second, server: name)
   end
 
   test "manager monitors checked-out session owners and frees abandoned capacity" do
@@ -457,6 +548,72 @@ defmodule RunicSandboxTest do
     assert Enum.uniq(sprites) == sprites
   end
 
+  test "agent CLI consumer profiles keep model credentials behind host proxies" do
+    assert {:agent_cli_dev, dev_config} =
+             ConsumerProfiles.agent_cli_dev(mcp_port: 4000, model_proxy_port: 4100)
+
+    assert {:agent_cli_execution, execution_config} =
+             ConsumerProfiles.agent_cli_execution(mcp_port: 4000, model_proxy_port: 4100)
+
+    assert [{:agent_cli_dev, pair_dev_config}, {:agent_cli_execution, pair_execution_config}] =
+             ConsumerProfiles.agent_cli_pair(
+               mcp_port: 5000,
+               execution: [model_proxy_port: 5100]
+             )
+
+    assert {:ok, dev_profile} = Profile.from_named_config(:agent_cli_dev, dev_config)
+
+    assert {:ok, execution_profile} =
+             Profile.from_named_config(:agent_cli_execution, execution_config)
+
+    assert {:ok, pair_dev_profile} = Profile.from_named_config(:agent_cli_dev, pair_dev_config)
+
+    assert {:ok, pair_execution_profile} =
+             Profile.from_named_config(:agent_cli_execution, pair_execution_config)
+
+    assert dev_profile.backend == :docker
+    assert dev_profile.stateful?
+    assert dev_profile.workspace.persist?
+    assert dev_profile.pool.warm == 1
+    assert dev_profile.pool.max == 2
+    assert dev_profile.pool.checkpoint_on_checkout?
+    refute dev_profile.pool.reset_on_checkin?
+
+    assert execution_profile.pool.max == 4
+    assert execution_profile.pool.reset_on_checkin?
+    refute execution_profile.pool.checkpoint_on_checkout?
+
+    assert dev_profile.backend_options.image == "runic-ai/sandbox-agent-cli:latest"
+
+    assert dev_profile.backend_options.environment == %{
+             "RUNIC_MCP_URL" => "http://host.docker.internal:4000",
+             "RUNIC_MODEL_PROXY_URL" => "http://host.docker.internal:4100"
+           }
+
+    assert pair_dev_profile.backend_options.environment["RUNIC_MCP_URL"] ==
+             "http://host.docker.internal:5000"
+
+    assert pair_execution_profile.backend_options.environment["RUNIC_MODEL_PROXY_URL"] ==
+             "http://host.docker.internal:5100"
+
+    refute Map.has_key?(dev_profile.backend_options.environment, "ANTHROPIC_API_KEY")
+    refute Map.has_key?(dev_profile.backend_options.environment, "OPENAI_API_KEY")
+
+    assert RunicSandbox.Policy.egress_allowlist(dev_profile.policy) == [
+             %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: "mcp"},
+             %{scheme: "http", host: "host.docker.internal", port: 4100, purpose: "model"}
+           ]
+
+    assert RunicSandbox.Policy.mcp_boundary(dev_profile.policy) == %{
+             transport: "egress_allowlist",
+             purpose: "mcp"
+           }
+
+    refute dev_profile.policy.metadata.internet_egress?
+    assert dev_profile.metadata.credential_boundary == :host_proxy
+    assert dev_profile.metadata.agent_home == "/opt/runic-ai/agents"
+  end
+
   test "libbit-like workspace isolation contract uses sandbox primitives only" do
     workspace_id = "workspace-123"
     workflow_run_id = "workflow-run-123"
@@ -492,6 +649,8 @@ defmodule RunicSandboxTest do
     assert {:ok, checkpoint} = Backend.checkpoint(FakeBackend, session, checkpoint_spec, [])
 
     assert checkpoint.session_id == session.id
+    assert Checkpoint.kind(checkpoint) == :microvm_snapshot
+    assert Checkpoint.preserves?(checkpoint, :process_memory)
 
     assert {:ok, result} =
              Backend.exec_session(
@@ -723,6 +882,12 @@ defmodule RunicSandboxTest do
                    stdin_supported?: true,
                    stdin_close_supported?: true,
                    stderr_separate?: true,
+                   state_tier: :persistent_process_host,
+                   process_host?: true,
+                   workspace_persistent?: true,
+                   live_process_stream?: true,
+                   service_host?: false,
+                   snapshot_modes: [:microvm_snapshot],
                    provider_transport: :test
                  )
              )
@@ -740,6 +905,12 @@ defmodule RunicSandboxTest do
     refute Capabilities.mcp_boundary_supported?(capabilities)
     refute Capabilities.restricted_egress_supported?(capabilities)
     refute Capabilities.pty_supported?(capabilities)
+    assert Capabilities.state_tier(capabilities) == :persistent_process_host
+    assert Capabilities.process_host?(capabilities)
+    assert Capabilities.workspace_persistent?(capabilities)
+    assert Capabilities.live_process_stream?(capabilities)
+    refute Capabilities.service_host?(capabilities)
+    assert Capabilities.snapshot_modes(capabilities) == [:microvm_snapshot]
 
     terminal_capabilities =
       Capabilities.one_shot_exec(
@@ -752,6 +923,12 @@ defmodule RunicSandboxTest do
     assert Capabilities.terminal_result_adapter?(terminal_capabilities)
     refute Capabilities.streaming_live?(terminal_capabilities)
     refute Capabilities.stdin_supported?(terminal_capabilities)
+    assert Capabilities.state_tier(terminal_capabilities) == :one_shot_exec
+    refute Capabilities.process_host?(terminal_capabilities)
+    refute Capabilities.workspace_persistent?(terminal_capabilities)
+    refute Capabilities.live_process_stream?(terminal_capabilities)
+    refute Capabilities.service_host?(terminal_capabilities)
+    assert Capabilities.snapshot_modes(terminal_capabilities) == []
 
     assert Capabilities.attach_mode(%{streaming?: false, metadata: %{}}) == :none
 
@@ -759,6 +936,16 @@ defmodule RunicSandboxTest do
              Capabilities.new(exec?: true, metadata: %{attach_mode: :made_up})
 
     assert error.message == "invalid sandbox attach capability mode"
+
+    assert {:error, error} =
+             Capabilities.new(exec?: true, metadata: %{state_tier: :made_up})
+
+    assert error.message == "invalid sandbox lifecycle state tier"
+
+    assert {:error, error} =
+             Capabilities.new(exec?: true, metadata: %{snapshot_modes: [:filesystem, :made_up]})
+
+    assert error.message == "invalid sandbox snapshot capability mode"
 
     assert {:ok, session} =
              Session.new(
@@ -791,6 +978,21 @@ defmodule RunicSandboxTest do
              )
 
     assert checkpoint.backend == :docker
+
+    assert Checkpoint.kinds() == [
+             :filesystem,
+             :microvm_snapshot,
+             :memory_snapshot,
+             :provider_checkpoint,
+             :suspended_session
+           ]
+
+    assert Checkpoint.kind(checkpoint) == nil
+    assert Checkpoint.preserves(:filesystem).filesystem
+    refute Checkpoint.preserves(:filesystem).process_memory
+    assert Checkpoint.preserves(:provider_checkpoint).running_service_state == :provider_dependent
+    assert Checkpoint.support_matrix().microvm_snapshot.running_processes
+
     assert {:ok, service} = Service.new(id: "svc", session_id: session.id, name: "web")
     assert service.status == :starting
 
@@ -841,6 +1043,25 @@ defmodule RunicSandboxTest do
 
     assert handle.status == :open
     assert Enum.to_list(AttachHandle.events(handle)) == [stdout_event]
+
+    assert {:ok, process} =
+             ProcessHandle.new(
+               id: "process",
+               session_id: session.id,
+               backend: session.backend,
+               status: "running",
+               command: ["sleep", "60"],
+               events: [stdout_event]
+             )
+
+    assert process.status == :running
+    assert Enum.to_list(ProcessHandle.events(process)) == [stdout_event]
+
+    assert {:ok, process_status} =
+             ProcessStatus.from_handle(process, status: "exited", exit_status: 0)
+
+    assert process_status.status == :exited
+    assert process_status.exit_status == 0
 
     assert {:error, error} = Capabilities.new(exec?: :yes)
     assert error.message =~ "exec?"
@@ -1019,6 +1240,35 @@ defmodule RunicSandboxTest do
     assert :ok = Backend.write_stdin(FakeBackend, handle, "hello\n", [])
     assert :ok = Backend.close_attach(FakeBackend, handle, [])
 
+    assert {:ok, process} =
+             Backend.start_process(
+               FakeBackend,
+               session,
+               ExecutionRequest.new!(sandbox: :local_code, runtime: :bash, source: "process-ok"),
+               []
+             )
+
+    assert %ProcessHandle{id: "process-1", backend: :docker, status: :running} = process
+    assert [:process_started, :stdout_chunk] = process.events |> Enum.map(& &1.type)
+
+    assert {:ok, [status]} = Backend.list_processes(FakeBackend, session, [])
+    assert %ProcessStatus{id: "process-1", status: :running} = status
+
+    assert {:ok, status} = Backend.process_status(FakeBackend, session, process, [])
+    assert status.id == process.id
+    assert status.status == :running
+
+    assert {:ok, events} = Backend.process_events(FakeBackend, process, [])
+    assert [:process_started, :stdout_chunk] = events |> Enum.map(& &1.type)
+
+    assert :ok = Backend.write_process_stdin(FakeBackend, process, "input\n", [])
+    assert :ok = Backend.close_process_stdin(FakeBackend, process, [])
+    assert :ok = Backend.signal_process(FakeBackend, process, :term, [])
+    assert :ok = Backend.kill_process(FakeBackend, process, [])
+    assert {:ok, waited} = Backend.wait_process(FakeBackend, process, [])
+    assert waited.status == :exited
+    assert waited.exit_status == 0
+
     assert {:ok, checkpoint} = Backend.checkpoint(FakeBackend, session, [], [])
     assert checkpoint.session_id == session.id
     assert {:ok, ^session} = Backend.restore(FakeBackend, session, checkpoint, [])
@@ -1053,6 +1303,15 @@ defmodule RunicSandboxTest do
 
     assert error.message == "sandbox backend does not support attach_session"
     assert error.details.operation == :attach_session
+
+    assert {:error, error} = Backend.start_process(NoAttachBackend, session, request, [])
+    assert error.message == "sandbox backend does not support start_process"
+    assert error.details.operation == :start_process
+
+    assert {:error, error} =
+             RunicSandbox.start_process(session, runtime: :bash, source: "sleep 1")
+
+    assert error.message == "sandbox session does not support process hosting"
 
     assert :ok = RunicSandbox.close_session(session)
   end
@@ -1096,7 +1355,7 @@ defmodule RunicSandboxTest do
     assert error.message == "sandbox restricted egress allow-list is not supported by backend"
   end
 
-  test "docker accepts egress allow-list and MCP egress-boundary policy shape" do
+  test "docker accepts egress allow-list and MCP/model egress-boundary policy shape" do
     assert {:ok, profile} =
              Profile.new(
                name: :local_code,
@@ -1104,7 +1363,8 @@ defmodule RunicSandboxTest do
                runtimes: [:bash],
                network: :restricted,
                egress_allowlist: [
-                 %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: :mcp}
+                 %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: :mcp},
+                 %{scheme: "http", host: "host.docker.internal", port: 4100, purpose: :model}
                ],
                mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp}
              )
@@ -1114,7 +1374,8 @@ defmodule RunicSandboxTest do
     assert RunicSandbox.Policy.mcp_boundary_requested?(profile.policy)
 
     assert RunicSandbox.Policy.egress_allowlist(profile.policy) == [
-             %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: "mcp"}
+             %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: "mcp"},
+             %{scheme: "http", host: "host.docker.internal", port: 4100, purpose: "model"}
            ]
 
     request =
@@ -1359,6 +1620,61 @@ defmodule RunicSandboxTest do
 
       assert Capabilities.terminal_result_adapter?(health.capabilities) ==
                (expected_attach_mode == :terminal_adapter)
+
+      expected_lifecycle =
+        case profile.backend do
+          backend when backend in [:just_bash, :lua] ->
+            %{
+              state_tier: :one_shot_exec,
+              process_host?: false,
+              workspace_persistent?: false,
+              live_process_stream?: false,
+              service_host?: false,
+              snapshot_modes: []
+            }
+
+          backend when backend in [:docker, :gvisor] ->
+            %{
+              state_tier: :one_shot_exec,
+              process_host?: false,
+              workspace_persistent?: false,
+              live_process_stream?: true,
+              service_host?: false,
+              snapshot_modes: []
+            }
+
+          :vmsan ->
+            %{
+              state_tier: :persistent_process_host,
+              process_host?: true,
+              workspace_persistent?: true,
+              live_process_stream?: true,
+              service_host?: false,
+              snapshot_modes: [:microvm_snapshot]
+            }
+
+          :remote ->
+            %{
+              state_tier: :persistent_workspace,
+              process_host?: false,
+              workspace_persistent?: true,
+              live_process_stream?: false,
+              service_host?: false,
+              snapshot_modes: []
+            }
+        end
+
+      assert Capabilities.state_tier(health.capabilities) == expected_lifecycle.state_tier
+      assert Capabilities.process_host?(health.capabilities) == expected_lifecycle.process_host?
+
+      assert Capabilities.workspace_persistent?(health.capabilities) ==
+               expected_lifecycle.workspace_persistent?
+
+      assert Capabilities.live_process_stream?(health.capabilities) ==
+               expected_lifecycle.live_process_stream?
+
+      assert Capabilities.service_host?(health.capabilities) == expected_lifecycle.service_host?
+      assert Capabilities.snapshot_modes(health.capabilities) == expected_lifecycle.snapshot_modes
     end
   end
 
@@ -1447,6 +1763,15 @@ defmodule RunicSandboxTest do
     assert %{message: "fly or flyctl executable is unavailable"} in health.diagnostics
 
     assert %{requirement: :auth, message: "Remote provider credentials are required"} in health.missing_requirements
+
+    assert health.capabilities.metadata.provider_api_capabilities == %{
+             exec?: true,
+             ps?: true,
+             signal?: true,
+             suspend?: true,
+             live_process_contract?: false,
+             reason: :fly_machines_api_client_not_implemented
+           }
   end
 
   test "remote backend does not expose provider config through status or snapshot" do
@@ -1607,6 +1932,12 @@ defmodule RunicSandboxTest do
       assert session.state_model == :persistent_workspace
       assert session.capabilities.session_files?
       assert session.capabilities.checkpoints?
+      assert Capabilities.state_tier(session.capabilities) == :persistent_process_host
+      assert Capabilities.workspace_persistent?(session.capabilities)
+      assert Capabilities.process_host?(session.capabilities)
+      assert Capabilities.live_process_stream?(session.capabilities)
+      assert Capabilities.snapshot_modes(session.capabilities) == [:filesystem]
+      assert is_binary(session.metadata.container_name)
 
       assert {:ok, ref} = RunicSandbox.write_file(session, "input.txt", "alpha")
       assert ref.path == "input.txt"
@@ -1620,13 +1951,32 @@ defmodule RunicSandboxTest do
 
       assert result.status == :pass
       assert result.stdout == "done"
+      assert result.metadata.container_name == session.metadata.container_name
       assert {:ok, "alpha"} = RunicSandbox.read_file(session, "output.txt")
+
+      assert {:ok, process} =
+               RunicSandbox.start_process(session,
+                 runtime: :bash,
+                 source: "read line; printf \"$line\" > process.txt"
+               )
+
+      assert process.status == :running
+      assert :ok = RunicSandbox.write_process_stdin(process, "from-process\n")
+      assert {:ok, process_events} = RunicSandbox.process_events(process)
+      assert [:process_started, :process_finished] = Enum.map(process_events, & &1.type)
+      assert {:ok, "from-process"} = RunicSandbox.read_file(session, "process.txt")
+
       assert {:ok, files} = RunicSandbox.list_files(session)
       assert Enum.any?(files, &(&1.path == "input.txt"))
       assert Enum.any?(files, &(&1.path == "output.txt"))
+      assert Enum.any?(files, &(&1.path == "process.txt"))
 
       assert {:ok, checkpoint} = RunicSandbox.checkpoint(session, id: "phase2")
       assert checkpoint.metadata.kind == :filesystem
+      assert checkpoint.metadata.preserves.filesystem
+      refute checkpoint.metadata.preserves.process_memory
+      refute checkpoint.metadata.preserves.running_service_state
+      assert hd(checkpoint.metadata.caveats) =~ "files only"
       assert checkpoint.metadata.authority.version == 1
       assert {:ok, _ref} = RunicSandbox.write_file(session, "input.txt", "beta")
       assert {:ok, "beta"} = RunicSandbox.read_file(session, "input.txt")
@@ -1638,6 +1988,182 @@ defmodule RunicSandboxTest do
       assert :ok = RunicSandbox.close_session(restored)
       assert {:error, error} = RunicSandbox.exec(restored, runtime: :bash, source: "echo no")
       assert error.message == "sandbox session authority is not active"
+    end
+  end
+
+  test "managed docker warm pool reuses and cleans persistent containers" do
+    if docker_image_available?() do
+      name = :"runic_sandbox_docker_warm_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {RunicSandbox,
+         name: name,
+         sandboxes: [
+           local_code: [
+             backend: :docker,
+             runtimes: [:bash],
+             network: :disabled,
+             image: "runic-ai/sandbox:elixir-python-node",
+             pool: [warm: 1, max: 1, idle_ttl_ms: :infinity]
+           ]
+         ]}
+      )
+
+      assert {:ok, first} = RunicSandbox.acquire_session(:local_code, [], server: name)
+      container_name = first.metadata.container_name
+      assert docker_container_exists?(container_name)
+
+      assert {:ok, process} =
+               RunicSandbox.start_process(
+                 first,
+                 [runtime: :bash, source: "printf ready; sleep 30"],
+                 server: name
+               )
+
+      assert {:ok, events} = RunicSandbox.process_events(process)
+      assert [:process_started, :stdout_chunk] = events |> Enum.take(2) |> Enum.map(& &1.type)
+
+      assert {:error, error} = RunicSandbox.release_session(first, server: name)
+      assert error.message == "sandbox session has active processes"
+      assert :ok = RunicSandbox.kill_process(process, server: name)
+
+      assert :ok = RunicSandbox.release_session(first, server: name)
+      assert {:ok, second} = RunicSandbox.acquire_session(:local_code, [], server: name)
+      assert second.id == first.id
+      assert second.metadata.container_name == container_name
+
+      assert :ok = RunicSandbox.close_session(second, server: name)
+      refute docker_container_exists?(container_name)
+    end
+  end
+
+  test "docker restricted session close removes egress resources" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :restricted,
+                 egress_allowlist: [
+                   %{scheme: "http", host: "host.docker.internal", port: 4000, purpose: :mcp}
+                 ],
+                 mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp},
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+      container_name = session.metadata.container_name
+      network_name = session.metadata.network.network
+      proxy_name = session.metadata.network.proxy_container
+
+      assert docker_container_exists?(container_name)
+      assert docker_container_exists?(proxy_name)
+      assert docker_network_exists?(network_name)
+
+      assert :ok = RunicSandbox.close_session(session)
+      refute docker_container_exists?(container_name)
+      refute docker_container_exists?(proxy_name)
+      refute docker_network_exists?(network_name)
+    end
+  end
+
+  test "managed docker owner death and manager termination clean containers" do
+    if docker_image_available?() do
+      name = :"runic_sandbox_docker_owner_#{System.unique_integer([:positive])}"
+      parent = self()
+
+      start_supervised!(
+        {RunicSandbox,
+         name: name,
+         sandboxes: [
+           local_code: [
+             backend: :docker,
+             runtimes: [:bash],
+             network: :disabled,
+             image: "runic-ai/sandbox:elixir-python-node",
+             pool: [warm: 0, max: 1]
+           ]
+         ]}
+      )
+
+      owner =
+        spawn(fn ->
+          {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+          send(parent, {:docker_owner_session, session.metadata.container_name})
+        end)
+
+      assert_receive {:docker_owner_session, owner_container}, 5_000
+      ref = Process.monitor(owner)
+      assert_receive {:DOWN, ^ref, :process, ^owner, _reason}
+      assert wait_until(fn -> not docker_container_exists?(owner_container) end, 2_000)
+
+      assert {:ok, session} = RunicSandbox.acquire_session(:local_code, [], server: name)
+      manager_container = session.metadata.container_name
+      assert docker_container_exists?(manager_container)
+
+      assert :ok = RunicSandbox.release_session(session, server: name)
+      assert :ok = stop_supervised(name)
+      assert wait_until(fn -> not docker_container_exists?(manager_container) end, 2_000)
+    end
+  end
+
+  test "docker services expose explicit localhost proxies and clean up" do
+    if docker_image_available?() do
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
+
+      assert {:ok, session} = RunicSandbox.open_session(:local_code, [], profile: profile)
+      assert {:ok, _ref} = RunicSandbox.write_file(session, "index.html", "hello-service")
+
+      assert {:ok, service} =
+               RunicSandbox.start_service(session,
+                 name: "web",
+                 cmd: "python3",
+                 args: ["-m", "http.server", "8765", "--bind", "127.0.0.1"],
+                 port: 8765,
+                 readiness: [type: :http, port: 8765, path: "/"]
+               )
+
+      assert service.status == :running
+      assert [%{port: 8765}] = service.ports
+
+      assert {:ok, [listed]} = RunicSandbox.list_services(session)
+      assert listed.id == service.id
+      assert listed.status == :running
+
+      assert {:ok, proxy} = RunicSandbox.open_proxy(session, service)
+      assert proxy.url =~ "http://127.0.0.1:"
+      assert {:ok, 200, body} = host_http_get(proxy.url)
+      assert body =~ "hello-service"
+
+      assert :ok = RunicSandbox.stop_service(session, service)
+      assert wait_until(fn -> match?({:error, _reason}, host_http_get(proxy.url)) end, 2_000)
+      assert :ok = RunicSandbox.close_proxy(proxy)
+
+      assert {:ok, replacement} =
+               RunicSandbox.start_service(session,
+                 name: "web2",
+                 cmd: "python3",
+                 args: ["-m", "http.server", "8766", "--bind", "127.0.0.1"],
+                 port: 8766,
+                 readiness: [type: :http, port: 8766, path: "/"]
+               )
+
+      assert {:ok, close_proxy} = RunicSandbox.open_proxy(session, replacement)
+      assert {:ok, 200, _body} = host_http_get(close_proxy.url)
+      assert :ok = RunicSandbox.close_session(session)
+
+      assert wait_until(
+               fn -> match?({:error, _reason}, host_http_get(close_proxy.url)) end,
+               2_000
+             )
     end
   end
 
@@ -1841,10 +2367,12 @@ defmodule RunicSandboxTest do
     end
   end
 
-  test "docker restricted egress reaches only allow-listed host MCP port" do
+  test "docker restricted egress reaches only allow-listed host MCP and model ports" do
     if docker_image_available?() do
       {:ok, server} = start_mcp_http_server("mcp-ok")
       {:ok, port} = :inet.port(server)
+      {:ok, model_server} = start_mcp_http_server("model-ok")
+      {:ok, model_port} = :inet.port(model_server)
       {:ok, denied_server} = start_mcp_http_server("should-not-be-reachable")
       {:ok, denied_port} = :inet.port(denied_server)
 
@@ -1855,7 +2383,13 @@ defmodule RunicSandboxTest do
                  runtimes: [:python],
                  network: :restricted,
                  egress_allowlist: [
-                   %{scheme: "http", host: "host.docker.internal", port: port, purpose: :mcp}
+                   %{scheme: "http", host: "host.docker.internal", port: port, purpose: :mcp},
+                   %{
+                     scheme: "http",
+                     host: "host.docker.internal",
+                     port: model_port,
+                     purpose: :model
+                   }
                  ],
                  mcp_boundary: %{transport: :egress_allowlist, purpose: :mcp},
                  image: "runic-ai/sandbox:elixir-python-node"
@@ -1866,6 +2400,9 @@ defmodule RunicSandboxTest do
 
       allowed = urllib.request.urlopen("http://host.docker.internal:#{port}", timeout=5).read().decode()
       print("allowed=" + allowed)
+
+      model = urllib.request.urlopen("http://host.docker.internal:#{model_port}", timeout=5).read().decode()
+      print("model=" + model)
 
       try:
           urllib.request.urlopen("https://example.com", timeout=3).read()
@@ -1890,6 +2427,7 @@ defmodule RunicSandboxTest do
 
       assert result.status == :pass
       assert result.stdout =~ "allowed=mcp-ok"
+      assert result.stdout =~ "model=model-ok"
       assert result.stdout =~ "public_denied=ok"
       assert result.stdout =~ "host_port_denied=ok"
       assert result.metadata.effective_network.restricted_egress?
@@ -1947,6 +2485,9 @@ defmodule RunicSandboxTest do
     assert VmsanCLI.command(["create"], executable: "vmsan", sudo?: true, path: "/bin") ==
              {"sudo", ["-n", "env", "PATH=/bin", "vmsan", "--json", "create"]}
 
+    assert VmsanCLI.command(["exec", "vm-1"], executable: "/usr/bin/vmsan", json?: false) ==
+             {"/usr/bin/vmsan", ["exec", "vm-1"]}
+
     assert VmsanCLI.create_args(
              vcpus: 2,
              memory: 512,
@@ -1969,6 +2510,16 @@ defmodule RunicSandboxTest do
 
     assert VmsanCLI.exec_args("vm-1", ["sh", "-lc", "echo ok"], workdir: "/workspace") ==
              ["exec", "--workdir", "/workspace", "vm-1", "--", "sh", "-lc", "echo ok"]
+
+    assert VmsanCLI.exec_interactive_args("vm-1", ["sh"], workdir: "/workspace") == [
+             "exec",
+             "--interactive",
+             "--workdir",
+             "/workspace",
+             "vm-1",
+             "--",
+             "sh"
+           ]
 
     runner = fn "vmsan", ["--json", "exec", "vm-1", "echo", "ok"], _opts ->
       {"ok\n{\"path\":\"exec\",\"vmId\":\"vm-1\"}\n", 0}
@@ -2122,6 +2673,30 @@ defmodule RunicSandboxTest do
         send(agent_pid, :vmsan_exec)
         {"hello\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
 
+      "/usr/bin/vmsan",
+      ["--json", "exec", "vm-a", "--", "sh", "-lc", "ps -eo pid=,stat=,comm= 2>/dev/null || true"],
+      _opts ->
+        send(agent_pid, :vmsan_ps)
+        {"222 S sh\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
+
+      "/usr/bin/vmsan",
+      ["--json", "exec", "vm-a", "--", "sh", "-lc", "cat " <> _pidfile],
+      _opts ->
+        send(agent_pid, :vmsan_pidfile)
+        {"222\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
+
+      "/usr/bin/vmsan",
+      ["--json", "exec", "vm-a", "--", "sh", "-lc", "ps -p '222' " <> _rest],
+      _opts ->
+        send(agent_pid, :vmsan_ps_pid)
+        {"222 S sh\n" <> Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
+
+      "/usr/bin/vmsan",
+      ["--json", "exec", "vm-a", "--", "sh", "-lc", "kill -s 'TERM' '222'"],
+      _opts ->
+        send(agent_pid, :vmsan_kill)
+        {Jason.encode!(%{"path" => "exec", "vmId" => "vm-a"}) <> "\n", 0}
+
       "sudo",
       ["-n", "env", "PATH=" <> _path, "/usr/bin/vmsan", "--json", "snapshot", "create", "vm-a"],
       _opts ->
@@ -2139,8 +2714,22 @@ defmodule RunicSandboxTest do
         send(agent_pid, {:vmsan_remove, :sudo})
         {Jason.encode!(%{"path" => "remove", "vmId" => "vm-a"}), 0}
 
-      _command, _args, _opts ->
+      command, args, _opts ->
+        send(agent_pid, {:vmsan_unmatched, command, args})
         {"", 1}
+    end
+
+    port_open = fn args, opts ->
+      send(agent_pid, {:vmsan_process_port, args, Keyword.take(opts, [:executable, :sudo?])})
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("sh")}, [
+          :binary,
+          :exit_status,
+          args: ["-c", "printf process-live"]
+        ])
+
+      {:ok, port}
     end
 
     assert {:ok, profile} =
@@ -2204,6 +2793,72 @@ defmodule RunicSandboxTest do
     assert_receive {:vmsan_upload, _local_path}
     assert_receive :vmsan_exec
 
+    assert Capabilities.process_host?(session.capabilities)
+    assert Capabilities.live_process_stream?(session.capabilities)
+
+    assert {:ok, process} =
+             RunicSandbox.start_process(
+               session,
+               [
+                 runtime: :bash,
+                 source: "printf process-live",
+                 timeout_ms: 1_234
+               ],
+               commands: commands,
+               runner: commands,
+               port_open: port_open
+             )
+
+    assert process.metadata.provider_transport == :vmsan_cli
+    assert process.metadata.streaming_live?
+    assert_receive {:vmsan_process_port, process_args, process_opts}
+    assert "exec" in process_args
+    assert "--interactive" in process_args
+    assert Map.new(process_opts) == %{executable: "/usr/bin/vmsan", sudo?: false}
+
+    assert {:ok, process_event_stream} = RunicSandbox.process_events(process)
+    process_events = Enum.to_list(process_event_stream)
+
+    assert [:process_started, :stdout_chunk, :process_finished] =
+             Enum.map(process_events, & &1.type)
+
+    assert Enum.any?(process_events, &(&1.payload[:chunk] == "process-live"))
+
+    assert {:ok, waited_process} =
+             RunicSandbox.start_process(
+               session,
+               [
+                 runtime: :bash,
+                 source: "printf process-live"
+               ],
+               commands: commands,
+               runner: commands,
+               port_open: port_open
+             )
+
+    assert_receive {:vmsan_process_port, _wait_args, _wait_opts}
+    assert {:ok, waited} = RunicSandbox.wait_process(waited_process)
+    assert waited.status == :exited
+    assert waited.exit_status == 0
+
+    assert {:ok, [listed_process]} =
+             RunicSandbox.list_processes(session, commands: commands, runner: commands)
+
+    assert listed_process.pid == 222
+    assert listed_process.status == :running
+    assert_receive :vmsan_ps
+
+    assert {:ok, status} =
+             RunicSandbox.process_status(session, process, commands: commands, runner: commands)
+
+    assert status.status == :running
+    assert_receive :vmsan_pidfile
+    assert_receive :vmsan_ps_pid
+
+    assert :ok = RunicSandbox.kill_process(process, commands: commands, runner: commands)
+    assert_receive :vmsan_pidfile
+    assert_receive :vmsan_kill
+
     assert {:error, escape_error} =
              RunicSandbox.exec(
                session,
@@ -2237,6 +2892,10 @@ defmodule RunicSandboxTest do
              RunicSandbox.checkpoint(session, %{}, commands: commands, runner: commands)
 
     assert checkpoint.id == "snap-a"
+    assert checkpoint.metadata.kind == :microvm_snapshot
+    assert checkpoint.metadata.preserves.process_memory
+    assert checkpoint.metadata.preserves.running_processes
+    refute checkpoint.metadata.preserves.tcp_connections
     assert_receive {:vmsan_snapshot, :sudo}
 
     assert :ok = RunicSandbox.close_session(session, commands: commands, runner: commands)
@@ -2381,6 +3040,43 @@ defmodule RunicSandboxTest do
            body: Jason.encode!(%{stdout: "sprite-ok\n", stderr: "", exit_code: 0})
          }}
 
+      :get, _config, "/v1/sprites/runic-test-sprite/exec", %{}, "", _opts ->
+        send(parent, {:sprites_request, :exec_list})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             Jason.encode!([
+               %{
+                 id: "exec-1",
+                 command: "sh -lc sleep",
+                 is_active: true,
+                 tty: false,
+                 created: "2026-05-31T00:00:00Z"
+               }
+             ])
+         }}
+
+      :post,
+      _config,
+      "/v1/sprites/runic-test-sprite/exec/exec-1/kill",
+      %{signal: "SIGTERM"},
+      "",
+      _opts ->
+        send(parent, {:sprites_request, :exec_kill})
+
+        {:ok,
+         %{
+           status: 200,
+           body:
+             [
+               Jason.encode!(%{type: "signal", pid: 42, signal: "SIGTERM"}),
+               Jason.encode!(%{type: "complete", exit_code: 0})
+             ]
+             |> Enum.join("\n")
+         }}
+
       :get, _config, "/v1/sprites/runic-test-sprite/fs/read", query, "", _opts ->
         send(parent, {:sprites_request, :read, query})
         {:ok, %{status: 200, body: "sprite-file"}}
@@ -2454,6 +3150,28 @@ defmodule RunicSandboxTest do
       _name -> nil
     end
 
+    websocket_open = fn config, url, query, opts ->
+      send(parent, {:sprites_websocket, config, url, query, Keyword.get(opts, :headers)})
+
+      {:ok,
+       %{
+         session_id: "exec-1",
+         events: [<<1, "process-live">>, <<3, 0>>],
+         stdin: fn input ->
+           send(parent, {:sprites_stdin, input})
+           :ok
+         end,
+         stdin_eof: fn ->
+           send(parent, :sprites_stdin_eof)
+           :ok
+         end,
+         closer: fn ->
+           send(parent, :sprites_process_close)
+           :ok
+         end
+       }}
+    end
+
     assert {:ok, profile} =
              Profile.new(
                name: :sprites_code,
@@ -2472,10 +3190,18 @@ defmodule RunicSandboxTest do
     assert health.available?
     assert health.token_env == "SPRITES_TOKEN"
     assert health.token_value == :redacted
+    assert health.process_transport.native == :sprites_websocket_exec
+    assert health.process_transport.default_adapter == :websocat
     assert capabilities.session_files?
     assert capabilities.checkpoints?
     assert capabilities.services?
     assert capabilities.proxy?
+    assert Capabilities.state_tier(capabilities) == :service_actor
+    assert Capabilities.workspace_persistent?(capabilities)
+    assert Capabilities.service_host?(capabilities)
+    assert Capabilities.process_host?(capabilities)
+    assert Capabilities.live_process_stream?(capabilities)
+    assert Capabilities.snapshot_modes(capabilities) == [:provider_checkpoint]
     refute inspect(status) =~ "secret-token"
 
     assert {:ok, session} =
@@ -2491,6 +3217,10 @@ defmodule RunicSandboxTest do
     assert session.metadata.token_env == "SPRITES_TOKEN"
     assert session.metadata.default_cwd == "/home/sprite"
     assert Capabilities.default_cwd(session.capabilities) == "/home/sprite"
+    assert Capabilities.state_tier(session.capabilities) == :service_actor
+    assert Capabilities.service_host?(session.capabilities)
+    assert Capabilities.process_host?(session.capabilities)
+    assert Capabilities.live_process_stream?(session.capabilities)
     refute inspect(session) =~ "secret-token"
     assert_receive {:sprites_request, :create, %{"name" => "runic-test-sprite"}, headers}
     assert inspect(headers) =~ "secret-token"
@@ -2540,6 +3270,68 @@ defmodule RunicSandboxTest do
 
     assert_receive {:sprites_request, :exec, %{cmd: ["sh", "-lc", "cat in.txt"]}, ""}
 
+    assert {:ok, process} =
+             RunicSandbox.start_process(
+               session,
+               [runtime: :bash, source: "printf process-live"],
+               env: env,
+               websocket_open: websocket_open
+             )
+
+    assert process.id == "exec-1"
+    assert process.metadata.provider_transport == :sprites_websocket_exec
+    assert process.metadata.streaming_live?
+
+    assert_receive {:sprites_websocket, %{api_url: "https://api.sprites.dev"},
+                    "wss://api.sprites.dev/v1/sprites/runic-test-sprite/exec" <> _query_string,
+                    %{cmd: ["sh", "-lc", "printf process-live"], stdin: true}, websocket_headers}
+
+    assert inspect(websocket_headers) =~ "secret-token"
+
+    assert :ok = RunicSandbox.write_process_stdin(process, "hello\n")
+    assert_receive {:sprites_stdin, "hello\n"}
+    assert :ok = RunicSandbox.close_process_stdin(process)
+    assert_receive :sprites_stdin_eof
+
+    assert {:ok, process_event_stream} = RunicSandbox.process_events(process)
+    process_events = Enum.to_list(process_event_stream)
+
+    assert [:process_started, :stdout_chunk, :process_finished] =
+             Enum.map(process_events, & &1.type)
+
+    assert Enum.any?(process_events, &(&1.payload[:chunk] == "process-live"))
+
+    assert {:ok, [listed_process]} =
+             RunicSandbox.list_processes(session, env: env, requester: requester)
+
+    assert listed_process.id == "exec-1"
+    assert listed_process.status == :running
+    assert_receive {:sprites_request, :exec_list}
+
+    assert {:ok, status} =
+             RunicSandbox.process_status(session, process, env: env, requester: requester)
+
+    assert status.id == "exec-1"
+    assert status.status == :running
+    assert_receive {:sprites_request, :exec_list}
+
+    assert {:ok, waited_process} =
+             RunicSandbox.start_process(
+               session,
+               [runtime: :bash, source: "printf process-live"],
+               env: env,
+               websocket_open: websocket_open
+             )
+
+    assert_receive {:sprites_websocket, _config, _url, _query, _headers}
+    assert {:ok, waited} = RunicSandbox.wait_process(waited_process)
+    assert waited.status == :exited
+    assert waited.exit_status == 0
+
+    assert :ok = RunicSandbox.kill_process(process, env: env, requester: requester)
+    assert_receive {:sprites_request, :exec_kill}
+    assert_receive :sprites_process_close
+
     assert {:ok, "sprite-file"} =
              RunicSandbox.read_file(session, "/workspace/in.txt", env: env, requester: requester)
 
@@ -2559,6 +3351,9 @@ defmodule RunicSandboxTest do
              )
 
     assert checkpoint.id == "v2"
+    assert checkpoint.metadata.kind == :provider_checkpoint
+    assert checkpoint.metadata.preserves.running_service_state == :provider_dependent
+    assert checkpoint.metadata.preserves.process_memory == :provider_dependent
     assert_receive {:sprites_request, :checkpoint, %{"comment" => "before"}}
 
     assert {:ok, ^session} =
@@ -3006,6 +3801,84 @@ defmodule RunicSandboxTest do
     end
   rescue
     _exception -> false
+  end
+
+  defp docker_container_exists?(nil), do: false
+
+  defp docker_container_exists?(container_name) do
+    case System.find_executable("docker") do
+      nil ->
+        false
+
+      docker ->
+        case System.cmd(docker, ["container", "inspect", container_name], stderr_to_stdout: true) do
+          {_output, 0} -> true
+          _other -> false
+        end
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp docker_network_exists?(nil), do: false
+
+  defp docker_network_exists?(network_name) do
+    case System.find_executable("docker") do
+      nil ->
+        false
+
+      docker ->
+        case System.cmd(docker, ["network", "inspect", network_name], stderr_to_stdout: true) do
+          {_output, 0} -> true
+          _other -> false
+        end
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp host_http_get(url) do
+    uri = URI.parse(url)
+    port = uri.port || 80
+    path = if uri.path in [nil, ""], do: "/", else: uri.path
+
+    with {:ok, socket} <-
+           :gen_tcp.connect(String.to_charlist(uri.host), port, [
+             :binary,
+             active: false,
+             packet: :raw
+           ]),
+         :ok <-
+           :gen_tcp.send(socket, [
+             "GET ",
+             path,
+             " HTTP/1.1\r\nhost: ",
+             uri.host,
+             "\r\nconnection: close\r\n\r\n"
+           ]),
+         {:ok, response} <- recv_all(socket, "") do
+      :gen_tcp.close(socket)
+      parse_http_response(response)
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp recv_all(socket, acc) do
+    case :gen_tcp.recv(socket, 0, 1_000) do
+      {:ok, chunk} -> recv_all(socket, acc <> chunk)
+      {:error, :closed} -> {:ok, acc}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_http_response(response) do
+    [head, body] = String.split(response, "\r\n\r\n", parts: 2)
+    [status_line | _headers] = String.split(head, "\r\n")
+    ["HTTP/" <> _version, status, _reason] = String.split(status_line, " ", parts: 3)
+    {:ok, String.to_integer(status), body}
+  rescue
+    _exception -> {:error, :invalid_http_response}
   end
 
   defp start_mcp_http_server(body) do

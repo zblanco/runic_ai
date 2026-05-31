@@ -215,17 +215,38 @@ defmodule RunicAI.Coding.Prompt do
   end
 
   defp sandbox_instructions(%Recipe{visible_tools: visible_tools}, opts) do
-    if Enum.any?(visible_tools, &(&1 in ["execute_code", "sandbox_status"])) do
+    if Enum.any?(visible_tools, &(&1 in sandbox_tool_names())) do
       summary = sandbox_summary(opts)
+      process_guidance = sandbox_process_guidance(visible_tools)
 
       """
       Sandbox execution:
       - Use execute_code for arbitrary generated code, polyglot experiments, untrusted snippets, isolated runtime probes, or code that should not mutate the host workspace.
+      #{process_guidance}
       - Use run_command for project-native host commands only when run_command is visible; otherwise use project_command and verification tools for normal project checks.
       - Prefer deterministic safe computing or built-in project verification when it directly expresses the task; escalate to execute_code when an isolated runtime is the better fit.
       - Active sandbox profile: backend=#{format_value(summary.backend)}; runtimes=#{format_value(summary.runtimes)}; network=#{format_value(summary.network)}; stateful=#{format_value(summary.stateful?)}; workspace=#{format_value(summary.workspace)}; review=#{format_value(summary.review)}.
       - Summarize sandbox diagnostics and artifact refs instead of pasting large stdout or generated files into the final answer.
       """
+    end
+  end
+
+  defp sandbox_tool_names do
+    [
+      "execute_code",
+      "sandbox_status",
+      "open_sandbox_session",
+      "sandbox_exec",
+      "start_sandbox_process",
+      "sandbox_process_events"
+    ]
+  end
+
+  defp sandbox_process_guidance(visible_tools) do
+    if Enum.any?(visible_tools, &(&1 in ["open_sandbox_session", "start_sandbox_process"])) do
+      "- Use open_sandbox_session with start_sandbox_process for interactive, multi-turn, or agent-CLI work that benefits from a warm stateful sandbox; keep dev sandboxes for iterative promotion and execution sandboxes for workflow runs."
+    else
+      ""
     end
   end
 

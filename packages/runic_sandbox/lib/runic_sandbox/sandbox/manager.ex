@@ -7,6 +7,7 @@ defmodule RunicSandbox.Manager do
   alias RunicSandbox.Error
   alias RunicSandbox.ExecutionRequest
   alias RunicSandbox.Lease
+  alias RunicSandbox.ProcessHandle
   alias RunicSandbox.Profile
   alias RunicSandbox.Session
 
@@ -64,6 +65,55 @@ defmodule RunicSandbox.Manager do
   def close_attach(server, %AttachHandle{} = handle, opts),
     do: GenServer.call(server, {:close_attach, handle, opts}, :infinity)
 
+  @spec start_process(
+          GenServer.server(),
+          Session.t(),
+          ExecutionRequest.t() | keyword() | map(),
+          keyword()
+        ) ::
+          {:ok, ProcessHandle.t()} | {:error, Error.t()}
+  def start_process(server, %Session{} = session, request, opts) do
+    with {:ok, managed_session} <- prepare_process(server, session),
+         {:ok, handle} <-
+           RunicSandbox.start_process(managed_session, request, Keyword.delete(opts, :server)) do
+      register_process(server, managed_session, handle)
+    end
+  end
+
+  @spec prepare_process(GenServer.server(), Session.t()) ::
+          {:ok, Session.t()} | {:error, Error.t()}
+  def prepare_process(server, %Session{} = session),
+    do: GenServer.call(server, {:prepare_process, session}, :infinity)
+
+  @spec register_process(GenServer.server(), Session.t(), ProcessHandle.t()) ::
+          {:ok, ProcessHandle.t()} | {:error, Error.t()}
+  def register_process(server, %Session{} = session, %ProcessHandle{} = handle),
+    do: GenServer.call(server, {:register_process, session, handle}, :infinity)
+
+  @spec list_processes(GenServer.server(), Session.t(), keyword()) ::
+          {:ok, [RunicSandbox.ProcessStatus.t()]} | {:error, Error.t()}
+  def list_processes(server, %Session{} = session, opts),
+    do: GenServer.call(server, {:list_processes, session, opts}, :infinity)
+
+  @spec process_status(
+          GenServer.server(),
+          Session.t(),
+          ProcessHandle.t() | String.t(),
+          keyword()
+        ) ::
+          {:ok, RunicSandbox.ProcessStatus.t()} | {:error, Error.t()}
+  def process_status(server, %Session{} = session, process, opts),
+    do: GenServer.call(server, {:process_status, session, process, opts}, :infinity)
+
+  @spec complete_process(GenServer.server(), ProcessHandle.t()) :: :ok | {:error, Error.t()}
+  def complete_process(server, %ProcessHandle{} = handle),
+    do: GenServer.call(server, {:complete_process, handle}, :infinity)
+
+  @spec kill_process(GenServer.server(), ProcessHandle.t(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def kill_process(server, %ProcessHandle{} = handle, opts),
+    do: GenServer.call(server, {:kill_process, handle, opts}, :infinity)
+
   @spec close_session(GenServer.server(), Session.t(), keyword()) :: :ok | {:error, Error.t()}
   def close_session(server, %Session{} = session, opts),
     do: GenServer.call(server, {:close_session, session, opts}, :infinity)
@@ -87,6 +137,8 @@ defmodule RunicSandbox.Manager do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
+
     with {:ok, profiles} <- profiles(Keyword.get(opts, :sandboxes, [])),
          {:ok, state} <- warm_state(%__MODULE__{profiles: profiles}) do
       {:ok, schedule_reaper(state)}
@@ -168,12 +220,78 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  def handle_call({:prepare_process, session}, _from, state) do
+    with {:ok, _id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session) do
+      {:reply, {:ok, entry.session}, state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:register_process, session, handle}, _from, state) do
+    with {:ok, id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session),
+         :ok <- validate_process_handle(entry, handle) do
+      managed_handle = managed_process_handle(handle, self())
+      state = put_active_process(state, id, entry, managed_handle)
+      {:reply, {:ok, managed_handle}, state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:list_processes, session, opts}, _from, state) do
+    with {:ok, _id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session) do
+      {:reply, RunicSandbox.list_processes(entry.session, Keyword.delete(opts, :server)), state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:process_status, session, process, opts}, _from, state) do
+    with {:ok, _id, entry} <- fetch_entry(state, session),
+         :ok <- validate_entry_handle(entry, session) do
+      result =
+        RunicSandbox.process_status(entry.session, process, Keyword.delete(opts, :server))
+
+      {:reply, result, state}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  def handle_call({:complete_process, handle}, _from, state) do
+    case fetch_active_process(state, handle) do
+      {:ok, id, entry} ->
+        {:reply, :ok, delete_active_process(state, id, entry, handle)}
+
+      :not_found ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:kill_process, handle, opts}, _from, state) do
+    case fetch_active_process(state, handle) do
+      {:ok, id, entry} ->
+        result = RunicSandbox.kill_process(handle, Keyword.delete(opts, :server))
+        state = delete_active_process(state, id, entry, handle)
+        {:reply, result, state}
+
+      :not_found ->
+        {:reply, RunicSandbox.kill_process(handle, Keyword.delete(opts, :server)), state}
+    end
+  end
+
   def handle_call({:close_session, session, opts}, _from, state) do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
          :ok <- validate_no_active_leases(state, session),
+         {process_results, state} <- close_entry_processes(state, id, entry, opts),
+         :ok <- active_close_result(process_results),
          {close_results, state} <- close_entry_attaches(state, id, entry, opts),
-         :ok <- active_attach_close_result(close_results),
+         :ok <- active_close_result(close_results),
          :ok <- RunicSandbox.close_session(entry.session, Keyword.delete(opts, :server)) do
       {:reply, :ok, delete_entry(state, id, entry)}
     else
@@ -263,6 +381,14 @@ defmodule RunicSandbox.Manager do
     {:noreply, state}
   end
 
+  def handle_info({:EXIT, port, _reason}, %__MODULE__{} = state) when is_port(port) do
+    {:noreply, state}
+  end
+
+  def handle_info({:EXIT, pid, :normal}, %__MODULE__{} = state) when is_pid(pid) do
+    {:noreply, state}
+  end
+
   defp profiles([]) do
     profile = Profile.new!()
     {:ok, %{profile.name => profile}}
@@ -319,15 +445,15 @@ defmodule RunicSandbox.Manager do
 
   defp checkout_session(%__MODULE__{} = state, %Profile{} = profile, spec, owner_pid \\ nil) do
     state = reap_idle(state, profile)
+    checkout_started_at_ms = now_ms()
 
     case idle_entry(state, profile) do
       {id, entry} ->
-        state = update_entry(state, id, entry, :checked_out, owner_pid)
-        {:ok, entry.session, state}
+        checkout_existing_entry(state, id, entry, profile, owner_pid, checkout_started_at_ms)
 
       nil ->
         if pool_size(state, profile) < profile.pool.max do
-          open_pooled_session(state, profile, spec, :checked_out, owner_pid)
+          checkout_new_entry(state, profile, spec, owner_pid, checkout_started_at_ms)
         else
           {:error,
            Error.validation("sandbox session pool is exhausted",
@@ -347,7 +473,8 @@ defmodule RunicSandbox.Manager do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
          :ok <- validate_no_active_leases(state, session),
-         :ok <- validate_no_active_attaches(entry, session) do
+         :ok <- validate_no_active_attaches(entry, session),
+         :ok <- validate_no_active_processes(entry, session) do
       if Keyword.get(opts, :reset?, profile.pool.reset_on_checkin?) do
         case reset_entry(state, entry.session, profile, opts) do
           {:ok, _session, state} -> {:ok, state}
@@ -364,7 +491,8 @@ defmodule RunicSandbox.Manager do
     with {:ok, id, entry} <- fetch_entry(state, session),
          :ok <- validate_entry_handle(entry, session),
          :ok <- validate_no_active_leases(state, session),
-         :ok <- validate_no_active_attaches(entry, session) do
+         :ok <- validate_no_active_attaches(entry, session),
+         :ok <- validate_no_active_processes(entry, session) do
       case RunicSandbox.close_session(entry.session, Keyword.delete(opts, :server)) do
         :ok ->
           state = delete_entry(state, id, entry)
@@ -401,6 +529,90 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  defp checkout_existing_entry(
+         %__MODULE__{} = state,
+         id,
+         entry,
+         %Profile{} = profile,
+         owner_pid,
+         checkout_started_at_ms
+       ) do
+    with {:ok, entry, state} <- maybe_checkpoint_entry(state, id, entry, profile) do
+      state =
+        update_entry(state, id, entry, :checked_out, owner_pid,
+          checkout_source: :warm,
+          checkout_started_at_ms: checkout_started_at_ms
+        )
+
+      {:ok, entry.session, state}
+    end
+  end
+
+  defp checkout_new_entry(
+         %__MODULE__{} = state,
+         %Profile{} = profile,
+         spec,
+         owner_pid,
+         checkout_started_at_ms
+       ) do
+    with {:ok, session, state} <-
+           open_pooled_session(state, profile, spec, :checked_out, owner_pid),
+         {:ok, id, entry} <- fetch_entry(state, session),
+         {:ok, entry, state} <- maybe_checkpoint_entry(state, id, entry, profile) do
+      state =
+        update_entry(state, id, entry, :checked_out, owner_pid,
+          checkout_source: :cold,
+          checkout_started_at_ms: checkout_started_at_ms
+        )
+
+      {:ok, session, state}
+    end
+  end
+
+  defp maybe_checkpoint_entry(
+         %__MODULE__{} = state,
+         id,
+         entry,
+         %Profile{pool: %{checkpoint_on_checkout?: true}}
+       ) do
+    if checkpoint_supported?(entry.session) do
+      case RunicSandbox.checkpoint(entry.session,
+             id: "checkout-#{System.unique_integer([:positive])}"
+           ) do
+        {:ok, checkpoint} ->
+          entry = Map.put(entry, :checkout_checkpoint, checkpoint_snapshot(checkpoint))
+          {:ok, entry, %{state | sessions: Map.put(state.sessions, id, entry)}}
+
+        {:error, %Error{} = error} ->
+          {:error, error}
+      end
+    else
+      entry =
+        Map.put(entry, :checkout_checkpoint, %{
+          status: :skipped,
+          reason: :unsupported,
+          at_ms: now_ms()
+        })
+
+      {:ok, entry, %{state | sessions: Map.put(state.sessions, id, entry)}}
+    end
+  end
+
+  defp maybe_checkpoint_entry(%__MODULE__{} = state, _id, entry, _profile),
+    do: {:ok, entry, state}
+
+  defp checkpoint_supported?(%Session{capabilities: capabilities}), do: capabilities.checkpoints?
+
+  defp checkpoint_snapshot(checkpoint) do
+    %{
+      status: :created,
+      id: checkpoint.id,
+      ref: checkpoint.ref,
+      kind: Map.get(checkpoint.metadata, :kind),
+      created_at: checkpoint.created_at
+    }
+  end
+
   defp put_session(
          %__MODULE__{} = state,
          %Profile{} = profile,
@@ -418,16 +630,21 @@ defmodule RunicSandbox.Manager do
         created_at_ms: now,
         last_used_at_ms: now,
         checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil),
-        active_attaches: %{}
+        active_attaches: %{},
+        active_processes: %{},
+        checkout_source: if(lifecycle == :checked_out, do: :cold, else: nil),
+        last_checkout_latency_ms: nil,
+        checkout_checkpoint: nil
       }
       |> Map.merge(owner_fields(lifecycle, owner_pid))
 
     %{state | sessions: Map.put(state.sessions, session.id, entry)}
   end
 
-  defp update_entry(%__MODULE__{} = state, id, entry, lifecycle, owner_pid \\ nil) do
+  defp update_entry(%__MODULE__{} = state, id, entry, lifecycle, owner_pid \\ nil, opts \\ []) do
     now = now_ms()
     demonitor(entry.monitor_ref)
+    checkout_started_at_ms = Keyword.get(opts, :checkout_started_at_ms, now)
 
     entry =
       entry
@@ -435,12 +652,21 @@ defmodule RunicSandbox.Manager do
         lifecycle: lifecycle,
         last_used_at_ms: now,
         checked_out_at_ms: if(lifecycle == :checked_out, do: now, else: nil),
-        active_attaches: Map.get(entry, :active_attaches, %{})
+        active_attaches: Map.get(entry, :active_attaches, %{}),
+        active_processes: Map.get(entry, :active_processes, %{}),
+        checkout_source: checkout_source(lifecycle, opts),
+        last_checkout_latency_ms: checkout_latency(lifecycle, now, checkout_started_at_ms)
       })
       |> Map.merge(owner_fields(lifecycle, owner_pid))
 
     %{state | sessions: Map.put(state.sessions, id, entry)}
   end
+
+  defp checkout_source(:checked_out, opts), do: Keyword.get(opts, :checkout_source)
+  defp checkout_source(_lifecycle, _opts), do: nil
+
+  defp checkout_latency(:checked_out, now, started_at_ms), do: max(now - started_at_ms, 0)
+  defp checkout_latency(_lifecycle, _now, _started_at_ms), do: nil
 
   defp delete_entry(%__MODULE__{} = state, id, entry) do
     demonitor(entry.monitor_ref)
@@ -507,6 +733,23 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  defp validate_process_handle(%{session: %Session{} = session}, %ProcessHandle{} = handle) do
+    if handle.session_id == session.id and handle.backend == session.backend do
+      :ok
+    else
+      {:error,
+       Error.validation("sandbox process handle does not match managed session",
+         source: __MODULE__,
+         details: %{
+           session_id: session.id,
+           process_session_id: handle.session_id,
+           backend: session.backend,
+           process_backend: handle.backend
+         }
+       )}
+    end
+  end
+
   defp validate_no_conflicting_lease(%__MODULE__{} = state, %Session{} = session, resource, opts) do
     mode = Keyword.get(opts, :mode, :exclusive)
     resource = to_string(resource)
@@ -567,6 +810,25 @@ defmodule RunicSandbox.Manager do
     end
   end
 
+  defp validate_no_active_processes(entry, %Session{} = session) do
+    active_processes =
+      entry
+      |> Map.get(:active_processes, %{})
+      |> Map.values()
+
+    case active_processes do
+      [] ->
+        :ok
+
+      processes ->
+        {:error,
+         Error.validation("sandbox session has active processes",
+           source: __MODULE__,
+           details: %{session_id: session.id, process_ids: Enum.map(processes, & &1.id)}
+         )}
+    end
+  end
+
   defp put_active_attach(%__MODULE__{} = state, id, entry, %AttachHandle{} = handle) do
     attach = attach_snapshot(handle)
     active_attaches = entry |> Map.get(:active_attaches, %{}) |> Map.put(handle.id, attach)
@@ -592,6 +854,44 @@ defmodule RunicSandbox.Manager do
     end)
   end
 
+  defp put_active_process(%__MODULE__{} = state, id, entry, %ProcessHandle{} = handle) do
+    process = process_snapshot(handle)
+    active_processes = entry |> Map.get(:active_processes, %{}) |> Map.put(handle.id, process)
+    entry = Map.put(entry, :active_processes, active_processes)
+    %{state | sessions: Map.put(state.sessions, id, entry)}
+  end
+
+  defp delete_active_process(%__MODULE__{} = state, id, entry, %ProcessHandle{} = handle) do
+    active_processes = entry |> Map.get(:active_processes, %{}) |> Map.delete(handle.id)
+    entry = Map.put(entry, :active_processes, active_processes)
+    %{state | sessions: Map.put(state.sessions, id, entry)}
+  end
+
+  defp fetch_active_process(%__MODULE__{} = state, %ProcessHandle{} = handle) do
+    Enum.find_value(state.sessions, :not_found, fn {id, entry} ->
+      active_processes = Map.get(entry, :active_processes, %{})
+
+      if Map.has_key?(active_processes, handle.id) do
+        {:ok, id, entry}
+      else
+        false
+      end
+    end)
+  end
+
+  defp close_entry_processes(%__MODULE__{} = state, id, entry, opts) do
+    results =
+      entry
+      |> Map.get(:active_processes, %{})
+      |> Map.values()
+      |> Enum.map(fn process ->
+        RunicSandbox.kill_process(process.handle, Keyword.delete(opts, :server))
+      end)
+
+    entry = Map.put(entry, :active_processes, %{})
+    {results, %{state | sessions: Map.put(state.sessions, id, entry)}}
+  end
+
   defp managed_attach_handle(%AttachHandle{} = handle, manager) do
     events =
       Stream.transform(
@@ -600,6 +900,27 @@ defmodule RunicSandbox.Manager do
         fn event, acc -> {[event], acc} end,
         fn _acc ->
           _ = close_attach(manager, handle, [])
+          :ok
+        end
+      )
+
+    %{handle | events: events}
+  end
+
+  defp managed_process_handle(%ProcessHandle{} = handle, manager) do
+    events =
+      Stream.transform(
+        handle.events,
+        fn -> false end,
+        fn event, completed? ->
+          if event.type == :process_finished and not completed? do
+            _ = complete_process(manager, handle)
+            {[event], true}
+          else
+            {[event], completed?}
+          end
+        end,
+        fn _completed? ->
           :ok
         end
       )
@@ -620,11 +941,23 @@ defmodule RunicSandbox.Manager do
     {results, %{state | sessions: Map.put(state.sessions, id, entry)}}
   end
 
-  defp active_attach_close_result(results) do
+  defp active_close_result(results) do
     Enum.find(results, &match?({:error, _error}, &1)) || :ok
   end
 
   defp attach_snapshot(%AttachHandle{} = handle) do
+    %{
+      id: handle.id,
+      session_id: handle.session_id,
+      backend: handle.backend,
+      status: handle.status,
+      metadata: handle.metadata,
+      opened_at_ms: now_ms(),
+      handle: handle
+    }
+  end
+
+  defp process_snapshot(%ProcessHandle{} = handle) do
     %{
       id: handle.id,
       session_id: handle.session_id,
@@ -733,10 +1066,17 @@ defmodule RunicSandbox.Manager do
         sandbox -> Map.take(profiles, [sandbox])
       end
 
+    now = now_ms()
+
     %{
       status: :available,
       sandboxes:
         Map.new(selected, fn {name, profile} ->
+          profile_sessions =
+            sessions
+            |> Map.values()
+            |> Enum.filter(&(&1.sandbox == name))
+
           {name,
            %{
              backend: profile.backend,
@@ -746,25 +1086,34 @@ defmodule RunicSandbox.Manager do
              stateful?: profile.stateful?,
              workspace: profile.workspace,
              pool: profile.pool,
+             pool_status: pool_status(profile, profile_sessions, leases, now),
              metadata: profile.metadata,
              instance: Map.get(instances, name),
              sessions:
-               sessions
-               |> Map.values()
-               |> Enum.filter(&(&1.sandbox == name))
+               profile_sessions
                |> Enum.map(fn entry ->
+                 active_attaches = Map.get(entry, :active_attaches, %{})
+                 active_processes = Map.get(entry, :active_processes, %{})
+                 readiness = entry_readiness(entry, profile, leases, now)
+
                  entry.session
                  |> Map.take([:id, :state, :state_model, :transport_model])
                  |> Map.merge(%{
                    lifecycle: entry.lifecycle,
+                   readiness: readiness,
                    created_at_ms: entry.created_at_ms,
                    last_used_at_ms: entry.last_used_at_ms,
                    checked_out_at_ms: entry.checked_out_at_ms,
+                   idle_age_ms: idle_age_ms(entry, now),
+                   checkout_age_ms: checkout_age_ms(entry, now),
+                   checkout_source: Map.get(entry, :checkout_source),
+                   last_checkout_latency_ms: Map.get(entry, :last_checkout_latency_ms),
+                   checkout_checkpoint: Map.get(entry, :checkout_checkpoint),
                    owner_alive?: is_pid(entry.owner_pid) and Process.alive?(entry.owner_pid),
-                   active_attach_count: entry |> Map.get(:active_attaches, %{}) |> map_size(),
+                   active_attach_count: map_size(active_attaches),
+                   active_process_count: map_size(active_processes),
                    active_attaches:
-                     entry
-                     |> Map.get(:active_attaches, %{})
+                     active_attaches
                      |> Map.values()
                      |> Enum.map(&Map.drop(&1, [:handle]))
                  })
@@ -780,4 +1129,76 @@ defmodule RunicSandbox.Manager do
         end)
     }
   end
+
+  defp pool_status(%Profile{} = profile, sessions, leases, now) do
+    counts =
+      sessions
+      |> Enum.map(&entry_readiness(&1, profile, leases, now))
+      |> Enum.frequencies()
+
+    total = length(sessions)
+
+    %{
+      warm: profile.pool.warm,
+      max: profile.pool.max,
+      total: total,
+      ready: Map.get(counts, :ready, 0),
+      busy: Map.get(counts, :busy, 0),
+      stale: Map.get(counts, :stale, 0),
+      unhealthy: Map.get(counts, :unhealthy, 0),
+      available_capacity: max(profile.pool.max - total, 0)
+    }
+  end
+
+  defp entry_readiness(entry, %Profile{} = profile, leases, now) do
+    active_lease_count =
+      leases
+      |> Map.values()
+      |> Enum.count(&(&1.session_id == entry.session.id))
+
+    active_attach_count = entry |> Map.get(:active_attaches, %{}) |> map_size()
+    active_process_count = entry |> Map.get(:active_processes, %{}) |> map_size()
+
+    cond do
+      entry.session.state != :ready ->
+        :unhealthy
+
+      entry.lifecycle == :checked_out ->
+        :busy
+
+      active_lease_count > 0 or active_attach_count > 0 or active_process_count > 0 ->
+        :busy
+
+      stale_idle?(entry, profile, now) ->
+        :stale
+
+      true ->
+        :ready
+    end
+  end
+
+  defp stale_idle?(
+         %{lifecycle: :idle, last_used_at_ms: last_used_at_ms},
+         %Profile{
+           pool: %{idle_ttl_ms: ttl}
+         },
+         now
+       )
+       when is_integer(ttl) do
+    now - last_used_at_ms >= ttl
+  end
+
+  defp stale_idle?(_entry, _profile, _now), do: false
+
+  defp idle_age_ms(%{lifecycle: :idle, last_used_at_ms: last_used_at_ms}, now)
+       when is_integer(last_used_at_ms),
+       do: max(now - last_used_at_ms, 0)
+
+  defp idle_age_ms(_entry, _now), do: nil
+
+  defp checkout_age_ms(%{lifecycle: :checked_out, checked_out_at_ms: checked_out_at_ms}, now)
+       when is_integer(checked_out_at_ms),
+       do: max(now - checked_out_at_ms, 0)
+
+  defp checkout_age_ms(_entry, _now), do: nil
 end

@@ -334,7 +334,21 @@ defmodule RunicSandbox.Backends.Remote do
   defp remote_attach_metadata do
     Capabilities.attach_metadata(:terminal_adapter,
       provider_transport: :fly_machine_exec,
-      restricted_egress_supported?: false
+      restricted_egress_supported?: false,
+      state_tier: :persistent_workspace,
+      process_host?: false,
+      workspace_persistent?: true,
+      live_process_stream?: false,
+      service_host?: false,
+      snapshot_modes: [],
+      provider_api_capabilities: %{
+        exec?: true,
+        ps?: true,
+        signal?: true,
+        suspend?: true,
+        live_process_contract?: false,
+        reason: :fly_machines_api_client_not_implemented
+      }
     )
   end
 

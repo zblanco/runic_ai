@@ -6,6 +6,8 @@ defmodule RunicSandbox.Capabilities do
   alias RunicSandbox.Error
 
   @attach_modes [:none, :terminal_adapter, :live_stream]
+  @state_tiers [:one_shot_exec, :persistent_workspace, :persistent_process_host, :service_actor]
+  @snapshot_modes [:filesystem, :microvm_snapshot, :provider_checkpoint]
 
   @attach_metadata_keys [
     :attach_mode,
@@ -16,7 +18,13 @@ defmodule RunicSandbox.Capabilities do
     :stderr_separate?,
     :mcp_boundary_supported?,
     :restricted_egress_supported?,
-    :pty_supported?
+    :pty_supported?,
+    :state_tier,
+    :process_host?,
+    :workspace_persistent?,
+    :live_process_stream?,
+    :service_host?,
+    :snapshot_modes
   ]
 
   @enforce_keys [
@@ -65,6 +73,9 @@ defmodule RunicSandbox.Capabilities do
         }
 
   @type attach_mode :: :none | :terminal_adapter | :live_stream
+  @type state_tier ::
+          :one_shot_exec | :persistent_workspace | :persistent_process_host | :service_actor
+  @type snapshot_mode :: :filesystem | :microvm_snapshot | :provider_checkpoint
 
   @spec new(keyword() | map() | t()) :: {:ok, t()} | {:error, Error.t()}
   def new(%__MODULE__{} = capabilities), do: validate(capabilities)
@@ -133,7 +144,13 @@ defmodule RunicSandbox.Capabilities do
       stderr_separate?: get(input, :stderr_separate?, false),
       mcp_boundary_supported?: get(input, :mcp_boundary_supported?, false),
       restricted_egress_supported?: get(input, :restricted_egress_supported?, false),
-      pty_supported?: get(input, :pty_supported?, false)
+      pty_supported?: get(input, :pty_supported?, false),
+      state_tier: state_tier_default(get(input, :state_tier, nil)),
+      process_host?: get(input, :process_host?, false),
+      workspace_persistent?: get(input, :workspace_persistent?, false),
+      live_process_stream?: get(input, :live_process_stream?, mode == :live_stream),
+      service_host?: get(input, :service_host?, false),
+      snapshot_modes: get(input, :snapshot_modes, [])
     }
 
     input
@@ -191,6 +208,47 @@ defmodule RunicSandbox.Capabilities do
   @spec pty_supported?(t() | map()) :: boolean()
   def pty_supported?(capabilities), do: metadata_truthy?(capabilities, :pty_supported?)
 
+  @spec state_tier(t() | map()) :: state_tier()
+  def state_tier(capabilities) when is_map(capabilities) do
+    metadata = get(capabilities, :metadata, %{})
+
+    case normalize_state_tier(get(metadata, :state_tier, nil)) do
+      tier when tier in @state_tiers ->
+        tier
+
+      _other ->
+        inferred_state_tier(capabilities)
+    end
+  end
+
+  @spec process_host?(t() | map()) :: boolean()
+  def process_host?(capabilities), do: metadata_truthy?(capabilities, :process_host?)
+
+  @spec workspace_persistent?(t() | map()) :: boolean()
+  def workspace_persistent?(capabilities) do
+    metadata_truthy?(capabilities, :workspace_persistent?) or
+      (get(capabilities, :persistent_identity?, false) and
+         get(capabilities, :session_files?, false))
+  end
+
+  @spec live_process_stream?(t() | map()) :: boolean()
+  def live_process_stream?(capabilities),
+    do: metadata_truthy?(capabilities, :live_process_stream?)
+
+  @spec service_host?(t() | map()) :: boolean()
+  def service_host?(capabilities) do
+    metadata_truthy?(capabilities, :service_host?) or
+      get(capabilities, :services?, false) or get(capabilities, :proxy?, false)
+  end
+
+  @spec snapshot_modes(t() | map()) :: [snapshot_mode()]
+  def snapshot_modes(capabilities) when is_map(capabilities) do
+    capabilities
+    |> get(:metadata, %{})
+    |> get(:snapshot_modes, [])
+    |> normalize_snapshot_modes()
+  end
+
   @spec default_cwd(t() | map()) :: String.t() | nil
   def default_cwd(capabilities) do
     capabilities
@@ -218,7 +276,8 @@ defmodule RunicSandbox.Capabilities do
          :ok <- validate_boolean(capabilities.persistent_identity?, :persistent_identity?),
          :ok <- validate_map(capabilities.metadata, :metadata),
          :ok <- validate_optional_string(capabilities.metadata, :default_cwd),
-         :ok <- validate_attach_metadata(capabilities.metadata) do
+         :ok <- validate_attach_metadata(capabilities.metadata),
+         :ok <- validate_lifecycle_metadata(capabilities.metadata) do
       {:ok, capabilities}
     end
   end
@@ -284,6 +343,83 @@ defmodule RunicSandbox.Capabilities do
     end
   end
 
+  defp validate_lifecycle_metadata(metadata) do
+    with :ok <- validate_state_tier(metadata),
+         :ok <- validate_metadata_boolean(metadata, :process_host?),
+         :ok <- validate_metadata_boolean(metadata, :workspace_persistent?),
+         :ok <- validate_metadata_boolean(metadata, :live_process_stream?),
+         :ok <- validate_metadata_boolean(metadata, :service_host?) do
+      validate_snapshot_modes(metadata)
+    end
+  end
+
+  defp validate_state_tier(metadata) do
+    case get(metadata, :state_tier, nil) do
+      nil ->
+        :ok
+
+      value ->
+        case normalize_state_tier(value) do
+          tier when tier in @state_tiers ->
+            :ok
+
+          _other ->
+            {:error,
+             Error.validation("invalid sandbox lifecycle state tier",
+               source: __MODULE__,
+               details: %{state_tier: value, valid_state_tiers: @state_tiers}
+             )}
+        end
+    end
+  end
+
+  defp validate_metadata_boolean(metadata, field) do
+    case get(metadata, field, nil) do
+      nil ->
+        :ok
+
+      value when is_boolean(value) ->
+        :ok
+
+      value when value in ["true", "false"] ->
+        :ok
+
+      value ->
+        {:error,
+         Error.validation("sandbox capability #{field} metadata must be a boolean",
+           source: __MODULE__,
+           details: %{field: field, value: value}
+         )}
+    end
+  end
+
+  defp validate_snapshot_modes(metadata) do
+    case get(metadata, :snapshot_modes, nil) do
+      nil ->
+        :ok
+
+      value when is_list(value) ->
+        invalid = Enum.reject(value, &(normalize_snapshot_mode(&1) in @snapshot_modes))
+
+        if invalid == [] do
+          :ok
+        else
+          {:error,
+           Error.validation("invalid sandbox snapshot capability mode",
+             source: __MODULE__,
+             details: %{snapshot_modes: value, invalid_snapshot_modes: invalid}
+           )}
+        end
+
+      value ->
+        {:error,
+         Error.validation("sandbox capability snapshot_modes metadata must be a list",
+           source: __MODULE__,
+           details: %{snapshot_modes: value}
+         )}
+    end
+  end
+
   defp metadata_truthy?(capabilities, key) do
     capabilities
     |> get(:metadata, %{})
@@ -301,6 +437,49 @@ defmodule RunicSandbox.Capabilities do
   end
 
   defp normalize_attach_mode(_value), do: nil
+
+  defp state_tier_default(nil), do: :one_shot_exec
+  defp state_tier_default(value), do: normalize_state_tier(value) || value
+
+  defp inferred_state_tier(capabilities) do
+    cond do
+      service_host?(capabilities) ->
+        :service_actor
+
+      process_host?(capabilities) ->
+        :persistent_process_host
+
+      workspace_persistent?(capabilities) ->
+        :persistent_workspace
+
+      true ->
+        :one_shot_exec
+    end
+  end
+
+  defp normalize_state_tier(value) when value in @state_tiers, do: value
+
+  defp normalize_state_tier(value) when is_binary(value) do
+    Enum.find(@state_tiers, &(Atom.to_string(&1) == value))
+  end
+
+  defp normalize_state_tier(_value), do: nil
+
+  defp normalize_snapshot_modes(value) when is_list(value) do
+    value
+    |> Enum.map(&normalize_snapshot_mode/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_snapshot_modes(_value), do: []
+
+  defp normalize_snapshot_mode(value) when value in @snapshot_modes, do: value
+
+  defp normalize_snapshot_mode(value) when is_binary(value) do
+    Enum.find(@snapshot_modes, &(Atom.to_string(&1) == value))
+  end
+
+  defp normalize_snapshot_mode(_value), do: nil
 
   defp drop_attach_metadata_keys(input) do
     Enum.reduce(@attach_metadata_keys, input, fn key, acc ->
