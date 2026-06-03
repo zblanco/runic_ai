@@ -9,6 +9,8 @@ defmodule RunicSandbox.Backends.Docker do
 
   @behaviour RunicSandbox.Backend
 
+  import Bitwise, only: [band: 2]
+
   alias RunicSandbox.AttachEvents
   alias RunicSandbox.AttachHandle
   alias RunicSandbox.Capabilities
@@ -243,6 +245,8 @@ defmodule RunicSandbox.Backends.Docker do
          :ok <- ensure_container_available(instance),
          {:ok, workspace_root} <- session_workspace_root(instance),
          :ok <- File.mkdir_p(workspace_root),
+         :ok <- maybe_seed_stateful_workspace(instance, workspace_root),
+         :ok <- ensure_workspace_user_writable(workspace_root),
          {:ok, container} <- start_session_container(instance, workspace_root) do
       Session.from_instance(instance,
         capabilities:
@@ -801,6 +805,129 @@ defmodule RunicSandbox.Backends.Docker do
   defp persistent_profile(%Profile{} = profile) do
     workspace = %{profile.workspace | persist?: true}
     %{profile | stateful?: true, workspace: workspace}
+  end
+
+  defp maybe_seed_stateful_workspace(%Instance{workspace: %{host_root: nil}}, _workspace_root),
+    do: :ok
+
+  defp maybe_seed_stateful_workspace(
+         %Instance{workspace: %{host_root: host_root}},
+         workspace_root
+       )
+       when is_binary(host_root) do
+    seed_workspace_from_host_root(host_root, workspace_root)
+  end
+
+  defp seed_workspace_from_host_root(host_root, workspace_root) do
+    host_root = Path.expand(host_root)
+
+    with :ok <- ensure_seed_host_root(host_root),
+         {:ok, entries} <- File.ls(host_root),
+         :ok <- copy_seed_entries(entries, host_root, workspace_root) do
+      :ok
+    else
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error,
+         Error.from_reason(reason,
+           source: __MODULE__,
+           message: "failed to seed docker workspace from host_root",
+           details: %{host_root: host_root, workspace_root: workspace_root}
+         )}
+    end
+  end
+
+  defp ensure_seed_host_root(host_root) do
+    case File.lstat(host_root) do
+      {:ok, %{type: :directory}} ->
+        :ok
+
+      {:ok, stat} ->
+        {:error,
+         Error.validation("docker workspace host_root must be an existing directory",
+           source: __MODULE__,
+           details: %{host_root: host_root, type: stat.type}
+         )}
+
+      {:error, reason} ->
+        {:error,
+         Error.validation("docker workspace host_root must be an existing directory",
+           source: __MODULE__,
+           details: %{host_root: host_root, reason: reason}
+         )}
+    end
+  end
+
+  defp copy_seed_entries(entries, host_root, workspace_root) do
+    Enum.reduce_while(entries, :ok, fn entry, :ok ->
+      source_path = Path.join(host_root, entry)
+      destination_path = Path.join(workspace_root, entry)
+
+      case File.cp_r(source_path, destination_path) do
+        {:ok, _paths} ->
+          {:cont, :ok}
+
+        {:error, reason, path} ->
+          {:halt,
+           {:error,
+            Error.from_reason(reason,
+              source: __MODULE__,
+              message: "failed to seed docker workspace from host_root",
+              details: %{host_root: host_root, workspace_root: workspace_root, path: path}
+            )}}
+      end
+    end)
+  end
+
+  defp ensure_workspace_user_writable(workspace_root) do
+    make_path_user_writable(workspace_root)
+  end
+
+  defp make_path_user_writable(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :directory}} ->
+        with :ok <- File.chmod(path, 0o777),
+             {:ok, entries} <- File.ls(path) do
+          Enum.reduce_while(entries, :ok, fn entry, :ok ->
+            case make_path_user_writable(Path.join(path, entry)) do
+              :ok -> {:cont, :ok}
+              {:error, error} -> {:halt, {:error, error}}
+            end
+          end)
+        else
+          {:error, reason} -> workspace_chmod_error(reason, path)
+        end
+
+      {:ok, %{type: :regular, mode: mode}} ->
+        mode =
+          if band(mode, 0o111) == 0 do
+            0o666
+          else
+            0o777
+          end
+
+        case File.chmod(path, mode) do
+          :ok -> :ok
+          {:error, reason} -> workspace_chmod_error(reason, path)
+        end
+
+      {:ok, _stat} ->
+        :ok
+
+      {:error, reason} ->
+        workspace_chmod_error(reason, path)
+    end
+  end
+
+  defp workspace_chmod_error(reason, path) do
+    {:error,
+     Error.from_reason(reason,
+       source: __MODULE__,
+       message: "failed to prepare docker workspace permissions",
+       details: %{path: path}
+     )}
   end
 
   defp session_workspace_root(%Session{} = session) do
@@ -2043,7 +2170,8 @@ defmodule RunicSandbox.Backends.Docker do
     case option(instance.metadata, :workspace_root) do
       workspace_root when is_binary(workspace_root) ->
         with :ok <- File.mkdir_p(workspace_root),
-             :ok <- write_files(workspace_root, request.files) do
+             :ok <- write_files(workspace_root, request.files),
+             :ok <- ensure_workspace_user_writable(workspace_root) do
           {:ok, workspace_root, false}
         end
 
@@ -2085,7 +2213,14 @@ defmodule RunicSandbox.Backends.Docker do
       :ok ->
         case write_files(workspace_root, request.files) do
           :ok ->
-            {:ok, workspace_root, true}
+            case ensure_workspace_user_writable(workspace_root) do
+              :ok ->
+                {:ok, workspace_root, true}
+
+              {:error, error} ->
+                File.rm_rf(workspace_root)
+                {:error, error}
+            end
 
           {:error, error} ->
             File.rm_rf(workspace_root)

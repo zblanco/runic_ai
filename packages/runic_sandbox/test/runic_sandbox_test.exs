@@ -20,6 +20,7 @@ defmodule RunicSandboxTest do
   alias RunicSandbox.Session
   alias RunicSandbox.SessionEvent
   alias RunicSandbox.Test.FakeBackend
+  alias RunicSandbox.Test.FakeDocker
   alias RunicSandbox.Test.NoAttachBackend
   alias RunicSandbox.VmsanCLI
 
@@ -1891,30 +1892,32 @@ defmodule RunicSandboxTest do
   end
 
   test "docker one-shot workspace is cleaned when file preparation fails" do
-    before = tmp_runic_sandbox_dirs()
+    FakeDocker.with_fake_docker(fn _docker_log ->
+      before = tmp_runic_sandbox_dirs()
 
-    assert {:ok, profile} =
-             Profile.new(
-               name: :local_code,
-               backend: :docker,
-               runtimes: [:bash],
-               network: :disabled,
-               image: "runic-ai/sandbox:elixir-python-node"
-             )
+      assert {:ok, profile} =
+               Profile.new(
+                 name: :local_code,
+                 backend: :docker,
+                 runtimes: [:bash],
+                 network: :disabled,
+                 image: "runic-ai/sandbox:elixir-python-node"
+               )
 
-    assert {:error, error} =
-             RunicSandbox.exec(
-               [
-                 sandbox: :local_code,
-                 runtime: :bash,
-                 source: "echo blocked",
-                 files: %{"ok.txt" => "secret", "../escape.txt" => "blocked"}
-               ],
-               profile: profile
-             )
+      assert {:error, error} =
+               RunicSandbox.exec(
+                 [
+                   sandbox: :local_code,
+                   runtime: :bash,
+                   source: "echo blocked",
+                   files: %{"ok.txt" => "secret", "../escape.txt" => "blocked"}
+                 ],
+                 profile: profile
+               )
 
-    assert error.message == "failed to prepare docker sandbox workspace"
-    assert tmp_runic_sandbox_dirs() -- before == []
+      assert error.message == "failed to prepare docker sandbox workspace"
+      assert tmp_runic_sandbox_dirs() -- before == []
+    end)
   end
 
   test "docker session persists files, checkpoints, and restores when local image exists" do
