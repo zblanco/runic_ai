@@ -30,8 +30,11 @@ defmodule RunicAI.SandboxImageTest do
     assert dockerfile =~ "RUNIC_MODEL_PROXY_URL=http://host.docker.internal:4100"
     assert dockerfile =~ "ARG AGENT_CLI_APT_PACKAGES"
     assert dockerfile =~ "ARG AGENT_CLI_NPM_PACKAGES"
+    assert dockerfile =~ "ARG RUNIC_AGENT_UID=10001"
+    assert dockerfile =~ "USER ${RUNIC_AGENT_UID}:${RUNIC_AGENT_GID}"
     assert dockerfile =~ "runic-agent-cli-check"
 
+    refute dockerfile =~ "python3-minimal"
     refute dockerfile =~ "ANTHROPIC_API_KEY"
     refute dockerfile =~ "OPENAI_API_KEY"
     refute dockerfile =~ "GEMINI_API_KEY"

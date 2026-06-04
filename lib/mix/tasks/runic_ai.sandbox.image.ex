@@ -146,14 +146,15 @@ defmodule Mix.Tasks.RunicAi.Sandbox.Image do
              sandbox: :local_code,
              runtime: :bash,
              source:
-               "runic-agent-cli-check claude codex; printf 'env=%s|%s\\n' \"$RUNIC_MCP_URL\" \"$RUNIC_MODEL_PROXY_URL\"",
+               "runic-agent-cli-check claude codex; python3 -c 'import json; print(\"python-json=ok\")'; printf 'uid=%s\\n' \"$(id -u)\"; printf 'env=%s|%s\\n' \"$RUNIC_MCP_URL\" \"$RUNIC_MODEL_PROXY_URL\"",
              timeout_ms: 30_000,
              max_output_bytes: 8_192
            },
            profile: profile
          ) do
       {:ok, %{status: :pass, stdout: stdout, isolation_level: :container}} ->
-        unless stdout =~ "env=http://host.docker.internal:4000|http://host.docker.internal:4100" do
+        unless stdout =~ "env=http://host.docker.internal:4000|http://host.docker.internal:4100" and
+                 stdout =~ "python-json=ok" and stdout =~ "uid=10001" do
           Mix.raise("agent-cli env smoke failed: #{inspect(stdout)}")
         end
 

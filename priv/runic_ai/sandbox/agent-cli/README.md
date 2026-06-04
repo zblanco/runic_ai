@@ -17,6 +17,12 @@ Optional CLI installation hooks:
 
 - `AGENT_CLI_NPM_PACKAGES` installs global npm packages during image build.
 - `AGENT_CLI_APT_PACKAGES` installs extra apt packages during image build.
+- `RUNIC_AGENT_UID`, `RUNIC_AGENT_GID`, and `RUNIC_AGENT_USER` control the
+  non-root runtime user. Defaults are uid/gid `10001` and user `runic`.
+
+The image installs full `python3`, not `python3-minimal`, because the Docker
+restricted-egress proxy and future sidecars may need stdlib modules such as
+`json`.
 
 For example:
 
@@ -31,3 +37,8 @@ docker build \
 The Gemini CLI path is intentionally deferred. If Gemini rejects a
 non-HTTPS base URL, the model proxy will need a TLS-presenting endpoint or a
 loopback-compatible sidecar path.
+
+Project-specific images should derive from this Dockerfile when they need
+additional language runtimes, system libraries, browser dependencies, or
+provider CLIs. Keep provider credentials out of the image and inject only
+endpoint URLs such as `RUNIC_MCP_URL` and `RUNIC_MODEL_PROXY_URL` at runtime.
