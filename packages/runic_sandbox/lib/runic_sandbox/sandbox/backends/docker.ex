@@ -1434,7 +1434,7 @@ defmodule RunicSandbox.Backends.Docker do
 
     {:ok,
      Path.join(
-       System.tmp_dir!(),
+       host_tmp_dir(),
        "runic_sandbox_checkpoint_#{session_path_id}_#{checkpoint_id}"
      )}
   end
@@ -1555,7 +1555,7 @@ defmodule RunicSandbox.Backends.Docker do
            details: %{checkpoint_id: checkpoint.id}
          )}
 
-      not String.starts_with?(Path.expand(path), Path.expand(System.tmp_dir!()) <> "/") ->
+      not String.starts_with?(Path.expand(path), Path.expand(host_tmp_dir()) <> "/") ->
         {:error,
          Error.validation("filesystem checkpoint path is outside the managed checkpoint root",
            source: __MODULE__,
@@ -2207,7 +2207,7 @@ defmodule RunicSandbox.Backends.Docker do
 
   defp prepare_one_shot_workspace(%ExecutionRequest{} = request) do
     workspace_root =
-      Path.join(System.tmp_dir!(), "runic_sandbox_#{System.unique_integer([:positive])}")
+      Path.join(host_tmp_dir(), "runic_sandbox_#{System.unique_integer([:positive])}")
 
     case File.mkdir_p(workspace_root) do
       :ok ->
@@ -3114,6 +3114,18 @@ defmodule RunicSandbox.Backends.Docker do
 
   defp option(_map, _key, default), do: default
 
+  # Host directory under which runic creates managed temp paths (stateful
+  # workspaces, checkpoints) that are bind-mounted into containers. Defaults to
+  # `System.tmp_dir!()`. Overridable via `config :runic_sandbox, host_tmp_dir: "/path"`
+  # for Docker engines that do not share the OS temp dir into their VM — e.g.
+  # Colima/Lima with default mounts, where `/var/folders` (macOS) and `/tmp` are
+  # not visible to dockerd, producing bind-mount "source path does not exist"
+  # failures even though the directory exists on the host. Point this at a shared
+  # path (e.g. a dir under `$HOME`) in those environments.
+  defp host_tmp_dir do
+    Application.get_env(:runic_sandbox, :host_tmp_dir) || System.tmp_dir!()
+  end
+
   defp secure_equal?(left, right) when is_binary(left) and is_binary(right) do
     byte_size(left) == byte_size(right) and :crypto.hash_equals(left, right)
   end
@@ -3131,7 +3143,7 @@ defmodule RunicSandbox.Backends.Docker do
         metadata,
         :workspace_root,
         Path.join(
-          System.tmp_dir!(),
+          host_tmp_dir(),
           "runic_sandbox_stateful_#{profile.name}_#{System.system_time(:nanosecond)}_#{System.unique_integer([:positive])}"
         )
       )
