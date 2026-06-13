@@ -121,6 +121,7 @@ defmodule RunicSandbox.Profile do
     pool = normalize_pool(Keyword.get(opts, :pool, %{warm: 0, max: 1}))
     stateful? = Keyword.get(opts, :stateful?, Keyword.get(opts, :persist?, false))
     enabled? = Keyword.get(opts, :enabled?, true)
+    policy_runtimes = policy_runtimes(runtimes)
 
     backend_options =
       opts
@@ -133,7 +134,7 @@ defmodule RunicSandbox.Profile do
     policy_input =
       policy_input
       |> policy_input_map()
-      |> Map.put_new(:allowed_runtimes, runtimes)
+      |> Map.put_new(:allowed_runtimes, policy_runtimes)
       |> Map.put_new(:isolation_minimum, isolation_level)
       |> maybe_put_network(network)
       |> maybe_put_policy_field(:egress_allowlist, Keyword.get(opts, :egress_allowlist))
@@ -394,7 +395,22 @@ defmodule RunicSandbox.Profile do
     end
   end
 
+  defp normalize_atom_list(value, field) when is_binary(value) and value != "" do
+    value
+    |> String.split([",", "\n"], trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> normalize_atom_list(field)
+  end
+
   defp normalize_atom_list(value, field), do: invalid_atom_list(field, value)
+
+  defp policy_runtimes(runtimes) do
+    case normalize_atom_list(runtimes, :runtimes) do
+      {:ok, normalized} -> normalized
+      {:error, _error} -> runtimes
+    end
+  end
 
   defp invalid_atom_list(field, value) do
     {:error,

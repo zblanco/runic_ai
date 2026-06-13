@@ -19,6 +19,8 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   @default_model "openai:gpt-5.4-mini"
   @default_repair_attempts 1
   @default_generation_mode :json_text
+  @max_conversation_history_messages 12
+  @max_conversation_history_chars 16_000
 
   @spec propose(String.t(), CodebaseEnvironment.t(), keyword()) ::
           {:ok, WorkflowProposal.t(), WorkflowValidationReport.t()} | {:error, Error.t()}
@@ -61,6 +63,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
     Objective:
     #{objective}
+
+    Prior conversation context:
+    #{conversation_context(opts)}
 
     Sources:
     #{Jason.encode!(CodebaseEnvironment.source_summaries(environment, Keyword.get(opts, :source_limit, 40)))}
@@ -298,6 +303,9 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     Objective:
     #{objective}
 
+    Prior conversation context:
+    #{conversation_context(opts)}
+
     Sources:
     #{Jason.encode!(CodebaseEnvironment.source_summaries(environment, Keyword.get(opts, :source_limit, 40)))}
 
@@ -371,6 +379,88 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       {:error, error} ->
         {:error, error}
     end
+  end
+
+  defp conversation_context(opts) do
+    opts
+    |> Keyword.get(:conversation_context)
+    |> case do
+      context when is_binary(context) and context != "" ->
+        truncate_history(context)
+
+      _other ->
+        opts
+        |> conversation_history()
+        |> format_conversation_history()
+    end
+  end
+
+  defp conversation_history(opts) do
+    opts
+    |> Keyword.get(:conversation_history, [])
+    |> List.wrap()
+    |> Enum.map(&normalize_history_message/1)
+    |> Enum.reject(&(String.trim(&1.content) == ""))
+    |> Enum.take(-@max_conversation_history_messages)
+  end
+
+  defp normalize_history_message(message) when is_map(message) do
+    %{
+      role: history_field(message, :role) || "message",
+      message_kind: history_field(message, :message_kind) || history_field(message, :kind),
+      content: history_content(history_field(message, :content))
+    }
+  end
+
+  defp normalize_history_message(message) when is_binary(message) do
+    %{role: "message", message_kind: nil, content: message}
+  end
+
+  defp normalize_history_message(message) do
+    %{role: "message", message_kind: nil, content: inspect(message)}
+  end
+
+  defp history_field(message, key) when is_map(message) do
+    Map.get(message, key) || Map.get(message, Atom.to_string(key))
+  end
+
+  defp history_content(nil), do: ""
+  defp history_content(content) when is_binary(content), do: content
+  defp history_content(content), do: inspect(content)
+
+  defp format_conversation_history([]), do: "[]"
+
+  defp format_conversation_history(history) do
+    history
+    |> Enum.map(&format_history_message/1)
+    |> Enum.join("\n\n")
+    |> truncate_history()
+  end
+
+  defp format_history_message(message) do
+    role =
+      message.role
+      |> to_string()
+      |> String.capitalize()
+
+    kind =
+      case message.message_kind do
+        nil -> ""
+        "" -> ""
+        kind -> " (#{kind})"
+      end
+
+    "#{role}#{kind}:\n#{message.content}"
+  end
+
+  defp truncate_history(text) when byte_size(text) <= @max_conversation_history_chars, do: text
+
+  defp truncate_history(text) do
+    omitted = byte_size(text) - @max_conversation_history_chars
+
+    text
+    |> binary_part(omitted, @max_conversation_history_chars)
+    |> then(&("[earlier conversation omitted]\n" <> &1))
   end
 
   defp decode_generated_json(text) when is_binary(text) do

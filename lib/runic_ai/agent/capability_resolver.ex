@@ -228,13 +228,13 @@ defmodule RunicAI.Agent.CapabilityResolver do
           Map.fetch!(@preset_toolsets, preset) ++ explicit_toolsets
         end
 
-      {:ok, toolsets |> Enum.uniq() |> maybe_disable_code_execution(explicit_toolsets, opts)}
+      {:ok, toolsets |> Enum.uniq() |> configure_code_execution_toolset(explicit_toolsets, opts)}
     end
   end
 
-  defp maybe_disable_code_execution(toolsets, explicit_toolsets, opts) do
+  defp configure_code_execution_toolset(toolsets, explicit_toolsets, opts) do
     if code_execution_enabled?(explicit_toolsets, opts) do
-      toolsets
+      Enum.uniq(toolsets ++ [:code_execution])
     else
       Enum.reject(toolsets, &(&1 == :code_execution))
     end
@@ -245,7 +245,18 @@ defmodule RunicAI.Agent.CapabilityResolver do
       truthy?(Keyword.get(opts, :enable_code_execution?)) or
       truthy?(Keyword.get(opts, :code_execution_enabled?)) or
       truthy?(get_in_config(Keyword.get(opts, :tool_config, %{}), [:code_execution, :enabled])) or
+      code_execution_configured?(opts) or
       application_code_execution_enabled?()
+  end
+
+  defp code_execution_configured?(opts) do
+    opts
+    |> Keyword.get(:tool_config, %{})
+    |> get_in_config([:code_execution])
+    |> case do
+      config when is_map(config) -> map_size(config) > 0
+      _other -> false
+    end
   end
 
   defp application_code_execution_enabled? do

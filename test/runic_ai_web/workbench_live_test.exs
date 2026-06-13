@@ -42,9 +42,74 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
 
     assert html =~ ~s(src="/images/runic-tome-logo.png")
     assert html =~ "Ask RunicAI to research, explain, inspect, plan, or make a local change"
+    assert html =~ "Standard"
+    assert html =~ "Assistant"
+    assert html =~ "Workflow RLM"
+    assert html =~ "Sandbox"
     refute html =~ "Show recent session"
     refute html =~ "Recent sessions"
     refute html =~ "Agent workbench"
+  end
+
+  test "root agent mode selector keeps launch fields in sync", %{conn: conn} do
+    {:ok, view, html} = live(conn, ~p"/")
+
+    assert landing_form_value(html, "agent") == "assistant"
+    assert landing_form_value(html, "mode") == "verify"
+    assert landing_form_value(html, "write_policy") == "docs_only"
+
+    view
+    |> element("button[phx-click='select_landing_agent'][phx-value-agent='rlm']")
+    |> render_click()
+
+    html = render(view)
+
+    assert landing_form_value(html, "agent") == "rlm"
+    assert landing_form_value(html, "mode") == "patch"
+    assert landing_form_value(html, "write_policy") == "workspace_review"
+    assert landing_mode_pressed?(html, "rlm")
+
+    view
+    |> element("button[phx-click='select_landing_agent'][phx-value-agent='assistant']")
+    |> render_click()
+
+    html = render(view)
+
+    assert landing_form_value(html, "agent") == "assistant"
+    assert landing_form_value(html, "mode") == "verify"
+    assert landing_form_value(html, "write_policy") == "docs_only"
+    assert landing_mode_pressed?(html, "assistant")
+  end
+
+  test "root sandbox selector exposes usable and cold sandbox profiles", %{conn: conn} do
+    {:ok, view, html} = live(conn, ~p"/")
+
+    assert html =~ "Local Code"
+    assert html =~ ~s(phx-value-sandbox="local_code")
+    assert html =~ "Docker"
+    assert html =~ ~s(phx-value-sandbox="docker")
+    assert html =~ "Starts on demand" or html =~ "Needs setup"
+    assert html =~ "selected bash"
+    assert html =~ "available bash"
+    assert landing_form_value(html, "sandbox_profile") == "local_code"
+    assert landing_form_value(html, "sandbox_backend") == "just_bash"
+    assert landing_form_value(html, "sandbox_runtime") == "bash"
+    assert landing_form_value(html, "sandbox_network") == "disabled"
+    assert landing_form_value(html, "sandbox_stateful") == "false"
+    assert landing_form_value(html, "sandbox_pool_warm") == "0"
+    assert landing_form_value(html, "sandbox_pool_max") == "1"
+
+    view
+    |> element("button[phx-click='select_landing_sandbox'][phx-value-sandbox='local_code']")
+    |> render_click()
+
+    html = render(view)
+
+    assert landing_sandbox_pressed?(html, "local_code")
+    assert landing_form_value(html, "sandbox_profile") == "local_code"
+    assert landing_form_value(html, "sandbox_backend") == "just_bash"
+    assert landing_form_value(html, "sandbox_runtime") == "bash"
+    assert landing_form_value(html, "sandbox_network") == "disabled"
   end
 
   test "root composer starts a run and navigates to the workbench session", %{conn: conn} do
@@ -958,6 +1023,45 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     do: "#{prefix}:#{System.unique_integer([:positive])}"
 
   defp unique_event_id(label), do: "test:web:event:#{label}:#{System.unique_integer([:positive])}"
+
+  defp landing_form_value(html, field) do
+    html
+    |> tag_with_attr("name", "run[#{field}]")
+    |> attr_value("value")
+  end
+
+  defp landing_mode_pressed?(html, agent) do
+    html
+    |> tag_with_attr("phx-value-agent", agent)
+    |> attr_value("aria-pressed") == "true"
+  end
+
+  defp landing_sandbox_pressed?(html, sandbox) do
+    html
+    |> tag_with_attr("phx-value-sandbox", sandbox)
+    |> attr_value("aria-pressed") == "true"
+  end
+
+  defp tag_with_attr(html, attr, value) do
+    attr = Regex.escape(attr)
+    value = Regex.escape(value)
+
+    case Regex.run(~r/<[^>]+#{attr}="#{value}"[^>]*>/, html) do
+      [tag] -> tag
+      nil -> nil
+    end
+  end
+
+  defp attr_value(nil, _attr), do: nil
+
+  defp attr_value(tag, attr) do
+    attr = Regex.escape(attr)
+
+    case Regex.run(~r/#{attr}="([^"]*)"/, tag) do
+      [_match, value] -> value
+      nil -> nil
+    end
+  end
 
   def fake_landing_run(_cwd, objective, opts) do
     opts[:event_sink].(%{

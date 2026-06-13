@@ -33,6 +33,56 @@ defmodule RunicAI.Workbench do
 
   @topic "runic_ai:workbench"
   @task_supervisor RunicAI.Workbench.TaskSupervisor
+  @sandbox_inventory_profiles [
+    local_code: [
+      backend: :just_bash,
+      runtimes: [:bash],
+      network: :disabled,
+      stateful?: false,
+      workspace: [mode: :copy_in, persist?: false],
+      pool: [warm: 0, max: 1]
+    ],
+    lua: [
+      backend: :lua,
+      runtimes: [:lua],
+      network: :disabled,
+      stateful?: false,
+      workspace: [mode: :copy_in, persist?: false],
+      pool: [warm: 0, max: 1]
+    ],
+    docker: [
+      backend: :docker,
+      runtimes: [:bash, :python, :node, :elixir],
+      network: :disabled,
+      stateful?: true,
+      workspace: [mode: :copy_in, persist?: true],
+      pool: [warm: 0, max: 2]
+    ],
+    gvisor: [
+      backend: :gvisor,
+      runtimes: [:bash, :python, :node, :elixir],
+      network: :disabled,
+      stateful?: true,
+      workspace: [mode: :copy_in, persist?: true],
+      pool: [warm: 0, max: 2]
+    ],
+    vmsan: [
+      backend: :vmsan,
+      runtimes: [:bash, :python, :node, :elixir],
+      network: :disabled,
+      stateful?: true,
+      workspace: [mode: :copy_in, persist?: true],
+      pool: [warm: 0, max: 2]
+    ],
+    sprites: [
+      backend: :sprites,
+      runtimes: [:bash, :python, :node, :elixir],
+      network: :restricted,
+      stateful?: true,
+      workspace: [mode: :copy_in, persist?: true],
+      pool: [warm: 0, max: 2]
+    ]
+  ]
 
   @agent_choices %{"assistant" => :assistant, "standard" => :standard, "rlm" => :rlm}
   @approval_choices %{"safe" => :safe, "never" => :never, "ask" => :ask}
@@ -72,6 +122,7 @@ defmodule RunicAI.Workbench do
     "sandbox_network" => :sandbox_network,
     "sandbox_pool_max" => :sandbox_pool_max,
     "sandbox_pool_warm" => :sandbox_pool_warm,
+    "sandbox_profile" => :sandbox_profile,
     "sandbox_runtime" => :sandbox_runtime,
     "sandbox_stateful" => :sandbox_stateful,
     "session_id" => :session_id,
@@ -100,19 +151,188 @@ defmodule RunicAI.Workbench do
   def config, do: Application.get_env(:runic_ai, :workbench, [])
 
   defp sandbox_health do
+    profiles = sandbox_inventory_profiles()
+    manager = sandbox_manager_status()
+
+    sandboxes =
+      Map.new(profiles, fn {name, profile} ->
+        direct = direct_sandbox_status(profile)
+        managed = manager |> field(:sandboxes) |> field(name)
+
+        {name, sandbox_inventory_status(profile, direct, managed)}
+      end)
+
+    %{
+      status: if(map_size(sandboxes) == 0, do: :unavailable, else: :available),
+      manager: Map.take(manager, [:status, :reason]),
+      sandboxes: sandboxes
+    }
+  rescue
+    exception -> %{status: :unavailable, reason: Exception.message(exception), sandboxes: %{}}
+  end
+
+  defp sandbox_inventory_profiles do
+    (@sandbox_inventory_profiles ++ configured_sandbox_profiles())
+    |> Enum.reduce(%{}, fn {name, profile_config}, acc ->
+      case sandbox_inventory_profile_name(name) do
+        nil ->
+          acc
+
+        name ->
+          case RunicSandbox.Profile.from_named_config(name, profile_config) do
+            {:ok, profile} -> Map.put(acc, profile.name, profile)
+            {:error, _error} -> acc
+          end
+      end
+    end)
+  end
+
+  defp sandbox_inventory_profile_name(name) when is_atom(name), do: name
+
+  defp sandbox_inventory_profile_name(name) when is_binary(name) do
+    String.to_existing_atom(name)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp sandbox_inventory_profile_name(_name), do: nil
+
+  defp configured_sandbox_profiles do
+    :runic_ai
+    |> Application.get_env(:sandbox, [])
+    |> case do
+      config when is_list(config) -> Keyword.get(config, :sandboxes, [])
+      %{} = config -> Map.get(config, :sandboxes, Map.get(config, "sandboxes", []))
+      _other -> []
+    end
+    |> case do
+      profiles when is_list(profiles) -> profiles
+      profiles when is_map(profiles) -> Map.to_list(profiles)
+      _other -> []
+    end
+  end
+
+  defp sandbox_manager_status do
     case Process.whereis(RunicAI.Sandbox) do
       nil ->
-        %{status: :unavailable, reason: :not_started}
+        %{status: :not_started, reason: :not_started, sandboxes: %{}}
 
       _pid ->
         case RunicSandbox.status(server: RunicAI.Sandbox) do
-          {:ok, status} -> sandbox_health_output(status)
-          {:error, error} -> %{status: :unavailable, reason: error}
+          {:ok, status} ->
+            status
+            |> sandbox_health_output()
+            |> Map.put(:status, :running)
+
+          {:error, error} ->
+            %{status: :unavailable, reason: sandbox_error_reason(error), sandboxes: %{}}
         end
+    end
+  rescue
+    exception -> %{status: :unavailable, reason: Exception.message(exception), sandboxes: %{}}
+  end
+
+  defp direct_sandbox_status(profile) do
+    case RunicSandbox.status(profile: profile) do
+      {:ok, status} -> sandbox_health_output(status)
+      {:error, error} -> %{status: :unavailable, reason: sandbox_error_reason(error)}
     end
   rescue
     exception -> %{status: :unavailable, reason: Exception.message(exception)}
   end
+
+  defp sandbox_inventory_status(profile, direct, managed) do
+    profile_status = field(direct, :profile) || sandbox_profile_snapshot(profile)
+    pool_status = field(managed, :pool_status) || empty_pool_status(profile)
+    sessions = field(managed, :sessions) || []
+    backend_health = direct |> field(:backends) |> List.wrap() |> List.first() || %{}
+    available? = field(direct, :status) in [:available, "available"]
+    active? = is_map(managed)
+    warm_ready = field(pool_status, :ready) || 0
+    busy = field(pool_status, :busy) || 0
+
+    readiness =
+      cond do
+        warm_ready > 0 -> :ready
+        busy > 0 -> :busy
+        available? -> :cold
+        true -> :unavailable
+      end
+
+    profile_status
+    |> Map.merge(%{
+      backend_health: backend_health,
+      status: field(direct, :status) || :unknown,
+      readiness: readiness,
+      status_label: sandbox_readiness_label(readiness),
+      status_detail: sandbox_readiness_detail(readiness, active?, pool_status, direct),
+      active?: active?,
+      selectable?: available?,
+      reason: field(direct, :reason),
+      pool_status: pool_status,
+      sessions: sessions
+    })
+  end
+
+  defp sandbox_profile_snapshot(%RunicSandbox.Profile{} = profile) do
+    %{
+      name: profile.name,
+      backend: profile.backend,
+      runtimes: profile.runtimes,
+      isolation_level: profile.isolation_level,
+      network: profile.policy.network,
+      stateful?: profile.stateful?,
+      workspace: profile.workspace,
+      pool: profile.pool,
+      metadata: profile.metadata
+    }
+    |> sandbox_health_output()
+  end
+
+  defp empty_pool_status(%RunicSandbox.Profile{} = profile) do
+    %{
+      warm: profile.pool.warm,
+      max: profile.pool.max,
+      total: 0,
+      ready: 0,
+      busy: 0,
+      stale: 0,
+      unhealthy: 0,
+      available_capacity: profile.pool.max
+    }
+  end
+
+  defp sandbox_readiness_label(:ready), do: "Ready"
+  defp sandbox_readiness_label(:busy), do: "Busy"
+  defp sandbox_readiness_label(:cold), do: "Starts on demand"
+  defp sandbox_readiness_label(:unavailable), do: "Needs setup"
+
+  defp sandbox_readiness_detail(:ready, true, pool_status, _direct) do
+    ready = field(pool_status, :ready) || 0
+    total = field(pool_status, :total) || 0
+    "#{ready}/#{total} warm sessions ready"
+  end
+
+  defp sandbox_readiness_detail(:busy, true, pool_status, _direct) do
+    busy = field(pool_status, :busy) || 0
+    "All warm sessions are checked out (#{busy} busy)"
+  end
+
+  defp sandbox_readiness_detail(:cold, true, _pool_status, _direct),
+    do: "Backend manager is running; this profile will open cold"
+
+  defp sandbox_readiness_detail(:cold, false, _pool_status, _direct),
+    do: "Backend is usable and will start when selected"
+
+  defp sandbox_readiness_detail(:unavailable, _active?, _pool_status, direct) do
+    case field(direct, :reason) do
+      nil -> "Host requirements or credentials are missing"
+      reason -> to_string(reason)
+    end
+  end
+
+  defp sandbox_error_reason(%{message: message}) when is_binary(message), do: message
+  defp sandbox_error_reason(error), do: error
 
   defp sandbox_health_output(%_struct{} = value),
     do: value |> Map.from_struct() |> sandbox_health_output()
@@ -1875,6 +2095,7 @@ defmodule RunicAI.Workbench do
 
   defp normalize_sandbox_tool_config(config, params) when is_map(config) and is_map(params) do
     sandbox_values = [
+      value(params, "sandbox_profile"),
       value(params, "sandbox_backend"),
       value(params, "sandbox_runtime"),
       value(params, "sandbox_network"),
@@ -1886,16 +2107,18 @@ defmodule RunicAI.Workbench do
     if Enum.all?(sandbox_values, &blank?/1) do
       {:ok, config}
     else
-      with {:ok, backend} <- normalize_sandbox_backend(value(params, "sandbox_backend")),
+      with {:ok, sandbox} <- normalize_sandbox_profile(value(params, "sandbox_profile")),
+           {:ok, backend} <- normalize_sandbox_backend(value(params, "sandbox_backend")),
            {:ok, runtime} <- normalize_sandbox_runtime(value(params, "sandbox_runtime")),
            {:ok, network} <- normalize_sandbox_network(value(params, "sandbox_network")),
            {:ok, stateful?} <- normalize_sandbox_stateful(value(params, "sandbox_stateful")),
            {:ok, pool} <- normalize_sandbox_pool(params) do
         {:ok,
          config
+         |> maybe_put_sandbox_config(["code_execution", "enabled"], true)
+         |> maybe_put_sandbox_config(["code_execution", "sandbox"], sandbox)
          |> maybe_put_sandbox_config(["code_execution", "backend"], backend)
          |> maybe_put_sandbox_config(["code_execution", "default_backend"], backend)
-         |> maybe_put_sandbox_config(["code_execution", "runtimes"], [runtime])
          |> maybe_put_sandbox_config(["code_execution", "allowed_runtimes"], [runtime])
          |> maybe_put_sandbox_config(["code_execution", "network"], network)
          |> maybe_put_sandbox_config(["code_execution", "stateful?"], stateful?)
@@ -1910,6 +2133,29 @@ defmodule RunicAI.Workbench do
 
   defp maybe_put_sandbox_config(config, _path, nil), do: config
   defp maybe_put_sandbox_config(config, path, value), do: put_nested_config(config, path, value)
+
+  defp normalize_sandbox_profile(value) do
+    value =
+      value
+      |> blank_to_nil()
+      |> case do
+        nil ->
+          "local_code"
+
+        value ->
+          value
+          |> to_string()
+          |> String.trim()
+          |> String.downcase()
+          |> String.replace("-", "_")
+      end
+
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, value) do
+      {:ok, value}
+    else
+      {:error, {:invalid_sandbox_profile, value}}
+    end
+  end
 
   defp normalize_sandbox_backend(value) do
     value =

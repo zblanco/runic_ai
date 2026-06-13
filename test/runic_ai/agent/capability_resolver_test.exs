@@ -76,6 +76,28 @@ defmodule RunicAI.Agent.CapabilityResolverTest do
     assert "sandbox_status" in resolved.visible_tools
   end
 
+  test "code execution tool config enables sandbox tools without a duplicate toolset flag" do
+    workspace = sample_workspace()
+
+    resolved =
+      CapabilityResolver.resolve!(workspace,
+        profile: :local_workbench,
+        tool_config: %{
+          code_execution: %{
+            backend: "docker",
+            allowed_runtimes: ["elixir"],
+            network: "host"
+          }
+        }
+      )
+
+    assert :code_execution in resolved.profile.toolsets
+    assert "execute_code" in resolved.visible_tools
+    assert "sandbox_status" in resolved.visible_tools
+    assert resolved.profile.config.code_execution.backend == "docker"
+    assert resolved.profile.config.code_execution.allowed_runtimes == ["elixir"]
+  end
+
   test "disabled tools are represented separately and blocked at tool execution time" do
     workspace = sample_workspace()
 

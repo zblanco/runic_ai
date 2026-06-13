@@ -16,13 +16,44 @@ defmodule RunicAIWeb.WorkbenchLive do
   @inspector_tabs ["trace", "logs", "artifacts", "details"]
   @session_filters ["all", "active", "review", "failed", "completed", "pinned"]
   @workbench_refresh_debounce_ms 75
+  @landing_agent_modes [
+    %{
+      id: "standard",
+      label: "Standard",
+      icon: "hero-command-line",
+      meta: "coding agent",
+      detail:
+        "Direct local coding loop for repo inspection, shell-backed changes, and verification."
+    },
+    %{
+      id: "assistant",
+      label: "Assistant",
+      icon: "hero-sparkles",
+      meta: "workflow builder",
+      detail:
+        "General-purpose assistant for research, explanation, planning, and structured workflow runs."
+    },
+    %{
+      id: "rlm",
+      label: "Workflow RLM",
+      icon: "hero-cpu-chip",
+      meta: "patch mode",
+      detail:
+        "Objective-gated workflow coordination for local implementation with reviewable writes."
+    }
+  ]
 
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket), do: Workbench.subscribe()
 
     model_catalog = ModelCatalog.catalog()
-    launch_defaults = launch_defaults(model_catalog)
+    health = Workbench.health()
+
+    launch_defaults =
+      model_catalog
+      |> launch_defaults()
+      |> put_default_sandbox_params(health)
 
     socket =
       socket
@@ -55,7 +86,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       |> assign(:model_catalog, model_catalog)
       |> assign(:new_run_params, launch_defaults)
       |> assign(:new_run_form, to_form(launch_defaults, as: :run))
-      |> assign(:health, Workbench.health())
+      |> assign(:health, health)
 
     {:ok, socket}
   end
@@ -112,6 +143,28 @@ defmodule RunicAIWeb.WorkbenchLive do
   def handle_event("change_run_form", %{"run" => params}, socket) do
     params = Map.merge(socket.assigns.new_run_params, params)
     {:noreply, put_new_run_form(socket, params)}
+  end
+
+  def handle_event("select_landing_agent", %{"agent" => agent}, socket) do
+    params =
+      socket.assigns.new_run_params
+      |> Map.merge(landing_agent_launch_params(agent))
+
+    {:noreply, put_new_run_form(socket, params)}
+  end
+
+  def handle_event("select_landing_sandbox", %{"sandbox" => sandbox_id}, socket) do
+    case landing_sandbox_option(socket.assigns.health, sandbox_id) do
+      %{selectable?: true} = sandbox ->
+        params =
+          socket.assigns.new_run_params
+          |> Map.merge(landing_sandbox_launch_params(sandbox))
+
+        {:noreply, put_new_run_form(socket, params)}
+
+      _sandbox ->
+        {:noreply, socket}
+    end
   end
 
   def handle_event("select_model_provider", %{"run" => %{"model_provider" => provider}}, socket) do
@@ -511,6 +564,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       "toolsets" => "",
       "disabled_tools" => "",
       "tool_config" => "terminal.shell_review=always",
+      "sandbox_profile" => "local_code",
       "sandbox_backend" => "just_bash",
       "sandbox_runtime" => "bash",
       "sandbox_network" => "disabled",
@@ -622,6 +676,222 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp default_write_policy("patch"), do: :workspace_review
   defp default_write_policy(_mode), do: :docs_only
 
+  defp landing_agent_modes, do: @landing_agent_modes
+
+  defp landing_agent_selected?(form, agent) do
+    Phoenix.HTML.Form.input_value(form, :agent) == agent
+  end
+
+  defp landing_agent_pressed(form, agent) do
+    if landing_agent_selected?(form, agent), do: "true", else: "false"
+  end
+
+  defp landing_agent_launch_params("rlm") do
+    %{
+      "agent" => "rlm",
+      "mode" => "patch",
+      "write_policy" => "workspace_review"
+    }
+  end
+
+  defp landing_agent_launch_params(agent) when agent in ["standard", "assistant"] do
+    cfg = Workbench.config()
+    mode = cfg |> Keyword.get(:default_mode, :verify) |> mode_value()
+
+    write_policy =
+      cfg
+      |> Keyword.get(:default_write_policy, default_write_policy(mode))
+      |> write_policy_value()
+
+    %{
+      "agent" => agent,
+      "mode" => mode,
+      "write_policy" => write_policy
+    }
+  end
+
+  defp landing_agent_launch_params(_agent), do: %{}
+
+  defp put_default_sandbox_params(params, health) do
+    options = landing_sandbox_options(health)
+
+    if Enum.any?(options, &landing_sandbox_selected?(params, &1)) do
+      params
+    else
+      case Enum.find(options, & &1.selectable?) do
+        nil -> params
+        sandbox -> Map.merge(params, landing_sandbox_launch_params(sandbox))
+      end
+    end
+  end
+
+  defp landing_sandbox_options(health) do
+    health
+    |> field(:sandbox)
+    |> case do
+      sandbox when is_map(sandbox) ->
+        sandbox
+        |> field(:sandboxes)
+        |> sandbox_profile_options()
+
+      _sandbox ->
+        []
+    end
+  end
+
+  defp sandbox_profile_options(sandboxes) when is_map(sandboxes) do
+    sandboxes
+    |> Enum.map(fn {id, profile} -> sandbox_profile_option(id, profile) end)
+    |> Enum.sort_by(& &1.sort_key)
+  end
+
+  defp sandbox_profile_options(_sandboxes), do: []
+
+  defp sandbox_profile_option(id, profile) do
+    backend = profile |> field(:backend) |> sandbox_value("just_bash")
+    runtimes = profile |> field(:runtimes) |> List.wrap() |> Enum.map(&to_string/1)
+    runtime = List.first(runtimes) || "bash"
+    network = profile |> field(:network) |> sandbox_value("disabled")
+    stateful? = profile |> field(:stateful?) |> sandbox_truthy?()
+    pool = field(profile, :pool) || %{}
+    pool_warm = pool |> field(:warm) |> integer_string("0")
+    pool_max = pool |> field(:max) |> integer_string("1")
+    isolation = profile |> field(:isolation_level) |> sandbox_value("unknown")
+    readiness = profile |> field(:readiness) |> sandbox_value("unknown")
+    selectable? = profile |> field(:selectable?) |> sandbox_truthy?()
+
+    %{
+      id: to_string(id),
+      label: sandbox_profile_label(id, backend),
+      status_label: profile |> field(:status_label) |> sandbox_text("Unknown"),
+      status_detail: profile |> field(:status_detail) |> sandbox_text("Status unavailable"),
+      readiness: readiness,
+      backend: backend,
+      runtime: runtime,
+      runtimes: runtimes,
+      network: network,
+      stateful?: stateful?,
+      pool_warm: pool_warm,
+      pool_max: pool_max,
+      isolation: isolation,
+      selectable?: selectable? and backend != "",
+      active?: profile |> field(:active?) |> sandbox_truthy?(),
+      sort_key: sandbox_sort_key(backend, id)
+    }
+  end
+
+  defp landing_sandbox_option(health, sandbox_id) do
+    health
+    |> landing_sandbox_options()
+    |> Enum.find(&(&1.id == to_string(sandbox_id)))
+  end
+
+  defp landing_sandbox_selected?(form_or_params, sandbox) do
+    sandbox_form_value(form_or_params, :sandbox_profile) == sandbox.id and
+      sandbox_form_value(form_or_params, :sandbox_backend) == sandbox.backend and
+      sandbox_form_value(form_or_params, :sandbox_runtime) == sandbox.runtime and
+      sandbox_form_value(form_or_params, :sandbox_network) == sandbox.network and
+      sandbox_form_value(form_or_params, :sandbox_stateful) == to_string(sandbox.stateful?)
+  end
+
+  defp landing_sandbox_pressed(form, sandbox) do
+    if landing_sandbox_selected?(form, sandbox), do: "true", else: "false"
+  end
+
+  defp landing_sandbox_launch_params(sandbox) do
+    %{
+      "sandbox_profile" => sandbox.id,
+      "sandbox_backend" => sandbox.backend,
+      "sandbox_runtime" => sandbox.runtime,
+      "sandbox_network" => sandbox.network,
+      "sandbox_stateful" => to_string(sandbox.stateful?),
+      "sandbox_pool_warm" => sandbox.pool_warm,
+      "sandbox_pool_max" => sandbox.pool_max
+    }
+  end
+
+  defp selected_landing_sandbox_label(form, health) do
+    health
+    |> landing_sandbox_options()
+    |> Enum.find(&landing_sandbox_selected?(form, &1))
+    |> case do
+      %{label: label, backend: backend, runtime: runtime, status_label: status} ->
+        "#{label} / #{backend}:#{runtime} / #{status}"
+
+      _sandbox ->
+        "No available sandbox selected"
+    end
+  end
+
+  defp sandbox_form_value(%Phoenix.HTML.Form{} = form, field_name) do
+    form
+    |> Phoenix.HTML.Form.input_value(field_name)
+    |> sandbox_value("")
+  end
+
+  defp sandbox_form_value(params, field_name) when is_map(params) do
+    field = field_name |> Atom.to_string()
+    params |> Map.get(field) |> sandbox_value("")
+  end
+
+  defp sandbox_value(nil, fallback), do: fallback
+  defp sandbox_value("", fallback), do: fallback
+
+  defp sandbox_value(value, _fallback) do
+    value
+    |> to_string()
+    |> String.replace("-", "_")
+  end
+
+  defp sandbox_text(nil, fallback), do: fallback
+  defp sandbox_text("", fallback), do: fallback
+  defp sandbox_text(value, _fallback), do: to_string(value)
+
+  defp integer_string(value, _fallback) when is_integer(value), do: Integer.to_string(value)
+  defp integer_string(value, _fallback) when is_binary(value) and value != "", do: value
+  defp integer_string(_value, fallback), do: fallback
+
+  defp sandbox_truthy?(value) when value in [true, "true", "1", "yes", "on"], do: true
+  defp sandbox_truthy?(_value), do: false
+
+  defp sandbox_sort_key("just_bash", id), do: {0, to_string(id)}
+  defp sandbox_sort_key("docker", id), do: {1, to_string(id)}
+  defp sandbox_sort_key("gvisor", id), do: {2, to_string(id)}
+  defp sandbox_sort_key("vmsan", id), do: {3, to_string(id)}
+  defp sandbox_sort_key("firecracker", id), do: {4, to_string(id)}
+  defp sandbox_sort_key("sprites", id), do: {5, to_string(id)}
+  defp sandbox_sort_key(_backend, id), do: {9, to_string(id)}
+
+  defp sandbox_status_badge_class(%{readiness: "ready"}),
+    do: "border-rune-success/30 bg-rune-success/10 text-rune-success"
+
+  defp sandbox_status_badge_class(%{readiness: "busy"}),
+    do: "border-rune-warning/30 bg-rune-warning/10 text-rune-warning"
+
+  defp sandbox_status_badge_class(%{readiness: "cold"}),
+    do: "border-rune-primary/30 bg-rune-primary/10 text-rune-primary"
+
+  defp sandbox_status_badge_class(_sandbox),
+    do: "border-rune-error/30 bg-rune-error/10 text-rune-error"
+
+  defp sandbox_runtimes_label(%{runtimes: runtimes}) when is_list(runtimes) and runtimes != [] do
+    runtimes
+    |> Enum.join(", ")
+  end
+
+  defp sandbox_runtimes_label(_sandbox), do: "none"
+
+  defp sandbox_profile_label(id, "just_bash"), do: "#{titleize_sandbox_id(id)}"
+  defp sandbox_profile_label(id, _backend), do: titleize_sandbox_id(id)
+
+  defp titleize_sandbox_id(id) do
+    id
+    |> to_string()
+    |> String.replace(~r/[_-]+/, " ")
+    |> String.split(" ", trim: true)
+    |> Enum.map_join(" ", fn word -> String.capitalize(word) end)
+  end
+
   defp profile_value(profile) when is_atom(profile),
     do: profile |> Atom.to_string() |> String.replace("_", "-")
 
@@ -639,13 +909,13 @@ defmodule RunicAIWeb.WorkbenchLive do
       Skip to composer
     </a>
 
-    <main class="runic-workbench grid min-h-screen place-items-center overflow-hidden px-4 py-8 text-rune-text">
-      <section class="grid w-full max-w-[760px] place-items-center gap-10">
+    <main class="runic-workbench runic-scrollbar h-screen overflow-y-auto px-4 py-6 text-rune-text">
+      <section class="mx-auto grid min-h-full w-full max-w-[760px] content-start justify-items-center gap-6">
         <h1 class="sr-only">RunicAI</h1>
         <img
           src={~p"/images/runic-tome-logo.png"}
           alt="RunicAI"
-          class="object-contain drop-shadow-[0_28px_70px_rgba(0,0,0,0.46)]"
+          class="max-h-[220px] w-auto object-contain drop-shadow-[0_28px_70px_rgba(0,0,0,0.46)] max-[700px]:max-h-[160px]"
         />
 
         <.form
@@ -655,6 +925,137 @@ defmodule RunicAIWeb.WorkbenchLive do
           phx-submit="submit_objective"
           class="runic-composer-shell runic-frost grid w-full grid-cols-[1fr_auto] items-end gap-3 rounded-3xl p-3 shadow-[0_22px_70px_rgba(0,0,0,0.34)] max-[700px]:grid-cols-1"
         >
+          <div
+            role="radiogroup"
+            aria-label="Agent mode"
+            class="col-span-2 grid grid-cols-3 gap-2 max-[700px]:col-span-1 max-[700px]:grid-cols-1"
+          >
+            <button
+              :for={mode <- landing_agent_modes()}
+              type="button"
+              phx-click="select_landing_agent"
+              phx-value-agent={mode.id}
+              aria-pressed={landing_agent_pressed(@new_run_form, mode.id)}
+              class={[
+                "group grid min-h-[112px] content-between rounded-[22px] border px-4 py-3 text-left transition shadow-[inset_0_1px_0_rgba(255,244,211,0.045)]",
+                landing_agent_selected?(@new_run_form, mode.id) &&
+                  "border-rune-gold/45 bg-rune-gold/[0.105] text-rune-text shadow-[inset_0_1px_0_rgba(255,244,211,0.08),0_12px_30px_rgba(0,0,0,0.26)]",
+                !landing_agent_selected?(@new_run_form, mode.id) &&
+                  "border-rune-text/10 bg-black/20 text-rune-text-soft hover:border-rune-gold/30 hover:bg-rune-text/[0.045]"
+              ]}
+            >
+              <span class="flex items-start justify-between gap-3">
+                <span class="grid gap-1">
+                  <span class="font-display text-[17px] font-semibold leading-tight text-rune-text">
+                    {mode.label}
+                  </span>
+                  <span class="font-mono text-[10px] uppercase text-rune-muted">{mode.meta}</span>
+                </span>
+                <span class={[
+                  "grid size-8 shrink-0 place-items-center rounded-[12px] border",
+                  landing_agent_selected?(@new_run_form, mode.id) &&
+                    "border-rune-gold/35 bg-rune-gold/15 text-rune-gold",
+                  !landing_agent_selected?(@new_run_form, mode.id) &&
+                    "border-rune-text/10 bg-black/25 text-rune-primary"
+                ]}>
+                  <.icon name={mode.icon} class="size-4" />
+                </span>
+              </span>
+              <span class="mt-3 block text-xs leading-5 text-rune-muted group-hover:text-rune-text-soft">
+                {mode.detail}
+              </span>
+            </button>
+          </div>
+
+          <details class="col-span-2 overflow-hidden rounded-[22px] border border-rune-text/10 bg-black/15 max-[700px]:col-span-1">
+            <summary class="grid cursor-pointer grid-cols-[1fr_auto] items-center gap-3 px-4 py-3 marker:text-rune-gold hover:bg-rune-text/[0.035]">
+              <span class="min-w-0">
+                <span class="block font-mono text-[10px] uppercase text-rune-muted">
+                  Sandbox
+                </span>
+                <span class="mt-1 block truncate text-sm font-semibold text-rune-text">
+                  {selected_landing_sandbox_label(@new_run_form, @health)}
+                </span>
+              </span>
+              <span class="inline-flex items-center gap-2 rounded-full border border-rune-gold/20 bg-rune-gold/10 px-2.5 py-1.5 font-mono text-[10px] uppercase text-rune-gold">
+                <.icon name="hero-cube-transparent" class="size-3.5" /> settings
+              </span>
+            </summary>
+            <div class="runic-scrollbar max-h-[34vh] overflow-y-auto border-t border-rune-text/10 p-3">
+              <div
+                :if={landing_sandbox_options(@health) == []}
+                class="rounded-[16px] border border-rune-warning/25 bg-rune-warning/10 px-4 py-3 text-sm leading-6 text-rune-text-soft"
+              >
+                No sandbox profile is configured for this workbench.
+              </div>
+              <div
+                :if={landing_sandbox_options(@health) != []}
+                role="radiogroup"
+                aria-label="Sandbox backend"
+                class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1"
+              >
+                <button
+                  :for={sandbox <- landing_sandbox_options(@health)}
+                  type="button"
+                  phx-click="select_landing_sandbox"
+                  phx-value-sandbox={sandbox.id}
+                  disabled={!sandbox.selectable?}
+                  aria-pressed={landing_sandbox_pressed(@new_run_form, sandbox)}
+                  class={[
+                    "group grid min-h-[112px] content-between rounded-[18px] border px-4 py-3 text-left transition shadow-[inset_0_1px_0_rgba(255,244,211,0.035)]",
+                    landing_sandbox_selected?(@new_run_form, sandbox) &&
+                      "border-rune-gold/40 bg-rune-gold/[0.095] text-rune-text shadow-[0_10px_26px_rgba(0,0,0,0.22)]",
+                    !landing_sandbox_selected?(@new_run_form, sandbox) &&
+                      sandbox.selectable? &&
+                      "border-rune-text/10 bg-black/20 text-rune-text-soft hover:border-rune-gold/30 hover:bg-rune-text/[0.045]",
+                    !sandbox.selectable? &&
+                      "cursor-not-allowed border-rune-text/10 bg-black/10 text-rune-muted opacity-70"
+                  ]}
+                >
+                  <span class="flex items-start justify-between gap-3">
+                    <span class="min-w-0">
+                      <span class="block truncate font-display text-[16px] font-semibold leading-tight text-rune-text">
+                        {sandbox.label}
+                      </span>
+                      <span class="mt-1 block truncate font-mono text-[10px] uppercase text-rune-muted">
+                        {sandbox.backend} / {sandbox.isolation}
+                      </span>
+                      <span class={[
+                        "mt-2 inline-flex max-w-full items-center rounded-full border px-2 py-1 font-mono text-[10px] uppercase",
+                        sandbox_status_badge_class(sandbox)
+                      ]}>
+                        <span class="truncate">{sandbox.status_label}</span>
+                      </span>
+                    </span>
+                    <span class={[
+                      "grid size-8 shrink-0 place-items-center rounded-[12px] border",
+                      landing_sandbox_selected?(@new_run_form, sandbox) &&
+                        "border-rune-gold/35 bg-rune-gold/15 text-rune-gold",
+                      !landing_sandbox_selected?(@new_run_form, sandbox) &&
+                        "border-rune-text/10 bg-black/25 text-rune-primary"
+                    ]}>
+                      <.icon name="hero-cpu-chip" class="size-4" />
+                    </span>
+                  </span>
+                  <span class="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10.5px] text-rune-muted">
+                    <span class="truncate">selected {sandbox.runtime}</span>
+                    <span class="truncate">network {sandbox.network}</span>
+                    <span class="truncate">
+                      {if sandbox.stateful?, do: "stateful", else: "stateless"}
+                    </span>
+                    <span class="truncate">pool {sandbox.pool_warm}/{sandbox.pool_max}</span>
+                  </span>
+                  <span class="mt-2 block truncate font-mono text-[10.5px] text-rune-text-soft">
+                    available {sandbox_runtimes_label(sandbox)}
+                  </span>
+                  <span class="mt-2 block truncate text-xs leading-5 text-rune-muted">
+                    {sandbox.status_detail}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </details>
+
           <textarea
             id="run-objective"
             name={@new_run_form[:objective].name}
@@ -733,6 +1134,11 @@ defmodule RunicAIWeb.WorkbenchLive do
             type="hidden"
             name={@new_run_form[:tool_config].name}
             value={Phoenix.HTML.Form.input_value(@new_run_form, :tool_config)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_profile].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_profile)}
           />
           <input
             type="hidden"

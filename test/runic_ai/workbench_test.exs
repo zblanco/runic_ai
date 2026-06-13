@@ -1126,6 +1126,7 @@ defmodule RunicAI.WorkbenchTest do
                    "checkpoint_policy" => %{"mode" => "manual"}
                  }
                },
+               "sandbox_profile" => "docker",
                "sandbox_backend" => "docker",
                "sandbox_runtime" => "python",
                "sandbox_network" => "restricted",
@@ -1151,6 +1152,7 @@ defmodule RunicAI.WorkbenchTest do
                "restricted"
 
       assert get_in(launch_event.data, ["sandbox", "backend"]) == "docker"
+      assert get_in(launch_event.data, ["sandbox", "sandbox"]) == "docker"
       assert get_in(launch_event.data, ["sandbox", "runtimes"]) == ["python"]
       assert get_in(launch_event.data, ["sandbox", "network"]) == "restricted"
       assert get_in(launch_event.data, ["sandbox", "stateful?"]) == true
@@ -1168,6 +1170,58 @@ defmodule RunicAI.WorkbenchTest do
       assert capability_event
       assert get_in(capability_event.data, ["sandbox", "backend"]) == "docker"
       assert get_in(capability_event.data, ["sandbox", "stateful?"]) == true
+    end)
+  end
+
+  test "browser sandbox fields enable code execution without explicit toolsets" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, &__MODULE__.fake_assistant_run/3)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("sandbox-implicit-toolset")
+
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Implement a sandboxed Elixir coding slice",
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "patch",
+               "profile" => "coding-patch",
+               "sandbox_backend" => "docker",
+               "sandbox_runtime" => "elixir",
+               "sandbox_network" => "host",
+               "sandbox_stateful" => "true",
+               "sandbox_pool_warm" => "1",
+               "sandbox_pool_max" => "1"
+             })
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      launch_event =
+        Enum.find(snapshot.events, fn event ->
+          event.title == "Workbench run queued" and get_in(event.data, ["run_id"]) == run_id
+        end)
+
+      assert launch_event
+      assert get_in(launch_event.data, ["toolsets"]) == []
+      assert get_in(launch_event.data, ["tool_config", "code_execution", "enabled"]) == true
+
+      profile = get_in(launch_event.data, ["capability_profile"])
+      assert "code_execution" in get_in(profile, ["toolsets"])
+      assert "execute_code" in get_in(profile, ["visible_tools"])
+      assert "sandbox_exec" in get_in(profile, ["visible_tools"])
+
+      assert get_in(launch_event.data, ["sandbox", "backend"]) == "docker"
+      assert get_in(launch_event.data, ["sandbox", "runtimes"]) == ["elixir"]
     end)
   end
 
@@ -1228,6 +1282,107 @@ defmodule RunicAI.WorkbenchTest do
       assert first_run_id in run_ids
       assert second_run_id in run_ids
     end)
+  end
+
+  test "browser agent switches keep prior conversation history for the new agent" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+    caller = self()
+
+    run_fun = fn _cwd, objective, opts ->
+      send(caller, {:agent_run, objective, opts[:conversation_history] || []})
+
+      reply =
+        if String.contains?(objective, "Plan") do
+          "Plan: build the game with Phoenix LiveView, DynamicSupervisor, GameSessionServer, ECS tables, and ReqLLM."
+        else
+          "Implementation run received."
+        end
+
+      Keyword.fetch!(opts, :event_sink).(%{
+        stage: :direct_response_completed,
+        status: :ok,
+        data: %{reply_text: reply, output: %{text_preview: reply}}
+      })
+
+      {:ok,
+       %{scorecard: %{objective_status: :objective_satisfied}, artifacts: [], repair_history: []}}
+    end
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, run_fun)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("agent-switch-history")
+
+    prior_run_id = "standard:web:prior-plan"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("standard-user-plan"),
+               session_id: session_id,
+               run_id: prior_run_id,
+               agent: :standard,
+               kind: :message,
+               phase: :user,
+               status: :ok,
+               title: "User request",
+               detail: "Plan the LiveView text adventure architecture",
+               data_json: %{
+                 run_id: prior_run_id,
+                 role: "user",
+                 message_kind: "objective",
+                 content: "Plan the LiveView text adventure architecture",
+                 presentation_group_id: prior_run_id
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("standard-assistant-plan"),
+               session_id: session_id,
+               run_id: prior_run_id,
+               agent: :standard,
+               kind: :message,
+               phase: :assistant,
+               status: :ok,
+               title: "Assistant response",
+               detail:
+                 "Plan: build the game with Phoenix LiveView, DynamicSupervisor, GameSessionServer, ECS tables, and ReqLLM.",
+               data_json: %{
+                 run_id: prior_run_id,
+                 role: "assistant",
+                 message_kind: "assistant",
+                 content:
+                   "Plan: build the game with Phoenix LiveView, DynamicSupervisor, GameSessionServer, ECS tables, and ReqLLM.",
+                 presentation_group_id: prior_run_id
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, %{session_id: ^session_id, run_id: second_run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Implement this as described in the repo using ReqLLM",
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "safe",
+               "mode" => "patch",
+               "profile" => "coding-patch"
+             })
+
+    assert String.starts_with?(second_run_id, "rlm:web")
+
+    assert_receive {:agent_run, "Implement this as described in the repo using ReqLLM", history},
+                   1_000
+
+    assert Enum.any?(history, &String.contains?(&1.content, "Plan the LiveView text adventure"))
+    assert Enum.any?(history, &String.contains?(&1.content, "DynamicSupervisor"))
+    assert Enum.any?(history, &(&1.role == "assistant"))
   end
 
   test "browser repo RLM requests without workspace cues route to assistant" do

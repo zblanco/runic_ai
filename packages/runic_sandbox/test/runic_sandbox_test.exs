@@ -78,6 +78,16 @@ defmodule RunicSandboxTest do
     assert error.message == "sandbox pool must include non-negative warm and positive max"
   end
 
+  test "profile normalizes scalar runtime strings" do
+    assert {:ok, profile} = Profile.new(name: :local_code, runtimes: "python")
+    assert profile.runtimes == [:python]
+    assert profile.policy.allowed_runtimes == [:python]
+
+    assert {:ok, profile} = Profile.new(name: :local_code, runtimes: "python,node")
+    assert profile.runtimes == [:python, :node]
+    assert profile.policy.allowed_runtimes == [:python, :node]
+  end
+
   test "supervised facade executes through configured sandbox profile" do
     name = :"runic_sandbox_#{System.unique_integer([:positive])}"
 

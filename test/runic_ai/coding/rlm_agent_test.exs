@@ -254,6 +254,35 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert opt_in_prompt =~ "project_generation"
   end
 
+  test "coordinator prompt includes prior conversation history for agent handoffs" do
+    root = sample_project()
+    environment = Agent.prepare!(root)
+
+    prompt =
+      Coordinator.prompt("Implement the first version as described", environment,
+        mode: :patch,
+        conversation_history: [
+          %{
+            role: "user",
+            message_kind: "objective",
+            content: "How should the LiveView game runtime be structured?"
+          },
+          %{
+            role: "assistant",
+            message_kind: "assistant",
+            content:
+              "Plan: use Phoenix LiveView, a DynamicSupervisor, GameSessionServer, ECS tables, and ReqLLM intent parsing."
+          }
+        ]
+      )
+
+    assert prompt =~ "Prior conversation context:"
+    assert prompt =~ "User (objective):"
+    assert prompt =~ "Assistant (assistant):"
+    assert prompt =~ "DynamicSupervisor"
+    assert prompt =~ "ReqLLM intent parsing"
+  end
+
   test "project generator applies into a fresh scenario workspace" do
     workspace = Workspace.new!(root: sample_scaffold_mix_project())
 
