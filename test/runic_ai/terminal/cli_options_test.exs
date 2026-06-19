@@ -42,6 +42,36 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.sqlite_path == Path.join([cwd, ".runic_ai", "runs.db"])
   end
 
+  test "parses approve-all aliases" do
+    cwd = tmp_dir()
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "summarize repo",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--approve",
+               "always"
+             ])
+
+    assert opts.approve == :always
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "summarize repo",
+               "--agent",
+               "rlm",
+               "--cwd",
+               cwd,
+               "--approve",
+               "all"
+             ])
+
+    assert opts.approve == :always
+  end
+
   test "parses presentation options" do
     cwd = tmp_dir()
 

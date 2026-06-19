@@ -18,6 +18,7 @@ defmodule RunicAI.Coding.RLM.Agent do
   alias RunicAI.Coding.RLM.Checkpoint
   alias RunicAI.Coding.RLM.CodebaseEnvironment
   alias RunicAI.Coding.RLM.Coordinator
+  alias RunicAI.Coding.RLM.ObjectiveContract
   alias RunicAI.Coding.RLM.Persistence
   alias RunicAI.Coding.RLM.ProgressGate
   alias RunicAI.Coding.RLM.RepairLoop
@@ -145,7 +146,8 @@ defmodule RunicAI.Coding.RLM.Agent do
              objective: objective,
              source_count: map_size(environment.source_index.refs_by_id),
              max_runtime_ms: Keyword.get(opts, :max_runtime_ms),
-             run_deadline_ms: Keyword.get(opts, :run_deadline_ms)
+             run_deadline_ms: Keyword.get(opts, :run_deadline_ms),
+             objective_contract: early_objective_contract(objective, opts)
            }),
          {:ok, proposal, report} <-
            Checkpoint.result(
@@ -349,6 +351,19 @@ defmodule RunicAI.Coding.RLM.Agent do
     end
   end
 
+  defp early_objective_contract(objective, opts) do
+    contract =
+      case Keyword.get(opts, :objective_contract) do
+        nil -> ObjectiveContract.infer(objective, metadata: %{source: :proposal_started})
+        input -> ObjectiveContract.from_input(input)
+      end
+
+    case contract do
+      {:ok, %ObjectiveContract{} = contract} -> ObjectiveContract.to_map(contract)
+      {:error, _error} -> nil
+    end
+  end
+
   defp emit_stage(opts, stage, status, data) do
     sink = Keyword.get(opts, :event_sink) || Keyword.get(opts, :stage_sink)
 
@@ -443,6 +458,10 @@ defmodule RunicAI.Coding.RLM.Agent do
       :child_agent_started,
       :child_agent_progress,
       :child_agent_event,
+      :child_noop_repair_started,
+      :child_noop_repair_completed,
+      :child_patch_repair_started,
+      :child_patch_repair_completed,
       :child_agent_completed
     ]
   end

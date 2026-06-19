@@ -76,7 +76,8 @@ defmodule RunicAI.Agent.ToolExecution do
                details: %{
                  tool_name: definition.name,
                  resume_key: request.resume_key,
-                 decision_status: decision.status
+                 decision_status: decision.status,
+                 review_request: review_request_payload(request)
                }
              )}
 
@@ -126,6 +127,18 @@ defmodule RunicAI.Agent.ToolExecution do
         requires_review?: true
       }
     )
+  end
+
+  defp review_request_payload(%ReviewRequest{} = request) do
+    %{
+      kind: request.kind,
+      subject: request.subject,
+      checkpoint: request.checkpoint,
+      resume_key: request.resume_key,
+      options: request.options,
+      details: request.details,
+      metadata: request.metadata
+    }
   end
 
   defp tool_review_details(%Definition{name: "execute_code"} = definition, args)

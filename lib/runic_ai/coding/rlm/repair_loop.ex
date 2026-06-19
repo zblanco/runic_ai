@@ -29,7 +29,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
   alias RunicAI.Error
   alias RunicAI.RLM.Episode
 
-  @default_max_iterations 2
+  @default_max_iterations 4
 
   @type run_result :: map()
 
@@ -112,32 +112,54 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       context
       |> record_repair_attempt(attempt)
       |> record_child_result(attempt.child_result, iteration)
-      |> run_verification_commands(result.proposal, environment.workspace, opts, iteration)
-      |> run_verification_gates(result.proposal, environment.workspace, opts, iteration)
 
-    result =
-      result
-      |> refresh_result(context)
-      |> ProgressGate.apply(opts)
-
-    event = %{
+    base_event = %{
       iteration: iteration,
       attempt_status: attempt.status,
       child_status: attempt.child_result.status,
       changed_files: attempt.changed_files,
       delta: Map.take(attempt.delta, [:created, :modified, :deleted]),
       error: error_summary(attempt.error),
-      repair_plan: repair_plan,
-      scorecard_status: scorecard_status(final_scorecard(result)),
-      repair_needs: Enum.map(repair_needs(result.context), &repair_need_summary/1)
+      repair_plan: repair_plan
     }
 
-    emit_stage(opts, :repair_attempt_completed, attempt.status, event)
+    if child_needs_review?(attempt.child_result) do
+      event =
+        base_event
+        |> Map.put(:scorecard_status, scorecard_status(final_scorecard(result)))
+        |> Map.put(:repair_needs, Enum.map(repair_needs(context), &repair_need_summary/1))
 
-    if satisfied?(result) do
-      {:ok, mark_repair_status(result, :satisfied, history ++ [event])}
+      emit_stage(opts, :repair_attempt_completed, :review, event)
+
+      result =
+        result
+        |> refresh_result(context)
+        |> mark_repair_status(:needs_review, history ++ [event])
+
+      {:ok, result}
     else
-      iterate(result, environment, opts, repair_opts, iterations_left - 1, history ++ [event])
+      context =
+        context
+        |> run_verification_commands(result.proposal, environment.workspace, opts, iteration)
+        |> run_verification_gates(result.proposal, environment.workspace, opts, iteration)
+
+      result =
+        result
+        |> refresh_result(context)
+        |> ProgressGate.apply(opts)
+
+      event =
+        base_event
+        |> Map.put(:scorecard_status, scorecard_status(final_scorecard(result)))
+        |> Map.put(:repair_needs, Enum.map(repair_needs(result.context), &repair_need_summary/1))
+
+      emit_stage(opts, :repair_attempt_completed, attempt.status, event)
+
+      if satisfied?(result) do
+        {:ok, mark_repair_status(result, :satisfied, history ++ [event])}
+      else
+        iterate(result, environment, opts, repair_opts, iterations_left - 1, history ++ [event])
+      end
     end
   end
 
@@ -220,6 +242,8 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       Keyword.get(repair_opts, :objective) || original_objective(result) ||
         result.proposal.objective
 
+    recent_failure = latest_command_failure(result)
+
     """
     Repair iteration #{iteration}.
 
@@ -231,6 +255,8 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
 
     Structured repair plan:
     #{inspect(repair_plan, pretty: true, limit: 20)}
+
+    #{command_repair_focus(recent_failure)}
 
     Prior repair attempts and current handoff context:
     #{inspect(repair_handoff_summary(result), pretty: true, limit: 20)}
@@ -244,14 +270,42 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       removing scaffold placeholders or making cosmetic edits.
     - Treat semantic repair instructions, failed command output, and concrete
       source/test checks as the repair acceptance checklist.
+    - When a compile, test, or runtime smoke command failed, reproduce and fix
+      that command first before chasing weaker source text checks. Syntax and
+      compile errors must be fixed before semantic or cosmetic repairs.
     - Follow the structured repair plan: address the observed failure, test the
       hypothesis with the planned edit, run the verification command, and stop
       only when the stop condition is met.
     - Replace default scaffold files with working project-specific code rather
       than deleting them and leaving references broken.
+    - Preserve the objective's project identity when repairing generated app,
+      module, file, test, and smoke API names; if a check expects a public
+      entry point implied by the objective, add or adapt that entry point
+      instead of only explaining nearby behavior.
     - Run the relevant verification command before claiming completion.
     - Do not edit sibling projects or unrelated workspace files.
     - If no repair is possible within budget, report that explicitly.
+    """
+  end
+
+  defp command_repair_focus(nil),
+    do: "Command-first repair focus: no failed verification command is currently recorded."
+
+  defp command_repair_focus(command) do
+    """
+    Command-first repair focus:
+    - Reproduce this failed command first: #{command_display(command)}
+    - Status: #{inspect(field(command, :status))}
+    - Cwd: #{inspect(field(command, :cwd))}
+    - Use the command output below as the primary diagnostic signal.
+    - Patch the smallest source or test slice implicated by the error; preserve
+      correct existing work and avoid broad rewrites.
+    - For Elixir syntax or compile errors, make the project compile before
+      changing runtime behavior. For runtime smoke failures, align the public
+      API return shape with the smoke command contract and then rerun it.
+
+    Command output preview:
+    #{field(command, :output_preview) || field(command, :output) || "(no output captured)"}
     """
   end
 
@@ -607,7 +661,10 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
             workflow =
               StandardAgent.patch(workspace, objective, repair_child_opts(opts, repair_opts))
 
-            workflow |> StandardAgent.summary() |> child_from_summary("repair:#{iteration}")
+            workflow
+            |> StandardAgent.summary()
+            |> maybe_put_latest_review_request(StandardAgent.latest_review_request(workflow))
+            |> child_from_summary("repair:#{iteration}")
         end
       end,
       timeout_ms: Keyword.get(repair_opts, :max_child_runtime_ms),
@@ -754,10 +811,23 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     |> Keyword.merge(Keyword.get(repair_opts, :agent_opts, []))
     |> Keyword.put_new(:model, Keyword.get(opts, :model))
     |> Keyword.put_new(:client, Keyword.get(opts, :client))
-    |> Keyword.put_new(:review_gates?, Keyword.get(opts, :agent_review_gates?, true))
+    |> Keyword.put_new(:review_decider, Keyword.get(opts, :review_decider))
+    |> Keyword.put_new(:approval, Keyword.get(opts, :approval, Keyword.get(opts, :approve)))
+    |> Keyword.put_new(:review_gate_opts, Keyword.get(opts, :review_gate_opts))
+    |> Keyword.put_new(:review_gates?, repair_child_review_gates?(opts))
     |> Keyword.put_new(:max_turns, Keyword.get(repair_opts, :max_child_turns, 12))
     |> Keyword.put_new(:max_tool_calls, Keyword.get(repair_opts, :max_tool_calls, 80))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp repair_child_review_gates?(opts) do
+    case Keyword.get(opts, :approval, Keyword.get(opts, :approve)) do
+      policy when policy in [:always, "always", :all, "all"] ->
+        false
+
+      _other ->
+        Keyword.get(opts, :agent_review_gates?, true)
+    end
   end
 
   defp normalize_child_result({:ok, %ChildResult{} = child}, _id), do: {:ok, child}
@@ -785,6 +855,12 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
 
   defp child_from_summary(summary, id) do
     {:ok, ChildResult.from_agent_summary(summary, nil, id: id)}
+  end
+
+  defp maybe_put_latest_review_request(summary, nil), do: summary
+
+  defp maybe_put_latest_review_request(summary, review_request) when is_map(summary) do
+    Map.put(summary, :latest_review_request, review_request)
   end
 
   defp record_repair_attempt(context, %RepairAttempt{} = attempt) do
@@ -820,6 +896,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
     context
     |> update_in([:child_results], &append_unique(&1, child_result, fn child -> child.id end))
     |> update_in([:changed_files], &Enum.uniq(List.wrap(&1) ++ child_result.changed_files))
+    |> maybe_record_child_review_request(child_result)
     |> put_in([:outputs, "repair:#{iteration}:child"], child_result)
     |> update_in([:episodes], &append_unique(&1, episode, fn episode -> episode.id end))
     |> update_in(
@@ -833,6 +910,26 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
       )
     )
   end
+
+  defp maybe_record_child_review_request(context, %ChildResult{} = child_result) do
+    case field(child_result.metadata, :review_request) do
+      nil ->
+        context
+
+      review_request ->
+        context
+        |> Map.put(:latest_review_request, review_request)
+        |> update_in(
+          [:review_requests],
+          &append_unique(&1, review_request, fn request -> field(request, :resume_key) end)
+        )
+    end
+  end
+
+  defp child_needs_review?(%ChildResult{status: :needs_review}), do: true
+
+  defp child_needs_review?(%ChildResult{metadata: metadata}),
+    do: not is_nil(field(metadata, :review_request))
 
   defp run_verification_commands(
          context,

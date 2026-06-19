@@ -53,7 +53,7 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
   end
 
   defp do_evaluate(workspace, %AcceptanceCheck{type: :source_not_contains} = check, _context) do
-    with {:ok, content, metadata} <- read_check_sources(workspace, check),
+    with {:ok, content, metadata} <- read_check_sources(workspace, check, allow_empty?: true),
          {:ok, text} <- required_text(check) do
       if source_matches_text?(content, text, check) do
         AcceptanceCheck.result(check, :fail, "source contains forbidden text", metadata)
@@ -83,8 +83,9 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
   end
 
   defp do_evaluate(workspace, %AcceptanceCheck{type: :function_exists} = check, _context) do
-    function = param(check, :function) || param(check, :name)
-    arity = param(check, :arity)
+    {function, arity} =
+      function_signature(param(check, :function) || param(check, :name), param(check, :arity))
+
     needle = function_needle(function, arity)
 
     cond do
@@ -200,7 +201,7 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
 
   defp do_evaluate(_workspace, %AcceptanceCheck{type: :test_count_min} = check, context) do
     min = integer_param(check, :min, 1)
-    output = all_command_output(context)
+    output = latest_command_output(context)
     count = parse_exunit_test_count(output)
 
     cond do
@@ -215,8 +216,45 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     end
   end
 
+  defp do_evaluate(
+         _workspace,
+         %AcceptanceCheck{type: :changed_file_count_between} = check,
+         context
+       ) do
+    min = optional_integer_param(check, :min)
+    max = optional_integer_param(check, :max)
+    changed_files = context |> field(:changed_files) |> List.wrap() |> Enum.uniq()
+    count = length(changed_files)
+
+    cond do
+      is_integer(min) and count < min ->
+        AcceptanceCheck.result(check, :fail, "observed too few changed files", %{
+          min: min,
+          max: max,
+          count: count,
+          changed_files: changed_files
+        })
+
+      is_integer(max) and count > max ->
+        AcceptanceCheck.result(check, :fail, "observed too many changed files", %{
+          min: min,
+          max: max,
+          count: count,
+          changed_files: changed_files
+        })
+
+      true ->
+        AcceptanceCheck.result(check, :pass, "changed file count matched", %{
+          min: min,
+          max: max,
+          count: count,
+          changed_files: changed_files
+        })
+    end
+  end
+
   defp do_evaluate(_workspace, %AcceptanceCheck{type: :warning_count_zero} = check, context) do
-    output = all_command_output(context)
+    output = latest_command_output(context)
     warnings = parse_warning_count(output)
 
     if warnings == 0 do
@@ -328,7 +366,7 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     end
   end
 
-  defp read_check_sources(workspace, check) do
+  defp read_check_sources(workspace, check, opts \\ []) do
     check
     |> source_selectors()
     |> Enum.reduce_while({:ok, []}, fn selector, {:ok, acc} ->
@@ -339,7 +377,11 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     end)
     |> case do
       {:ok, []} ->
-        {:error, "source check did not match any files", %{selectors: source_selectors(check)}}
+        if Keyword.get(opts, :allow_empty?, false) do
+          {:ok, "", %{paths: [], file_count: 0, selectors: source_selectors(check)}}
+        else
+          {:error, "source check did not match any files", %{selectors: source_selectors(check)}}
+        end
 
       {:ok, files} ->
         files = Enum.uniq_by(files, & &1.relative)
@@ -524,9 +566,46 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     end
   end
 
+  defp function_signature(function, arity) do
+    normalized_arity = normalize_arity(arity)
+
+    case function do
+      function when is_binary(function) ->
+        function = String.trim(function)
+
+        case Regex.run(~r/^([a-zA-Z_][\w?!]*)\/(\d+)$/, function) do
+          [_, name, parsed_arity] when is_nil(normalized_arity) ->
+            {name, String.to_integer(parsed_arity)}
+
+          [_, name, _parsed_arity] ->
+            {name, normalized_arity}
+
+          _other ->
+            {function, normalized_arity}
+        end
+
+      function when is_atom(function) ->
+        {Atom.to_string(function), normalized_arity}
+
+      other ->
+        {other, normalized_arity}
+    end
+  end
+
+  defp normalize_arity(nil), do: nil
+  defp normalize_arity(arity) when is_integer(arity) and arity >= 0, do: arity
+
+  defp normalize_arity(arity) when is_binary(arity) do
+    case Integer.parse(String.trim(arity)) do
+      {arity, ""} when arity >= 0 -> arity
+      _other -> nil
+    end
+  end
+
+  defp normalize_arity(_arity), do: nil
+
   defp function_needle(nil, _arity), do: nil
   defp function_needle(function, _arity) when is_binary(function), do: "def #{function}"
-  defp function_needle(function, _arity) when is_atom(function), do: "def #{function}"
   defp function_needle(_function, _arity), do: nil
 
   defp command_observations(context) do
@@ -638,11 +717,40 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     Enum.join(argv, " ") <> " (cwd: #{cwd})"
   end
 
-  defp all_command_output(context) do
+  defp latest_command_output(context) do
     context
     |> command_observations()
+    |> latest_command_observations()
     |> Enum.map(&output_text/1)
     |> Enum.join("\n")
+  end
+
+  defp latest_command_observations(observations) do
+    {observations, _seen} =
+      observations
+      |> Enum.reverse()
+      |> Enum.reduce({[], MapSet.new()}, fn observation, {acc, seen} ->
+        case command_signature(observation) do
+          nil ->
+            {acc, seen}
+
+          signature ->
+            if MapSet.member?(seen, signature) do
+              {acc, seen}
+            else
+              {[observation | acc], MapSet.put(seen, signature)}
+            end
+        end
+      end)
+
+    observations
+  end
+
+  defp command_signature(observation) do
+    case observed_command(observation) do
+      %{argv: argv, cwd: cwd} -> {argv, cwd}
+      _other -> nil
+    end
   end
 
   defp output_text(observed) do
@@ -683,6 +791,17 @@ defmodule RunicAI.Coding.RLM.VerificationAssertions do
     end
   rescue
     ArgumentError -> default
+  end
+
+  defp optional_integer_param(check, key) do
+    case param(check, key) do
+      nil -> nil
+      value when is_integer(value) -> value
+      value when is_binary(value) -> String.to_integer(value)
+      _other -> nil
+    end
+  rescue
+    ArgumentError -> nil
   end
 
   defp normalize_identifier(value) when is_atom(value), do: Atom.to_string(value)

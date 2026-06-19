@@ -11,7 +11,7 @@ defmodule RunicAI.Terminal.CliOptions do
 
   @agents [:standard, :rlm, :assistant]
   @details [:hidden, :collapsed, :expanded]
-  @approvals [:never, :safe, :ask]
+  @approvals [:always, :never, :safe, :ask]
   @modes [:read_only, :patch, :verify]
   @generated_function_policies [:tier0, :tier1, :tier2_review]
   @write_policies [:none, :docs_only, :workspace_review]
@@ -147,8 +147,7 @@ defmodule RunicAI.Terminal.CliOptions do
          {:ok, agent} <- normalize_choice(Keyword.get(opts, :agent, "standard"), @agents, :agent),
          {:ok, detail} <-
            normalize_choice(Keyword.get(opts, :detail, "collapsed"), @details, :detail),
-         {:ok, approve} <-
-           normalize_choice(Keyword.get(opts, :approve, "ask"), @approvals, :approve),
+         {:ok, approve} <- normalize_approval(Keyword.get(opts, :approve, "ask")),
          {:ok, mode} <- normalize_choice(Keyword.get(opts, :mode, "verify"), @modes, :mode),
          {:ok, allow_generated_functions} <-
            normalize_choice(
@@ -418,6 +417,9 @@ defmodule RunicAI.Terminal.CliOptions do
        details: %{field: field, value: value, valid: choices}
      )}
   end
+
+  defp normalize_approval("all"), do: {:ok, :always}
+  defp normalize_approval(value), do: normalize_choice(value, @approvals, :approve)
 
   defp normalize_optional_profile(nil), do: {:ok, nil}
   defp normalize_optional_profile(""), do: {:ok, nil}

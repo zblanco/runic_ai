@@ -21,6 +21,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   alias RunicAI.Coding.RLM.Reducers
   alias RunicAI.Coding.RLM.RuntimeBudget
   alias RunicAI.Coding.RLM.VerificationGate
+  alias RunicAI.Coding.RLM.WorkspaceDelta
   alias RunicAI.Coding.RLM.WorkflowProposal
   alias RunicAI.Coding.RLM.WorkflowValidationReport
   alias RunicAI.Coding.RLM.WorkflowValidator
@@ -30,6 +31,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
   alias RunicAI.Ids
+  alias RunicAI.ReviewDecision
+  alias RunicAI.ReviewRequest
   alias RunicAI.RLM.Episode
   alias RunicAI.RLM.Components.SafeCompute
   alias RunicAI.RLM.PlanPatch
@@ -37,6 +40,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   @default_model "openai:gpt-5.4-mini"
   @default_child_runtime_ms 120_000
   @child_agent_cleanup_grace_ms 5_000
+  @default_child_noop_repair_attempts 1
+  @default_child_patch_repair_attempts 1
   @min_default_child_runtime_ms 250
   @child_runtime_completion_reserve_ms 2_000
   @default_child_runtime_by_mode %{
@@ -558,11 +563,12 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   end
 
   defp record_special_output(context, %{kind: :agent}, %ChildResult{} = child_result) do
-    update_in(
-      context,
+    context
+    |> update_in(
       [:child_results],
       &append_unique(&1, child_result, fn result -> result.id end)
     )
+    |> maybe_record_child_review_request(child_result)
   end
 
   defp record_special_output(context, %{kind: :edit}, %{changed_paths: changed_paths} = output) do
@@ -601,6 +607,21 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
   defp record_special_output(context, _node, output) do
     update_in(context, [:artifacts], &Enum.uniq(List.wrap(&1) ++ List.wrap(output)))
+  end
+
+  defp maybe_record_child_review_request(context, %ChildResult{} = child_result) do
+    case map_value(child_result.metadata, :review_request) do
+      nil ->
+        context
+
+      review_request ->
+        context
+        |> Map.put(:latest_review_request, review_request)
+        |> update_in(
+          [:review_requests],
+          &append_unique(&1, review_request, fn request -> map_value(request, :resume_key) end)
+        )
+    end
   end
 
   defp maybe_record_runtime_smoke(context, node, output) do
@@ -969,18 +990,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     |> code_execution_config_value(:runtime, nil)
     |> case do
       nil ->
-        runtimes =
-          opts
-          |> code_execution_config()
-          |> then(fn config ->
-            config_value(config, :allowed_runtimes, config_value(config, :runtimes, [:bash]))
-          end)
-          |> sandbox_runtime_list()
-
-        case runtimes do
-          [runtime | _rest] -> runtime
-          [] -> :bash
-        end
+        :bash
 
       runtime ->
         runtime
@@ -1200,21 +1210,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
   defp normalize_review_edit(_edited, original), do: original
 
-  defp rlm_node_review_safety(:edit, %EditPatchSet{metadata: metadata}) do
-    if Map.get(metadata, :generator) == :elixir_project_generator do
-      %{safe?: true, risk: :low}
-    else
-      %{safe?: false, risk: :medium}
-    end
-  end
-
-  defp rlm_node_review_safety(:edit, %{metadata: metadata}) when is_map(metadata) do
-    if Map.get(metadata, :generator) in [:elixir_project_generator, "elixir_project_generator"] do
-      %{safe?: true, risk: :low}
-    else
-      %{safe?: false, risk: :medium}
-    end
-  end
+  defp rlm_node_review_safety(:edit, %EditPatchSet{}), do: %{safe?: false, risk: :medium}
+  defp rlm_node_review_safety(:edit, _value), do: %{safe?: false, risk: :medium}
 
   defp rlm_node_review_safety(:command, value) when is_map(value) do
     metadata = Map.get(value, :metadata) || Map.get(value, "metadata") || %{}
@@ -1382,14 +1379,51 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     RuntimeBudget.run(
       fn ->
         started_ms = System.monotonic_time(:millisecond)
-        workflow = call_standard_agent(mode, workspace, task, agent_opts)
+        before_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+
+        workflow =
+          run_standard_agent_child_attempt(mode, workspace, task, agent_opts, node, opts)
+
+        after_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+        delta = WorkspaceDelta.diff(before_snapshot, after_snapshot)
+
+        {workflow, delta, patch_repair_attempts} =
+          maybe_repair_patch_child(
+            workflow,
+            delta,
+            mode,
+            workspace,
+            task,
+            agent_opts,
+            node,
+            opts
+          )
+
+        {workflow, delta, noop_repair_attempts} =
+          maybe_repair_noop_child(
+            workflow,
+            delta,
+            mode,
+            workspace,
+            task,
+            agent_opts,
+            node,
+            opts
+          )
+
         elapsed_ms = System.monotonic_time(:millisecond) - started_ms
         forward_child_agent_events(opts, node, workflow)
 
         if child_elapsed_timeout?(child_timeout_ms, elapsed_ms) do
           child_timeout_error(node, mode, workspace, task, child_timeout_ms)
         else
-          summary = StandardAgent.summary(workflow)
+          summary =
+            workflow
+            |> StandardAgent.summary()
+            |> merge_summary_changed_files(WorkspaceDelta.changed_paths(delta))
+            |> maybe_put_child_noop_repair_attempts(noop_repair_attempts)
+            |> maybe_put_child_patch_repair_attempts(patch_repair_attempts)
+            |> maybe_put_latest_review_request(StandardAgent.latest_review_request(workflow))
 
           emit_node_stage(opts, :child_agent_completed, :ok, %{
             node_id: node.id,
@@ -1398,7 +1432,9 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
             elapsed_ms: elapsed_ms,
             changed_files: Map.get(summary, :changed_files, []),
             tools_used: Map.get(summary, :tools_used, []),
-            objective_status: Map.get(summary, :objective_status)
+            objective_status: Map.get(summary, :objective_status),
+            child_noop_repair_attempts: noop_repair_attempts,
+            child_patch_repair_attempts: patch_repair_attempts
           })
 
           {:ok, summary}
@@ -1416,6 +1452,300 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
       }
     )
   end
+
+  defp run_standard_agent_child_attempt(mode, workspace, task, agent_opts, node, opts) do
+    mode
+    |> call_standard_agent(workspace, task, agent_opts)
+    |> maybe_auto_review_child_workflow(node, mode, workspace, task, opts)
+  end
+
+  defp maybe_repair_patch_child(workflow, delta, mode, workspace, task, agent_opts, node, opts) do
+    if repair_patch_child?(workflow, delta, mode, opts) do
+      repair_patch_child(workflow, delta, mode, workspace, task, agent_opts, node, opts)
+    else
+      {workflow, delta, 0}
+    end
+  end
+
+  defp repair_patch_child(workflow, delta, mode, workspace, task, agent_opts, node, opts) do
+    attempts = child_patch_repair_attempts(opts)
+
+    Enum.reduce_while(1..attempts, {workflow, delta, 0}, fn attempt,
+                                                            {current_workflow, current_delta,
+                                                             count} ->
+      if repair_patch_child?(current_workflow, current_delta, mode, opts) do
+        patch_failure = failed_patch_summary(current_workflow)
+
+        emit_node_stage(opts, :child_patch_repair_started, :running, %{
+          node_id: node.id,
+          kind: node.kind,
+          mode: mode,
+          attempt: attempt,
+          reason: :apply_patch_failed,
+          diagnostics: patch_failure_diagnostics(patch_failure)
+        })
+
+        before_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+
+        repair_task =
+          child_patch_repair_task(task, current_workflow, node, patch_failure)
+
+        repair_workflow =
+          run_standard_agent_child_attempt(mode, workspace, repair_task, agent_opts, node, opts)
+
+        after_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+        repair_delta = WorkspaceDelta.diff(before_snapshot, after_snapshot)
+        merged_delta = merge_workspace_delta(current_delta, repair_delta)
+        changed_files = WorkspaceDelta.changed_paths(repair_delta)
+        repaired? = changed_files != [] and is_nil(failed_patch_summary(repair_workflow))
+
+        emit_node_stage(opts, :child_patch_repair_completed, :ok, %{
+          node_id: node.id,
+          kind: node.kind,
+          mode: mode,
+          attempt: attempt,
+          changed_files: changed_files,
+          repaired?: repaired?
+        })
+
+        if repaired? do
+          {:halt, {repair_workflow, merged_delta, count + 1}}
+        else
+          {:cont, {repair_workflow, merged_delta, count + 1}}
+        end
+      else
+        {:halt, {current_workflow, current_delta, count}}
+      end
+    end)
+  end
+
+  defp repair_patch_child?(workflow, delta, mode, opts) do
+    child_patch_repair_enabled?(mode, opts) and
+      WorkspaceDelta.changed_paths(delta) == [] and
+      is_nil(StandardAgent.latest_review_request(workflow)) and
+      not is_nil(failed_patch_summary(workflow))
+  end
+
+  defp child_patch_repair_enabled?(mode, opts) when mode in [:patch, "patch"] do
+    child_patch_repair_attempts(opts) > 0
+  end
+
+  defp child_patch_repair_enabled?(_mode, _opts), do: false
+
+  defp child_patch_repair_attempts(opts) do
+    opts
+    |> Keyword.get(:child_patch_repair_attempts, @default_child_patch_repair_attempts)
+    |> case do
+      attempts when is_integer(attempts) and attempts >= 0 -> attempts
+      _other -> @default_child_patch_repair_attempts
+    end
+  end
+
+  defp failed_patch_summary(workflow) do
+    workflow
+    |> StandardAgent.summary()
+    |> Map.get(:patches, [])
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.find(&failed_patch_summary?/1)
+  end
+
+  defp failed_patch_summary?(patch) when is_map(patch) do
+    patch_status(patch) in [:error, "error"] or patch_failure_diagnostics(patch) != []
+  end
+
+  defp failed_patch_summary?(_patch), do: false
+
+  defp patch_status(patch) when is_map(patch) do
+    Map.get(patch, :status, Map.get(patch, "status"))
+  end
+
+  defp patch_failure_diagnostics(patch) when is_map(patch) do
+    patch
+    |> Map.get(:diagnostics, Map.get(patch, "diagnostics", []))
+    |> List.wrap()
+    |> Enum.take(5)
+  end
+
+  defp patch_failure_diagnostics(_patch), do: []
+
+  defp child_patch_repair_task(task, workflow, node, patch_failure) do
+    summary = StandardAgent.summary(workflow)
+
+    """
+    The previous patch-mode child attempt for node #{node.id} called apply_patch, but the patch failed.
+
+    Retry the same objective now with a valid apply_patch call:
+    - Use the apply_patch tool schema exactly: operations is a list of create, update, delete, or move operations.
+    - For creating a file, use %{op: "create", path: "relative/path", content: "..."}.
+    - For updating an existing file, use %{op: "update", path: "relative/path", content: "..."}.
+    - Do not repeat the failed operation shape. Stop only after changed files exist, a review request is pending, or a concrete blocking error prevents edits.
+
+    Original task:
+    #{task}
+
+    Failed patch diagnostics:
+    #{inspect(patch_failure_diagnostics(patch_failure), limit: 10, printable_limit: 1_200)}
+
+    Previous child summary:
+    #{String.slice(to_string(Map.get(summary, :reply, "")), 0, 1_200)}
+    """
+  end
+
+  defp maybe_repair_noop_child(workflow, delta, mode, workspace, task, agent_opts, node, opts) do
+    if repair_noop_child?(workflow, delta, mode, opts) do
+      repair_noop_child(workflow, delta, mode, workspace, task, agent_opts, node, opts)
+    else
+      {workflow, delta, 0}
+    end
+  end
+
+  defp repair_noop_child(workflow, delta, mode, workspace, task, agent_opts, node, opts) do
+    attempts = child_noop_repair_attempts(opts)
+
+    Enum.reduce_while(1..attempts, {workflow, delta, 0}, fn attempt,
+                                                            {current_workflow, current_delta,
+                                                             count} ->
+      if repair_noop_child?(current_workflow, current_delta, mode, opts) do
+        emit_node_stage(opts, :child_noop_repair_started, :running, %{
+          node_id: node.id,
+          kind: node.kind,
+          mode: mode,
+          attempt: attempt,
+          reason: :patch_child_no_changed_files
+        })
+
+        before_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+
+        repair_task =
+          child_noop_repair_task(task, current_workflow, node)
+
+        repair_workflow =
+          run_standard_agent_child_attempt(mode, workspace, repair_task, agent_opts, node, opts)
+
+        after_snapshot = WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+        repair_delta = WorkspaceDelta.diff(before_snapshot, after_snapshot)
+        merged_delta = merge_workspace_delta(current_delta, repair_delta)
+        changed_files = WorkspaceDelta.changed_paths(repair_delta)
+
+        emit_node_stage(opts, :child_noop_repair_completed, :ok, %{
+          node_id: node.id,
+          kind: node.kind,
+          mode: mode,
+          attempt: attempt,
+          changed_files: changed_files,
+          repaired?: changed_files != []
+        })
+
+        if changed_files == [] do
+          {:cont, {repair_workflow, merged_delta, count + 1}}
+        else
+          {:halt, {repair_workflow, merged_delta, count + 1}}
+        end
+      else
+        {:halt, {current_workflow, current_delta, count}}
+      end
+    end)
+  end
+
+  defp repair_noop_child?(workflow, delta, mode, opts) do
+    child_noop_repair_enabled?(mode, opts) and
+      WorkspaceDelta.changed_paths(delta) == [] and
+      is_nil(StandardAgent.latest_review_request(workflow)) and
+      summary_no_changed_files?(StandardAgent.summary(workflow))
+  end
+
+  defp child_noop_repair_enabled?(mode, opts) when mode in [:patch, "patch"] do
+    child_noop_repair_attempts(opts) > 0
+  end
+
+  defp child_noop_repair_enabled?(_mode, _opts), do: false
+
+  defp child_noop_repair_attempts(opts) do
+    opts
+    |> Keyword.get(:child_noop_repair_attempts, @default_child_noop_repair_attempts)
+    |> case do
+      attempts when is_integer(attempts) and attempts >= 0 -> attempts
+      _other -> @default_child_noop_repair_attempts
+    end
+  end
+
+  defp child_noop_repair_task(task, workflow, node) do
+    summary = StandardAgent.summary(workflow)
+
+    """
+    The previous patch-mode child attempt for node #{node.id} made no workspace changes.
+
+    Retry the same objective now with concrete file edits:
+    - Use apply_patch for file changes.
+    - If the selected workspace is empty and the task asks to create or build artifacts, create the requested files in this workspace or in an objective-named subdirectory.
+    - Do not stop after inspection. Stop only after changed files exist, a review request is pending, or a concrete blocking error prevents edits.
+
+    Original task:
+    #{task}
+
+    Previous child summary:
+    #{String.slice(to_string(Map.get(summary, :reply, "")), 0, 1_200)}
+    """
+  end
+
+  defp summary_no_changed_files?(summary) when is_map(summary) do
+    List.wrap(Map.get(summary, :changed_files, [])) == []
+  end
+
+  defp child_workspace_delta_opts(opts) do
+    [max_files: Keyword.get(opts, :child_workspace_delta_max_files, 1_000)]
+  end
+
+  defp merge_workspace_delta(left, right) do
+    %{
+      created: Enum.uniq(List.wrap(left.created) ++ List.wrap(right.created)) |> Enum.sort(),
+      modified: Enum.uniq(List.wrap(left.modified) ++ List.wrap(right.modified)) |> Enum.sort(),
+      deleted: Enum.uniq(List.wrap(left.deleted) ++ List.wrap(right.deleted)) |> Enum.sort(),
+      unchanged: Enum.uniq(List.wrap(left.unchanged) ++ List.wrap(right.unchanged)) |> Enum.sort()
+    }
+  end
+
+  defp merge_summary_changed_files(summary, changed_files) when is_map(summary) do
+    Map.update(summary, :changed_files, List.wrap(changed_files), fn existing ->
+      existing
+      |> List.wrap()
+      |> Kernel.++(List.wrap(changed_files))
+      |> Enum.uniq()
+      |> Enum.sort()
+    end)
+  end
+
+  defp maybe_put_child_noop_repair_attempts(summary, 0), do: summary
+
+  defp maybe_put_child_noop_repair_attempts(summary, attempts) when is_map(summary) do
+    summary
+    |> Map.put(:child_noop_repair_attempts, attempts)
+    |> Map.update(:metadata, %{child_noop_repair_attempts: attempts}, fn
+      metadata when is_map(metadata) -> Map.put(metadata, :child_noop_repair_attempts, attempts)
+      _other -> %{child_noop_repair_attempts: attempts}
+    end)
+  end
+
+  defp maybe_put_child_patch_repair_attempts(summary, 0), do: summary
+
+  defp maybe_put_child_patch_repair_attempts(summary, attempts) when is_map(summary) do
+    summary
+    |> Map.put(:child_patch_repair_attempts, attempts)
+    |> Map.update(:metadata, %{child_patch_repair_attempts: attempts}, fn
+      metadata when is_map(metadata) -> Map.put(metadata, :child_patch_repair_attempts, attempts)
+      _other -> %{child_patch_repair_attempts: attempts}
+    end)
+  end
+
+  defp maybe_put_latest_review_request(summary, nil), do: summary
+
+  defp maybe_put_latest_review_request(%{status: status} = summary, review_request)
+       when status in [:review, "review"] do
+    Map.put(summary, :latest_review_request, review_request)
+  end
+
+  defp maybe_put_latest_review_request(summary, _review_request), do: summary
 
   defp forward_child_agent_events(opts, node, workflow) do
     workflow
@@ -1505,6 +1835,73 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
          workspace_root: workspace.root
        }
      )}
+  end
+
+  defp maybe_auto_review_child_workflow(workflow, node, mode, workspace, task, opts) do
+    case Keyword.get(opts, :review_decider) do
+      decider when is_function(decider, 2) ->
+        auto_review_child_workflow(
+          workflow,
+          node,
+          mode,
+          workspace,
+          task,
+          decider,
+          opts,
+          Keyword.get(opts, :child_auto_review_limit, 3)
+        )
+
+      _other ->
+        workflow
+    end
+  end
+
+  defp auto_review_child_workflow(
+         workflow,
+         _node,
+         _mode,
+         _workspace,
+         _task,
+         _decider,
+         _opts,
+         limit
+       )
+       when limit <= 0,
+       do: workflow
+
+  defp auto_review_child_workflow(workflow, node, mode, workspace, task, decider, opts, limit) do
+    case StandardAgent.latest_review_request(workflow) do
+      %ReviewRequest{} = request ->
+        context = %{
+          child_agent?: true,
+          node_id: node.id,
+          node_kind: node.kind,
+          mode: mode,
+          workspace_root: workspace.root,
+          task: task
+        }
+
+        case decider.(request, context) do
+          {:ok, %ReviewDecision{status: status} = decision} when status in [:approved, :edited] ->
+            emit_node_stage(opts, :child_agent_review_decided, :ok, %{
+              node_id: node.id,
+              kind: node.kind,
+              mode: mode,
+              resume_key: request.resume_key,
+              decision_status: decision.status
+            })
+
+            workflow
+            |> Workflow.react_until_satisfied(%{agent_id: "coding", review_decision: decision})
+            |> auto_review_child_workflow(node, mode, workspace, task, decider, opts, limit - 1)
+
+          _other ->
+            workflow
+        end
+
+      _other ->
+        workflow
+    end
   end
 
   defp child_progress_sink(opts, node, mode, workspace) do
@@ -1972,6 +2369,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   defp node_selected_timeout_ms(_remaining_ms, max_runtime_ms), do: max_runtime_ms
 
   defp normalize_event_status(status) when status in [:satisfied, :completed, :ok], do: :ok
+  defp normalize_event_status(status) when status in [:needs_review, :review], do: :review
   defp normalize_event_status(status) when status in [:partial, :blocked], do: :blocked
   defp normalize_event_status(status) when status in [:failed, :error], do: :error
   defp normalize_event_status(_status), do: :ok
@@ -1984,8 +2382,10 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
       changed_files: result.changed_files,
       checks_attempted: result.checks_attempted,
       commands: result.commands,
-      unresolved_risks: result.unresolved_risks
+      unresolved_risks: result.unresolved_risks,
+      review_request: map_value(result.metadata, :review_request)
     }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp summarize_node_output(%{status: status} = output) do

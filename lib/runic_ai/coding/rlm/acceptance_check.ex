@@ -18,6 +18,7 @@ defmodule RunicAI.Coding.RLM.AcceptanceCheck do
     :command_passes,
     :command_fails_with,
     :test_count_min,
+    :changed_file_count_between,
     :warning_count_zero,
     :runtime_smoke,
     :child_status,
@@ -39,6 +40,7 @@ defmodule RunicAI.Coding.RLM.AcceptanceCheck do
           | :command_passes
           | :command_fails_with
           | :test_count_min
+          | :changed_file_count_between
           | :warning_count_zero
           | :runtime_smoke
           | :child_status
@@ -96,6 +98,8 @@ defmodule RunicAI.Coding.RLM.AcceptanceCheck do
   end
 
   def from_input(input) when is_map(input) do
+    input = normalize_generated_check(input)
+
     new(get(input, :type),
       id: get(input, :id),
       params: get(input, :params, %{}),
@@ -158,6 +162,8 @@ defmodule RunicAI.Coding.RLM.AcceptanceCheck do
   defp lookup_type("command_passes"), do: :command_passes
   defp lookup_type("command_fails_with"), do: :command_fails_with
   defp lookup_type("test_count_min"), do: :test_count_min
+  defp lookup_type("changed_file_count_between"), do: :changed_file_count_between
+  defp lookup_type("changed_file_count"), do: :changed_file_count_between
   defp lookup_type("warning_count_zero"), do: :warning_count_zero
   defp lookup_type("runtime_smoke"), do: :runtime_smoke
   defp lookup_type("child_status"), do: :child_status
@@ -208,6 +214,70 @@ defmodule RunicAI.Coding.RLM.AcceptanceCheck do
   defp normalize_map(value) when is_map(value), do: value
   defp normalize_map(value) when is_list(value), do: Map.new(value)
   defp normalize_map(_value), do: %{}
+
+  defp normalize_generated_check(input) do
+    type = get(input, :type)
+
+    if changed_file_count_check?(input) and type in [:test_count_min, "test_count_min"] do
+      input
+      |> put(:type, :changed_file_count_between)
+      |> put(:params, changed_file_count_params(input))
+    else
+      input
+    end
+  end
+
+  defp changed_file_count_check?(input) do
+    text =
+      [
+        get(input, :id),
+        get(input, :type),
+        input |> get(:metadata, %{}) |> inspect(limit: 20),
+        input |> get(:params, %{}) |> inspect(limit: 20)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    String.contains?(text, [
+      "changed_file_count",
+      "changed-file-count",
+      "changed file count",
+      "changed files"
+    ])
+  end
+
+  defp changed_file_count_params(input) do
+    id = input |> get(:id, "") |> to_string() |> String.downcase()
+    params = input |> get(:params, %{}) |> normalize_map()
+    value = first_present(params, [:count, :expected, :value, :min, :max])
+
+    cond do
+      String.contains?(id, "max") ->
+        params |> Map.drop(["min", :min]) |> put(:max, value)
+
+      String.contains?(id, "min") ->
+        params |> Map.drop(["max", :max]) |> put(:min, value)
+
+      true ->
+        params
+    end
+  end
+
+  defp first_present(map, keys) do
+    Enum.find_value(keys, fn key ->
+      case get(map, key) do
+        nil -> nil
+        value -> value
+      end
+    end)
+  end
+
+  defp put(map, key, value) when is_map(map) do
+    map
+    |> Map.delete(Atom.to_string(key))
+    |> Map.put(key, value)
+  end
 
   defp get(map, key, default \\ nil),
     do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))

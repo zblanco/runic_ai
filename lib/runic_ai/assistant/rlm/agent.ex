@@ -736,7 +736,7 @@ defmodule RunicAI.Assistant.RLM.Agent do
     else
       Keyword.put(
         llm_opts,
-        :max_tokens,
+        :max_completion_tokens,
         Keyword.get(
           opts,
           :workflow_response_max_tokens,

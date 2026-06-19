@@ -113,6 +113,58 @@ defmodule RunicAI.RLM.Robustness.DeterministicChecks do
 
   defp evaluate_check(
          root,
+         %{type: :command_passes_without_warnings, argv: [exe | args]} = check,
+         opts
+       ) do
+    timeout = Map.get(check, :timeout, Keyword.get(opts, :command_timeout, 120_000))
+
+    try do
+      case run_command(root, exe, args) do
+        {%{stdout: _stdout, stderr: _stderr} = output, 0} ->
+          details = output_details(output, timeout)
+          warning_count = warning_count([output.stdout, output.stderr])
+
+          if warning_count == 0 do
+            %{
+              check: check,
+              status: :pass,
+              message: "command passed without warnings",
+              details: Map.put(details, :warning_count, 0)
+            }
+          else
+            %{
+              check: check,
+              status: :fail,
+              message: "command emitted #{warning_count} warning(s)",
+              details: Map.put(details, :warning_count, warning_count)
+            }
+          end
+
+        {%{stdout: _stdout, stderr: _stderr} = output, status} ->
+          %{
+            check: check,
+            status: :fail,
+            message: "command failed with #{status}",
+            details:
+              output
+              |> output_details(timeout)
+              |> Map.put(:status, status)
+              |> Map.put(:warning_count, warning_count([output.stdout, output.stderr]))
+          }
+      end
+    rescue
+      exception ->
+        %{
+          check: check,
+          status: :fail,
+          message: "command raised",
+          details: %{exception: Exception.message(exception), timeout: timeout}
+        }
+    end
+  end
+
+  defp evaluate_check(
+         root,
          %{type: :command_passes_if_env, argv: [_exe | _args], env: env} = check,
          opts
        )
@@ -221,6 +273,10 @@ defmodule RunicAI.RLM.Robustness.DeterministicChecks do
   defp normalize_type("source_not_contains"), do: :source_not_contains
   defp normalize_type("test_count_min"), do: :test_count_min
   defp normalize_type("command_passes"), do: :command_passes
+
+  defp normalize_type("command_passes_without_warnings"),
+    do: :command_passes_without_warnings
+
   defp normalize_type("command_passes_if_env"), do: :command_passes_if_env
   defp normalize_type("changed_file_count_between"), do: :changed_file_count_between
   defp normalize_type(type), do: type
@@ -312,6 +368,19 @@ defmodule RunicAI.RLM.Robustness.DeterministicChecks do
       stderr_truncated?: truncated?(stderr),
       timeout: timeout
     }
+  end
+
+  defp warning_count(output) when is_binary(output) do
+    ~r/(^|\n)\s*warning[:\s]/i
+    |> Regex.scan(output)
+    |> length()
+  end
+
+  defp warning_count(outputs) when is_list(outputs) do
+    outputs
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
+    |> warning_count()
   end
 
   defp tail(output) when is_binary(output) do

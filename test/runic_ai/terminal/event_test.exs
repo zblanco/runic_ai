@@ -163,6 +163,78 @@ defmodule RunicAI.Terminal.EventTest do
     assert data["content"] =~ "- lib/demo.ex"
   end
 
+  test "scorecard final output outranks incidental command stdout" do
+    command_episode =
+      Episode.new!(:satisfied, %{command: "git status --short", stdout: "M design/agents.md\n"},
+        id: "episode:command",
+        parent_node_id: "verify",
+        artifacts: [%{command: "git status --short", stdout: "M design/agents.md\n"}]
+      )
+
+    events =
+      Event.from_rlm_result(
+        %{
+          output: %{
+            command: "git diff --name-only HEAD",
+            stdout: "lib/runic_ai/coding/rlm/coordinator.ex\nlib/runic_ai/design/agents.md\n"
+          },
+          context: %{episodes: [command_episode]},
+          objective_scorecard:
+            WorkflowScorecard.new!(
+              objective_status: :objective_satisfied,
+              changed_files: ["reports/delivery_risk_report.md"],
+              residual_risks: []
+            )
+        },
+        session_id: "session:rlm",
+        run_id: "run:rlm"
+      )
+
+    assert %Event{kind: :message, phase: :assistant, status: :ok, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["content"] =~ "RLM completed."
+    assert data["content"] =~ "- reports/delivery_risk_report.md"
+    refute data["content"] =~ "design/agents.md"
+  end
+
+  test "scorecard final output outranks late non-answer report episodes" do
+    report_episode =
+      Episode.new!(
+        :satisfied,
+        %{
+          status: :objective_incomplete,
+          scorecard: %{objective_status: :objective_incomplete},
+          content: "%{status: :objective_incomplete, scorecard: %{}}"
+        },
+        id: "episode:report_result",
+        parent_node_id: "report_result"
+      )
+
+    events =
+      Event.from_rlm_result(
+        %{
+          context: %{episodes: [report_episode]},
+          objective_scorecard:
+            WorkflowScorecard.new!(
+              objective_status: :objective_satisfied,
+              changed_files: ["lib/existing_app_feature.ex"],
+              residual_risks: []
+            )
+        },
+        session_id: "session:rlm",
+        run_id: "run:rlm"
+      )
+
+    assert %Event{kind: :message, phase: :assistant, status: :ok, data: data} =
+             Enum.find(events, &(&1.kind == :message))
+
+    assert data["content"] =~ "RLM completed."
+    assert data["content"] =~ "Objective status: objective_satisfied"
+    assert data["content"] =~ "- lib/existing_app_feature.ex"
+    refute data["content"] =~ "objective_incomplete"
+  end
+
   test "normalizes assistant artifact outcomes on final chat messages" do
     events =
       Event.from_rlm_result(

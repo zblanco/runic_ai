@@ -8,6 +8,7 @@ defmodule RunicAI.Coding.RLM.ChildResult do
 
   alias RunicAI.Coding.RLM.ChildContract
   alias RunicAI.Error
+  alias RunicAI.ReviewRequest
 
   @statuses [:completed, :partial, :blocked, :failed, :needs_review]
 
@@ -134,11 +135,16 @@ defmodule RunicAI.Coding.RLM.ChildResult do
       checks_attempted: contract_checks(contract),
       unresolved_risks: List.wrap(field(summary, :risks)),
       summary: field(summary, :reply) || "",
-      metadata: %{
-        source: :standard_coding_agent,
-        raw_status: field(summary, :status),
-        tools_used: List.wrap(field(summary, :tools_used))
-      }
+      metadata:
+        %{
+          source: :standard_coding_agent,
+          raw_status: field(summary, :status),
+          tools_used: List.wrap(field(summary, :tools_used)),
+          child_noop_repair_attempts: field(summary, :child_noop_repair_attempts),
+          child_patch_repair_attempts: field(summary, :child_patch_repair_attempts)
+        }
+        |> Map.merge(summary_metadata(summary))
+        |> maybe_put_review_request(summary)
     )
   end
 
@@ -178,6 +184,7 @@ defmodule RunicAI.Coding.RLM.ChildResult do
 
   defp derive_status(summary, nil) do
     cond do
+      review_request(summary) -> :needs_review
       blocked?(summary) -> :blocked
       failed?(summary) -> :failed
       incomplete_text?(field(summary, :reply)) -> :partial
@@ -212,9 +219,67 @@ defmodule RunicAI.Coding.RLM.ChildResult do
     do: status in [:satisfied, :completed, :complete, "satisfied", "completed", "complete"]
 
   defp blocked?(summary),
-    do: field(summary, :status) in [:waiting, :review, :blocked, "waiting", "review", "blocked"]
+    do: field(summary, :status) in [:waiting, :blocked, "waiting", "blocked"]
 
   defp failed?(summary), do: field(summary, :status) in [:failed, :error, "failed", "error"]
+
+  defp summary_metadata(summary) do
+    case field(summary, :metadata) do
+      metadata when is_map(metadata) -> metadata
+      _other -> %{}
+    end
+  end
+
+  defp maybe_put_review_request(metadata, summary) do
+    case review_request(summary) do
+      nil -> metadata
+      request -> Map.put(metadata, :review_request, normalize_review_request(request))
+    end
+  end
+
+  defp review_request(summary) do
+    [
+      field(summary, :latest_review_request),
+      field(summary, :review_request),
+      field(summary, :pending_review_request),
+      field(field(summary, :context), :latest_review_request),
+      field(field(summary, :context), :review_request)
+    ]
+    |> Enum.find(&review_request?/1)
+  end
+
+  defp review_request?(%ReviewRequest{}), do: true
+
+  defp review_request?(request) when is_map(request) do
+    not is_nil(field(request, :resume_key)) and not is_nil(field(request, :kind))
+  end
+
+  defp review_request?(_request), do: false
+
+  defp normalize_review_request(%ReviewRequest{} = request) do
+    %{
+      kind: request.kind,
+      subject: request.subject,
+      checkpoint: request.checkpoint,
+      resume_key: request.resume_key,
+      options: request.options,
+      details: request.details,
+      metadata: request.metadata
+    }
+  end
+
+  defp normalize_review_request(request) when is_map(request) do
+    %{
+      kind: field(request, :kind),
+      subject: field(request, :subject),
+      checkpoint: field(request, :checkpoint),
+      resume_key: field(request, :resume_key),
+      options: field(request, :options) || [],
+      details: field(request, :details) || %{},
+      metadata: field(request, :metadata) || %{}
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
 
   defp incomplete_text?(text) when is_binary(text) do
     text = String.downcase(text)

@@ -51,8 +51,12 @@ defmodule RunicAI.Recipes.IntegratedAgentKernel do
 
     process_lane_step =
       Runic.step(
-        fn bundle ->
-          processor.(bundle)
+        fn
+          %{runtime: %RuntimeState{}, session: %SessionState{}, signal: _signal} = bundle ->
+            processor.(bundle)
+
+          _other ->
+            []
         end,
         name: :process_integrated_lane
       )

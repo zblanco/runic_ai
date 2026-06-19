@@ -21,8 +21,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   @scaffold_markers [
     "Hello world.",
     "greets the world",
-    "def hello do",
-    ":world"
+    "def hello do"
   ]
 
   @objective_stop_terms MapSet.new([
@@ -100,7 +99,8 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
         semantic_coverage_result(terms, workspace_evidence, policy, semantic_enabled?),
         scaffold_marker_result(workspace_evidence),
         meaningful_tests_result(objective, terms, workspace_evidence, policy, semantic_enabled?),
-        implementation_activity_result(context, workspace_evidence, policy)
+        implementation_activity_result(context, workspace_evidence, policy),
+        delivery_root_result(proposal, objective, context, workspace_evidence, policy)
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -331,6 +331,60 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     end
   end
 
+  defp delivery_root_result(proposal, objective, context, evidence, policy) do
+    if truthy_policy?(policy, :allow_scratch_delivery_root?) do
+      nil
+    else
+      changed = Map.get(evidence, :changed_source_files, [])
+      check = progress_check("progress-delivery-root")
+      allowed_roots = explicit_delivery_roots(proposal, objective, context)
+      scratch_files = Enum.filter(changed, &scratch_delivery_path?(&1, allowed_roots))
+      root_files = changed -- scratch_files
+
+      cond do
+        changed == [] ->
+          nil
+
+        scratch_files == [] ->
+          AcceptanceCheck.result(
+            check,
+            :pass,
+            "implementation files target the selected workspace root",
+            %{
+              changed_files: changed,
+              allowed_delivery_roots: allowed_roots
+            }
+          )
+
+        root_files != [] ->
+          AcceptanceCheck.result(
+            check,
+            :pass,
+            "implementation includes selected workspace root deliverables",
+            %{
+              changed_files: changed,
+              scratch_files: scratch_files,
+              root_files: root_files,
+              allowed_delivery_roots: allowed_roots
+            }
+          )
+
+        true ->
+          AcceptanceCheck.result(
+            check,
+            :fail,
+            "implementation files were written under scratch paths instead of the selected workspace root",
+            %{
+              scratch_files: scratch_files,
+              allowed_delivery_roots: allowed_roots,
+              repair_instruction:
+                "Move or recreate the deliverable at the selected workspace root, or explicitly target the nested workspace path when that is intentional."
+            }
+          )
+      end
+    end
+  end
+
   defp workspace_evidence(%Workspace{} = workspace, policy, context) do
     source_globs =
       List.wrap(
@@ -365,6 +419,8 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     %{
       source_files: source_files,
       test_files: test_files,
+      changed_source_files: changed,
+      changed_test_files: changed_tests,
       source_entries: source_entries,
       test_entries: test_entries,
       source_text: entries_text(source_entries),
@@ -431,6 +487,73 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   end
 
   defp safe_relative_glob?(_glob), do: false
+
+  defp explicit_delivery_roots(%WorkflowProposal{} = proposal, objective, context) do
+    proposal_roots =
+      proposal.nodes
+      |> Enum.flat_map(fn node ->
+        params = Map.get(node, :params, %{})
+        [param_from(params, :workspace_path), param_from(params, :cwd), param_from(params, :root)]
+      end)
+
+    metadata = Map.get(context, :metadata, %{})
+
+    (proposal_roots ++
+       objective_delivery_roots(objective) ++
+       objective_delivery_roots(
+         Map.get(metadata, :original_objective) || Map.get(metadata, "original_objective")
+       ))
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&normalize_delivery_root/1)
+    |> Enum.reject(&(&1 in [nil, "", "."]))
+    |> Enum.uniq()
+  end
+
+  defp param_from(params, key) when is_map(params) do
+    Map.get(params, key) || Map.get(params, Atom.to_string(key))
+  end
+
+  defp objective_delivery_roots(objective) when is_binary(objective) do
+    ~r/(?:\.\/)?(?:tmp|apps|packages|examples|fixtures)\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*/
+    |> Regex.scan(objective)
+    |> List.flatten()
+  end
+
+  defp objective_delivery_roots(_objective), do: []
+
+  defp normalize_delivery_root(root) when is_binary(root) do
+    root =
+      root
+      |> String.trim()
+      |> String.trim_leading("./")
+      |> String.trim_trailing("/")
+
+    parts = Path.split(root)
+
+    case parts do
+      [prefix, name | _rest] when prefix in ["tmp", "apps", "packages", "examples", "fixtures"] ->
+        Path.join(prefix, name)
+
+      _other ->
+        root
+    end
+  end
+
+  defp scratch_delivery_path?(path, allowed_roots) do
+    scratch_path?(path) and not Enum.any?(allowed_roots, &path_under_root?(path, &1))
+  end
+
+  defp scratch_path?(path) when is_binary(path) do
+    String.starts_with?(path, ["tmp/", ".tmp/", ".runic_ai/"])
+  end
+
+  defp scratch_path?(_path), do: false
+
+  defp path_under_root?(path, root) when is_binary(path) and is_binary(root) do
+    path == root or String.starts_with?(path, root <> "/")
+  end
+
+  defp path_under_root?(_path, _root), do: false
 
   defp extracted_terms(objective) do
     camel_terms =

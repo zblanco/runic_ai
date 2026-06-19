@@ -15,6 +15,7 @@ defmodule RunicAIWeb.WorkbenchLive do
   @workspace_tabs ["chat", "plan", "reviews"]
   @inspector_tabs ["trace", "logs", "artifacts", "details"]
   @session_filters ["all", "active", "review", "failed", "completed", "pinned"]
+  @session_sidebar_limit 16
   @workbench_refresh_debounce_ms 75
   @landing_agent_modes [
     %{
@@ -206,6 +207,34 @@ defmodule RunicAIWeb.WorkbenchLive do
       {:error, reason} ->
         {:noreply,
          put_flash(socket, :error, "Could not record review decision: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("approval_policy", %{"approval" => params}, socket) do
+    session_id = socket.assigns.selected_session_id
+
+    with true <- is_binary(session_id),
+         {:ok, result} <- Workbench.record_approval_policy(session_id, params) do
+      message =
+        case result do
+          %{policy: :always, approved_count: count} ->
+            "Approval policy set to always; approved #{count} pending non-budget review(s)"
+
+          %{policy: policy} ->
+            "Approval policy set to #{policy}"
+        end
+
+      {:noreply,
+       socket
+       |> put_flash(:info, message)
+       |> load_workbench(session_id)}
+    else
+      false ->
+        {:noreply, put_flash(socket, :error, "Select a session first")}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(socket, :error, "Could not update approval policy: #{inspect(reason)}")}
     end
   end
 
@@ -404,12 +433,16 @@ defmodule RunicAIWeb.WorkbenchLive do
         socket.assigns[:pinned_session_ids] || MapSet.new()
       )
 
+    selected_session_changed? =
+      assigns.selected_session_id != socket.assigns[:selected_session_id]
+
     socket
     |> assign(assigns)
     |> assign(:workbench_refresh_generation, generation)
     |> assign(:workbench_refresh_active?, false)
     |> assign(:workbench_refresh_dirty?, false)
     |> assign(:workbench_refresh_session_id, requested_session_id)
+    |> maybe_put_session_run_form(assigns.snapshot, selected_session_changed?)
     |> maybe_subscribe_selected_session()
   end
 
@@ -451,7 +484,7 @@ defmodule RunicAIWeb.WorkbenchLive do
   end
 
   defp workbench_assigns(requested_session_id, live_action, filter, pinned_session_ids) do
-    all_sessions = Workbench.recent_sessions(limit: 40)
+    all_sessions = Workbench.recent_session_summaries(limit: @session_sidebar_limit)
     sessions = filter_sessions(all_sessions, filter, pinned_session_ids)
 
     selected_session_id =
@@ -514,6 +547,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       messages: [],
       events: [],
       sandbox_executions: [],
+      child_repairs: [],
       tool_calls: [],
       runs: [],
       review_requests: [],
@@ -529,6 +563,7 @@ defmodule RunicAIWeb.WorkbenchLive do
         messages: 0,
         events: 0,
         sandbox_executions: 0,
+        child_repairs: 0,
         tool_calls: 0,
         runs: 0,
         review_requests: 0,
@@ -567,6 +602,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       "sandbox_profile" => "local_code",
       "sandbox_backend" => "just_bash",
       "sandbox_runtime" => "bash",
+      "sandbox_runtimes" => "bash",
       "sandbox_network" => "disabled",
       "sandbox_stateful" => "false",
       "sandbox_pool_warm" => "0",
@@ -595,6 +631,70 @@ defmodule RunicAIWeb.WorkbenchLive do
     |> assign(:new_run_params, params)
     |> assign(:new_run_form, to_form(params, as: :run))
   end
+
+  defp maybe_put_session_run_form(socket, %{session: %{id: id}} = snapshot, true)
+       when is_binary(id) do
+    params =
+      socket.assigns.new_run_params
+      |> Map.merge(session_run_params(snapshot, socket.assigns.model_catalog))
+      |> Map.put("objective", "")
+      |> Map.put("session_id", id)
+
+    put_new_run_form(socket, params)
+  end
+
+  defp maybe_put_session_run_form(socket, _snapshot, _changed?), do: socket
+
+  defp session_run_params(%{session: session} = snapshot, model_catalog) do
+    metadata = session.metadata || %{}
+    sandbox = field(metadata, :sandbox) || %{}
+    runtimes = sandbox |> field(:runtimes) |> List.wrap() |> Enum.map(&to_string/1)
+    runtime = sandbox |> field(:runtime) |> sandbox_value(List.first(runtimes) || "bash")
+    runtimes = if runtimes == [], do: [runtime], else: runtimes
+    {provider, model_id} = model_selection_from_spec(session.model, model_catalog)
+
+    %{
+      "agent" => session.agent || "assistant",
+      "cwd" => session.workspace_root || File.cwd!(),
+      "model_provider" => provider,
+      "model_id" => model_id,
+      "model" => "#{provider}:#{model_id}",
+      "approve" =>
+        metadata
+        |> field(:runtime_approval)
+        |> sandbox_value(selected_approval(snapshot) || "safe"),
+      "mode" =>
+        metadata |> field(:mode) |> mode_value_string(default_mode_for_agent(session.agent)),
+      "write_policy" =>
+        metadata
+        |> field(:write_policy)
+        |> write_policy_value_string(default_mode_for_agent(session.agent)),
+      "profile" => metadata |> field(:profile) |> sandbox_value("local-workbench"),
+      "sandbox_profile" => sandbox |> field(:sandbox) |> sandbox_value("local_code"),
+      "sandbox_backend" => sandbox |> field(:backend) |> sandbox_value("just_bash"),
+      "sandbox_runtime" => runtime,
+      "sandbox_runtimes" => Enum.join(runtimes, ","),
+      "sandbox_network" => sandbox |> field(:network) |> sandbox_value("disabled"),
+      "sandbox_stateful" => sandbox |> field(:stateful?) |> sandbox_truthy?() |> to_string(),
+      "sandbox_pool_warm" => sandbox |> field(:pool) |> field(:warm) |> integer_string("0"),
+      "sandbox_pool_max" => sandbox |> field(:pool) |> field(:max) |> integer_string("1")
+    }
+  end
+
+  defp default_mode_for_agent("rlm"), do: "patch"
+  defp default_mode_for_agent(:rlm), do: "patch"
+  defp default_mode_for_agent(_agent), do: "verify"
+
+  defp mode_value_string(nil, fallback), do: fallback
+  defp mode_value_string("", fallback), do: fallback
+  defp mode_value_string(value, _fallback) when is_atom(value), do: mode_value(value)
+  defp mode_value_string(value, _fallback), do: to_string(value)
+
+  defp write_policy_value_string(nil, mode),
+    do: mode |> default_write_policy() |> write_policy_value()
+
+  defp write_policy_value_string("", mode), do: write_policy_value_string(nil, mode)
+  defp write_policy_value_string(value, _mode), do: write_policy_value(value)
 
   defp normalize_new_run_model_params(params, model_catalog) do
     provider =
@@ -677,6 +777,19 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp default_write_policy(_mode), do: :docs_only
 
   defp landing_agent_modes, do: @landing_agent_modes
+
+  defp sandbox_backend_options do
+    [
+      {"just_bash", "just bash"},
+      {"docker", "docker"},
+      {"podman", "podman"},
+      {"gvisor", "gvisor"},
+      {"vmsan", "vmsan"},
+      {"firecracker", "firecracker"},
+      {"sprites", "sprites"},
+      {"remote", "remote"}
+    ]
+  end
 
   defp landing_agent_selected?(form, agent) do
     Phoenix.HTML.Form.input_value(form, :agent) == agent
@@ -769,6 +882,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       backend: backend,
       runtime: runtime,
       runtimes: runtimes,
+      runtimes_value: Enum.join(runtimes, ","),
       network: network,
       stateful?: stateful?,
       pool_warm: pool_warm,
@@ -790,6 +904,7 @@ defmodule RunicAIWeb.WorkbenchLive do
     sandbox_form_value(form_or_params, :sandbox_profile) == sandbox.id and
       sandbox_form_value(form_or_params, :sandbox_backend) == sandbox.backend and
       sandbox_form_value(form_or_params, :sandbox_runtime) == sandbox.runtime and
+      sandbox_form_value(form_or_params, :sandbox_runtimes) == sandbox.runtimes_value and
       sandbox_form_value(form_or_params, :sandbox_network) == sandbox.network and
       sandbox_form_value(form_or_params, :sandbox_stateful) == to_string(sandbox.stateful?)
   end
@@ -803,6 +918,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       "sandbox_profile" => sandbox.id,
       "sandbox_backend" => sandbox.backend,
       "sandbox_runtime" => sandbox.runtime,
+      "sandbox_runtimes" => sandbox.runtimes_value,
       "sandbox_network" => sandbox.network,
       "sandbox_stateful" => to_string(sandbox.stateful?),
       "sandbox_pool_warm" => sandbox.pool_warm,
@@ -815,11 +931,22 @@ defmodule RunicAIWeb.WorkbenchLive do
     |> landing_sandbox_options()
     |> Enum.find(&landing_sandbox_selected?(form, &1))
     |> case do
-      %{label: label, backend: backend, runtime: runtime, status_label: status} ->
-        "#{label} / #{backend}:#{runtime} / #{status}"
+      %{label: label, backend: backend, status_label: status} = sandbox ->
+        "#{label} / #{backend}:#{sandbox_runtimes_label(sandbox)} / #{status}"
 
       _sandbox ->
-        "No available sandbox selected"
+        selected_landing_sandbox_form_label(form)
+    end
+  end
+
+  defp selected_landing_sandbox_form_label(form) do
+    backend = sandbox_form_value(form, :sandbox_backend)
+    runtimes = sandbox_form_value(form, :sandbox_runtimes)
+
+    cond do
+      backend != "" and runtimes != "" -> "Selected sandbox / #{backend}:#{runtimes} / Custom"
+      backend != "" -> "Selected sandbox / #{backend} / Custom"
+      true -> "No available sandbox selected"
     end
   end
 
@@ -1038,15 +1165,12 @@ defmodule RunicAIWeb.WorkbenchLive do
                     </span>
                   </span>
                   <span class="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10.5px] text-rune-muted">
-                    <span class="truncate">selected {sandbox.runtime}</span>
+                    <span class="truncate">runtimes {sandbox_runtimes_label(sandbox)}</span>
                     <span class="truncate">network {sandbox.network}</span>
                     <span class="truncate">
                       {if sandbox.stateful?, do: "stateful", else: "stateless"}
                     </span>
                     <span class="truncate">pool {sandbox.pool_warm}/{sandbox.pool_max}</span>
-                  </span>
-                  <span class="mt-2 block truncate font-mono text-[10.5px] text-rune-text-soft">
-                    available {sandbox_runtimes_label(sandbox)}
                   </span>
                   <span class="mt-2 block truncate text-xs leading-5 text-rune-muted">
                     {sandbox.status_detail}
@@ -1149,6 +1273,11 @@ defmodule RunicAIWeb.WorkbenchLive do
             type="hidden"
             name={@new_run_form[:sandbox_runtime].name}
             value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_runtime)}
+          />
+          <input
+            type="hidden"
+            name={@new_run_form[:sandbox_runtimes].name}
+            value={Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_runtimes)}
           />
           <input
             type="hidden"
@@ -1568,6 +1697,7 @@ defmodule RunicAIWeb.WorkbenchLive do
 
           <footer class="bg-[linear-gradient(0deg,rgba(10,7,14,0.56),transparent)] pt-0 runic-frost">
             <.form
+              id={"session-run-form-#{dom_id(selected_session_id(@snapshot))}"}
               for={@new_run_form}
               phx-change="change_run_form"
               phx-submit="submit_objective"
@@ -1632,6 +1762,12 @@ defmodule RunicAIWeb.WorkbenchLive do
                   name={@new_run_form[:approve].name}
                   class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 text-center font-mono text-[11px] text-rune-text-soft"
                 >
+                  <option
+                    value="always"
+                    selected={Phoenix.HTML.Form.input_value(@new_run_form, :approve) == "always"}
+                  >
+                    approve all
+                  </option>
                   <option
                     value="safe"
                     selected={Phoenix.HTML.Form.input_value(@new_run_form, :approve) == "safe"}
@@ -1801,40 +1937,14 @@ defmodule RunicAIWeb.WorkbenchLive do
                           class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft"
                         >
                           <option
-                            value="just_bash"
+                            :for={{backend, label} <- sandbox_backend_options()}
+                            value={backend}
                             selected={
                               Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
-                                "just_bash"
+                                backend
                             }
                           >
-                            just bash
-                          </option>
-                          <option
-                            value="docker"
-                            selected={
-                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
-                                "docker"
-                            }
-                          >
-                            docker
-                          </option>
-                          <option
-                            value="gvisor"
-                            selected={
-                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
-                                "gvisor"
-                            }
-                          >
-                            gvisor
-                          </option>
-                          <option
-                            value="firecracker"
-                            selected={
-                              Phoenix.HTML.Form.input_value(@new_run_form, :sandbox_backend) ==
-                                "firecracker"
-                            }
-                          >
-                            firecracker
+                            {label}
                           </option>
                         </select>
                       </label>
@@ -1992,7 +2102,7 @@ defmodule RunicAIWeb.WorkbenchLive do
                       <strong class="text-rune-text">verify</strong>: inspect/analyze, <strong class="text-rune-text">patch</strong>: may write workspace files, <strong class="text-rune-text">read only</strong>: no writes expected
                     </p>
                     <p>
-                      <strong class="text-rune-text">safe</strong>: auto-approve low-risk gated actions only, <strong class="text-rune-text">ask</strong>: pause in browser, <strong class="text-rune-text">never</strong>: deny gated actions
+                      <strong class="text-rune-text">approve all</strong>: approve non-budget review gates, <strong class="text-rune-text">safe</strong>: auto-approve low-risk gated actions only, <strong class="text-rune-text">ask</strong>: pause in browser, <strong class="text-rune-text">never</strong>: deny gated actions
                     </p>
                     <p>
                       <strong class="text-rune-text">workspace writes gated</strong>: allow non-doc artifacts inside the selected cwd after policy review
@@ -2073,18 +2183,30 @@ defmodule RunicAIWeb.WorkbenchLive do
                 <.progress_summary_panel summary={@snapshot.progress_summary} compact />
               </div>
               <div
-                :if={@snapshot.sandbox_executions != []}
+                :if={snapshot_sandbox_executions(@snapshot) != []}
                 class="px-[18px] pb-3 pt-1"
               >
                 <div class="mb-2 font-mono text-[10.5px] font-bold uppercase text-rune-muted">
                   Sandbox executions
                 </div>
                 <.artifact_record
-                  :for={execution <- Enum.take(@snapshot.sandbox_executions, 4)}
+                  :for={execution <- Enum.take(snapshot_sandbox_executions(@snapshot), 4)}
                   title={sandbox_execution_title(execution)}
                   meta={execution.status}
                   tone={execution.status}
                   detail={sandbox_execution_detail(execution)}
+                />
+              </div>
+              <div
+                :if={snapshot_child_repairs(@snapshot) != []}
+                class="px-[18px] pb-3 pt-1"
+              >
+                <div class="mb-2 font-mono text-[10.5px] font-bold uppercase text-rune-muted">
+                  Child repairs
+                </div>
+                <.child_repair_record
+                  :for={repair <- Enum.take(snapshot_child_repairs(@snapshot), 4)}
+                  repair={repair}
                 />
               </div>
               <div :if={@snapshot.events == []} class="px-[22px] py-8 text-sm text-rune-muted">
@@ -2503,6 +2625,22 @@ defmodule RunicAIWeb.WorkbenchLive do
           </button>
         </div>
       </.form>
+      <.form
+        :if={review_open?(@review)}
+        id={"approval-policy-form-#{dom_id(@review.id)}"}
+        for={%{}}
+        as={:approval}
+        phx-submit="approval_policy"
+        class="px-[18px] pb-[18px]"
+      >
+        <input type="hidden" name="approval[policy]" value="always" />
+        <button
+          type="submit"
+          class="min-h-[34px] rounded-[11px] border border-rune-primary/25 bg-rune-primary/10 px-3 py-2 text-xs font-semibold text-rune-primary-soft hover:border-rune-primary/45"
+        >
+          Approve tool reviews for session
+        </button>
+      </.form>
       <div
         :if={@review && !review_open?(@review)}
         class="mx-[18px] mb-[18px] mt-4 rounded-[12px] border border-rune-text/5 bg-black/20 px-3 py-2 font-mono text-[11px] text-rune-text-soft"
@@ -2833,6 +2971,43 @@ defmodule RunicAIWeb.WorkbenchLive do
     """
   end
 
+  attr :repair, :map, required: true
+
+  defp child_repair_record(assigns) do
+    ~H"""
+    <div class="mb-3 rounded-[17px] border border-rune-gold/15 bg-rune-gold/[0.055] p-[15px] shadow-[inset_0_1px_0_rgba(255,215,128,0.07)]">
+      <div class="mb-2 flex items-center justify-between gap-2 font-mono text-[10.5px] text-rune-muted">
+        <span class="truncate">{child_repair_meta(@repair)}</span>
+        <span class={["rounded-full px-2 py-1 uppercase", child_repair_status_class(@repair)]}>
+          {field(@repair, :status)}
+        </span>
+      </div>
+      <h3 class="text-[13px] font-semibold leading-snug text-rune-text">
+        {field(@repair, :title)}
+      </h3>
+      <p class="mt-2 line-clamp-3 text-xs leading-5 text-rune-text-soft">
+        {field(@repair, :detail)}
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2">
+        <div
+          :for={fact <- child_repair_facts(@repair)}
+          class="rounded-xl border border-rune-text/5 bg-black/20 px-3 py-2"
+        >
+          <span class="block font-mono text-[10px] uppercase text-rune-muted">{fact.label}</span>
+          <span class="mt-1 block truncate text-xs text-rune-text-soft">{fact.value}</span>
+        </div>
+      </div>
+      <div
+        :if={child_repair_next_action(@repair)}
+        class="mt-3 flex items-start gap-2 rounded-xl border border-rune-primary/15 bg-rune-primary/[0.075] px-3 py-2 text-xs leading-5 text-rune-text-soft"
+      >
+        <.icon name="hero-arrow-right" class="mt-0.5 size-3.5 shrink-0 text-rune-primary" />
+        <span>{child_repair_next_action(@repair)}</span>
+      </div>
+    </div>
+    """
+  end
+
   attr :title, :string, required: true
   attr :meta, :any, required: true
   attr :tone, :any, default: nil
@@ -2884,6 +3059,79 @@ defmodule RunicAIWeb.WorkbenchLive do
     </div>
     """
   end
+
+  defp child_repair_meta(repair) do
+    [
+      field(repair, :type),
+      field(repair, :node_id),
+      child_repair_attempt_label(repair)
+    ]
+    |> Enum.map(&present_string/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(" - ")
+  end
+
+  defp child_repair_attempt_label(repair) do
+    case field(repair, :attempt) do
+      nil -> nil
+      attempt -> "attempt #{attempt}"
+    end
+  end
+
+  defp child_repair_status_class(repair) do
+    case field(repair, :status) do
+      "repaired" -> "bg-rune-primary/15 text-rune-primary"
+      "running" -> "bg-rune-gold/15 text-rune-gold"
+      "unresolved" -> "bg-rune-warning/15 text-rune-warning"
+      _other -> event_status_class(field(repair, :status))
+    end
+  end
+
+  defp child_repair_facts(repair) do
+    [
+      %{label: "reason", value: present_string(field(repair, :reason))},
+      %{label: "changed", value: child_repair_changed_label(repair)},
+      %{label: "diagnostic", value: child_repair_diagnostic_label(repair)},
+      %{label: "mode", value: present_string(field(repair, :mode))}
+    ]
+    |> Enum.reject(fn fact -> fact.value in [nil, ""] end)
+  end
+
+  defp child_repair_changed_label(repair) do
+    files = field(repair, :changed_files) |> List.wrap() |> Enum.reject(&is_nil/1)
+
+    case files do
+      [] -> nil
+      [file] -> file
+      files -> "#{length(files)} files"
+    end
+  end
+
+  defp child_repair_diagnostic_label(repair) do
+    repair
+    |> field(:diagnostics)
+    |> List.wrap()
+    |> case do
+      [] -> nil
+      [diagnostic | _rest] -> child_repair_diagnostic_text(diagnostic)
+    end
+  end
+
+  defp child_repair_diagnostic_text(diagnostic) when is_map(diagnostic) do
+    message = field(diagnostic, :message)
+    code = field(diagnostic, :code)
+    details = field(diagnostic, :details)
+    op = field(details, :op)
+
+    [message, code, op && "op=#{op}"]
+    |> Enum.map(&present_string/1)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(" - ")
+  end
+
+  defp child_repair_diagnostic_text(diagnostic), do: present_string(diagnostic)
+
+  defp child_repair_next_action(repair), do: field(repair, :next_action)
 
   attr :artifact, :map, required: true
   attr :bookmarked?, :boolean, default: false
@@ -3229,6 +3477,14 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp selected_session_id(%{session: %{id: id}}) when is_binary(id), do: id
   defp selected_session_id(_snapshot), do: "none"
 
+  defp snapshot_sandbox_executions(%{sandbox_executions: executions}) when is_list(executions),
+    do: executions
+
+  defp snapshot_sandbox_executions(_snapshot), do: []
+
+  defp snapshot_child_repairs(%{child_repairs: repairs}) when is_list(repairs), do: repairs
+  defp snapshot_child_repairs(_snapshot), do: []
+
   defp selected_status(%{session: %{status: status}}), do: status
   defp selected_status(_snapshot), do: "idle"
 
@@ -3310,13 +3566,21 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp sandbox_execution_title(execution) do
     backend = field(execution, :backend) || field(execution, :sandbox) || "sandbox"
     runtime = field(execution, :runtime) || "runtime"
-    "#{backend} / #{runtime}"
+    proof = sandbox_execution_proof_label(execution)
+
+    [backend, runtime, proof]
+    |> Enum.reject(&(&1 in [nil, "", "-"]))
+    |> Enum.map(&to_string/1)
+    |> Enum.join(" / ")
   end
 
   defp sandbox_execution_detail(execution) do
     [
       field(execution, :isolation_level),
       field(execution, :network),
+      sandbox_security_boundary_label(field(execution, :security_boundary?)),
+      sandbox_copy_label("copy-in", field(execution, :copy_in_status)),
+      sandbox_copy_label("copy-back", field(execution, :copy_back_status)),
       sandbox_duration_label(field(execution, :duration_ms)),
       changed_files_label(field(execution, :files_changed))
     ]
@@ -3325,6 +3589,34 @@ defmodule RunicAIWeb.WorkbenchLive do
     |> Enum.join(" - ")
   end
 
+  defp sandbox_execution_proof_label(execution) do
+    proof = field(execution, :proof) || %{}
+
+    cond do
+      field(proof, :session_id) not in [nil, ""] ->
+        "session #{short_id(field(proof, :session_id))}"
+
+      field(proof, :vm_id) not in [nil, ""] ->
+        "vm #{short_id(field(proof, :vm_id))}"
+
+      field(proof, :container_name) not in [nil, ""] ->
+        "container #{short_id(field(proof, :container_name))}"
+
+      field(proof, :execution_event_id) not in [nil, ""] ->
+        "event #{short_id(field(proof, :execution_event_id))}"
+
+      true ->
+        nil
+    end
+  end
+
+  defp sandbox_security_boundary_label(true), do: "security boundary"
+  defp sandbox_security_boundary_label("true"), do: "security boundary"
+  defp sandbox_security_boundary_label(_value), do: nil
+
+  defp sandbox_copy_label(_label, value) when value in [nil, ""], do: nil
+  defp sandbox_copy_label(label, value), do: "#{label} #{value}"
+
   defp sandbox_duration_label(duration_ms) when is_integer(duration_ms), do: "#{duration_ms}ms"
   defp sandbox_duration_label(_duration_ms), do: nil
 
@@ -3332,6 +3624,12 @@ defmodule RunicAIWeb.WorkbenchLive do
     do: "#{length(files)} changed"
 
   defp changed_files_label(_files), do: nil
+
+  defp short_id(value) do
+    value
+    |> to_string()
+    |> String.slice(0, 18)
+  end
 
   defp capability_profile(%{capability_profile: profile}) when is_map(profile), do: profile
 

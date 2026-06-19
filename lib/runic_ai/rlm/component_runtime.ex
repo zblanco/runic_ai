@@ -1126,10 +1126,23 @@ defmodule RunicAI.RLM.ComponentRuntime do
          path: request.details[:path],
          resume_key: request.resume_key,
          decision_status: decision.status,
+         review_request: review_request_payload(request),
          suggested_paths: request.details[:suggested_paths] || [],
          artifact_outcome: outcome
        }
      )}
+  end
+
+  defp review_request_payload(%ReviewRequest{} = request) do
+    %{
+      kind: request.kind,
+      subject: request.subject,
+      checkpoint: request.checkpoint,
+      resume_key: request.resume_key,
+      options: request.options,
+      details: request.details,
+      metadata: request.metadata
+    }
   end
 
   defp apply_artifact_write_edit(params, %ReviewDecision{edited_value: edited})

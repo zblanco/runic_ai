@@ -334,6 +334,42 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
     assert result.metadata.tool == :execute_code
   end
 
+  test "artifact writer review denials preserve the review request in runtime errors" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Write reviewed artifact",
+        [
+          ComponentBlueprint.new!("write", :artifact_writer,
+            params: %{path: ".docs/out.md", write_policy: :docs_only}
+          )
+        ],
+        stop_conditions: ["artifact written"]
+      )
+
+    {:ok, runtime} =
+      ComponentRuntime.initial_context(workspace, blueprint,
+        run_id: "assistant:test-review-denial",
+        review_decider: fn request, _context ->
+          {:ok, ReviewDecision.new!(request.resume_key, :cancelled)}
+        end
+      )
+
+    component = hd(blueprint.components)
+
+    assert {:error, %Error{} = error} =
+             ComponentRuntime.execute_node(component, "Reviewed report", runtime)
+
+    assert error.details.resume_key ==
+             "review:artifact_writer:assistant:test-review-denial:.docs/out.md"
+
+    assert error.details.review_request.resume_key == error.details.resume_key
+    assert error.details.review_request.kind == :assistant_artifact_write
+    assert error.details.review_request.checkpoint == :pre_write
+  end
+
   test "sandbox session components execute through reviewed stateful tools" do
     root = tmp_dir()
     workspace = Workspace.new!(root: root)

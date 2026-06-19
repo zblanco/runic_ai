@@ -3,7 +3,25 @@ defmodule RunicAI.Recipes.IntegratedChatAgentTest do
 
   alias Runic.Workflow
   alias RunicAI.Prompt
+  alias RunicAI.Recipes.IntegratedAgentKernel
   alias RunicAI.Recipes.IntegratedChatAgent
+
+  test "kernel ignores non-ready productions without calling lane processor" do
+    parent = self()
+
+    workflow =
+      IntegratedAgentKernel.new(
+        default_agent_id: "chat",
+        processor: fn bundle ->
+          send(parent, {:processor_called, bundle})
+          []
+        end
+      )
+      |> Workflow.react_until_satisfied(%{kind: :stop})
+
+    assert RunicAI.Recipes.IntegratedAgentKernel.runtime_state(workflow).ready_queue == []
+    refute_receive {:processor_called, _bundle}
+  end
 
   test "keeps chat state inside the workflow across repeated signals" do
     client = fn _model, %Prompt{messages: messages}, _opts ->

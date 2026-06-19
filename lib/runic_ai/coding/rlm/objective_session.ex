@@ -264,11 +264,18 @@ defmodule RunicAI.Coding.RLM.ObjectiveSession do
     error = normalize_error(error)
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
+    review_request = error_review_request(error)
+
     status =
-      if budget_error?(error) or iteration_number(session) > session.max_iterations do
-        :needs_budget_approval
-      else
-        :failed
+      cond do
+        review_request ->
+          :needs_review_approval
+
+        budget_error?(error) or iteration_number(session) > session.max_iterations ->
+          :needs_budget_approval
+
+        true ->
+          :failed
       end
 
     request =
@@ -294,6 +301,8 @@ defmodule RunicAI.Coding.RLM.ObjectiveSession do
     |> Map.put(:latest_error, error)
     |> Map.put(:next_objective, nil)
     |> Map.put(:updated_at, now)
+    |> update_tasks_for_error(status, review_request)
+    |> maybe_append_review_request(review_request)
     |> maybe_append_budget_request(request)
     |> append_progress(:iteration_error, %{
       iteration: iteration_number(session),
@@ -301,6 +310,12 @@ defmodule RunicAI.Coding.RLM.ObjectiveSession do
       error: error_summary(error)
     })
   end
+
+  defp update_tasks_for_error(session, :needs_review_approval, review_request) do
+    update_tasks(session, :needs_review_approval, %{}, [], review_request)
+  end
+
+  defp update_tasks_for_error(session, _status, _review_request), do: session
 
   @spec record_review_decision(t(), ReviewDecision.t() | map(), keyword()) ::
           {:ok, t()} | {:error, Error.t()}
@@ -1132,6 +1147,15 @@ defmodule RunicAI.Coding.RLM.ObjectiveSession do
       field(field(result, :context), :latest_review_request),
       field(field(result, :context), :review_request),
       field(field(result, :context), :review_requests) |> List.wrap() |> List.last()
+    ]
+    |> Enum.find(&review_request?/1)
+    |> normalize_review_request()
+  end
+
+  defp error_review_request(%Error{} = error) do
+    [
+      field(error.details, :review_request),
+      field(error.metadata, :review_request)
     ]
     |> Enum.find(&review_request?/1)
     |> normalize_review_request()

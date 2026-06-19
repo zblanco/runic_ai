@@ -1,8 +1,8 @@
 defmodule RunicAI.RLM.RobustnessTest do
   use ExUnit.Case, async: false
 
+  alias RunicAI.Coding.RLM.EditOperation
   alias RunicAI.Coding.RLM.EditPatchSet
-  alias RunicAI.Coding.RLM.ElixirProjectGenerator
   alias RunicAI.Coding.Workspace
   alias RunicAI.RLM.Robustness
   alias RunicAI.RLM.Robustness.Catalog
@@ -30,6 +30,19 @@ defmodule RunicAI.RLM.RobustnessTest do
            ]
 
     assert Keyword.get_values(opts, :lane) == ["rlm", "browser_tidewave"]
+  end
+
+  test "robustness Mix task accepts a named general dynamic workflow matrix" do
+    {opts, [], []} =
+      Mix.Tasks.RunicAi.Rlm.Robustness.parse_args([
+        "--matrix",
+        "general_dynamic_workflow",
+        "--lane",
+        "browser_tidewave"
+      ])
+
+    assert Keyword.get(opts, :matrix) == "general_dynamic_workflow"
+    assert Keyword.get_values(opts, :lane) == ["browser_tidewave"]
   end
 
   test "deterministic command checks persist bounded stdout and stderr excerpts" do
@@ -75,6 +88,49 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert byte_size(details.stdout_excerpt) <= 4_003
 
     File.rm_rf(root)
+  end
+
+  test "deterministic warning-free command checks reject warning output" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "rlm-warning-free-command-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+
+    on_exit(fn -> File.rm_rf(root) end)
+
+    scenario =
+      ProjectScenario.new!(
+        id: "warning_free_command",
+        title: "Warning Free Command",
+        prompt: "Reject warning output from otherwise successful verification commands.",
+        deterministic_checks: [
+          %{
+            type: :command_passes_without_warnings,
+            argv: ["sh", "-c", "printf 'ok\\n'; printf 'warning: deprecated config\\n' >&2"]
+          },
+          %{type: :command_passes_without_warnings, argv: ["sh", "-c", "printf 'ok\\n'"]}
+        ],
+        judge_rubric: %{},
+        browser_user_story: "As a tester, I want warning output to block completion.",
+        browser_validation_tasks: ["Inspect warning-free command status."],
+        metadata: %{}
+      )
+
+    result = DeterministicChecks.evaluate(scenario, root)
+
+    assert result.status == :fail
+
+    assert [
+             %{
+               status: :fail,
+               message: "command emitted 1 warning(s)",
+               details: %{warning_count: 1}
+             },
+             %{status: :pass, message: "command passed without warnings"}
+           ] = result.checks
   end
 
   test "optional deterministic command checks stay visible without blocking required pass status" do
@@ -140,6 +196,37 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert Enum.all?(scenarios, &(length(&1.browser_validation_tasks) > 0))
   end
 
+  test "catalog exposes a general dynamic workflow matrix with required task shapes" do
+    assert {:ok,
+            [
+              "empty_app_creation",
+              "existing_app_feature",
+              "research_report",
+              "refactor_existing_module",
+              "denied_tool_review"
+            ] = ids} = Robustness.scenario_matrix("general-dynamic-workflow")
+
+    scenarios =
+      Enum.map(ids, fn id ->
+        {:ok, scenario} = Catalog.get(id)
+        scenario
+      end)
+
+    assert Enum.map(scenarios, & &1.metadata[:task_shape]) == [
+             :empty_app_creation,
+             :existing_app_feature,
+             :research_report,
+             :refactor,
+             :denied_tool_review
+           ]
+
+    assert Enum.all?(scenarios, &(&1.metadata[:general_dynamic_workflow?] == true))
+
+    assert scenarios
+           |> Enum.reject(&(&1.id == "denied_tool_review"))
+           |> Enum.all?(&(&1.metadata[:browser_approval] == :always))
+  end
+
   test "OpsLogic approval-resume scenario gates plan and product-shape artifacts" do
     {:ok, scenario} = Catalog.get("opslogic_objective_loop_approval_resume")
     label = "test-opslogic-approval-resume-#{System.unique_integer([:positive])}"
@@ -171,7 +258,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     """
 
     assert {:ok, %{status: :ok}} =
-             EditPatchSet.apply(coding_workspace, ElixirProjectGenerator.patch_set(objective))
+             EditPatchSet.apply(coding_workspace, opslogic_fixture_patch_set(objective))
 
     result = DeterministicChecks.evaluate(scenario, workspace.root)
 
@@ -189,6 +276,26 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert String.contains?(workspace.root, "/tmp/rlm_robustness/")
     assert File.exists?(Path.join(workspace.root, "mix.exs"))
     assert File.exists?(Path.join(workspace.root, "test/test_helper.exs"))
+  end
+
+  test "workspace factory supports general dynamic workflow seed shapes" do
+    label = "test-general-matrix-seeds-#{System.unique_integer([:positive])}"
+
+    {:ok, empty} = Catalog.get("empty_app_creation")
+    assert {:ok, empty_workspace} = WorkspaceFactory.create(empty, :rlm, run_label: label)
+    refute File.exists?(Path.join(empty_workspace.root, "mix.exs"))
+
+    {:ok, report} = Catalog.get("research_report")
+    assert {:ok, report_workspace} = WorkspaceFactory.create(report, :assistant, run_label: label)
+    assert File.exists?(Path.join(report_workspace.root, "notes/incidents.md"))
+    assert File.exists?(Path.join(report_workspace.root, "notes/roadmap.md"))
+    refute File.exists?(Path.join(report_workspace.root, "mix.exs"))
+
+    {:ok, refactor} = Catalog.get("refactor_existing_module")
+    assert {:ok, refactor_workspace} = WorkspaceFactory.create(refactor, :rlm, run_label: label)
+
+    assert File.read!(Path.join(refactor_workspace.root, "lib/event_normalizer.ex")) =~
+             "String.split(raw, \",\")"
   end
 
   test "workspace factory can seed a broken field-service repair fixture" do
@@ -337,11 +444,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert {:ok, _output} =
              [root: workspace.root]
              |> Workspace.new!()
-             |> EditPatchSet.apply(
-               ElixirProjectGenerator.patch_set(
-                 "Add one bounded existing app feature slice that adapts to ExistingApp.Accounts and includes an integration smoke"
-               )
-             )
+             |> EditPatchSet.apply(existing_app_feature_patch_set())
 
     repaired = DeterministicChecks.evaluate(scenario, workspace.root, check_opts)
 
@@ -369,6 +472,24 @@ defmodule RunicAI.RLM.RobustnessTest do
 
     assert judge.overall == "fail"
     assert "lane execution failed" in judge.blocking_failures
+  end
+
+  test "heuristic judge scores successful no-repair runs as repair-effective" do
+    {:ok, scenario} = Catalog.get("empty_app_creation")
+
+    judge =
+      Judge.evaluate(scenario, %{
+        lane: :browser_tidewave,
+        lane_status: "completed",
+        deterministic: %{status: :pass, passed: 11, failed: 0, total: 11, checks: []},
+        repair_count: 0,
+        final_output: "empty_app_creation_smoke_pass",
+        ui_gaps: []
+      })
+
+    assert judge.overall == "pass"
+    assert judge.scores.repair_effectiveness == 1
+    assert judge.scores.user_output_quality == 1
   end
 
   test "LLM judge accepts a known-good fixture and records audit evidence" do
@@ -528,11 +649,42 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert audit["response_excerpt"] =~ "judge response persisted"
   end
 
+  test "runner writes task-shape evidence for the general dynamic workflow matrix" do
+    label = "test-general-matrix-report-#{System.unique_integer([:positive])}"
+
+    assert {:ok, ids} = Robustness.scenario_matrix(:general_dynamic_workflow)
+
+    assert {:ok, result} =
+             Robustness.run_matrix(ids,
+               lanes: [:rlm],
+               run_label: label,
+               browser_probe?: false
+             )
+
+    assert File.exists?(result.matrix_path)
+    report = File.read!(result.matrix_path)
+
+    assert report =~ "| Scenario | Task shape | Lane | Status |"
+    assert report =~ "empty_app_creation | empty_app_creation | rlm"
+    assert report =~ "existing_app_feature | existing_app_feature | rlm"
+    assert report =~ "research_report | research_report | rlm"
+    assert report =~ "refactor_existing_module | refactor | rlm"
+
+    json_report = result.matrix_path |> Path.rootname() |> Kernel.<>(".json")
+    rows = json_report |> File.read!() |> Jason.decode!()
+
+    assert Enum.any?(
+             rows,
+             &(&1["scenario_id"] == "empty_app_creation" and
+                 &1["task_shape"] == "empty_app_creation")
+           )
+  end
+
   test "runner writes a browser/backend matrix report" do
     label = "test-matrix-#{System.unique_integer([:positive])}"
 
     assert {:ok, result} =
-             Robustness.run_matrix(["field_service_dispatch"],
+             Robustness.run_matrix(["empty_app_creation"],
                lanes: [:browser_tidewave],
                run_label: label,
                browser_probe?: true
@@ -625,11 +777,17 @@ defmodule RunicAI.RLM.RobustnessTest do
 
   test "runner can launch browser lane through injected UI interaction evidence" do
     label = "test-browser-ui-launch-#{System.unique_integer([:positive])}"
+    parent = self()
 
     launch_fun = fn request ->
+      send(parent, {:browser_objective, request.launch["objective"]})
+
       assert request.launch["agent"] == "rlm"
       assert request.launch["mode"] == "patch"
-      assert request.follow_up_prompt =~ "same session"
+
+      if request.follow_up_prompt do
+        assert request.follow_up_prompt =~ "same session"
+      end
 
       {:ok, %{session_id: session_id, run_id: run_id}} =
         RunicAI.Workbench.start_agent_run(request.launch)
@@ -732,7 +890,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     end
 
     assert {:ok, result} =
-             Robustness.run_matrix(["field_service_dispatch"],
+             Robustness.run_matrix(["empty_app_creation"],
                lanes: [:browser_tidewave],
                run_label: label,
                browser_probe?: true,
@@ -791,6 +949,151 @@ defmodule RunicAI.RLM.RobustnessTest do
              true
 
     assert get_in(browser_evidence, ["browser_ui_capture", "browser_follow_up_captured?"]) == true
+
+    assert_receive {:browser_objective, objective}
+    assert objective =~ "Acceptance checks to satisfy before claiming completion"
+    assert objective =~ "command passes: mix compile --warnings-as-errors"
+    assert objective =~ "command passes without warning output: mix test"
+  end
+
+  test "runner records deterministic failure summaries for repair feedback" do
+    label = "test-deterministic-feedback-#{System.unique_integer([:positive])}"
+
+    assert {:ok, result} =
+             Robustness.run_matrix(["empty_app_creation"],
+               lanes: [:standard],
+               run_label: label,
+               browser_probe?: false
+             )
+
+    assert [
+             %{
+               evidence: %{deterministic_failures: failures},
+               deterministic: %{status: :fail}
+             }
+           ] = result.results
+
+    assert Enum.any?(
+             failures,
+             &match?(
+               %{type: :file_exists, target: "mix.exs", message: "file missing"},
+               &1
+             )
+           )
+
+    assert Enum.any?(
+             failures,
+             &match?(
+               %{type: :command_passes, command: "mix compile --warnings-as-errors"},
+               &1
+             )
+           )
+
+    assert File.read!(result.matrix_path) =~
+             "deterministic file_exists failed: mix.exs: file missing"
+  end
+
+  test "browser launch waits for terminal or stable checkpoint snapshot after UI capture" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    run_fun = fn _cwd, _objective, opts ->
+      opts[:event_sink].(%{
+        stage: :node_started,
+        status: :running,
+        data: %{node_id: "delayed-node", kind: :agent}
+      })
+
+      Process.sleep(300)
+
+      {:ok,
+       %{
+         output_text: "delayed browser run completed",
+         scorecard: %{objective_status: :objective_satisfied},
+         objective_scorecard: %{objective_status: :objective_satisfied},
+         artifacts: [],
+         repair_history: []
+       }}
+    end
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, run_fun)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    label = "test-browser-terminal-wait-#{System.unique_integer([:positive])}"
+
+    launch_fun = fn request ->
+      {:ok, %{session_id: session_id}} = RunicAI.Workbench.start_agent_run(request.launch)
+
+      dom_path = Path.join(request.output_dir, "session-dom.txt")
+      screenshot_path = Path.join(request.output_dir, "session.png")
+      console_path = Path.join(request.output_dir, "console.json")
+      network_path = Path.join(request.output_dir, "network.json")
+
+      File.write!(dom_path, "RunicAI\nworkflow rlm\nLIVE PROGRESS\nPlan")
+      File.write!(screenshot_path, <<137, 80, 78, 71, 13, 10, 26, 10>>)
+      File.write!(console_path, Jason.encode!([]))
+      File.write!(network_path, Jason.encode!([]))
+
+      %{
+        :status => "ok",
+        :session_id => session_id,
+        :session_url => "#{request.base_url}/sessions/#{URI.encode_www_form(session_id)}",
+        :dom_snapshot_path => dom_path,
+        :screenshot_path => screenshot_path,
+        :console_path => console_path,
+        "console_captured?" => true,
+        :network_path => network_path,
+        "network_captured?" => true,
+        "ui_launch_captured?" => true,
+        "plan_visibility_captured?" => true,
+        "workflow_stage_plan_visible?" => true,
+        "live_progress_visible?" => true,
+        "active_progress_snapshot_captured?" => true,
+        "active_progress_current_context_visible?" => true,
+        "active_progress_child_visible?" => true,
+        "active_progress_remaining_visible?" => true,
+        "active_progress_budget_visible?" => true,
+        "active_progress_pre_final_visible?" => true,
+        :plan_stage_labels => [
+          "objective",
+          "planning",
+          "implementation",
+          "verification",
+          "repair",
+          "review"
+        ],
+        :active_plan_text_preview =>
+          "LIVE PROGRESS\nNODE\ndelayed-node\nCHILD\ndelayed child\nREMAINING\n1.0s"
+      }
+    end
+
+    assert {:ok, result} =
+             Robustness.run_matrix(["existing_app_feature"],
+               lanes: [:browser_tidewave],
+               run_label: label,
+               browser_probe?: true,
+               browser_ui_launch?: true,
+               browser_ui_launch_fun: launch_fun,
+               browser_terminal_wait_ms: 2_000
+             )
+
+    assert [%{evidence: %{browser_evidence_path: browser_evidence_path}}] = result.results
+
+    browser_evidence = browser_evidence_path |> File.read!() |> Jason.decode!()
+
+    assert get_in(browser_evidence, ["visible_state", "session_status"]) == "completed"
+    assert get_in(browser_evidence, ["visible_state", "completion_proof", "terminal?"]) == true
+    assert get_in(browser_evidence, ["browser_ui_capture", "terminal_wait_observed?"]) == true
+
+    assert get_in(browser_evidence, ["browser_ui_capture", "terminal_wait_state", "source"]) ==
+             "persisted_completion_proof"
+
+    assert get_in(browser_evidence, ["visible_state", "completion_proof", "final_output?"]) ==
+             true
   end
 
   test "browser lane can force and capture a review-card approval decision" do
@@ -821,7 +1124,7 @@ defmodule RunicAI.RLM.RobustnessTest do
       assert {:ok, _output} =
                EditPatchSet.apply(
                  workspace,
-                 ElixirProjectGenerator.patch_set(request.launch["objective"])
+                 opslogic_fixture_patch_set(request.launch["objective"])
                )
 
       assert {:ok, _event} =
@@ -943,6 +1246,126 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert get_in(browser_evidence, ["visible_state", "review_request_count"]) >= 1
   end
 
+  test "browser lane prelaunches review scenarios so rendered UI can deny the review" do
+    label = "test-browser-review-deny-#{System.unique_integer([:positive])}"
+
+    launch_fun = fn request ->
+      assert request.launch["agent"] == "rlm"
+      assert request.launch["approve"] == "ask"
+      assert request.launch["max_objective_iterations"] == "1"
+      assert is_binary(request.open_session_url)
+      assert request.open_session_url =~ "/sessions/"
+
+      assert request.review_decision[:action] == "deny" or
+               request.review_decision["action"] == "deny"
+
+      session_id = request.launch["session_id"]
+      review = wait_for_review_request(session_id)
+
+      assert {:ok, _event} =
+               RunicAI.Workbench.record_review_decision(session_id, review.id, %{
+                 "action" => "deny"
+               })
+
+      wait_for_terminal_event(session_id, "browser_probe_completed")
+
+      dom_path = Path.join(request.output_dir, "session-dom.txt")
+      screenshot_path = Path.join(request.output_dir, "session.png")
+      console_path = Path.join(request.output_dir, "console.json")
+      network_path = Path.join(request.output_dir, "network.json")
+
+      File.write!(dom_path, "RunicAI\nworkflow rlm\nReview required\nrlm - blocked\nPlan")
+      File.write!(screenshot_path, <<137, 80, 78, 71, 13, 10, 26, 10>>)
+      File.write!(console_path, Jason.encode!([]))
+      File.write!(network_path, Jason.encode!([]))
+
+      %{
+        :status => "ok",
+        :session_id => session_id,
+        :session_url => request.open_session_url,
+        :dom_snapshot_path => dom_path,
+        :screenshot_path => screenshot_path,
+        :console_path => console_path,
+        "console_captured?" => true,
+        :network_path => network_path,
+        "network_captured?" => true,
+        "ui_launch_captured?" => true,
+        "existing_session_opened?" => true,
+        "plan_visibility_captured?" => true,
+        "workflow_stage_plan_visible?" => true,
+        "live_progress_visible?" => true,
+        "active_progress_snapshot_captured?" => true,
+        "active_progress_current_context_visible?" => true,
+        "active_progress_child_visible?" => true,
+        "active_progress_remaining_visible?" => true,
+        "active_progress_budget_visible?" => true,
+        "active_progress_pre_final_visible?" => true,
+        :active_plan_text_preview =>
+          "LIVE PROGRESS\nReview required: rlm_node_execution\nCHILD\nbrowser-probe-child\nREMAINING\n42.0s",
+        :plan_stage_labels => [
+          "objective",
+          "planning",
+          "implementation",
+          "verification",
+          "repair",
+          "review"
+        ],
+        "review_decision_required?" => true,
+        "review_card_captured?" => true,
+        "review_decision_captured?" => true,
+        :review_decision_state => %{
+          "found" => true,
+          "submitted" => true,
+          "id" => review.id,
+          "action" => "deny"
+        },
+        "browser_follow_up_required?" => false,
+        "browser_follow_up_captured?" => false,
+        "tidewave_interaction_captured?" => false
+      }
+    end
+
+    assert {:ok, result} =
+             Robustness.run_matrix(["denied_tool_review"],
+               lanes: [:browser_tidewave],
+               run_label: label,
+               browser_probe?: true,
+               browser_ui_launch?: true,
+               browser_ui_launch_fun: launch_fun
+             )
+
+    assert [
+             %{
+               status: :pass,
+               evidence: %{
+                 expected_lane_status: "blocked",
+                 browser_ui_checks: browser_ui_checks,
+                 ui_gaps: [],
+                 browser_evidence_path: browser_evidence_path
+               },
+               judge: %{overall: "pass", blocking_failures: []}
+             }
+           ] = result.results
+
+    assert Enum.any?(
+             browser_ui_checks,
+             &(&1.id == "browser_review_decision_captured" and &1.status == "pass")
+           )
+
+    assert Enum.any?(
+             browser_ui_checks,
+             &(&1.id == "completion_proof_visible" and &1.status == "pass")
+           )
+
+    browser_evidence = browser_evidence_path |> File.read!() |> Jason.decode!()
+    assert get_in(browser_evidence, ["browser_ui_capture", "existing_session_opened?"]) == true
+    assert get_in(browser_evidence, ["browser_ui_capture", "review_decision_captured?"]) == true
+    assert get_in(browser_evidence, ["visible_state", "selected_agent"]) == "rlm"
+
+    assert get_in(browser_evidence, ["visible_state", "completion_proof", "denied_review?"]) ==
+             true
+  end
+
   test "live lane writes an event trail and emits progress callbacks" do
     label = "test-live-trail-#{System.unique_integer([:positive])}"
     {:ok, progress} = Agent.start_link(fn -> [] end)
@@ -1050,7 +1473,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "Objective review approval required"
 
     assert File.read!(result.matrix_path) =~
-             "| opslogic_objective_loop_approval_resume | rlm | pass"
+             "| opslogic_objective_loop_approval_resume | unspecified | rlm | pass"
   end
 
   test "live OpsLogic objective-loop lane requests budget, resumes, and verifies" do
@@ -1100,7 +1523,7 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "Objective budget approval required"
 
     assert File.read!(result.matrix_path) =~
-             "| opslogic_objective_loop_budget_resume | rlm | pass"
+             "| opslogic_objective_loop_budget_resume | unspecified | rlm | pass"
   end
 
   test "live lane errors fail with explicit lane blocking evidence" do
@@ -1147,7 +1570,9 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert repair_plan.observed_failure =~ "mix test"
     assert repair_plan.verification_command == "mix test"
     assert File.read!(result.matrix_path) =~ "rlm_internal_repair_loop"
-    assert File.read!(result.matrix_path) =~ "| rlm_internal_repair_loop | rlm | pass"
+
+    assert File.read!(result.matrix_path) =~
+             "| rlm_internal_repair_loop | unspecified | rlm | pass"
   end
 
   test "live RLM repair loop can delegate command repair to a real child agent" do
@@ -1181,7 +1606,9 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "standard_coding_agent"
     assert jsonl =~ "apply_patch"
     assert File.read!(result.matrix_path) =~ "rlm_child_agent_repair_loop"
-    assert File.read!(result.matrix_path) =~ "| rlm_child_agent_repair_loop | rlm | pass"
+
+    assert File.read!(result.matrix_path) =~
+             "| rlm_child_agent_repair_loop | unspecified | rlm | pass"
   end
 
   test "live RLM lane can force the internal repair loop to consume semantic judge evidence" do
@@ -1216,7 +1643,9 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "apply_patch"
     assert jsonl =~ "lib/work_order.ex"
     assert File.read!(result.matrix_path) =~ "rlm_semantic_repair_loop"
-    assert File.read!(result.matrix_path) =~ "| rlm_semantic_repair_loop | rlm | pass"
+
+    assert File.read!(result.matrix_path) =~
+             "| rlm_semantic_repair_loop | unspecified | rlm | pass"
   end
 
   test "live RLM lane can force the internal repair loop to consume LLM judge evidence" do
@@ -1253,7 +1682,9 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "apply_patch"
     assert jsonl =~ "lib/work_order.ex"
     assert File.read!(result.matrix_path) =~ "rlm_llm_judge_repair_loop"
-    assert File.read!(result.matrix_path) =~ "| rlm_llm_judge_repair_loop | rlm | pass"
+
+    assert File.read!(result.matrix_path) =~
+             "| rlm_llm_judge_repair_loop | unspecified | rlm | pass"
   end
 
   test "live RLM lane can force the internal repair loop to consume runtime smoke evidence" do
@@ -1287,7 +1718,9 @@ defmodule RunicAI.RLM.RobustnessTest do
     assert jsonl =~ "apply_patch"
     assert jsonl =~ "lib/dispatch_runtime.ex"
     assert File.read!(result.matrix_path) =~ "rlm_runtime_smoke_repair_loop"
-    assert File.read!(result.matrix_path) =~ "| rlm_runtime_smoke_repair_loop | rlm | pass"
+
+    assert File.read!(result.matrix_path) =~
+             "| rlm_runtime_smoke_repair_loop | unspecified | rlm | pass"
   end
 
   defp all_judge_scores(value) do
@@ -1340,6 +1773,110 @@ defmodule RunicAI.RLM.RobustnessTest do
       final_output: "Scaffold only.",
       ui_gaps: []
     }
+  end
+
+  defp existing_app_feature_patch_set do
+    EditPatchSet.new!(
+      "Add existing app feature fixture",
+      [
+        EditOperation.new!(:create_file,
+          params: %{
+            path: "lib/existing_app_feature.ex",
+            overwrite: true,
+            content: """
+            defmodule ExistingAppFeature do
+              alias ExistingApp.Accounts
+
+              def integration_smoke do
+                _accounts = Accounts
+                {:ok, [%{feature: :dispatch_dashboard}]}
+              end
+            end
+            """
+          }
+        ),
+        EditOperation.new!(:create_file,
+          params: %{
+            path: "test/existing_app_feature_test.exs",
+            overwrite: true,
+            content: """
+            defmodule ExistingAppFeatureTest do
+              use ExUnit.Case
+
+              test "dispatch_dashboard integration smoke" do
+                assert {:ok, [%{feature: :dispatch_dashboard}]} =
+                         ExistingAppFeature.integration_smoke()
+              end
+
+              test "dispatch_dashboard includes seeded accounts context" do
+                assert {:ok, [%{feature: :dispatch_dashboard}]} =
+                         ExistingAppFeature.integration_smoke()
+              end
+
+              test "integration smoke returns a stable feature atom" do
+                {:ok, [result]} = ExistingAppFeature.integration_smoke()
+                assert result.feature == :dispatch_dashboard
+              end
+
+              test "integration smoke is repeatable" do
+                assert ExistingAppFeature.integration_smoke() ==
+                         ExistingAppFeature.integration_smoke()
+              end
+            end
+            """
+          }
+        )
+      ],
+      expected_changed_files: [
+        "lib/existing_app_feature.ex",
+        "test/existing_app_feature_test.exs"
+      ]
+    )
+  end
+
+  defp opslogic_fixture_patch_set(objective) do
+    files = [
+      {"tmp/ops_logic/mix.exs", "phoenix_live_view ecto_sql postgrex bandit lazy_html"},
+      {"tmp/ops_logic/config/test.exs", "import Config\n"},
+      {"tmp/ops_logic/lib/ops_logic/repo.ex",
+       "defmodule OpsLogic.Repo do\n  use Ecto.Repo\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/work_orders/scheduled_work_order.ex",
+       "defmodule OpsLogic.WorkOrders.ScheduledWorkOrder do\n  use Ecto.Schema\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic_web/endpoint.ex",
+       "defmodule OpsLogicWeb.Endpoint do\n  use Phoenix.Endpoint, otp_app: :ops_logic\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/application.ex",
+       "defmodule OpsLogic.Application do\n  def children, do: [OpsLogicWeb.Endpoint]\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/work_orders.ex",
+       "defmodule OpsLogic.WorkOrders do\n  def persisted_state, do: :ok\n  def apply_worker_action, do: Ecto.Multi.new()\n  def supervisor, do: DynamicSupervisor\nend\n"},
+      {"tmp/ops_logic/lib/mix/tasks/ops_logic.db_smoke.ex", "opslogic_db_smoke_pass"},
+      {"tmp/ops_logic/lib/mix/tasks/ops_logic.browser_smoke.ex", "opslogic_browser_smoke_pass"},
+      {"tmp/ops_logic/priv/browser_smoke_runner.js", "OpsLogic Worker"},
+      {"tmp/ops_logic/lib/ops_logic/work_order_server.ex",
+       "defmodule OpsLogic.WorkOrderServer do\n  use GenServer\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/webhooks.ex", "work_order.completed"},
+      {"tmp/ops_logic/lib/ops_logic/persistence.ex", "repo_boundary"},
+      {"tmp/ops_logic/lib/ops_logic_web.ex", "use Phoenix.Router"},
+      {"tmp/ops_logic/lib/ops_logic_web/router.ex",
+       "use OpsLogicWeb, :router\nlive \"/dispatch\""},
+      {"tmp/ops_logic/lib/ops_logic_web/dispatcher_live.ex",
+       "schedule_work_order dispatch_schedule"},
+      {"tmp/ops_logic/lib/ops_logic_web/worker_live.ex",
+       "initiate_travel apply_worker_event assigned_work_orders"},
+      {"tmp/ops_logic/test/ops_logic_web/live/ops_logic_live_test.exs", "live_isolated"},
+      {"tmp/ops_logic/priv/repo/migrations/20260617000000_create_scheduled_work_orders.sql",
+       "CREATE TABLE scheduled_work_orders"}
+    ]
+
+    EditPatchSet.new!(
+      "Write OpsLogic fixture implementation",
+      Enum.map(files, fn {path, content} ->
+        EditOperation.new!(:create_file,
+          params: %{path: path, content: content, overwrite: true}
+        )
+      end),
+      expected_changed_files: Enum.map(files, &elem(&1, 0)),
+      metadata: %{source: :opslogic_test_fixture, objective: objective}
+    )
   end
 
   defp wait_for_review_request(session_id, attempts \\ 80)

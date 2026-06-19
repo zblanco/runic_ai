@@ -1507,7 +1507,7 @@ defmodule RunicAI.Coding.Tools do
     [
       definition(
         "execute_code",
-        "Execute a bounded code snippet in the configured sandbox backend.",
+        "Execute a bounded code snippet in the configured sandbox backend. Choose runtime per call from the active sandbox runtimes.",
         [
           runtime: [type: :string, default: "bash"],
           code: [type: :string, required: true],
@@ -1593,7 +1593,7 @@ defmodule RunicAI.Coding.Tools do
       ),
       definition(
         "sandbox_exec",
-        "Execute code inside an existing managed sandbox session.",
+        "Execute code inside an existing managed sandbox session. Choose runtime per call from the active sandbox runtimes.",
         [
           session_id: [type: :string, required: true],
           runtime: [type: :string, default: "bash"],

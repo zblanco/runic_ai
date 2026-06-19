@@ -154,6 +154,10 @@ defmodule RunicAI.Coding.Prompt do
     """
     Inspect before editing. Use apply_patch for all file changes.
     In apply_patch operations, use create only for paths that do not exist and update for paths that already exist.
+    If inspection shows the workspace is empty and the task asks you to create
+    or build new artifacts, that empty listing is enough inspection: create the
+    requested files inside the workspace instead of stopping because there is no
+    existing project to patch.
     If a patch fails, read the diagnostic, repair the patch, and try again when appropriate.
     """
   end
@@ -222,6 +226,7 @@ defmodule RunicAI.Coding.Prompt do
       """
       Sandbox execution:
       - Use execute_code for arbitrary generated code, polyglot experiments, untrusted snippets, isolated runtime probes, or code that should not mutate the host workspace.
+      - Choose the execute_code runtime per tool call from the active sandbox runtimes based on user intent and the code being tested; do not assume the first listed runtime is preferred.
       #{process_guidance}
       - Use run_command for project-native host commands only when run_command is visible; otherwise use project_command and verification tools for normal project checks.
       - Prefer deterministic safe computing or built-in project verification when it directly expresses the task; escalate to execute_code when an isolated runtime is the better fit.

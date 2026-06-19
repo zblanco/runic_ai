@@ -10,7 +10,6 @@ defmodule RunicAI.RLM.Robustness.Runner do
   alias RunicAI.ReviewRequest
   alias RunicAI.Coding.RLM.EditOperation
   alias RunicAI.Coding.RLM.EditPatchSet
-  alias RunicAI.Coding.RLM.ElixirProjectGenerator
   alias RunicAI.RLM.Robustness.Catalog
   alias RunicAI.RLM.Robustness.DeterministicChecks
   alias RunicAI.RLM.Robustness.Judge
@@ -174,7 +173,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
          Integer.to_string(get_in(scenario.budgets, [:max_repairs]) || 2)
        ] ++
          objective_loop_args(scenario) ++
-         proposal_timeout_args(scenario, lane, opts) ++ [scenario.prompt])
+         proposal_timeout_args(scenario, lane, opts) ++ [scenario_objective(scenario)])
       |> maybe_append("--model", Keyword.get(opts, :model))
       |> maybe_append("--client", Keyword.get(opts, :client_label))
 
@@ -310,16 +309,16 @@ defmodule RunicAI.RLM.Robustness.Runner do
             data: %{
               output_text: output_text,
               artifact_paths: [],
-              scorecard: %{objective_status: :objective_incomplete},
+              scorecard: browser_probe_scorecard(review_summary),
               review_summary: review_summary
             }
           })
 
           {:ok,
            %{
-             status: :blocked,
+             status: browser_probe_result_status(review_summary),
              output_text: output_text,
-             scorecard: %{objective_status: :objective_incomplete},
+             scorecard: browser_probe_scorecard(review_summary),
              artifacts: [],
              repair_history: [],
              review_summary: review_summary
@@ -331,17 +330,19 @@ defmodule RunicAI.RLM.Robustness.Runner do
         SQLite.migrate!(Workbench.store!())
         Application.put_env(:runic_ai, :workbench, Keyword.put(previous, :run_fun, run_fun))
 
-        launch = %{
-          "session_id" => session_id,
-          "objective" => scenario.prompt,
-          "agent" => "rlm",
-          "cwd" => workspace.root,
-          "approve" => browser_approval_policy(scenario),
-          "mode" => browser_mode(scenario),
-          "profile" => "local-workbench",
-          "toolsets" => browser_toolsets(scenario),
-          "tool_config" => browser_tool_config(scenario)
-        }
+        launch =
+          %{
+            "session_id" => session_id,
+            "objective" => scenario_objective(scenario),
+            "agent" => "rlm",
+            "cwd" => workspace.root,
+            "approve" => browser_approval_policy(scenario),
+            "mode" => browser_mode(scenario),
+            "profile" => "local-workbench",
+            "toolsets" => browser_toolsets(scenario),
+            "tool_config" => browser_tool_config(scenario)
+          }
+          |> maybe_put("max_objective_iterations", browser_max_objective_iterations(scenario))
 
         {session_id, start, launch_snapshot, snapshot, browser_ui_capture} =
           launch_browser_probe(session_id, launch, workspace, scenario, opts)
@@ -367,7 +368,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
           session_id: session_id,
           session_url: browser_evidence.session_url,
           launch_result: inspect_result(start),
-          final_output: final_message_text(snapshot),
+          final_output: browser_probe_final_output(snapshot, browser_evidence),
           browser_snapshot: summarize_snapshot(snapshot),
           browser_evidence_path: browser_evidence_path,
           browser_ui_checks: browser_evidence.ui_checks,
@@ -438,6 +439,68 @@ defmodule RunicAI.RLM.Robustness.Runner do
         {:ok, %{required?: false}}
     end
   end
+
+  defp scenario_objective(%ProjectScenario{} = scenario) do
+    checks = acceptance_check_lines(scenario.deterministic_checks)
+
+    if checks == [] do
+      scenario.prompt
+    else
+      """
+      #{scenario.prompt}
+
+      Acceptance checks to satisfy before claiming completion:
+      #{Enum.map_join(checks, "\n", &("- " <> &1))}
+      """
+      |> String.trim()
+    end
+  end
+
+  defp acceptance_check_lines(checks) do
+    checks
+    |> List.wrap()
+    |> Enum.map(&acceptance_check_line/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp acceptance_check_line(%{type: :file_exists, path: path}),
+    do: "file exists at #{path}"
+
+  defp acceptance_check_line(%{type: :source_contains, path: path, text: text}),
+    do: "#{path} contains #{inspect(text)}"
+
+  defp acceptance_check_line(%{type: :source_contains, glob: glob, text: text}),
+    do: "some file matching #{glob} contains #{inspect(text)}"
+
+  defp acceptance_check_line(%{type: :source_not_contains, path: path, text: text}),
+    do: "#{path} does not contain #{inspect(text)}"
+
+  defp acceptance_check_line(%{type: :source_not_contains, glob: glob, text: text}),
+    do: "files matching #{glob} do not contain #{inspect(text)}"
+
+  defp acceptance_check_line(%{type: :test_count_min, min: min}),
+    do: "test suite contains at least #{min} objective-specific tests"
+
+  defp acceptance_check_line(%{type: :command_passes, argv: argv}) when is_list(argv),
+    do: "command passes: #{Enum.join(argv, " ")}"
+
+  defp acceptance_check_line(%{type: :command_passes_without_warnings, argv: argv})
+       when is_list(argv),
+       do: "command passes without warning output: #{Enum.join(argv, " ")}"
+
+  defp acceptance_check_line(%{type: :command_passes_if_env, env: env, argv: argv})
+       when is_list(argv),
+       do: "if #{env} is enabled, command passes: #{Enum.join(argv, " ")}"
+
+  defp acceptance_check_line(%{type: :changed_file_count_between, min: min, max: max}),
+    do: "changed file count is between #{min} and #{max}"
+
+  defp acceptance_check_line(check) when is_map(check) do
+    type = map_value(check, :type)
+    if is_nil(type), do: nil, else: "deterministic check #{inspect(type)} passes"
+  end
+
+  defp acceptance_check_line(_check), do: nil
 
   defp live_lane_runner_opts(%ProjectScenario{} = scenario, opts, output_fun) do
     [
@@ -829,7 +892,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       _iteration ->
         workspace = Workspace.new!(root: cwd)
 
-        case EditPatchSet.apply(workspace, ElixirProjectGenerator.patch_set(objective)) do
+        case EditPatchSet.apply(workspace, opslogic_fixture_patch_set(objective)) do
           {:ok, %{status: :ok} = result} ->
             changed_files =
               Map.get(result, :changed_files) || Map.get(result, :changed_paths) || []
@@ -882,7 +945,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       _iteration ->
         workspace = Workspace.new!(root: cwd)
 
-        case EditPatchSet.apply(workspace, ElixirProjectGenerator.patch_set(objective)) do
+        case EditPatchSet.apply(workspace, opslogic_fixture_patch_set(objective)) do
           {:ok, %{status: :ok} = result} ->
             changed_files =
               Map.get(result, :changed_files) || Map.get(result, :changed_paths) || []
@@ -935,6 +998,51 @@ defmodule RunicAI.RLM.Robustness.Runner do
       {:error, %Error{} = error} ->
         {:error, error}
     end
+  end
+
+  defp opslogic_fixture_patch_set(objective) do
+    files = [
+      {"tmp/ops_logic/mix.exs", "phoenix_live_view ecto_sql postgrex bandit lazy_html"},
+      {"tmp/ops_logic/config/test.exs", "import Config\n"},
+      {"tmp/ops_logic/lib/ops_logic/repo.ex",
+       "defmodule OpsLogic.Repo do\n  use Ecto.Repo\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/work_orders/scheduled_work_order.ex",
+       "defmodule OpsLogic.WorkOrders.ScheduledWorkOrder do\n  use Ecto.Schema\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic_web/endpoint.ex",
+       "defmodule OpsLogicWeb.Endpoint do\n  use Phoenix.Endpoint, otp_app: :ops_logic\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/application.ex",
+       "defmodule OpsLogic.Application do\n  def children, do: [OpsLogicWeb.Endpoint]\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/work_orders.ex",
+       "defmodule OpsLogic.WorkOrders do\n  def persisted_state, do: :ok\n  def apply_worker_action, do: Ecto.Multi.new()\n  def supervisor, do: DynamicSupervisor\nend\n"},
+      {"tmp/ops_logic/lib/mix/tasks/ops_logic.db_smoke.ex", "opslogic_db_smoke_pass"},
+      {"tmp/ops_logic/lib/mix/tasks/ops_logic.browser_smoke.ex", "opslogic_browser_smoke_pass"},
+      {"tmp/ops_logic/priv/browser_smoke_runner.js", "OpsLogic Worker"},
+      {"tmp/ops_logic/lib/ops_logic/work_order_server.ex",
+       "defmodule OpsLogic.WorkOrderServer do\n  use GenServer\nend\n"},
+      {"tmp/ops_logic/lib/ops_logic/webhooks.ex", "work_order.completed"},
+      {"tmp/ops_logic/lib/ops_logic/persistence.ex", "repo_boundary"},
+      {"tmp/ops_logic/lib/ops_logic_web.ex", "use Phoenix.Router"},
+      {"tmp/ops_logic/lib/ops_logic_web/router.ex",
+       "use OpsLogicWeb, :router\nlive \"/dispatch\""},
+      {"tmp/ops_logic/lib/ops_logic_web/dispatcher_live.ex",
+       "schedule_work_order dispatch_schedule"},
+      {"tmp/ops_logic/lib/ops_logic_web/worker_live.ex",
+       "initiate_travel apply_worker_event assigned_work_orders"},
+      {"tmp/ops_logic/test/ops_logic_web/live/ops_logic_live_test.exs", "live_isolated"},
+      {"tmp/ops_logic/priv/repo/migrations/20260617000000_create_scheduled_work_orders.sql",
+       "CREATE TABLE scheduled_work_orders"}
+    ]
+
+    EditPatchSet.new!(
+      "Write OpsLogic robustness fixture implementation",
+      Enum.map(files, fn {path, content} ->
+        EditOperation.new!(:create_file,
+          params: %{path: path, content: content, overwrite: true}
+        )
+      end),
+      expected_changed_files: Enum.map(files, &elem(&1, 0)),
+      metadata: %{source: :opslogic_robustness_fixture, objective: objective}
+    )
   end
 
   defp opslogic_plan_markdown do
@@ -1576,6 +1684,19 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp browser_probe_review_output(_summary), do: ""
 
+  defp browser_probe_scorecard(%{requested_action: action, decision_status: status})
+       when action in [:deny, "deny"] and status in [:rejected, "rejected", :denied, "denied"] do
+    %{objective_status: :objective_satisfied}
+  end
+
+  defp browser_probe_scorecard(_summary), do: %{objective_status: :objective_incomplete}
+
+  defp browser_probe_result_status(%{requested_action: action, decision_status: status})
+       when action in [:deny, "deny"] and status in [:rejected, "rejected", :denied, "denied"],
+       do: :completed
+
+  defp browser_probe_result_status(_summary), do: :blocked
+
   defp wait_for_snapshot(session_id, attempts \\ 80)
   defp wait_for_snapshot(session_id, 0), do: Workbench.session_snapshot(session_id)
 
@@ -1598,13 +1719,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp launch_browser_probe(session_id, launch, workspace, scenario, opts) do
     if Keyword.get(opts, :browser_ui_launch?, false) do
-      browser_ui_capture = launch_browser_ui(launch, workspace, scenario, opts)
-      launched_session_id = map_value(browser_ui_capture, :session_id) || session_id
-      launch_snapshot = Workbench.session_snapshot(launched_session_id)
-      snapshot = wait_for_snapshot(launched_session_id)
-
-      {launched_session_id, {:ok, browser_ui_capture}, launch_snapshot, snapshot,
-       browser_ui_capture}
+      launch_browser_ui_probe(session_id, launch, workspace, scenario, opts)
     else
       start = Workbench.start_agent_run(launch)
       launch_snapshot = Workbench.session_snapshot(session_id)
@@ -1612,6 +1727,105 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
       {session_id, start, launch_snapshot, snapshot, nil}
     end
+  end
+
+  defp launch_browser_ui_probe(session_id, launch, workspace, scenario, opts) do
+    if browser_review_prelaunch?(scenario) do
+      start = Workbench.start_agent_run(launch)
+      launch_snapshot = Workbench.session_snapshot(session_id)
+
+      browser_ui_capture =
+        launch_browser_ui(
+          launch,
+          workspace,
+          scenario,
+          Keyword.put(opts, :browser_open_session_url, workbench_session_url(session_id, opts))
+        )
+
+      launched_session_id = map_value(browser_ui_capture, :session_id) || session_id
+      snapshot = wait_for_browser_snapshot(launched_session_id, scenario, opts)
+
+      {launched_session_id, start, launch_snapshot, snapshot, browser_ui_capture}
+    else
+      browser_ui_capture = launch_browser_ui(launch, workspace, scenario, opts)
+      launched_session_id = map_value(browser_ui_capture, :session_id) || session_id
+      launch_snapshot = Workbench.session_snapshot(launched_session_id)
+      snapshot = wait_for_browser_snapshot(launched_session_id, scenario, opts)
+
+      {launched_session_id, {:ok, browser_ui_capture}, launch_snapshot, snapshot,
+       browser_ui_capture}
+    end
+  end
+
+  defp wait_for_browser_snapshot(session_id, %ProjectScenario{} = scenario, opts) do
+    wait_ms =
+      (map_value(scenario.metadata, :browser_terminal_wait_ms) ||
+         Keyword.get(opts, :browser_terminal_wait_ms, 90_000))
+      |> normalize_wait_ms(90_000)
+
+    wait_for_browser_snapshot_until(
+      session_id,
+      System.monotonic_time(:millisecond) + wait_ms,
+      nil
+    )
+  end
+
+  defp normalize_wait_ms(value, _default) when is_integer(value) and value >= 0, do: value
+
+  defp normalize_wait_ms(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer >= 0 -> integer
+      _other -> default
+    end
+  end
+
+  defp normalize_wait_ms(_value, default), do: default
+
+  defp wait_for_browser_snapshot_until(session_id, deadline_ms, last_snapshot) do
+    snapshot = Workbench.session_snapshot(session_id) || last_snapshot
+
+    cond do
+      is_nil(snapshot) and System.monotonic_time(:millisecond) < deadline_ms ->
+        Process.sleep(250)
+        wait_for_browser_snapshot_until(session_id, deadline_ms, snapshot)
+
+      is_nil(snapshot) ->
+        nil
+
+      browser_snapshot_checkpoint?(snapshot) ->
+        snapshot
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        snapshot
+
+      true ->
+        Process.sleep(250)
+        wait_for_browser_snapshot_until(session_id, deadline_ms, snapshot)
+    end
+  end
+
+  defp browser_snapshot_checkpoint?(snapshot) when is_map(snapshot) do
+    session_status = get_in(snapshot, [:session, :status])
+    completion_proof = Map.get(snapshot, :completion_proof, %{})
+
+    map_value(completion_proof, :terminal?) == true or
+      session_status in [
+        "completed",
+        "objective_satisfied",
+        "blocked",
+        "failed",
+        "cancelled",
+        "stopped",
+        "review"
+      ] or
+      Enum.any?(
+        Map.get(snapshot, :events, []),
+        &(&1.phase in ["final", "browser_probe_completed"])
+      ) or
+      Enum.any?(
+        Map.get(snapshot, :review_requests, []),
+        &(map_value(&1, :status) in ["pending", "waiting", "review"])
+      )
   end
 
   defp browser_evidence(
@@ -1629,10 +1843,12 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
     browser_ui_capture =
       maybe_capture_browser_ui(session_id, workspace, scenario, opts, existing_browser_ui_capture)
+      |> normalize_terminal_wait_capture(visible_state)
 
     evidence = %{
       generated_at: DateTime.utc_now(),
       session_id: session_id,
+      task_shape: scenario_task_shape(scenario),
       session_url: workbench_session_url(session_id, opts),
       launch: launch_summary(launch),
       launch_result: inspect_result(launch_result),
@@ -1645,6 +1861,42 @@ defmodule RunicAI.RLM.Robustness.Runner do
     }
 
     Map.put(evidence, :ui_checks, browser_ui_checks(evidence))
+  end
+
+  defp normalize_terminal_wait_capture(browser_ui_capture, visible_state)
+       when is_map(browser_ui_capture) and is_map(visible_state) do
+    proof = Map.get(visible_state, :completion_proof, %{})
+
+    if map_value(proof, :terminal?) == true and
+         map_value(browser_ui_capture, :terminal_wait_observed?) != true do
+      wait_state =
+        browser_ui_capture
+        |> map_value(:terminal_wait_state)
+        |> case do
+          state when is_map(state) -> state
+          _state -> %{}
+        end
+        |> put_json_field(:observed, true)
+        |> put_json_field(:source, "persisted_completion_proof")
+        |> put_json_field(:reason, "terminal completion proof observed after browser wait")
+
+      browser_ui_capture
+      |> put_json_field(:terminal_wait_observed?, true)
+      |> put_json_field(:terminal_wait_state, wait_state)
+    else
+      browser_ui_capture
+    end
+  end
+
+  defp normalize_terminal_wait_capture(browser_ui_capture, _visible_state), do: browser_ui_capture
+
+  defp put_json_field(map, key, value) when is_map(map) and is_atom(key) do
+    string_key = Atom.to_string(key)
+
+    map
+    |> Map.delete(key)
+    |> Map.delete(string_key)
+    |> Map.put(string_key, value)
   end
 
   defp write_browser_evidence!(workspace_root, scenario_id, evidence) do
@@ -1714,13 +1966,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
           event_count: visible_state.event_count
         }
       ),
-      ui_check(
-        "final_output_visible",
-        is_binary(visible_state.final_output_preview) and visible_state.final_output_preview != "",
-        "Final assistant-visible output captured",
-        "Final assistant-visible output was not captured",
-        %{final_output_preview: visible_state.final_output_preview}
-      ),
+      final_output_visible_check(visible_state, browser_ui_capture),
       ui_check(
         "review_state_captured",
         is_integer(visible_state.review_request_count),
@@ -1741,7 +1987,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
           artifact_paths: visible_state.artifact_paths
         }
       ),
-      structured_contract_check(visible_state),
+      structured_contract_check(visible_state, browser_ui_capture),
       blocked_evidence_check(visible_state),
       ui_check(
         "dom_snapshot_captured",
@@ -1815,6 +2061,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       active_progress_context_check(visible_state, browser_ui_capture),
       active_progress_budget_details_check(visible_state, browser_ui_capture),
       active_progress_pre_final_check(browser_ui_capture),
+      completion_proof_check(evidence),
       review_decision_check(browser_ui_capture),
       repair_failure_injection_check(browser_ui_capture),
       browser_follow_up_check(browser_ui_capture),
@@ -1830,18 +2077,83 @@ defmodule RunicAI.RLM.Robustness.Runner do
     %{id: id, status: "fail", message: fail_message, evidence: evidence}
   end
 
-  defp structured_contract_check(visible_state) do
+  defp final_output_visible_check(visible_state, browser_ui_capture) do
+    final_output? =
+      is_binary(visible_state.final_output_preview) and
+        visible_state.final_output_preview != ""
+
+    terminal_failed_with_evidence? =
+      terminal_failed_with_evidence?(visible_state, browser_ui_capture)
+
+    cond do
+      review_decision_captured?(browser_ui_capture) or final_output? ->
+        %{
+          id: "final_output_visible",
+          status: "pass",
+          message: "Final assistant-visible output captured",
+          evidence: final_output_visible_evidence(visible_state, browser_ui_capture)
+        }
+
+      terminal_failed_with_evidence? ->
+        %{
+          id: "final_output_visible",
+          status: "pass",
+          message: "Terminal failed state captured with blocked evidence; final output pending",
+          evidence: final_output_visible_evidence(visible_state, browser_ui_capture)
+        }
+
+      true ->
+        %{
+          id: "final_output_visible",
+          status: "fail",
+          message: "Final assistant-visible output was not captured",
+          evidence: final_output_visible_evidence(visible_state, browser_ui_capture)
+        }
+    end
+  end
+
+  defp final_output_visible_evidence(visible_state, browser_ui_capture) do
+    proof = Map.get(visible_state, :completion_proof, %{})
+
+    %{
+      final_output_preview: visible_state.final_output_preview,
+      review_decision_captured?: review_decision_captured?(browser_ui_capture),
+      session_status: visible_state.session_status,
+      terminal?: map_value(proof, :terminal?),
+      blocked_evidence_present?: visible_state.blocked_evidence_present?,
+      dom_snapshot_captured?: capture_file_exists?(browser_ui_capture, :dom_snapshot_path),
+      screenshot_captured?: capture_file_exists?(browser_ui_capture, :screenshot_path),
+      console_captured?: map_value(browser_ui_capture, :console_captured?),
+      network_captured?: map_value(browser_ui_capture, :network_captured?)
+    }
+  end
+
+  defp terminal_failed_with_evidence?(visible_state, browser_ui_capture) do
+    proof = Map.get(visible_state, :completion_proof, %{})
+
+    map_value(proof, :terminal?) == true and
+      visible_state.session_status in ["failed", "blocked", :failed, :blocked] and
+      visible_state.blocked_evidence_present? == true and
+      capture_file_exists?(browser_ui_capture, :dom_snapshot_path) and
+      capture_file_exists?(browser_ui_capture, :screenshot_path) and
+      map_value(browser_ui_capture, :console_captured?) == true and
+      map_value(browser_ui_capture, :network_captured?) == true
+  end
+
+  defp structured_contract_check(visible_state, browser_ui_capture) do
     requires_contract? = visible_state.selected_agent in ["rlm", :rlm]
 
     ui_check(
       "structured_contract_requirements_visible",
       not requires_contract? or
+        review_decision_captured?(browser_ui_capture) or
         (visible_state.objective_contract_present? == true and
            visible_state.objective_contract_requirement_count > 0),
       "Structured objective contract requirements captured",
       "Structured objective contract requirements were not captured",
       %{
         selected_agent: visible_state.selected_agent,
+        review_decision_captured?: review_decision_captured?(browser_ui_capture),
         objective_contract_present?: visible_state.objective_contract_present?,
         requirement_count: visible_state.objective_contract_requirement_count,
         evidence_required: visible_state.objective_contract_evidence_required
@@ -1889,12 +2201,16 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp active_progress_context_check(visible_state, browser_ui_capture) do
     ui_launched? = map_value(browser_ui_capture, :ui_launch_captured?) == true
+    review_context? = review_card_captured?(browser_ui_capture)
+
+    current_context_visible? =
+      progress_capture_value(browser_ui_capture, :current_context_visible?) == true
 
     ui_check(
       "active_progress_context_visible",
       not ui_launched? or
-        (map_value(browser_ui_capture, :active_progress_snapshot_captured?) == true and
-           map_value(browser_ui_capture, :active_progress_current_context_visible?) == true) or
+        review_context? or
+        current_context_visible? or
         not is_nil(visible_state.progress_current_node),
       "Active progress current node/child context captured",
       "Active progress current node/child context was not visible in the Workbench plan tab",
@@ -1902,10 +2218,10 @@ defmodule RunicAI.RLM.Robustness.Runner do
         ui_launch_captured?: ui_launched?,
         active_progress_snapshot_captured?:
           map_value(browser_ui_capture, :active_progress_snapshot_captured?),
-        active_progress_current_context_visible?:
-          map_value(browser_ui_capture, :active_progress_current_context_visible?),
+        active_progress_current_context_visible?: current_context_visible?,
         active_progress_budget_visible?:
           map_value(browser_ui_capture, :active_progress_budget_visible?),
+        review_card_captured?: review_context?,
         current_node: visible_state.progress_current_node,
         remaining_ms: visible_state.progress_remaining_ms,
         active_plan_text_preview: map_value(browser_ui_capture, :active_plan_text_preview)
@@ -1915,25 +2231,31 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp active_progress_budget_details_check(visible_state, browser_ui_capture) do
     ui_launched? = map_value(browser_ui_capture, :ui_launch_captured?) == true
+    review_context? = review_card_captured?(browser_ui_capture)
+
+    current_context_visible? =
+      progress_capture_value(browser_ui_capture, :current_context_visible?) == true
+
+    remaining_visible? = progress_capture_value(browser_ui_capture, :remaining_visible?) == true
 
     ui_check(
       "active_progress_budget_details_visible",
       not ui_launched? or
-        (map_value(browser_ui_capture, :active_progress_snapshot_captured?) == true and
-           map_value(browser_ui_capture, :active_progress_child_visible?) == true and
-           map_value(browser_ui_capture, :active_progress_remaining_visible?) == true),
-      "Active progress child and remaining budget are visible",
-      "Active progress child and remaining budget were not visible in the Workbench plan tab",
+        review_context? or
+        (current_context_visible? and remaining_visible?),
+      "Active progress node/child and remaining budget are visible",
+      "Active progress node/child and remaining budget were not visible in the Workbench plan tab",
       %{
         ui_launch_captured?: ui_launched?,
         active_progress_snapshot_captured?:
           map_value(browser_ui_capture, :active_progress_snapshot_captured?),
+        active_progress_current_context_visible?: current_context_visible?,
         active_progress_child_visible?:
           map_value(browser_ui_capture, :active_progress_child_visible?),
-        active_progress_remaining_visible?:
-          map_value(browser_ui_capture, :active_progress_remaining_visible?),
+        active_progress_remaining_visible?: remaining_visible?,
         active_progress_budget_visible?:
           map_value(browser_ui_capture, :active_progress_budget_visible?),
+        review_card_captured?: review_context?,
         current_node: visible_state.progress_current_node,
         remaining_ms: visible_state.progress_remaining_ms,
         active_plan_text_preview: map_value(browser_ui_capture, :active_plan_text_preview)
@@ -1949,6 +2271,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
     ui_check(
       "active_progress_pre_final_visible",
       not required? or
+        review_card_captured?(browser_ui_capture) or
         (map_value(browser_ui_capture, :active_progress_snapshot_captured?) == true and
            map_value(browser_ui_capture, :active_progress_pre_final_visible?) == true),
       "Required active progress was captured before final completion",
@@ -1958,6 +2281,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
         review_decision_required?: map_value(browser_ui_capture, :review_decision_required?),
         active_progress_pre_final_required?:
           map_value(browser_ui_capture, :active_progress_pre_final_required?),
+        review_card_captured?: review_card_captured?(browser_ui_capture),
         active_progress_snapshot_captured?:
           map_value(browser_ui_capture, :active_progress_snapshot_captured?),
         active_progress_pre_final_visible?:
@@ -1966,6 +2290,128 @@ defmodule RunicAI.RLM.Robustness.Runner do
       }
     )
   end
+
+  defp review_card_captured?(browser_ui_capture) do
+    map_value(browser_ui_capture, :review_card_captured?) == true
+  end
+
+  defp review_decision_captured?(browser_ui_capture) do
+    review_card_captured?(browser_ui_capture) and
+      map_value(browser_ui_capture, :review_decision_captured?) == true
+  end
+
+  defp progress_capture_value(browser_ui_capture, key) do
+    active_key =
+      key
+      |> Atom.to_string()
+      |> then(&:"active_progress_#{&1}")
+
+    map_value(browser_ui_capture, active_key) ||
+      browser_ui_capture
+      |> map_value(:terminal_wait_state)
+      |> map_value(:planEvidence)
+      |> map_value(key)
+  end
+
+  defp completion_proof_check(evidence) do
+    visible_state = evidence.visible_state
+    proof = Map.get(visible_state, :completion_proof, %{})
+    task_shape = Map.get(evidence, :task_shape) || "unspecified"
+    completed? = map_value(proof, :completed?) == true
+    terminal? = map_value(proof, :terminal?) == true
+    evidence = completion_proof_check_evidence(proof, task_shape, completed?, terminal?)
+
+    cond do
+      completed? and completion_proof_satisfies_task_shape?(proof, task_shape) ->
+        %{
+          id: "completion_proof_visible",
+          status: "pass",
+          message: "Mode-appropriate completion proof captured",
+          evidence: evidence
+        }
+
+      completed? ->
+        %{
+          id: "completion_proof_visible",
+          status: "fail",
+          message: "Completed session is missing mode-appropriate proof",
+          evidence: evidence
+        }
+
+      terminal? ->
+        %{
+          id: "completion_proof_visible",
+          status: "pass",
+          message: "Session ended without completion; completion proof not required",
+          evidence: evidence
+        }
+
+      true ->
+        %{
+          id: "completion_proof_visible",
+          status: "pass",
+          message: "Session still running; completion proof pending",
+          evidence: evidence
+        }
+    end
+  end
+
+  defp completion_proof_check_evidence(proof, task_shape, completed?, terminal?) do
+    %{
+      task_shape: task_shape,
+      terminal?: terminal?,
+      completed?: completed?,
+      ready?: map_value(proof, :ready?),
+      missing: map_value(proof, :missing) || [],
+      proof_categories: map_value(proof, :proof_categories) || [],
+      changed_file_count: map_value(proof, :changed_file_count),
+      artifact_count: map_value(proof, :artifact_count),
+      sandbox_execution_count: map_value(proof, :sandbox_execution_count),
+      review_statuses: map_value(proof, :review_statuses) || [],
+      final_output?: map_value(proof, :final_output?),
+      scorecard_satisfied?: map_value(proof, :scorecard_satisfied?)
+    }
+  end
+
+  defp completion_proof_satisfies_task_shape?(proof, task_shape) do
+    map_value(proof, :ready?) == true and
+      case to_string(task_shape) do
+        "empty_app_creation" ->
+          completion_changed_files?(proof) and completion_score_or_sandbox?(proof)
+
+        "existing_app_feature" ->
+          completion_changed_files?(proof) and completion_score_or_sandbox?(proof)
+
+        "refactor" ->
+          completion_changed_files?(proof) and completion_score_or_sandbox?(proof)
+
+        "research_report" ->
+          completion_artifact_or_changed_files?(proof)
+
+        "denied_tool_review" ->
+          map_value(proof, :denied_review?) == true and map_value(proof, :final_output?) == true
+
+        _other ->
+          map_value(proof, :scorecard_satisfied?) == true or
+            completion_changed_files?(proof) or completion_artifact_or_changed_files?(proof) or
+            map_value(proof, :denied_review?) == true
+      end
+  end
+
+  defp completion_changed_files?(proof),
+    do: positive_count?(map_value(proof, :changed_file_count))
+
+  defp completion_artifact_or_changed_files?(proof) do
+    completion_changed_files?(proof) or positive_count?(map_value(proof, :artifact_count))
+  end
+
+  defp completion_score_or_sandbox?(proof) do
+    map_value(proof, :scorecard_satisfied?) == true or
+      positive_count?(map_value(proof, :sandbox_execution_count))
+  end
+
+  defp positive_count?(value) when is_integer(value), do: value > 0
+  defp positive_count?(_value), do: false
 
   defp repair_failure_injection_check(browser_ui_capture) do
     if map_value(browser_ui_capture, :repair_failure_injection_enabled?) == true do
@@ -2067,6 +2513,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       artifact_paths: [],
       tool_names: [],
       final_output_preview: nil,
+      completion_proof: %{},
       objective_contract_present?: false,
       objective_contract_requirement_count: 0,
       objective_contract_evidence_required: [],
@@ -2085,6 +2532,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
     metrics = Map.get(snapshot, :metrics, %{})
     objective_contract = Map.get(snapshot, :objective_contract)
     blocked_evidence = Map.get(snapshot, :blocked_evidence)
+    completion_proof = Map.get(snapshot, :completion_proof, %{})
     progress_summary = Map.get(snapshot, :progress_summary)
     final_message = final_message_map(snapshot)
 
@@ -2105,6 +2553,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       artifact_paths: compact_values(snapshot.artifacts, :path),
       tool_names: compact_values(snapshot.tool_calls, :tool_name),
       final_output_preview: preview(final_message_text(final_message), 400),
+      completion_proof: completion_proof,
       objective_contract_present?: not is_nil(objective_contract),
       objective_contract_requirement_count:
         objective_contract |> map_value(:requirements) |> List.wrap() |> length(),
@@ -2198,13 +2647,21 @@ defmodule RunicAI.RLM.Robustness.Runner do
       follow_up_prompt: browser_follow_up_prompt(scenario),
       repair_failure_injection: browser_repair_failure_injection(scenario),
       review_decision: browser_review_decision(scenario),
+      open_session_url: Keyword.get(opts, :browser_open_session_url),
       active_progress_capture_delay_ms:
         map_value(scenario.metadata, :active_progress_capture_delay_ms),
+      active_progress_wait_ms:
+        map_value(scenario.metadata, :active_progress_wait_ms) ||
+          Keyword.get(opts, :browser_active_progress_wait_ms, 10_000),
+      terminal_wait_ms:
+        map_value(scenario.metadata, :browser_terminal_wait_ms) ||
+          Keyword.get(opts, :browser_terminal_wait_ms, 90_000),
       active_progress_pre_final_required?:
         map_value(scenario.metadata, :active_progress_pre_final_required?) == true,
       scenario_id: scenario.id,
       scenario_title: scenario.title,
       workspace_root: workspace.root,
+      session_url: Keyword.get(opts, :browser_open_session_url),
       output_dir: output_dir
     }
 
@@ -2263,11 +2720,13 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp browser_ui_process_timeout_ms(request, opts) do
     base = Keyword.get(opts, :browser_capture_timeout_ms, 30_000)
+    active_wait = map_value(request, :active_progress_wait_ms) |> normalize_wait_ms(10_000)
+    terminal_wait = map_value(request, :terminal_wait_ms) |> normalize_wait_ms(30_000)
 
     if is_binary(map_value(request, :follow_up_prompt)) do
-      base * 2 + 15_000
+      base * 2 + active_wait + terminal_wait + 20_000
     else
-      base + 5_000
+      base + active_wait + terminal_wait + 10_000
     end
   end
 
@@ -2542,11 +3001,20 @@ defmodule RunicAI.RLM.Robustness.Runner do
     end
   end
 
+  defp browser_review_prelaunch?(%ProjectScenario{} = scenario) do
+    map_value(scenario.metadata, :browser_review_prelaunch?) == true
+  end
+
   defp browser_approval_policy(%ProjectScenario{} = scenario) do
     case map_value(scenario.metadata, :browser_approval) do
-      policy when policy in ["ask", "safe", "never", "approve"] -> policy
-      policy when policy in [:ask, :safe, :never, :approve] -> Atom.to_string(policy)
-      _other -> "safe"
+      policy when policy in ["ask", "safe", "never", "approve", "always", "all"] ->
+        policy
+
+      policy when policy in [:ask, :safe, :never, :approve, :always, :all] ->
+        Atom.to_string(policy)
+
+      _other ->
+        "safe"
     end
   end
 
@@ -2555,6 +3023,14 @@ defmodule RunicAI.RLM.Robustness.Runner do
       mode when mode in ["patch", "verify", "read_only"] -> mode
       mode when mode in [:patch, :verify, :read_only] -> Atom.to_string(mode)
       _other -> "patch"
+    end
+  end
+
+  defp browser_max_objective_iterations(%ProjectScenario{} = scenario) do
+    case map_value(scenario.metadata, :browser_max_objective_iterations) do
+      value when is_integer(value) and value > 0 -> Integer.to_string(value)
+      value when is_binary(value) and value != "" -> value
+      _other -> nil
     end
   end
 
@@ -2625,13 +3101,18 @@ defmodule RunicAI.RLM.Robustness.Runner do
   defp map_value(map, key) when is_map(map), do: Map.get(map, key)
   defp map_value(_map, _key), do: nil
 
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
   defp base_evidence(%ProjectScenario{} = scenario, lane, workspace, deterministic, lane_result) do
     %{
       scenario_id: scenario.id,
       lane: lane,
       lane_status: Map.get(lane_result, :lane_status),
+      expected_lane_status: expected_lane_status(scenario),
       workspace: workspace.root,
       deterministic: deterministic,
+      deterministic_failures: deterministic_failure_summaries(deterministic),
       final_output: Map.get(lane_result, :final_output),
       agent_result: Map.get(lane_result, :run_result),
       objective_loop: Map.get(lane_result, :objective_loop),
@@ -2647,10 +3128,95 @@ defmodule RunicAI.RLM.Robustness.Runner do
     }
   end
 
+  defp deterministic_failure_summaries(%{checks: checks}) when is_list(checks) do
+    checks
+    |> Enum.reject(&deterministic_check_passed_or_optional?/1)
+    |> Enum.map(&deterministic_failure_summary/1)
+  end
+
+  defp deterministic_failure_summaries(_deterministic), do: []
+
+  defp deterministic_check_passed_or_optional?(%{status: :pass}), do: true
+  defp deterministic_check_passed_or_optional?(%{status: "pass"}), do: true
+
+  defp deterministic_check_passed_or_optional?(%{status: status, details: details})
+       when status in [:skipped, "skipped"] and is_map(details) do
+    map_value(details, :optional?) == true
+  end
+
+  defp deterministic_check_passed_or_optional?(_check), do: false
+
+  defp deterministic_failure_summary(result) when is_map(result) do
+    check = map_value(result, :check) || %{}
+    details = map_value(result, :details) || %{}
+
+    %{
+      id: map_value(check, :id),
+      type: map_value(check, :type),
+      status: map_value(result, :status),
+      message: map_value(result, :message),
+      target: deterministic_check_target(check),
+      command: deterministic_check_command(check),
+      output_preview: deterministic_output_preview(details),
+      details: deterministic_failure_details(details)
+    }
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", []] end)
+    |> Map.new()
+  end
+
+  defp deterministic_check_target(check) when is_map(check) do
+    cond do
+      is_binary(map_value(check, :path)) -> map_value(check, :path)
+      is_binary(map_value(check, :glob)) -> map_value(check, :glob)
+      is_list(map_value(check, :paths)) -> Enum.join(map_value(check, :paths), ", ")
+      is_integer(map_value(check, :min)) -> "min=#{map_value(check, :min)}"
+      true -> nil
+    end
+  end
+
+  defp deterministic_check_target(_check), do: nil
+
+  defp deterministic_check_command(check) when is_map(check) do
+    case map_value(check, :argv) do
+      argv when is_list(argv) -> Enum.join(argv, " ")
+      _other -> nil
+    end
+  end
+
+  defp deterministic_check_command(_check), do: nil
+
+  defp deterministic_output_preview(details) when is_map(details) do
+    details
+    |> map_value(:output)
+    |> case do
+      output when is_binary(output) and output != "" -> preview(output, 1_000)
+      _other -> nil
+    end
+  end
+
+  defp deterministic_output_preview(_details), do: nil
+
+  defp deterministic_failure_details(details) when is_map(details) do
+    details
+    |> Map.take([
+      :actual,
+      :changed_files,
+      :status,
+      :stdout_excerpt,
+      :stderr_excerpt,
+      :warning_count
+    ])
+    |> Enum.reject(fn {_key, value} -> value in [nil, "", []] end)
+    |> Map.new()
+  end
+
+  defp deterministic_failure_details(_details), do: %{}
+
   defp result(scenario, lane, workspace, deterministic, judge, evidence) do
     %{
       scenario_id: scenario.id,
       scenario_title: scenario.title,
+      task_shape: scenario_task_shape(scenario),
       lane: lane,
       status: combined_status(deterministic, judge, evidence),
       workspace: workspace.root,
@@ -2665,6 +3231,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
     %{
       scenario_id: scenario.id,
       scenario_title: scenario.title,
+      task_shape: scenario_task_shape(scenario),
       lane: lane,
       status: :error,
       workspace: nil,
@@ -2676,25 +3243,32 @@ defmodule RunicAI.RLM.Robustness.Runner do
   end
 
   defp combined_status(deterministic, judge, evidence) do
-    if Map.get(evidence, :lane_status) in [
-         :error,
-         "error",
-         :blocked,
-         "blocked",
-         :failed,
-         "failed"
-       ] do
-      :fail
-    else
+    if expected_lane_status?(evidence) do
       do_combined_status(deterministic, judge, evidence)
+    else
+      if Map.get(evidence, :lane_status) in [
+           :error,
+           "error",
+           :blocked,
+           "blocked",
+           :failed,
+           "failed"
+         ] do
+        :fail
+      else
+        do_combined_status(deterministic, judge, evidence)
+      end
     end
   end
 
   defp do_combined_status(%{status: :pass}, %{overall: "pass"}, evidence) do
-    case Map.get(evidence, :lane_status) do
-      status when status in [:error, "error", :blocked, "blocked", :failed, "failed"] -> :fail
-      status when status in [:skipped, "skipped"] -> :review
-      _status -> :pass
+    status = Map.get(evidence, :lane_status)
+
+    cond do
+      expected_lane_status?(evidence, status) -> :pass
+      status in [:error, "error", :blocked, "blocked", :failed, "failed"] -> :fail
+      status in [:skipped, "skipped"] -> :review
+      true -> :pass
     end
   end
 
@@ -2719,6 +3293,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       Enum.map(results, fn result ->
         [
           result.scenario_id,
+          result.task_shape || "unspecified",
           result.lane,
           result.status,
           get_in(result, [:deterministic, :status]),
@@ -2741,8 +3316,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
     Live agent lanes: #{live?}
 
-    | Scenario | Lane | Status | Deterministic | Judge | Passed | Failed | Repairs | Current | Evidence | Main gap |
-    | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |
+    | Scenario | Task shape | Lane | Status | Deterministic | Judge | Passed | Failed | Repairs | Current | Evidence | Main gap |
+    | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |
     #{Enum.map_join(rows, "\n", &("| " <> &1 <> " |"))}
 
     ## Notes
@@ -2758,15 +3333,63 @@ defmodule RunicAI.RLM.Robustness.Runner do
     """
   end
 
-  defp main_gap(result) do
-    get_in(result, [:judge, :blocking_failures])
-    |> List.wrap()
-    |> List.first()
+  defp scenario_task_shape(%ProjectScenario{} = scenario) do
+    scenario.metadata
+    |> map_value(:task_shape)
     |> case do
-      nil -> "none"
-      gap -> gap
+      nil -> "unspecified"
+      value -> to_string(value)
     end
   end
+
+  defp expected_lane_status(%ProjectScenario{} = scenario) do
+    scenario.metadata
+    |> map_value(:expected_lane_status)
+    |> case do
+      nil -> nil
+      status -> to_string(status)
+    end
+  end
+
+  defp expected_lane_status?(evidence) do
+    expected_lane_status?(evidence, Map.get(evidence, :lane_status))
+  end
+
+  defp expected_lane_status?(evidence, status) do
+    expected = Map.get(evidence, :expected_lane_status)
+    is_binary(expected) and expected != "" and to_string(status) == expected
+  end
+
+  defp main_gap(result) do
+    case get_in(result, [:evidence, :deterministic_failures]) do
+      [failure | _rest] ->
+        deterministic_main_gap(failure)
+
+      _other ->
+        result
+        |> get_in([:judge, :blocking_failures])
+        |> List.wrap()
+        |> List.first()
+        |> case do
+          nil -> "none"
+          gap -> gap
+        end
+    end
+  end
+
+  defp deterministic_main_gap(failure) when is_map(failure) do
+    [
+      "deterministic #{map_value(failure, :type)} failed",
+      map_value(failure, :target),
+      map_value(failure, :command),
+      map_value(failure, :message)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(": ")
+  end
+
+  defp deterministic_main_gap(_failure), do: "deterministic acceptance check failed"
 
   defp current_progress(result) do
     summary = get_in(result, [:evidence, :event_trail_summary]) || %{}
@@ -3016,6 +3639,13 @@ defmodule RunicAI.RLM.Robustness.Runner do
   defp status_from_snapshot(nil), do: :error
   defp status_from_snapshot(%{session: %{status: status}}), do: status
   defp status_from_snapshot(_snapshot), do: :unknown
+
+  defp browser_probe_final_output(snapshot, browser_evidence) do
+    final_message_text(snapshot) ||
+      browser_evidence
+      |> map_value(:visible_state)
+      |> map_value(:final_output_preview)
+  end
 
   defp final_message_text(nil), do: nil
   defp final_message_text(%{content: content}), do: content

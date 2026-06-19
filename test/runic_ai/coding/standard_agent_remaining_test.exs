@@ -312,6 +312,8 @@ defmodule RunicAI.Coding.StandardAgentRemainingTest do
     refute patch =~ "OODA"
     refute read_only =~ "generated scaffold tests"
     refute patch =~ "generated scaffold tests"
+    assert patch =~ "If inspection shows the workspace is empty"
+    assert patch =~ "create the\nrequested files inside the workspace"
 
     assert verify =~ "OODA loop"
     assert verify =~ "generated scaffold tests"

@@ -126,33 +126,42 @@ async function main() {
       });
     });
 
-    await cdp.send("Page.navigate", { url: request.base_url });
+    const openExistingSession = !!request.open_session_url;
+    const initialUrl = request.open_session_url || request.base_url;
+
+    await cdp.send("Page.navigate", { url: initialUrl });
     await waitFor(cdp, async () => {
       const text = await evalValue(cdp, "(() => document.body && document.body.innerText)()");
       return String(text || "").includes("RunicAI");
     }, request.timeout_ms || 30000);
 
-    await waitFor(cdp, async () => {
-      return await evalValue(cdp, `(() => {
-        const form = document.querySelector('form[phx-submit="submit_objective"]');
-        if (!form || !window.liveSocket || !window.liveSocket.owner) return false;
-        const view = window.liveSocket.owner(form);
-        return !!(view && view.isConnected && view.isConnected());
-      })()`);
-    }, request.timeout_ms || 30000);
+    let formState = null;
 
-    const formState = await submitWorkbenchObjective(cdp, request.launch);
+    if (openExistingSession) {
+      await waitForConnectedSession(cdp, request.timeout_ms || 30000);
+      formState = {
+        skipped: true,
+        reason: "opened existing session URL",
+        location: await evalValue(cdp, "(() => window.location.href)()"),
+      };
+    } else {
+      await waitForConnectedWorkbench(cdp, request.timeout_ms || 30000);
+      formState = await submitWorkbenchObjective(cdp, request.launch);
+    }
+
     stages.push({ stage: "submitted", formState });
     fs.writeFileSync(stagePath, JSON.stringify(stages, null, 2));
 
-    await waitFor(cdp, async () => {
-      const url = await evalValue(cdp, "(() => window.location.href)()");
-      return String(url || "").includes("/sessions/");
-    }, request.timeout_ms || 30000);
+    if (!openExistingSession) {
+      await waitFor(cdp, async () => {
+        const url = await evalValue(cdp, "(() => window.location.href)()");
+        return String(url || "").includes("/sessions/");
+      }, request.timeout_ms || 30000);
+    }
 
     await selectPlanTab(cdp, request.timeout_ms || 30000);
     await delay(request.active_progress_capture_delay_ms || 250);
-    const activePlanEvidence = await collectPlanEvidence(cdp);
+    const activePlanEvidence = await waitForActivePlanEvidence(cdp, request.active_progress_wait_ms || 10000);
     stages.push({ stage: "active_plan_snapshot", planEvidence: activePlanEvidence });
     fs.writeFileSync(stagePath, JSON.stringify(stages, null, 2));
 
@@ -166,7 +175,7 @@ async function main() {
     }
 
     await selectPlanTab(cdp, request.timeout_ms || 30000);
-    await waitForPlanAgentFinished(cdp, request.timeout_ms || 30000).catch(() => null);
+    await waitForPlanAgentFinished(cdp, request.pre_terminal_grace_ms || 5000).catch(() => null);
     await delay(250);
 
     let followUpState = null;
@@ -191,9 +200,13 @@ async function main() {
       }, request.timeout_ms || 30000).catch(() => null);
 
       await selectPlanTab(cdp, request.timeout_ms || 30000);
-      await waitForPlanAgentFinished(cdp, request.timeout_ms || 30000).catch(() => null);
+      await waitForPlanAgentFinished(cdp, request.pre_terminal_grace_ms || 5000).catch(() => null);
       await selectPlanTab(cdp, request.timeout_ms || 30000);
     }
+
+    const terminalWaitState = await waitForPlanTerminalOrStable(cdp, request.terminal_wait_ms || request.timeout_ms || 30000);
+    stages.push({ stage: "terminal_wait", state: terminalWaitState });
+    fs.writeFileSync(stagePath, JSON.stringify(stages, null, 2));
 
     const finalUrl = await evalValue(cdp, "(() => window.location.href)()");
     const capturedSessionId = sessionIdFromUrl(finalUrl) || request.launch.session_id;
@@ -229,17 +242,20 @@ async function main() {
       network_failure_count: networkEvents.filter((event) => event.type === "failed").length,
       "network_captured?": true,
       "ui_launch_captured?": true,
+      "existing_session_opened?": openExistingSession,
       "plan_visibility_captured?": planEvidence["plan_visible?"],
       "workflow_stage_plan_visible?": planEvidence["workflow_stages_visible?"],
       "live_progress_visible?": planEvidence["live_progress_visible?"],
-      "active_progress_snapshot_captured?": activePlanEvidence["live_progress_visible?"],
-      "active_progress_current_context_visible?": activePlanEvidence["current_context_visible?"],
-      "active_progress_child_visible?": activePlanEvidence["child_visible?"],
-      "active_progress_remaining_visible?": activePlanEvidence["remaining_visible?"],
-      "active_progress_budget_visible?": activePlanEvidence["runtime_budget_visible?"],
+      "active_progress_snapshot_captured?": activePlanEvidence["live_progress_visible?"] || planEvidence["live_progress_visible?"],
+      "active_progress_current_context_visible?": activePlanEvidence["current_context_visible?"] || planEvidence["current_context_visible?"],
+      "active_progress_child_visible?": activePlanEvidence["child_visible?"] || planEvidence["child_visible?"],
+      "active_progress_remaining_visible?": activePlanEvidence["remaining_visible?"] || planEvidence["remaining_visible?"],
+      "active_progress_budget_visible?": activePlanEvidence["runtime_budget_visible?"] || planEvidence["runtime_budget_visible?"],
       "active_progress_pre_final_visible?": activePlanEvidence["pre_final_visible?"],
       "active_progress_pre_final_required?": !!request["active_progress_pre_final_required?"],
       active_plan_text_preview: activePlanEvidence.text_preview,
+      "terminal_wait_observed?": !!terminalWaitState.observed,
+      terminal_wait_state: terminalWaitState,
       plan_stage_labels: planEvidence.stage_labels,
       plan_text_preview: planEvidence.text_preview,
       "repair_failure_injection_enabled?": !!request.repair_failure_injection,
@@ -348,14 +364,22 @@ async function collectPlanEvidence(cdp) {
     .map((line) => line.trim().toLowerCase())
     .filter(Boolean);
 
-  const childVisible = lines.includes("child");
-  const remainingVisible = lines.includes("remaining");
+  const childVisible = lines.some((line) => line.includes("child"));
+  const remainingVisible = lines.some((line) => line.includes("remaining"));
+  const currentContextVisible = lines.some((line) =>
+    line.includes("current node") ||
+    line.includes("current_node") ||
+    line.includes("node started") ||
+    line.includes("node_started") ||
+    line === "node" ||
+    line.includes("active node")
+  );
 
   return {
     "plan_visible?": labels.includes("objective") && labels.includes("review"),
     "workflow_stages_visible?": ["planning", "implementation", "verification", "repair"].every((label) => labels.includes(label)),
     "live_progress_visible?": normalized.includes("live progress") && normalized.includes("persisted events"),
-    "current_context_visible?": lines.includes("node") || childVisible,
+    "current_context_visible?": currentContextVisible || childVisible,
     "child_visible?": childVisible,
     "remaining_visible?": remainingVisible,
     "pre_final_visible?": normalized.includes("live progress") && !normalized.includes("agent finished"),
@@ -370,6 +394,52 @@ async function waitForPlanAgentFinished(cdp, timeoutMs) {
     const evidence = await collectPlanEvidence(cdp);
     return String(evidence.text_preview || "").toLowerCase().includes("agent finished");
   }, timeoutMs);
+}
+
+async function waitForActivePlanEvidence(cdp, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = await collectPlanEvidence(cdp);
+
+  while (Date.now() < deadline) {
+    latest = await collectPlanEvidence(cdp);
+    if (
+      latest["live_progress_visible?"] &&
+      latest["remaining_visible?"] &&
+      (latest["current_context_visible?"] || terminalOrReviewText(latest.text_preview))
+    ) {
+      return {...latest, observed: true};
+    }
+    await delay(200);
+  }
+
+  return {...latest, observed: false, reason: "active progress context not observed before timeout"};
+}
+
+async function waitForPlanTerminalOrStable(cdp, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let latest = await collectPlanEvidence(cdp);
+
+  while (Date.now() < deadline) {
+    latest = await collectPlanEvidence(cdp);
+    if (terminalOrReviewText(latest.text_preview)) {
+      return {observed: true, reason: "terminal or review checkpoint observed", planEvidence: latest};
+    }
+    await delay(250);
+  }
+
+  return {observed: false, reason: "terminal or review checkpoint not observed before timeout", planEvidence: latest};
+}
+
+function terminalOrReviewText(text) {
+  const normalized = String(text || "").toLowerCase();
+  return (
+    normalized.includes("agent finished") ||
+    normalized.includes("review required") ||
+    normalized.includes("needs review approval") ||
+    normalized.includes("blocked-run evidence") ||
+    normalized.includes("objective\ncompleted") ||
+    normalized.includes("objective\nfailed")
+  );
 }
 
 async function selectPlanTab(cdp, timeoutMs) {
@@ -395,6 +465,26 @@ async function waitForConnectedWorkbench(cdp, timeoutMs) {
       if (!form || !window.liveSocket || !window.liveSocket.owner) return false;
       const view = window.liveSocket.owner(form);
       return !!(view && view.isConnected && view.isConnected());
+    })()`);
+  }, timeoutMs);
+}
+
+async function waitForConnectedSession(cdp, timeoutMs) {
+  return waitFor(cdp, async () => {
+    return await evalValue(cdp, `(() => {
+      if (!window.liveSocket || !window.liveSocket.owner || !document.body) return false;
+      const candidate =
+        document.querySelector('form[phx-submit="review_decision"]') ||
+        document.querySelector('form[phx-submit="submit_objective"]') ||
+        document.querySelector('[data-phx-main]');
+      if (!candidate) return false;
+
+      try {
+        const view = window.liveSocket.owner(candidate);
+        return !!(view && view.isConnected && view.isConnected());
+      } catch (_error) {
+        return false;
+      }
     })()`);
   }, timeoutMs);
 }
@@ -467,13 +557,18 @@ async function submitWorkbenchObjective(cdp, values) {
 
 async function submitReviewDecisionWhenVisible(cdp, decision, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let lastState = null;
+
   while (Date.now() < deadline) {
     const state = await submitReviewDecision(cdp, decision);
-    if (state && state.found) return state;
+    if (state && state.found) {
+      lastState = state;
+      if (state.submitted) return state;
+    }
     await delay(150);
   }
 
-  return { found: false, submitted: false, reason: "review_decision form not found before timeout" };
+  return lastState || { found: false, submitted: false, reason: "review_decision form not found before timeout" };
 }
 
 async function submitReviewDecision(cdp, decision) {
@@ -509,6 +604,12 @@ async function submitReviewDecision(cdp, decision) {
         if (!view || !view.submitForm) {
           clearTimeout(timeout);
           resolve({ok: false, reason: "owner view submitForm unavailable"});
+          return;
+        }
+
+        if (!view.isConnected || !view.isConnected()) {
+          clearTimeout(timeout);
+          resolve({ok: false, reason: "owner view disconnected"});
           return;
         }
 

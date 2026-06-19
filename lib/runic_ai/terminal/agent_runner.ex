@@ -620,6 +620,9 @@ defmodule RunicAI.Terminal.AgentRunner do
   defp review_decider(%CliOptions{} = options, input_fun, output_fun, renderer, event_sink) do
     fn request, context ->
       case options.approve do
+        :always ->
+          {:ok, Review.allow(request, reason: "review approved by --approve always")}
+
         :never ->
           reason = "review denied by --approve never"
           emit_review_blocked(event_sink, request, context, reason)

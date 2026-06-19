@@ -8,5 +8,6 @@ defmodule RunicAI.RLM.Robustness do
 
   defdelegate scenarios(), to: Catalog, as: :all
   defdelegate scenario(id), to: Catalog, as: :get
+  defdelegate scenario_matrix(name), to: Catalog, as: :matrix_ids
   defdelegate run_matrix(ids \\ nil, opts \\ []), to: Runner
 end

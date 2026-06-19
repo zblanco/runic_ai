@@ -94,23 +94,20 @@ defmodule RunicAI.Coding.RLM.ObjectiveContract do
 
   @spec infer(String.t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
   def infer(objective, opts \\ []) when is_binary(objective) and is_list(opts) do
-    domain = infer_domain(objective)
     mutation_required? = mutation_required?(objective)
     verification = verification_requirements(objective)
 
     requirements =
       []
       |> Kernel.++(artifact_requirements(mutation_required?))
-      |> Kernel.++(domain_requirements(domain))
+      |> Kernel.++(generic_behavior_requirements(mutation_required?))
       |> Kernel.++(verification)
 
     metadata =
       %{
         source: :deterministic_intent,
-        domain: domain,
-        generation_profile: domain,
+        domain: :generic,
         mutation_required?: mutation_required?,
-        project_generation?: project_generation?(objective),
         required_capabilities: required_capabilities(mutation_required?, verification),
         evidence_required: evidence_required(mutation_required?, verification)
       }
@@ -229,146 +226,29 @@ defmodule RunicAI.Coding.RLM.ObjectiveContract do
     ]
   end
 
-  defp domain_requirements(:field_service) do
+  defp generic_behavior_requirements(false) do
     [
-      requirement("work_orders", "behavior", "Represent work orders with lifecycle state.", [
-        "work order state is visible in source and tests"
-      ]),
       requirement(
-        "technician_assignment",
-        "behavior",
-        "Assign work orders to matching available technicians.",
+        "grounded_response",
+        "evidence",
+        "Provide a final response grounded in the inspected objective evidence.",
         [
-          "assignment rules consider technician skills and availability"
-        ]
-      ),
-      requirement(
-        "runtime_supervision",
-        "integration",
-        "Expose runtime supervision components for the dispatch workflow.",
-        [
-          "runtime children include registry or supervisor components"
+          "final response directly addresses the objective",
+          "response cites or summarizes the evidence used to reach the answer"
         ]
       )
     ]
   end
 
-  defp domain_requirements(:inventory) do
-    [
-      requirement(
-        "stock_reservation",
-        "behavior",
-        "Reserve stock by SKU without over-allocation.",
-        [
-          "insufficient stock is rejected"
-        ]
-      ),
-      requirement(
-        "inventory_audit",
-        "behavior",
-        "Record inventory movement or allocation decisions.",
-        [
-          "allocation output includes an auditable decision"
-        ]
-      )
-    ]
-  end
-
-  defp domain_requirements(:billing) do
-    [
-      requirement("invoice_totals", "behavior", "Calculate deterministic invoice totals.", [
-        "invoice totals combine plan charges, usage, and discounts"
-      ]),
-      requirement(
-        "billing_adjustments",
-        "behavior",
-        "Support billing adjustments such as proration or discounts.",
-        [
-          "adjustment behavior is covered by tests"
-        ]
-      )
-    ]
-  end
-
-  defp domain_requirements(:clinic) do
-    [
-      requirement(
-        "appointment_scheduling",
-        "behavior",
-        "Schedule appointments while rejecting overlaps.",
-        [
-          "overlapping appointments are rejected"
-        ]
-      ),
-      requirement(
-        "waitlist_or_cancellation",
-        "behavior",
-        "Represent waitlist or cancellation workflow state.",
-        [
-          "waitlist or cancellation behavior is represented in source"
-        ]
-      )
-    ]
-  end
-
-  defp domain_requirements(:workflow) do
-    [
-      requirement(
-        "workflow_execution",
-        "behavior",
-        "Execute workflow steps with dependency ordering.",
-        [
-          "workflow execution respects dependencies"
-        ]
-      ),
-      requirement(
-        "retry_or_failure_handling",
-        "behavior",
-        "Represent retry or failure handling behavior.",
-        [
-          "failure or retry behavior is covered by source or tests"
-        ]
-      )
-    ]
-  end
-
-  defp domain_requirements(:audit) do
-    [
-      requirement(
-        "append_only_events",
-        "behavior",
-        "Record append-only events for audit history.",
-        [
-          "events can be appended and replayed"
-        ]
-      ),
-      requirement("audit_replay", "behavior", "Reconstruct state from recorded events.", [
-        "replay returns deterministic state"
-      ])
-    ]
-  end
-
-  defp domain_requirements(:existing_app) do
-    [
-      requirement(
-        "existing_app_feature",
-        "behavior",
-        "Add a feature slice that fits the existing project.",
-        [
-          "new source and tests integrate with the existing app shape"
-        ]
-      )
-    ]
-  end
-
-  defp domain_requirements(:generic) do
+  defp generic_behavior_requirements(true) do
     [
       requirement(
         "requested_behavior",
         "behavior",
         "Implement the behavior requested by the objective.",
         [
-          "source and tests demonstrate the requested behavior"
+          "source artifacts contain objective-specific behavior",
+          "verification evidence addresses the objective rather than generic scaffold behavior"
         ]
       )
     ]
@@ -415,6 +295,7 @@ defmodule RunicAI.Coding.RLM.ObjectiveContract do
 
   defp evidence_for_kind("verification"), do: ["tests", "command_result", "runtime_result"]
   defp evidence_for_kind("artifact"), do: ["source", "changed_files"]
+  defp evidence_for_kind("evidence"), do: ["final_answer", "source", "artifact"]
   defp evidence_for_kind(_kind), do: ["source", "tests"]
 
   defp required_capabilities(false, verification) do
@@ -434,43 +315,6 @@ defmodule RunicAI.Coding.RLM.ObjectiveContract do
       if verification == [], do: [], else: ["tests", "command_result"]
   end
 
-  defp infer_domain(objective) do
-    objective = String.downcase(objective)
-
-    cond do
-      contains_any?(objective, ["existing project", "existing app", "feature slice"]) ->
-        :existing_app
-
-      contains_any?(objective, ["event-sourced", "event sourced", "audit", "replay"]) ->
-        :audit
-
-      contains_any?(objective, [
-        "field service",
-        "field-service",
-        "dispatch",
-        "work order",
-        "work orders",
-        "technician"
-      ]) ->
-        :field_service
-
-      contains_any?(objective, ["inventory", "warehouse", "sku", "reservation"]) ->
-        :inventory
-
-      contains_any?(objective, ["billing", "invoice", "subscription", "proration"]) ->
-        :billing
-
-      contains_any?(objective, ["clinic", "appointment", "scheduling", "waitlist"]) ->
-        :clinic
-
-      contains_any?(objective, ["workflow", "dag", "retry", "orchestration"]) ->
-        :workflow
-
-      true ->
-        :generic
-    end
-  end
-
   defp mutation_required?(objective) do
     objective = String.downcase(objective)
 
@@ -478,34 +322,6 @@ defmodule RunicAI.Coding.RLM.ObjectiveContract do
       ~r/(^|[^a-z0-9_])(add|build|create|fix|generate|implement|patch|repair|update)([^a-z0-9_]|$)/,
       objective
     )
-  end
-
-  defp project_generation?(objective) do
-    objective = String.downcase(objective)
-
-    mutation_required?(objective) and
-      contains_any?(objective, [
-        "app",
-        "elixir",
-        "engine",
-        "include tests",
-        "module",
-        "platform",
-        "project",
-        "proof of concept",
-        "runtime smoke",
-        "service"
-      ])
-  end
-
-  defp contains_any?(text, terms), do: Enum.any?(terms, &contains_term?(text, &1))
-
-  defp contains_term?(text, term) do
-    Regex.match?(Regex.compile!(term_pattern(term)), text)
-  end
-
-  defp term_pattern(term) do
-    "(?<![a-z0-9_])#{Regex.escape(term)}(?![a-z0-9_])"
   end
 
   defp requirement_to_map(requirement) do

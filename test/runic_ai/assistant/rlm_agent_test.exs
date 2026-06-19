@@ -326,7 +326,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
 
     assert_receive {:execution_prompt, "test:model", execution_prompt, llm_opts}
     assert execution_prompt =~ "Write me a poem about frogs"
-    assert llm_opts[:max_tokens] == 12_000
+    assert llm_opts[:max_completion_tokens] == 12_000
 
     emitted = Elixir.Agent.get(events, & &1)
     assert Enum.any?(emitted, &(&1.stage == :blueprint_generation_started))
@@ -631,6 +631,7 @@ defmodule RunicAI.Assistant.RLMAgentTest do
     assert llm_opts[:max_output_tokens] == 321
     assert llm_opts[:temperature] == 0.1
     refute Keyword.has_key?(llm_opts, :max_tokens)
+    refute Keyword.has_key?(llm_opts, :max_completion_tokens)
   end
 
   test "assistant routes workspace path objectives through workflow planning" do

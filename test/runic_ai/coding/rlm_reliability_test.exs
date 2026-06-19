@@ -289,6 +289,35 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert [%{metadata: %{paths: ["generated_app/lib/demo.ex"]}}] = evaluation.results
   end
 
+  test "negative source glob checks pass when no files match" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "runic-ai-rlm-negative-empty-glob-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    File.mkdir_p!(Path.join(root, "notes"))
+    File.write!(Path.join(root, "notes/roadmap.md"), "# Roadmap\n")
+
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("verify no code delivery",
+        checks: [
+          AcceptanceCheck.new!(:source_not_contains,
+            id: "no-deliveryrisk-in-lib",
+            params: %{glob: "lib/**/*.ex", text: "DeliveryRisk"}
+          )
+        ]
+      )
+
+    assert {:ok, evaluation} = AcceptanceContract.evaluate(contract, workspace, %{})
+    assert evaluation.status == :satisfied
+    assert [%{status: :pass, metadata: %{paths: [], file_count: 0}}] = evaluation.results
+  end
+
   test "source globs remain confined to the workspace root" do
     root = sample_project()
     workspace = Workspace.new!(root: root)
@@ -397,6 +426,110 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert evaluation.status == :satisfied
     assert [%{metadata: metadata}] = evaluation.results
     assert metadata.observed.cwd == Path.join(root, "demo")
+  end
+
+  test "aggregate command-output checks prefer latest matching command observations" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("verify latest command output",
+        checks: [
+          AcceptanceCheck.new!(:test_count_min,
+            id: "test-count",
+            params: %{min: 3}
+          ),
+          AcceptanceCheck.new!(:warning_count_zero, id: "warning-free")
+        ]
+      )
+
+    context = %{
+      command_results: [
+        %{
+          command: "mix test",
+          argv: ["mix", "test"],
+          cwd: root,
+          status: :pass,
+          output: "warning: deprecated option\n2 tests, 0 failures\n"
+        },
+        %{
+          command: "mix compile --warnings-as-errors",
+          argv: ["mix", "compile", "--warnings-as-errors"],
+          cwd: root,
+          status: :pass,
+          output: ""
+        },
+        %{
+          command: "mix test",
+          argv: ["mix", "test"],
+          cwd: root,
+          status: :pass,
+          output: "Running ExUnit\n\n....\n4 tests, 0 failures\n"
+        }
+      ]
+    }
+
+    assert {:ok, evaluation} = AcceptanceContract.evaluate(contract, workspace, context)
+    assert evaluation.status == :satisfied
+    assert Enum.all?(evaluation.results, &(&1.status == :pass))
+  end
+
+  test "function_exists checks accept common name slash arity notation" do
+    root = sample_project()
+
+    File.write!(Path.join(root, "lib/event_normalizer.ex"), """
+    defmodule EventNormalizer do
+      def parse_event(raw), do: raw
+    end
+    """)
+
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("verify function notation",
+        checks: [
+          AcceptanceCheck.new!(:function_exists,
+            id: "parse-event",
+            params: %{function: "parse_event/1"}
+          )
+        ]
+      )
+
+    assert {:ok, evaluation} = AcceptanceContract.evaluate(contract, workspace, %{})
+    assert evaluation.status == :satisfied
+    assert [%{status: :pass, metadata: metadata}] = evaluation.results
+    assert metadata.function == "parse_event"
+    assert metadata.arity == 1
+  end
+
+  test "changed file count checks are not treated as test count observations" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("verify changed file count",
+        checks: [
+          %{
+            id: "changed-file-count-min",
+            type: "test_count_min",
+            params: %{min: 1}
+          },
+          %{
+            id: "changed-file-count-max",
+            type: "test_count_min",
+            params: %{min: 2}
+          }
+        ]
+      )
+
+    assert {:ok, evaluation} =
+             AcceptanceContract.evaluate(contract, workspace, %{
+               changed_files: ["reports/delivery_risk_report.md"]
+             })
+
+    assert evaluation.status == :satisfied
+    assert Enum.all?(evaluation.results, &(&1.type == :changed_file_count_between))
+    assert Enum.all?(evaluation.results, &(&1.status == :pass))
   end
 
   test "coordinator prompt steers generated checks toward generic acyclic workflows" do
@@ -658,6 +791,46 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert scaffold_failure.metadata.repair_instruction =~ "Remove or replace"
   end
 
+  test "generic progress gate does not treat every :world atom as scaffold residue" do
+    root = sample_project()
+    File.rm!(Path.join(root, "test/demo_test.exs"))
+
+    File.write!(Path.join(root, "lib/world_router.ex"), """
+    defmodule WorldRouter do
+      def route(:world), do: {:ok, :dispatch_dashboard}
+      def route(other), do: {:error, other}
+    end
+    """)
+
+    File.write!(Path.join(root, "test/world_router_test.exs"), """
+    defmodule WorldRouterTest do
+      use ExUnit.Case
+
+      test "routes world dashboard requests" do
+        assert WorldRouter.route(:world) == {:ok, :dispatch_dashboard}
+      end
+    end
+    """)
+
+    workspace = Workspace.new!(root: root)
+
+    proposal =
+      WorkflowProposal.new!(
+        "Add a world dashboard route with ExUnit tests",
+        [ProposalNode.new!("edit", :edit, params: %{operations: []})],
+        stop_conditions: ["implemented"]
+      )
+
+    results =
+      ProgressGate.evaluate(workspace, proposal, %{
+        changed_files: ["lib/world_router.ex", "test/world_router_test.exs"]
+      })
+
+    scaffold_result = Enum.find(results, &(&1.id == "progress-no-default-scaffold"))
+
+    assert scaffold_result.status == :pass
+  end
+
   test "generic progress gate accepts objective-specific implementation evidence" do
     root = sample_project()
     File.rm!(Path.join(root, "test/demo_test.exs"))
@@ -693,6 +866,123 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
       ProgressGate.evaluate(workspace, proposal, %{changed_files: ["lib/field_service.ex"]})
 
     refute Enum.any?(results, &(&1.status == :fail))
+  end
+
+  test "generic progress gate rejects accidental scratch-root delivery" do
+    root = sample_project()
+    File.mkdir_p!(Path.join(root, "tmp/lib"))
+    File.mkdir_p!(Path.join(root, "tmp/test"))
+
+    File.write!(Path.join(root, "tmp/lib/support_ticket_triage.ex"), """
+    defmodule SupportTicketTriage do
+      def classify(ticket), do: %{priority: ticket.priority}
+    end
+    """)
+
+    File.write!(Path.join(root, "tmp/test/support_ticket_triage_test.exs"), """
+    defmodule SupportTicketTriageTest do
+      use ExUnit.Case
+      test "runtime smoke", do: assert SupportTicketTriage.classify(%{priority: :high})
+    end
+    """)
+
+    workspace = Workspace.new!(root: root)
+
+    proposal =
+      WorkflowProposal.new!(
+        "Create a support ticket triage Mix project with tests and a runtime smoke",
+        [
+          ProposalNode.new!("implement", :agent, params: %{mode: "patch"}),
+          ProposalNode.new!("verify", :verification_gate, params: %{checks: []})
+        ],
+        edges: [%{from: "implement", to: "verify"}],
+        stop_conditions: ["verified"]
+      )
+
+    result =
+      ProgressGate.apply(
+        %{
+          proposal: proposal,
+          context: %{
+            workspace: workspace,
+            child_results: [],
+            command_results: [],
+            changed_files: [
+              "tmp/lib/support_ticket_triage.ex",
+              "tmp/test/support_ticket_triage_test.exs"
+            ],
+            scorecards: [],
+            repair_needs: [],
+            verification_observations: [],
+            risks: []
+          }
+        },
+        validation_opts: [allow_mutation?: true]
+      )
+
+    delivery_failure =
+      Enum.find(
+        result.objective_scorecard.acceptance_results,
+        &(&1.id == "progress-delivery-root")
+      )
+
+    assert delivery_failure.status == :fail
+    assert delivery_failure.message =~ "scratch paths"
+
+    assert delivery_failure.metadata.scratch_files == [
+             "tmp/lib/support_ticket_triage.ex",
+             "tmp/test/support_ticket_triage_test.exs"
+           ]
+
+    assert Enum.any?(result.context.repair_needs, &(&1.target == "progress-delivery-root"))
+  end
+
+  test "generic progress gate allows explicitly requested nested delivery roots" do
+    root = sample_project()
+    File.mkdir_p!(Path.join(root, "tmp/support_ticket_triage/lib"))
+    File.mkdir_p!(Path.join(root, "tmp/support_ticket_triage/test"))
+
+    File.write!(Path.join(root, "tmp/support_ticket_triage/lib/support_ticket_triage.ex"), """
+    defmodule SupportTicketTriage do
+      def classify(ticket), do: %{priority: ticket.priority}
+    end
+    """)
+
+    File.write!(
+      Path.join(root, "tmp/support_ticket_triage/test/support_ticket_triage_test.exs"),
+      """
+      defmodule SupportTicketTriageTest do
+        use ExUnit.Case
+        test "runtime smoke", do: assert SupportTicketTriage.classify(%{priority: :high})
+      end
+      """
+    )
+
+    workspace = Workspace.new!(root: root)
+
+    proposal =
+      WorkflowProposal.new!(
+        "Create the support ticket triage Mix project in ./tmp/support_ticket_triage with tests and a runtime smoke",
+        [
+          ProposalNode.new!("implement", :agent,
+            params: %{mode: "patch", workspace_path: "tmp/support_ticket_triage"}
+          )
+        ],
+        stop_conditions: ["verified"]
+      )
+
+    results =
+      ProgressGate.evaluate(workspace, proposal, %{
+        changed_files: [
+          "tmp/support_ticket_triage/lib/support_ticket_triage.ex",
+          "tmp/support_ticket_triage/test/support_ticket_triage_test.exs"
+        ]
+      })
+
+    delivery_result = Enum.find(results, &(&1.id == "progress-delivery-root"))
+
+    assert delivery_result.status == :pass
+    assert "tmp/support_ticket_triage" in delivery_result.metadata.allowed_delivery_roots
   end
 
   test "objective contracts extract semantic requirements through structured LLM output" do

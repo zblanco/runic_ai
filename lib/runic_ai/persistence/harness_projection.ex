@@ -67,17 +67,26 @@ defmodule RunicAI.Persistence.HarnessProjection do
       started_at: event.at,
       completed_at: completed_at(event),
       failed_at: failed_at(event),
-      metadata_json: %{
-        last_event_id: event.id,
-        last_event_kind: event.kind,
-        last_event_phase: event.phase,
-        last_event_title: event.title,
-        run_id: event.run_id,
-        approval: data_field(event, :approve),
-        mode: data_field(event, :mode),
-        client: data_field(event, :client),
-        capability_profile: data_field(event, :capability_profile)
-      }
+      metadata_json:
+        %{
+          last_event_id: event.id,
+          last_event_kind: event.kind,
+          last_event_phase: event.phase,
+          last_event_title: event.title,
+          run_id: event.run_id,
+          approval: data_field(event, :approve),
+          runtime_approval: data_field(event, :runtime_approval) || data_field(event, :approve),
+          mode: data_field(event, :mode),
+          write_policy: data_field(event, :write_policy),
+          profile: data_field(event, :profile),
+          client: data_field(event, :client),
+          sandbox: data_field(event, :sandbox),
+          tool_config: data_field(event, :tool_config),
+          toolsets: data_field(event, :toolsets),
+          disabled_tools: data_field(event, :disabled_tools),
+          capability_profile: data_field(event, :capability_profile)
+        }
+        |> compact_map()
     }
 
     attrs =
@@ -88,7 +97,8 @@ defmodule RunicAI.Persistence.HarnessProjection do
         %AgentSession{} = session ->
           %{
             attrs
-            | workspace_root: attrs.workspace_root || session.workspace_root,
+            | agent_kind: projected_session_agent_kind(session, attrs, event),
+              workspace_root: attrs.workspace_root || session.workspace_root,
               objective: attrs.objective || session.objective,
               model: attrs.model || session.model,
               started_at: session.started_at || attrs.started_at,
@@ -97,6 +107,18 @@ defmodule RunicAI.Persistence.HarnessProjection do
       end
 
     upsert_by_id!(store, AgentSession, event.session_id, attrs, [:metadata_json])
+  end
+
+  defp projected_session_agent_kind(%AgentSession{} = session, attrs, %TerminalEvent{} = event) do
+    if agent_route_event?(event) do
+      attrs.agent_kind || session.agent_kind
+    else
+      session.agent_kind || attrs.agent_kind
+    end
+  end
+
+  defp agent_route_event?(%TerminalEvent{} = event) do
+    not is_nil(data_field(event, :routed_agent)) or not is_nil(data_field(event, :route_reason))
   end
 
   defp ensure_workflow_run!(_store, %TerminalEvent{run_id: nil}), do: :ok
@@ -903,6 +925,16 @@ defmodule RunicAI.Persistence.HarnessProjection do
     |> maybe_put(:objective, data_field(event, :objective))
     |> maybe_put(:model, data_field(event, :model))
     |> maybe_put(:workspace, data_field(event, :workspace) || data_field(event, :cwd))
+    |> maybe_put(:approval, data_field(event, :approve))
+    |> maybe_put(
+      :runtime_approval,
+      data_field(event, :runtime_approval) || data_field(event, :approve)
+    )
+    |> maybe_put(:mode, data_field(event, :mode))
+    |> maybe_put(:write_policy, data_field(event, :write_policy))
+    |> maybe_put(:profile, data_field(event, :profile))
+    |> maybe_put(:sandbox, data_field(event, :sandbox))
+    |> maybe_put(:tool_config, data_field(event, :tool_config))
     |> maybe_put(:capability_profile, data_field(event, :capability_profile))
     |> maybe_put(:graph_summary, graph_summary(event))
     |> maybe_put(
@@ -1276,6 +1308,18 @@ defmodule RunicAI.Persistence.HarnessProjection do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> compact_value?(value) end)
+    |> Map.new()
+  end
+
+  defp compact_value?(nil), do: true
+  defp compact_value?(""), do: true
+  defp compact_value?([]), do: true
+  defp compact_value?(map) when is_map(map), do: map_size(map) == 0
+  defp compact_value?(_value), do: false
 
   defp optional_string(nil), do: nil
   defp optional_string(value) when is_binary(value), do: value

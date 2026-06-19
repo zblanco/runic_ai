@@ -3,6 +3,7 @@ defmodule Mix.Tasks.RunicAi.Rlm.Robustness do
   Run RLM robustness project-generation smoke scenarios.
 
       mix runic_ai.rlm.robustness --list
+      mix runic_ai.rlm.robustness --matrix general_dynamic_workflow
       mix runic_ai.rlm.robustness --scenario field_service_dispatch
       mix runic_ai.rlm.robustness --lane browser_tidewave --label browser-probe
       mix runic_ai.rlm.robustness --live-agent-lanes --scenario field_service_dispatch
@@ -34,7 +35,7 @@ defmodule Mix.Tasks.RunicAi.Rlm.Robustness do
         Mix.shell().info("#{scenario.id} - #{scenario.title}")
       end)
     else
-      ids = Keyword.get_values(opts, :scenario)
+      ids = scenario_ids(opts)
       lanes = lanes(Keyword.get_values(opts, :lane))
 
       run_opts =
@@ -57,7 +58,7 @@ defmodule Mix.Tasks.RunicAi.Rlm.Robustness do
         ]
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
-      case Robustness.run_matrix(if(ids == [], do: nil, else: ids), run_opts) do
+      case Robustness.run_matrix(ids, run_opts) do
         {:ok, %{matrix_path: path, results: results}} ->
           Mix.shell().info("RLM robustness matrix: #{Path.relative_to_cwd(path)}")
           Mix.shell().info("Rows: #{length(results)}")
@@ -83,6 +84,7 @@ defmodule Mix.Tasks.RunicAi.Rlm.Robustness do
         browser_workbench_url: :string,
         browser_capture_timeout_ms: :integer,
         llm_judge: :boolean,
+        matrix: :string,
         trace_live: :boolean,
         model: :string,
         client: :string,
@@ -90,6 +92,24 @@ defmodule Mix.Tasks.RunicAi.Rlm.Robustness do
         proposal_timeout_ms: :integer
       ]
     )
+  end
+
+  defp scenario_ids(opts) do
+    explicit = Keyword.get_values(opts, :scenario)
+
+    cond do
+      explicit != [] ->
+        explicit
+
+      matrix = Keyword.get(opts, :matrix) ->
+        case Robustness.scenario_matrix(matrix) do
+          {:ok, ids} -> ids
+          {:error, error} -> Mix.raise(error.message)
+        end
+
+      true ->
+        nil
+    end
   end
 
   defp lanes([]), do: [:standard, :assistant, :rlm, :browser_tidewave]

@@ -120,6 +120,46 @@ defmodule RunicAI.WorkbenchTest do
            ]
   end
 
+  test "session snapshot exposes objective contract from proposal-started events" do
+    session_id = unique_session_id("proposal-contract")
+    run_id = session_id <> ":run"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("proposal-contract"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :proposal_started,
+               status: :running,
+               title: "RLM proposal started",
+               detail: "planning",
+               data_json: %{
+                 stage: :proposal_started,
+                 status: :running,
+                 data: %{
+                   objective: "Create a report and verify it",
+                   objective_contract: %{
+                     id: "objective-contract:early",
+                     objective: "Create a report and verify it",
+                     requirements: [
+                       %{id: "report_artifact", description: "Write the requested report"}
+                     ],
+                     metadata: %{source: :proposal_started, evidence_required: ["artifact"]}
+                   }
+                 }
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+    assert snapshot.objective_contract["id"] == "objective-contract:early"
+    assert snapshot.objective_contract["metadata"]["source"] == "proposal_started"
+    assert snapshot.objective_contract["metadata"]["evidence_required"] == ["artifact"]
+    assert [%{"id" => "report_artifact"}] = snapshot.objective_contract["requirements"]
+  end
+
   test "session snapshot exposes latest progress and runtime budget summary" do
     session_id = unique_session_id("progress-summary")
     run_id = session_id <> ":run"
@@ -179,6 +219,250 @@ defmodule RunicAI.WorkbenchTest do
     assert snapshot.progress_summary.latest_event.title == "RLM child budget selected"
   end
 
+  test "session snapshot exposes completion proof for completed sessions" do
+    session_id = unique_session_id("completion-proof")
+    run_id = session_id <> ":run"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("completion-proof"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :summary,
+               phase: :final,
+               status: :ok,
+               title: "RLM final output",
+               detail: "done",
+               data_json: %{
+                 run_id: run_id,
+                 output_text: "Implemented dispatch proof with tests.",
+                 scorecard: %{
+                   objective_status: :objective_satisfied,
+                   changed_files: [
+                     "[depth limit]",
+                     "lib/dispatch.ex",
+                     "test/dispatch_test.exs",
+                     "tmp/dispatch/mix.exs",
+                     "tmp/dispatch/lib/dispatch.ex"
+                   ],
+                   acceptance_results: [
+                     %{id: :mix_test, status: :pass, evidence: "mix test passed"}
+                   ],
+                   metadata: %{
+                     objective_contract: %{
+                       id: "objective-contract:test",
+                       objective: "Implement dispatch proof",
+                       requirements: [%{id: "implementation_artifacts"}],
+                       metadata: %{evidence_required: ["source", "tests"]}
+                     }
+                   }
+                 }
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+
+    assert snapshot.session.status == "completed"
+    assert snapshot.completion_proof.completed? == true
+    assert snapshot.completion_proof.ready? == true
+    assert snapshot.completion_proof.final_output? == true
+    assert snapshot.completion_proof.scorecard_satisfied? == true
+    assert snapshot.completion_proof.objective_contract? == true
+    assert snapshot.completion_proof.changed_file_count == 2
+    assert snapshot.completion_proof.all_changed_file_count == 4
+    assert snapshot.completion_proof.scratch_changed_file_count == 2
+
+    assert snapshot.completion_proof.changed_files == [
+             "lib/dispatch.ex",
+             "test/dispatch_test.exs"
+           ]
+
+    assert snapshot.completion_proof.delivered_changed_files == [
+             "lib/dispatch.ex",
+             "test/dispatch_test.exs"
+           ]
+
+    assert snapshot.completion_proof.scratch_changed_files == [
+             "tmp/dispatch/lib/dispatch.ex",
+             "tmp/dispatch/mix.exs"
+           ]
+
+    assert snapshot.completion_proof.missing == []
+    assert "scorecard" in snapshot.completion_proof.proof_categories
+    assert "changed_files" in snapshot.completion_proof.proof_categories
+  end
+
+  test "completion proof ignores unrelated nested path values" do
+    session_id = unique_session_id("completion-proof-noisy-paths")
+    run_id = session_id <> ":run"
+    review_id = "review:noisy-paths:#{session_id}"
+
+    seed_review_request(session_id, review_id)
+
+    assert {:ok, _event} =
+             Workbench.record_review_decision(session_id, review_id, %{
+               "id" => review_id,
+               "action" => "deny",
+               "reason" => "do not write files"
+             })
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("completion-proof-noisy-final"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :summary,
+               phase: :final,
+               status: :ok,
+               title: "RLM final output",
+               detail: "blocked by denied review",
+               data_json: %{
+                 run_id: run_id,
+                 output_text: "Stopped after the write request was denied.",
+                 browser_capture: %{
+                   elements: [
+                     %{path: "html > body > main", text: "Workbench"},
+                     %{path: "html > body > section.review", text: "Denied"}
+                   ]
+                 },
+                 diagnostics: %{
+                   selected_node: %{path: "workflow.nodes.implement_project"}
+                 }
+               },
+               at: DateTime.add(DateTime.utc_now(), 1)
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+
+    assert snapshot.completion_proof.completed? == true
+    assert snapshot.completion_proof.ready? == true
+    assert snapshot.completion_proof.denied_review? == true
+    assert snapshot.completion_proof.final_output? == true
+    assert snapshot.completion_proof.changed_files == []
+    assert snapshot.completion_proof.artifact_paths == []
+    assert snapshot.completion_proof.changed_file_count == 0
+    assert snapshot.completion_proof.artifact_count == 0
+    assert snapshot.completion_proof.proof_categories == ["final_output", "review_decision"]
+  end
+
+  test "completion proof is pending for active sessions" do
+    session_id = unique_session_id("completion-proof-running")
+    run_id = session_id <> ":run"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("completion-proof-running"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :proposal_started,
+               status: :running,
+               title: "RLM proposal started",
+               detail: "planning",
+               data_json: %{
+                 stage: :proposal_started,
+                 status: :running,
+                 data: %{node_id: "create_project"}
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+
+    assert snapshot.session.status == "running"
+    assert snapshot.completion_proof.terminal? == false
+    assert snapshot.completion_proof.completed? == false
+    assert snapshot.completion_proof.ready? == false
+    assert snapshot.completion_proof.missing == []
+    assert snapshot.completion_proof.proof_categories == []
+  end
+
+  test "session snapshot summarizes child repair events for progress clarity" do
+    session_id = unique_session_id("child-repair-summary")
+    run_id = session_id <> ":run"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("child-patch-repair-started"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :child_patch_repair_started,
+               status: :running,
+               title: "RLM child patch repair started",
+               detail: "repairing patch",
+               data_json: %{
+                 stage: :child_patch_repair_started,
+                 status: :running,
+                 data: %{
+                   node_id: "child",
+                   mode: :patch,
+                   attempt: 1,
+                   reason: :apply_patch_failed,
+                   diagnostics: [
+                     %{
+                       code: :invalid_patch,
+                       message: "invalid patch operation",
+                       details: %{op: "make_file"}
+                     }
+                   ]
+                 }
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("child-patch-repair-completed"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :child_patch_repair_completed,
+               status: :ok,
+               title: "RLM child patch repair completed",
+               detail: "patched",
+               data_json: %{
+                 stage: :child_patch_repair_completed,
+                 status: :ok,
+                 data: %{
+                   node_id: "child",
+                   mode: :patch,
+                   attempt: 1,
+                   changed_files: ["lib/malformed_patch_repair.ex"],
+                   repaired?: true
+                 }
+               },
+               at: DateTime.add(DateTime.utc_now(), 1)
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+    assert snapshot.metrics.child_repairs == 1
+
+    assert [
+             %{
+               type: "patch",
+               status: "repaired",
+               title: "Malformed patch repaired",
+               node_id: "child",
+               attempt: 1,
+               changed_files: ["lib/malformed_patch_repair.ex"],
+               next_action: "Continue downstream verification or final objective proof."
+             } = repair
+           ] = snapshot.child_repairs
+
+    assert to_string(repair.reason) == "apply_patch_failed"
+    assert repair.detail =~ "Patch repair attempt 1 for child."
+    assert repair.detail =~ "lib/malformed_patch_repair.ex"
+    assert [diagnostic] = repair.diagnostics
+    assert to_string(diagnostic["message"] || diagnostic[:message]) == "invalid patch operation"
+  end
+
   test "session snapshot groups sandbox execution events from durable terminal events" do
     session_id = unique_session_id("sandbox-events")
     run_id = session_id <> ":run"
@@ -195,19 +479,28 @@ defmodule RunicAI.WorkbenchTest do
           output_bytes: 6,
           files_changed: [%{path: "out.txt", kind: :created}],
           artifacts: [%{ref: "sandbox://out.txt"}],
-          diagnostics: []
+          diagnostics: [],
+          metadata: %{
+            session_id: "sandbox-session-1",
+            vm_id: "vm-proof-1",
+            workspace_mode: :copy_in,
+            workspace_mount: "/workspace",
+            security_boundary?: true
+          }
         },
         status: :pass,
         input: %{
           sandbox: :local_code,
           runtime: :bash,
-          network: :disabled
+          network: :disabled,
+          file_paths: ["seed.txt"]
         },
         metadata: %{
           sandbox?: true,
           sandbox: :local_code,
           runtime: :bash,
-          network: :disabled
+          network: :disabled,
+          session_id: "sandbox-session-1"
         }
       )
 
@@ -230,7 +523,31 @@ defmodule RunicAI.WorkbenchTest do
                runtime: "bash",
                network: "disabled",
                isolation_level: "in_process_virtual",
-               files_changed: [%{"path" => "out.txt"}]
+               security_boundary?: true,
+               session_id: "sandbox-session-1",
+               vm_id: "vm-proof-1",
+               workspace_mode: "copy_in",
+               workspace_mount: "/workspace",
+               copy_in_status: "request_files_uploaded",
+               copy_back_status: "files_changed",
+               files_changed: [%{"path" => "out.txt"}],
+               proof: %{
+                 backend: "just_bash",
+                 sandbox: "local_code",
+                 runtime: "bash",
+                 network: "disabled",
+                 isolation_level: "in_process_virtual",
+                 security_boundary?: true,
+                 session_id: "sandbox-session-1",
+                 vm_id: "vm-proof-1",
+                 workspace_mode: "copy_in",
+                 workspace_mount: "/workspace",
+                 request_file_count: 1,
+                 files_changed_count: 1,
+                 artifact_count: 1,
+                 copy_in_status: "request_files_uploaded",
+                 copy_back_status: "files_changed"
+               }
              }
            ] = snapshot.sandbox_executions
   end
@@ -872,6 +1189,77 @@ defmodule RunicAI.WorkbenchTest do
     assert [%{"resume_key" => "review:opslogic:plan"}] = objective_session.review_requests
   end
 
+  test "session approve-all policy approves pending non-budget reviews only" do
+    session_id = unique_session_id("approval-policy")
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("approval-policy"),
+               session_id: session_id,
+               run_id: session_id,
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective review approval required",
+               detail: "status: needs_review_approval",
+               data_json: %{
+                 run_id: session_id,
+                 objective_decision: %{action: :request_review_approval},
+                 review_requests: [
+                   %{
+                     kind: :guard_review,
+                     resume_key: "review:tool:#{session_id}",
+                     checkpoint: :pre_tool
+                   }
+                 ]
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("approval-policy-budget"),
+               session_id: session_id,
+               run_id: session_id,
+               agent: :rlm,
+               kind: :summary,
+               phase: :objective_loop,
+               status: :review,
+               title: "Objective budget approval required",
+               detail: "status: needs_budget_approval",
+               data_json: %{
+                 run_id: session_id,
+                 objective_decision: %{action: :request_budget_approval},
+                 budget_requests: [
+                   %{
+                     kind: :objective_budget_approval,
+                     resume_key: "budget:#{session_id}:1",
+                     checkpoint: :budget_approval
+                   }
+                 ]
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, %{policy: :always, approved_count: 1}} =
+             Workbench.record_approval_policy(session_id, %{"policy" => "always"})
+
+    snapshot = Workbench.session_snapshot(session_id)
+
+    assert Enum.any?(
+             snapshot.review_requests,
+             &(&1.id == "review:tool:#{session_id}" and &1.status == "approved")
+           )
+
+    assert Enum.any?(
+             snapshot.review_requests,
+             &(&1.id == "budget:#{session_id}:1" and &1.status == "pending")
+           )
+
+    assert snapshot.session.metadata["runtime_approval"] == "always"
+  end
+
   test "records core events without requiring the web layer to consume terminal events" do
     session_id = unique_session_id("core-event")
     :ok = Workbench.subscribe_session(session_id)
@@ -1129,6 +1517,7 @@ defmodule RunicAI.WorkbenchTest do
                "sandbox_profile" => "docker",
                "sandbox_backend" => "docker",
                "sandbox_runtime" => "python",
+               "sandbox_runtimes" => "bash,python,node,elixir,lua",
                "sandbox_network" => "restricted",
                "sandbox_stateful" => "true",
                "sandbox_pool_warm" => "1",
@@ -1148,12 +1537,28 @@ defmodule RunicAI.WorkbenchTest do
       assert get_in(launch_event.data, ["tool_config", "code_execution", "enabled"]) == true
       assert get_in(launch_event.data, ["tool_config", "code_execution", "backend"]) == "docker"
 
+      assert get_in(launch_event.data, ["tool_config", "code_execution", "allowed_runtimes"]) == [
+               "bash",
+               "python",
+               "node",
+               "elixir",
+               "lua"
+             ]
+
       assert get_in(launch_event.data, ["tool_config", "code_execution", "network"]) ==
                "restricted"
 
       assert get_in(launch_event.data, ["sandbox", "backend"]) == "docker"
       assert get_in(launch_event.data, ["sandbox", "sandbox"]) == "docker"
-      assert get_in(launch_event.data, ["sandbox", "runtimes"]) == ["python"]
+
+      assert get_in(launch_event.data, ["sandbox", "runtimes"]) == [
+               "bash",
+               "python",
+               "node",
+               "elixir",
+               "lua"
+             ]
+
       assert get_in(launch_event.data, ["sandbox", "network"]) == "restricted"
       assert get_in(launch_event.data, ["sandbox", "stateful?"]) == true
       assert get_in(launch_event.data, ["sandbox", "pool"]) == %{"max" => 2, "warm" => 1}
@@ -1222,6 +1627,64 @@ defmodule RunicAI.WorkbenchTest do
 
       assert get_in(launch_event.data, ["sandbox", "backend"]) == "docker"
       assert get_in(launch_event.data, ["sandbox", "runtimes"]) == ["elixir"]
+    end)
+  end
+
+  test "browser launch preserves approve-all and vmsan sandbox metadata" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      Keyword.put(previous, :run_fun, &__MODULE__.fake_assistant_run/3)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("approve-all-vmsan")
+
+    assert {:ok, %{session_id: ^session_id, run_id: run_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Implement a small Elixir workspace change",
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "always",
+               "mode" => "patch",
+               "write_policy" => "workspace_review",
+               "profile" => "local-workbench",
+               "sandbox_profile" => "local_code",
+               "sandbox_backend" => "vmsan",
+               "sandbox_runtime" => "elixir",
+               "sandbox_runtimes" => "bash,python,node,elixir,lua",
+               "sandbox_network" => "disabled",
+               "sandbox_stateful" => "true",
+               "sandbox_pool_warm" => "0",
+               "sandbox_pool_max" => "2"
+             })
+
+    assert String.starts_with?(run_id, "rlm:web")
+
+    eventually(fn ->
+      snapshot = Workbench.session_snapshot(session_id)
+
+      assert snapshot.session.status in ["running", "completed"]
+      assert snapshot.session.metadata["approval"] == "always"
+      assert snapshot.session.metadata["runtime_approval"] == "always"
+      assert snapshot.session.metadata["mode"] == "patch"
+      assert snapshot.session.metadata["write_policy"] == "workspace_review"
+
+      sandbox = snapshot.session.metadata["sandbox"]
+      assert sandbox["backend"] == "vmsan"
+      assert sandbox["runtime"] == "elixir"
+      assert sandbox["runtimes"] == ["bash", "python", "node", "elixir", "lua"]
+      assert sandbox["network"] == "disabled"
+      assert sandbox["stateful?"] == true
+      assert sandbox["pool"] == %{"max" => 2, "warm" => 0}
+
+      assert Enum.any?(snapshot.events, fn event ->
+               event.run_id == run_id and event.phase == "capability_profile_updated"
+             end)
     end)
   end
 
@@ -1634,6 +2097,128 @@ defmodule RunicAI.WorkbenchTest do
                "id" => review_id,
                "action" => "approve"
              })
+  end
+
+  test "approval policy change carries approve-all into objective resume runs" do
+    previous = Application.get_env(:runic_ai, :workbench, [])
+    parent = self()
+
+    run_fun = fn _cwd, objective, opts ->
+      case Keyword.fetch!(opts, :objective_iteration) do
+        1 ->
+          request =
+            ReviewRequest.new!(:objective_plan_approval,
+              checkpoint: :plan_review,
+              resume_key: "review:objective-policy:#{opts[:session_id]}",
+              options: [:approve, :reject, :edit, :cancel],
+              details: %{objective_preview: objective},
+              metadata: %{safe?: false, source: :objective_loop_policy_test}
+            )
+
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_incomplete},
+             review_request: request,
+             context: %{changed_files: ["PLAN.md"]}
+           }}
+
+        2 ->
+          send(
+            parent,
+            {:objective_resume_opts, opts[:approval], is_function(opts[:review_decider], 2)}
+          )
+
+          {:ok,
+           %{
+             objective_scorecard: %{objective_status: :objective_satisfied},
+             context: %{changed_files: ["lib/demo.ex"]}
+           }}
+      end
+    end
+
+    Application.put_env(
+      :runic_ai,
+      :workbench,
+      previous
+      |> Keyword.put(:run_fun, run_fun)
+      |> Keyword.put(:max_runtime_ms, 3_000)
+    )
+
+    on_exit(fn -> Application.put_env(:runic_ai, :workbench, previous) end)
+
+    session_id = unique_session_id("objective-policy-resume")
+    review_id = "review:objective-policy:#{session_id}"
+
+    assert {:ok, %{session_id: ^session_id}} =
+             Workbench.start_agent_run(%{
+               "session_id" => session_id,
+               "objective" => "Plan and implement policy resume code",
+               "agent" => "rlm",
+               "cwd" => File.cwd!(),
+               "approve" => "ask",
+               "mode" => "patch"
+             })
+
+    eventually(fn ->
+      assert %{objective_loop: %{status: "needs_review_approval"}} =
+               Workbench.session_snapshot(session_id)
+
+      assert [%{id: ^review_id, status: "pending"}] =
+               Workbench.session_snapshot(session_id).review_requests
+    end)
+
+    assert {:ok, %{policy: :always, approved_count: 1}} =
+             Workbench.record_approval_policy(session_id, %{"policy" => "always"})
+
+    assert_receive {:objective_resume_opts, :always, true}, 1_000
+
+    eventually(fn ->
+      assert %{objective_loop: %{status: "objective_satisfied", action: "complete"}} =
+               Workbench.session_snapshot(session_id)
+    end)
+  end
+
+  test "review decisions preserve the selected session agent in the projection" do
+    session_id = unique_session_id("review-agent")
+    review_id = unique_event_id("review-agent")
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("start"),
+               session_id: session_id,
+               run_id: session_id,
+               agent: :rlm,
+               kind: :status,
+               phase: :session,
+               status: :running,
+               title: "RLM session started",
+               detail: "preserve agent",
+               data_json: %{
+                 run_id: session_id,
+                 objective: "Preserve RLM review attribution",
+                 model: "test:model",
+                 approve: :ask,
+                 mode: :patch
+               },
+               at: DateTime.utc_now()
+             })
+
+    seed_review_request(session_id, review_id)
+
+    assert {:ok, _event} =
+             Workbench.record_review_decision(session_id, review_id, %{
+               "id" => review_id,
+               "action" => "deny"
+             })
+
+    snapshot = Workbench.session_snapshot(session_id)
+
+    assert snapshot.session.agent == "rlm"
+    assert snapshot.session.status == "blocked"
+    assert [%{id: ^review_id, status: "denied"}] = snapshot.review_requests
+
+    assert %{agent: "rlm", phase: "review_decision", status: "blocked"} =
+             List.last(snapshot.events)
   end
 
   test "browser objective-loop budget approval resumes the persisted RLM objective" do

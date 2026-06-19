@@ -31,6 +31,8 @@ defmodule RunicAIWeb.Router do
     live "/debug/scorecards", DebugLive, :scorecards
     live "/debug/context", DebugLive, :context
     live "/debug/health", DebugLive, :health
+    get "/.well-known/oauth-authorization-server", PageController, :well_known_unavailable
+    get "/.well-known/oauth-authorization-server/*path", PageController, :well_known_unavailable
     live "/sessions/:session_id", WorkbenchLive, :show
 
     get "/health", PageController, :health

@@ -2,9 +2,11 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
   use RunicAIWeb.ConnCase, async: false
 
   alias RunicAI.Workbench
+  alias RunicAI.Coding.TraceEvent
   alias RunicAI.LLM.ModelCatalog
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
+  alias RunicAI.Terminal.Event, as: TerminalEvent
 
   test "renders the durable workbench shell and selected session", %{conn: conn} do
     session_id = unique_session_id()
@@ -51,6 +53,41 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     refute html =~ "Agent workbench"
   end
 
+  test "session pages bound the recent session sidebar", %{conn: conn} do
+    prefix = unique_session_id()
+
+    session_ids =
+      for index <- 1..20 do
+        session_id = "#{prefix}:#{index}"
+        seed_session(session_id, "Sidebar bounded session #{index}")
+        session_id
+      end
+
+    latest_session_id = List.last(session_ids)
+
+    {:ok, _view, html} = live(conn, ~p"/sessions/#{latest_session_id}")
+
+    assert html =~ "Sidebar bounded session 20"
+    assert html =~ "Sidebar bounded session 5"
+    refute html =~ "Sidebar bounded session 4\n"
+    refute html =~ "Sidebar bounded session 1\n"
+  end
+
+  test "well-known OAuth probe routes return lightweight responses", %{conn: conn} do
+    for path <- [
+          "/.well-known/oauth-authorization-server",
+          "/.well-known/oauth-authorization-server/tidewave/mcp"
+        ] do
+      conn = conn |> recycle() |> get(path)
+      body = response(conn, 404)
+
+      assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+      assert byte_size(body) < 256
+      assert body =~ "not_found"
+      refute body =~ "Phoenix.Router.NoRouteError"
+    end
+  end
+
   test "root agent mode selector keeps launch fields in sync", %{conn: conn} do
     {:ok, view, html} = live(conn, ~p"/")
 
@@ -89,11 +126,11 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert html =~ "Docker"
     assert html =~ ~s(phx-value-sandbox="docker")
     assert html =~ "Starts on demand" or html =~ "Needs setup"
-    assert html =~ "selected bash"
-    assert html =~ "available bash"
+    assert html =~ "runtimes bash"
     assert landing_form_value(html, "sandbox_profile") == "local_code"
     assert landing_form_value(html, "sandbox_backend") == "just_bash"
     assert landing_form_value(html, "sandbox_runtime") == "bash"
+    assert landing_form_value(html, "sandbox_runtimes") == "bash"
     assert landing_form_value(html, "sandbox_network") == "disabled"
     assert landing_form_value(html, "sandbox_stateful") == "false"
     assert landing_form_value(html, "sandbox_pool_warm") == "0"
@@ -109,6 +146,7 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert landing_form_value(html, "sandbox_profile") == "local_code"
     assert landing_form_value(html, "sandbox_backend") == "just_bash"
     assert landing_form_value(html, "sandbox_runtime") == "bash"
+    assert landing_form_value(html, "sandbox_runtimes") == "bash"
     assert landing_form_value(html, "sandbox_network") == "disabled"
   end
 
@@ -255,6 +293,7 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
              "backend" => "docker",
              "network" => "restricted",
              "review" => "unsafe_actions",
+             "runtime" => "python",
              "runtimes" => ["python"],
              "sandbox" => "local_code",
              "stateful?" => true,
@@ -556,6 +595,54 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
     assert html_response(conn, 200) =~ "Load an encoded session route"
   end
 
+  test "selected session launch metadata hydrates the follow-up composer", %{conn: conn} do
+    session_id = unique_session_id("rlm-vmsan-session")
+    seed_rlm_vmsan_session(session_id, "Implement a RayOps slice")
+
+    {:ok, _view, html} = live(conn, ~p"/sessions/#{session_id}")
+
+    assert html =~ ~s(value="rlm" selected)
+    assert html =~ ~s(value="patch" selected)
+    assert html =~ ~s(value="always" selected)
+    assert html =~ ~s(value="workspace_review" selected)
+    assert html =~ ~s(value="vmsan" selected)
+    assert html =~ ~s(value="elixir" selected)
+    assert html =~ ~s(name="run[cwd]" value="#{File.cwd!()}")
+  end
+
+  test "trace panel renders sandbox execution proof", %{conn: conn} do
+    session_id = unique_session_id("sandbox-proof")
+    seed_session(session_id, "Show sandbox proof")
+    seed_sandbox_execution(session_id)
+
+    {:ok, _view, html} = live(conn, ~p"/sessions/#{session_id}")
+
+    assert html =~ "Sandbox executions"
+    assert html =~ "docker / elixir / session sandbox-session-42"
+    assert html =~ "microvm"
+    assert html =~ "restricted"
+    assert html =~ "security boundary"
+    assert html =~ "copy-in request_files_uploaded"
+    assert html =~ "copy-back files_changed"
+    assert html =~ "1 changed"
+  end
+
+  test "trace panel renders child repair summaries without raw payload parsing", %{conn: conn} do
+    session_id = unique_session_id("child-repair")
+    seed_session(session_id, "Show child repair")
+    seed_child_patch_repair(session_id)
+
+    {:ok, _view, html} = live(conn, ~p"/sessions/#{session_id}")
+
+    assert html =~ "Child repairs"
+    assert html =~ "Malformed patch repaired"
+    assert html =~ "Patch repair attempt 1 for child"
+    assert html =~ "invalid patch operation"
+    assert html =~ "op=make_file"
+    assert html =~ "lib/malformed_patch_repair.ex"
+    assert html =~ "Continue downstream verification or final objective proof"
+  end
+
   defp seed_session(session_id, objective) do
     SQLite.migrate!(Workbench.store!())
 
@@ -594,6 +681,151 @@ defmodule RunicAIWeb.WorkbenchLiveTest do
         detail: "Durable browser message with `code`.",
         data_json: %{reply_text: "Durable browser message with `code`."},
         at: DateTime.add(now, 1)
+      })
+  end
+
+  defp seed_sandbox_execution(session_id) do
+    trace_event =
+      TraceEvent.sandbox(
+        :coding_sandbox_completed,
+        %{
+          status: :pass,
+          backend: :docker,
+          isolation_level: :microvm,
+          duration_ms: 42,
+          exit_status: 0,
+          output_bytes: 12,
+          files_changed: [%{path: "lib/example.ex", kind: :created}],
+          artifacts: [%{ref: "sandbox://lib/example.ex"}],
+          diagnostics: [],
+          metadata: %{
+            session_id: "sandbox-session-42",
+            workspace_mode: :copy_in,
+            workspace_mount: "/workspace",
+            security_boundary?: true
+          }
+        },
+        status: :pass,
+        input: %{
+          sandbox: :local_code,
+          runtime: :elixir,
+          network: :restricted,
+          file_paths: ["mix.exs"]
+        },
+        metadata: %{
+          sandbox?: true,
+          sandbox: :local_code,
+          runtime: :elixir,
+          network: :restricted,
+          session_id: "sandbox-session-42"
+        }
+      )
+
+    terminal_event =
+      TerminalEvent.from_trace_event(trace_event,
+        session_id: session_id,
+        agent: :rlm
+      )
+
+    terminal_event = %{terminal_event | data: Map.put(terminal_event.data, :run_id, session_id)}
+
+    {:ok, _event} = Workbench.record_terminal_event(terminal_event)
+  end
+
+  defp seed_child_patch_repair(session_id) do
+    now = DateTime.utc_now()
+
+    {:ok, _event} =
+      Workbench.record_terminal_event(%{
+        id: unique_event_id("child-patch-repair-started"),
+        session_id: session_id,
+        run_id: session_id,
+        agent: :rlm,
+        kind: :rlm_node,
+        phase: :child_patch_repair_started,
+        status: :running,
+        title: "RLM child patch repair started",
+        detail: "repairing patch",
+        data_json: %{
+          stage: :child_patch_repair_started,
+          status: :running,
+          data: %{
+            node_id: "child",
+            mode: :patch,
+            attempt: 1,
+            reason: :apply_patch_failed,
+            diagnostics: [
+              %{
+                code: :invalid_patch,
+                message: "invalid patch operation",
+                details: %{op: "make_file"}
+              }
+            ]
+          }
+        },
+        at: now
+      })
+
+    {:ok, _event} =
+      Workbench.record_terminal_event(%{
+        id: unique_event_id("child-patch-repair-completed"),
+        session_id: session_id,
+        run_id: session_id,
+        agent: :rlm,
+        kind: :rlm_node,
+        phase: :child_patch_repair_completed,
+        status: :ok,
+        title: "RLM child patch repair completed",
+        detail: "patched",
+        data_json: %{
+          stage: :child_patch_repair_completed,
+          status: :ok,
+          data: %{
+            node_id: "child",
+            mode: :patch,
+            attempt: 1,
+            changed_files: ["lib/malformed_patch_repair.ex"],
+            repaired?: true
+          }
+        },
+        at: DateTime.add(now, 1)
+      })
+  end
+
+  defp seed_rlm_vmsan_session(session_id, objective) do
+    SQLite.migrate!(Workbench.store!())
+
+    {:ok, _event} =
+      Workbench.record_terminal_event(%{
+        id: unique_event_id("rlm-vmsan-start"),
+        session_id: session_id,
+        run_id: session_id <> ":run",
+        agent: :rlm,
+        kind: :status,
+        phase: :session,
+        status: :running,
+        title: "Workbench run queued",
+        detail: objective,
+        data_json: %{
+          run_id: session_id <> ":run",
+          cwd: File.cwd!(),
+          objective: objective,
+          model: "openai:gpt-5.4-mini",
+          approve: :always,
+          mode: :patch,
+          write_policy: :workspace_review,
+          profile: :local_workbench,
+          sandbox: %{
+            sandbox: :local_code,
+            backend: :vmsan,
+            runtime: :elixir,
+            runtimes: [:bash, :python, :node, :elixir, :lua],
+            network: :disabled,
+            stateful?: true,
+            pool: %{warm: 0, max: 2}
+          }
+        },
+        at: DateTime.utc_now()
       })
   end
 

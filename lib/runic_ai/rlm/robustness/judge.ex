@@ -75,7 +75,10 @@ defmodule RunicAI.RLM.Robustness.Judge do
     command_failures =
       Enum.filter(
         checks,
-        &(get_in(&1, [:check, :type]) == :command_passes and &1.status != :pass)
+        &(get_in(&1, [:check, :type]) in [
+            :command_passes,
+            :command_passes_without_warnings
+          ] and &1.status != :pass)
       )
 
     source_failures =
@@ -117,11 +120,11 @@ defmodule RunicAI.RLM.Robustness.Judge do
         "lane execution errored"
       )
       |> maybe_block(
-        Map.get(evidence, :lane_status) in [:failed, "failed"],
+        unexpected_lane_status?(evidence, [:failed, "failed"]),
         "lane execution failed"
       )
       |> maybe_block(
-        Map.get(evidence, :lane_status) in [:blocked, "blocked"],
+        unexpected_lane_status?(evidence, [:blocked, "blocked"]),
         "lane execution blocked"
       )
       |> maybe_block(
@@ -246,9 +249,25 @@ defmodule RunicAI.RLM.Robustness.Judge do
     )
     |> maybe_block(lane_status in [:skipped, "skipped"], "lane execution was skipped")
     |> maybe_block(lane_status in [:error, "error"], "lane execution errored")
-    |> maybe_block(lane_status in [:failed, "failed"], "lane execution failed")
-    |> maybe_block(lane_status in [:blocked, "blocked"], "lane execution blocked")
+    |> maybe_block(
+      unexpected_lane_status?(evidence, [:failed, "failed"]),
+      "lane execution failed"
+    )
+    |> maybe_block(
+      unexpected_lane_status?(evidence, [:blocked, "blocked"]),
+      "lane execution blocked"
+    )
     |> Enum.reverse()
+  end
+
+  defp unexpected_lane_status?(evidence, statuses) do
+    lane_status = Map.get(evidence, :lane_status)
+    lane_status in statuses and not expected_lane_status?(evidence, lane_status)
+  end
+
+  defp expected_lane_status?(evidence, status) do
+    expected = Map.get(evidence, :expected_lane_status)
+    is_binary(expected) and expected != "" and to_string(status) == expected
   end
 
   defp normalize_overall(value) when is_atom(value),
@@ -330,7 +349,30 @@ defmodule RunicAI.RLM.Robustness.Judge do
 
   defp repair_score(evidence) do
     repair_count = Map.get(evidence, :repair_count, 0)
-    if repair_count > 0, do: 1, else: 0
+
+    cond do
+      repair_count > 0 -> 1
+      successful_lane_evidence?(evidence) -> 1
+      true -> 0
+    end
+  end
+
+  defp successful_lane_evidence?(evidence) do
+    deterministic_status = get_in(evidence, [:deterministic, :status])
+    lane_status = Map.get(evidence, :lane_status)
+
+    deterministic_status in [:pass, "pass"] and
+      lane_status not in [
+        :skipped,
+        "skipped",
+        :error,
+        "error",
+        :failed,
+        "failed",
+        :blocked,
+        "blocked"
+      ] and
+      Map.get(evidence, :ui_gaps, []) == []
   end
 
   defp user_output_score(evidence) do

@@ -891,17 +891,22 @@ defmodule RunicAI.Terminal.Event do
   end
 
   defp rlm_final_output_text(result) do
+    scorecard_text = scorecard_output_text(result)
+
     [
       text_field(result, :output_text),
       text_field(result, :final_answer),
       text_field(result, :reply_text),
       text_field(result, :content),
+      episode_output_text(result,
+        allow_command_output?: is_nil(scorecard_text),
+        allow_non_answer_output?: is_nil(scorecard_text)
+      ),
+      scorecard_text,
       text_candidate(field(result, :output)),
-      episode_output_text(result),
       text_candidate(field(result, :repair_history)),
       text_candidate(field(result, :repair_attempts)),
-      text_candidate(field(result, :artifacts)),
-      scorecard_output_text(result)
+      text_candidate(field(result, :artifacts))
     ]
     |> Enum.find(&present_text?/1)
   end
@@ -941,16 +946,70 @@ defmodule RunicAI.Terminal.Event do
   defp maybe_report_line(_label, ""), do: nil
   defp maybe_report_line(label, value), do: "#{label}: #{value}"
 
-  defp episode_output_text(result) do
+  defp episode_output_text(result, opts) do
+    allow_command_output? = Keyword.get(opts, :allow_command_output?, true)
+    allow_non_answer_output? = Keyword.get(opts, :allow_non_answer_output?, true)
+
     result
     |> episodes()
     |> Enum.reverse()
     |> Enum.find_value(fn episode ->
-      text_candidate(field(episode, :outcome)) ||
-        text_candidate(field(episode, :output)) ||
-        text_candidate(field(episode, :artifacts))
+      if episode_output_allowed?(episode, allow_command_output?, allow_non_answer_output?) do
+        text_candidate(field(episode, :outcome)) ||
+          text_candidate(field(episode, :output)) ||
+          text_candidate(field(episode, :artifacts))
+      end
     end)
   end
+
+  defp episode_output_allowed?(episode, allow_command_output?, allow_non_answer_output?) do
+    command_allowed? = allow_command_output? or not command_episode?(episode)
+    answer_allowed? = allow_non_answer_output? or answer_episode?(episode)
+
+    command_allowed? and answer_allowed?
+  end
+
+  defp answer_episode?(episode) do
+    episode
+    |> episode_identifiers()
+    |> Enum.any?(fn identifier ->
+      identifier == "answer" or String.contains?(identifier, "final_answer") or
+        String.ends_with?(identifier, ":answer")
+    end)
+  end
+
+  defp episode_identifiers(episode) do
+    [
+      field(episode, :id),
+      field(episode, :parent_node_id),
+      field(episode, :node_id),
+      field(episode, :name)
+    ]
+    |> Enum.flat_map(fn
+      value when is_binary(value) -> [value]
+      value when is_atom(value) -> [Atom.to_string(value)]
+      _value -> []
+    end)
+  end
+
+  defp command_episode?(episode) do
+    [
+      field(episode, :outcome),
+      field(episode, :output),
+      field(episode, :artifacts)
+    ]
+    |> Enum.any?(&command_output?/1)
+  end
+
+  defp command_output?(values) when is_list(values), do: Enum.any?(values, &command_output?/1)
+
+  defp command_output?(value) when is_map(value) do
+    Enum.any?([:command, :argv, :stdout, :stderr, :exit_status], fn key ->
+      not is_nil(field(value, key))
+    end)
+  end
+
+  defp command_output?(_value), do: false
 
   defp text_field(map, key) do
     case field(map, key) do

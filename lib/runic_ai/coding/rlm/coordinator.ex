@@ -17,7 +17,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   alias RunicAI.LLM.Result
 
   @default_model "openai:gpt-5.4-mini"
-  @default_repair_attempts 1
+  @default_repair_attempts 2
   @default_generation_mode :json_text
   @max_conversation_history_messages 12
   @max_conversation_history_chars 16_000
@@ -28,7 +28,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       when is_binary(objective) and is_list(opts) do
     opts = normalize_coordination_opts(opts)
     validation_opts = Keyword.fetch!(opts, :validation_opts)
-    seeded_result = maybe_project_generation_seed(objective, environment, opts, validation_opts)
+    seeded_result = maybe_implementation_seed(objective, environment, opts, validation_opts)
 
     result =
       cond do
@@ -74,7 +74,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     #{Jason.encode!(ProposalNode.allowed_kinds())}
 
     Recipe seeds:
-    #{Jason.encode!(RecipeLibrary.summaries(project_generation?: project_generation_recipe_enabled?(opts)))}
+    #{Jason.encode!(RecipeLibrary.summaries())}
 
     Generic coordination patterns:
     #{Jason.encode!(CoordinationPatterns.prompt_summary())}
@@ -287,12 +287,17 @@ defmodule RunicAI.Coding.RLM.Coordinator do
         end
 
       {:error, error} ->
-        {:error,
-         coordinator_error("RLM coding coordinator could not repair the workflow proposal",
-           stage: :repair_generation,
-           error: error_details(error),
-           previous_errors: Enum.map(errors, &error_details/1)
-         )}
+        repair_generated(
+          objective,
+          environment,
+          opts,
+          validation_opts,
+          model,
+          llm_opts,
+          object,
+          [error | errors],
+          attempts_left - 1
+        )
     end
   end
 
@@ -583,6 +588,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
   defp validate_candidate(candidate, opts, validation_opts, stage) do
     with {:ok, proposal} <- WorkflowProposal.from_input(candidate),
+         proposal <- enrich_mutating_agent_tasks(proposal, opts),
          :ok <- require_node_kinds(proposal, opts) do
       report = WorkflowValidator.validate(proposal, validation_opts)
 
@@ -607,24 +613,102 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     end
   end
 
+  defp enrich_mutating_agent_tasks(%WorkflowProposal{} = proposal, opts) do
+    if mutation_enabled?(opts) do
+      %{proposal | nodes: Enum.map(proposal.nodes, &enrich_mutating_agent_task/1)}
+    else
+      proposal
+    end
+  end
+
+  defp enrich_mutating_agent_task(%ProposalNode{kind: :agent, params: params} = node) do
+    mode = params |> param_value(:mode) |> to_string()
+
+    if mode in ["patch", "verify"] do
+      task =
+        params
+        |> param_value(:task)
+        |> append_empty_workspace_instruction()
+
+      %{node | params: put_param_value(params, :task, task)}
+    else
+      node
+    end
+  end
+
+  defp enrich_mutating_agent_task(node), do: node
+
+  @empty_workspace_instruction """
+
+  Empty-workspace handling:
+  - If the selected workspace is empty or does not contain a suitable existing
+    project, treat that as permission to create the requested project inside
+    the selected workspace or the objective's named subdirectory.
+  - When the objective does not explicitly name a nested project directory,
+    place the generated project root directly at the selected workspace root:
+    root-level manifests such as mix.exs, package.json, pyproject.toml,
+    source directories, tests, and runtime smoke entry points belong at that
+    root. Do not create scratch delivery roots such as tmp/, generated/, app/,
+    demo/, or a duplicate project directory just to hold the answer.
+  - Do not stop solely because there is no existing application to patch.
+  - Do not inspect or edit parent/sibling workspaces to compensate for an empty
+    selected workspace.
+  - Create objective-specific source, tests, and verification evidence instead
+    of leaving a scaffold or repository summary.
+  - Preserve the objective's project identity when naming generated apps,
+    modules, files, tests, and smoke APIs. Do not shorten a multi-word domain
+    noun phrase to a generic subset if the objective names a fuller concept.
+  - If the objective asks for a runtime smoke, expose a concrete non-interactive
+    smoke entry point in the generated project and verify it from the project
+    root before claiming completion.
+  """
+
+  defp append_empty_workspace_instruction(task) when is_binary(task) do
+    if String.contains?(task, "Empty-workspace handling") do
+      task
+    else
+      String.trim(task) <> @empty_workspace_instruction
+    end
+  end
+
+  defp append_empty_workspace_instruction(_task), do: String.trim(@empty_workspace_instruction)
+
+  defp param_value(params, key) when is_map(params),
+    do: Map.get(params, key, Map.get(params, Atom.to_string(key)))
+
+  defp param_value(_params, _key), do: nil
+
+  defp put_param_value(params, key, value) when is_map(params) do
+    params
+    |> Map.delete(Atom.to_string(key))
+    |> Map.put(key, value)
+  end
+
   defp fallback_proposal(objective, environment, opts) do
-    RecipeLibrary.proposal(Keyword.get(opts, :fallback_recipe, :repo_qa), objective,
-      sources: source_refs(environment)
-    )
+    case Keyword.fetch(opts, :fallback_recipe) do
+      {:ok, recipe} ->
+        {:ok, RecipeLibrary.proposal(recipe, objective, sources: source_refs(environment))}
+
+      :error ->
+        {:error, explicit_fallback_required_error()}
+    end
   end
 
   defp maybe_fallback(objective, environment, opts, validation_opts, error) do
     if fallback_enabled?(opts) do
-      fallback =
-        objective
-        |> fallback_proposal(environment, opts)
-        |> validate_candidate(opts, validation_opts, :fallback)
+      case fallback_proposal(objective, environment, opts) do
+        {:ok, proposal} ->
+          proposal
+          |> validate_candidate(opts, validation_opts, :fallback)
+          |> case do
+            {:ok, proposal, report} ->
+              {:ok, proposal, report}
 
-      case fallback do
-        {:ok, proposal, report} ->
-          {:ok, proposal, report}
+            {:error, fallback_error} ->
+              {:error, proposal_failure_error(:fallback, [fallback_error, error])}
+          end
 
-        {:error, fallback_error} ->
+        {:error, %Error{} = fallback_error} ->
           {:error, proposal_failure_error(:fallback, [fallback_error, error])}
       end
     else
@@ -706,11 +790,11 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   defp normalize_candidate_nodes(nodes) when is_list(nodes), do: nodes
   defp normalize_candidate_nodes(_nodes), do: []
 
-  defp maybe_project_generation_seed(objective, environment, opts, validation_opts) do
-    if project_generation_seed_enabled?(objective, opts) do
+  defp maybe_implementation_seed(objective, environment, opts, validation_opts) do
+    if implementation_seed_enabled?(objective, opts) do
       objective_contract = ObjectiveContract.infer!(objective)
 
-      RecipeLibrary.proposal(:project_generation, objective,
+      RecipeLibrary.proposal(:implementation, objective,
         sources: source_refs(environment),
         objective_contract: objective_contract
       )
@@ -718,51 +802,26 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     end
   end
 
-  defp project_generation_seed_enabled?(objective, opts) do
-    project_generation_recipe_enabled?(opts) and
+  defp implementation_seed_enabled?(objective, opts) do
+    implementation_recipe_enabled?(opts) and
       mutation_enabled?(opts) and
-      project_generation_objective?(objective)
+      implementation_objective?(objective)
   end
 
-  defp project_generation_recipe_enabled?(opts) do
-    Keyword.get(opts, :seed_project_generation?, false)
+  defp implementation_recipe_enabled?(opts) do
+    Keyword.get(opts, :seed_implementation?, Keyword.get(opts, :seed_project_generation?, false))
   end
 
-  defp project_generation_objective?(objective) when is_binary(objective) do
+  defp implementation_objective?(objective) when is_binary(objective) do
     objective = String.downcase(objective)
 
-    build_cue? =
-      Regex.match?(
-        ~r/(^|[^a-z0-9_])(build|create|generate|prototype|implement)([^a-z0-9_]|$)/,
-        objective
-      )
-
-    project_cue? =
-      Enum.any?(
-        [
-          "proof of concept",
-          "platform",
-          "service",
-          "engine",
-          "module",
-          "project",
-          "app",
-          "runtime smoke",
-          "include tests",
-          "elixir"
-        ],
-        &String.contains?(objective, &1)
-      )
-
-    existing_app_adaptation? =
-      String.contains?(objective, "existing project") or
-        String.contains?(objective, "inspect the existing project") or
-        String.contains?(objective, "existing app")
-
-    (build_cue? and project_cue?) or existing_app_adaptation?
+    Regex.match?(
+      ~r/(^|[^a-z0-9_])(add|build|change|create|fix|generate|implement|modify|patch|prototype|repair|update|write)([^a-z0-9_]|$)/,
+      objective
+    )
   end
 
-  defp project_generation_objective?(_objective), do: false
+  defp implementation_objective?(_objective), do: false
 
   defp policy_summary(opts) do
     validation_opts = Keyword.get(opts, :validation_opts, [])
@@ -818,7 +877,14 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   end
 
   defp fallback_enabled?(opts) do
-    Keyword.get(opts, :fallback?, not mutation_enabled?(opts))
+    Keyword.get(opts, :fallback?, false)
+  end
+
+  defp explicit_fallback_required_error do
+    coordinator_error("RLM coding fallback requires an explicit fallback_recipe",
+      stage: :fallback,
+      reason: :missing_fallback_recipe
+    )
   end
 
   defp mutation_enabled?(opts) do

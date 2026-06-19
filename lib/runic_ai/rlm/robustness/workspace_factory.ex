@@ -15,7 +15,7 @@ defmodule RunicAI.RLM.Robustness.WorkspaceFactory do
       |> Path.expand()
 
     with :ok <- prepare_root(root),
-         :ok <- write_mix_project(root, scenario),
+         :ok <- maybe_write_mix_project(root, scenario),
          :ok <- maybe_seed_existing(root, scenario) do
       {:ok,
        %{
@@ -75,6 +75,20 @@ defmodule RunicAI.RLM.Robustness.WorkspaceFactory do
     :ok
   end
 
+  defp maybe_write_mix_project(_root, %ProjectScenario{workspace_factory: :empty_workspace}) do
+    :ok
+  end
+
+  defp maybe_write_mix_project(_root, %ProjectScenario{
+         workspace_factory: :research_report_workspace
+       }) do
+    :ok
+  end
+
+  defp maybe_write_mix_project(root, %ProjectScenario{} = scenario) do
+    write_mix_project(root, scenario)
+  end
+
   defp maybe_seed_existing(root, %ProjectScenario{workspace_factory: :seeded_mix_project}) do
     File.mkdir_p!(Path.join(root, "lib/existing_app"))
 
@@ -92,6 +106,62 @@ defmodule RunicAI.RLM.Robustness.WorkspaceFactory do
 
       test "lists seeded users" do
         assert [%{email: "ada@example.test"}] = ExistingApp.Accounts.list_users()
+      end
+    end
+    """)
+
+    :ok
+  end
+
+  defp maybe_seed_existing(root, %ProjectScenario{
+         workspace_factory: :research_report_workspace
+       }) do
+    File.mkdir_p!(Path.join(root, "notes"))
+
+    File.write!(Path.join(root, "notes/incidents.md"), """
+    # Incident Notes
+
+    - 2026-06-10: Dispatcher import failed silently for malformed rows.
+    - 2026-06-12: Two customers reported duplicate schedule notifications.
+    - 2026-06-14: Support manually reconciled priority mismatches after launch.
+    """)
+
+    File.write!(Path.join(root, "notes/roadmap.md"), """
+    # Roadmap
+
+    - Ship schedule import automation before the pilot.
+    - Add idempotency for customer notifications.
+    - Publish a rollout checklist with owner and rollback columns.
+    """)
+
+    File.write!(Path.join(root, "README.md"), """
+    # Delivery Workspace
+
+    Use the notes directory as the source of truth for delivery risk reporting.
+    """)
+
+    :ok
+  end
+
+  defp maybe_seed_existing(root, %ProjectScenario{workspace_factory: :refactor_mix_project}) do
+    File.write!(Path.join(root, "lib/event_normalizer.ex"), """
+    defmodule EventNormalizer do
+      @moduledoc false
+
+      def normalize(raw) when is_binary(raw) do
+        [type, id, timestamp] = String.split(raw, ",")
+        %{type: String.to_atom(type), id: String.trim(id), timestamp: String.trim(timestamp)}
+      end
+    end
+    """)
+
+    File.write!(Path.join(root, "test/event_normalizer_test.exs"), """
+    defmodule EventNormalizerTest do
+      use ExUnit.Case, async: true
+
+      test "normalizes a comma separated event" do
+        assert %{type: :created, id: "A-1", timestamp: "2026-06-18"} =
+                 EventNormalizer.normalize("created,A-1,2026-06-18")
       end
     end
     """)

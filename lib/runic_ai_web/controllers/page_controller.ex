@@ -12,6 +12,15 @@ defmodule RunicAIWeb.PageController do
     text(conn, "ok")
   end
 
+  def well_known_unavailable(conn, _params) do
+    conn
+    |> put_status(:not_found)
+    |> json(%{
+      error: "not_found",
+      detail: "RunicAI Workbench does not expose OAuth authorization metadata on this route."
+    })
+  end
+
   defp runtime_status do
     if Code.ensure_loaded?(RunicAI.Runtime), do: "loaded", else: "missing"
   end
