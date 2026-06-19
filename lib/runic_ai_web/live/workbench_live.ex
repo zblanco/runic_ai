@@ -2471,8 +2471,7 @@ defmodule RunicAIWeb.WorkbenchLive do
         phx-click="close_command_palette"
         aria-label="Close command palette"
         class="absolute inset-0 cursor-default"
-      >
-      </button>
+      ></button>
       <section class="runic-command-palette runic-frost relative z-[1] mx-auto w-full max-w-[680px] overflow-hidden rounded-[18px] border border-rune-gold/20 bg-rune-bg/95 shadow-[0_30px_120px_rgba(0,0,0,0.58)]">
         <div class="flex items-center gap-3 border-b border-rune-text/10 px-4 py-3">
           <.icon name="hero-command-line" class="size-5 text-rune-gold" />

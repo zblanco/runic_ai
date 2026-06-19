@@ -26,9 +26,9 @@ defmodule RunicSandbox.MixProject do
   defp deps do
     [
       {:jason, "~> 1.2"},
-      {:req, "~> 0.5"},
+      {:req, "~> 0.6"},
       {:just_bash, "~> 0.3", optional: true},
-      {:lua, "~> 0.4", optional: true}
+      {:lua, "~> 1.0.0-rc.3", optional: true}
     ]
   end
 

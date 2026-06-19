@@ -37,14 +37,14 @@ defmodule RunicAI.MixProject do
       {:runic_sandbox, path: "packages/runic_sandbox"},
       {:runic, "~> 0.1.0-alpha.8"},
       {:req_llm, "~> 1.9"},
-      {:ecto_sql, "~> 3.13"},
-      {:ecto_sqlite3, "~> 0.22"},
+      {:ecto_sql, "~> 3.14"},
+      {:ecto_sqlite3, "~> 0.24"},
       {:phoenix, "~> 1.8.6"},
       {:phoenix_html, "~> 4.1"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
-      {:phoenix_live_view, "~> 1.1"},
+      {:phoenix_live_view, "~> 1.2"},
       {:lazy_html, ">= 0.1.0", only: :test},
-      {:mdex, "~> 0.12.2"},
+      {:mdex, "~> 0.13"},
       {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.3", runtime: Mix.env() == :dev},
       {:heroicons,
@@ -59,14 +59,14 @@ defmodule RunicAI.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2"},
       {:bandit, "~> 1.5"},
-      {:ex_ratatui, "~> 0.8"},
-      {:rustler, "~> 0.37.3", runtime: false},
+      {:ex_ratatui, "~> 0.11"},
+      {:rustler, "~> 0.38", runtime: false},
       {:owl, "~> 0.13"},
       {:bunt, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:just_bash, "~> 0.3", only: [:dev, :test], optional: true},
-      {:lua, "~> 0.4", only: [:dev, :test], optional: true},
-      {:tidewave, "~> 0.5", only: :dev}
+      {:lua, "~> 1.0.0-rc.3", only: [:dev, :test], optional: true},
+      {:tidewave, "~> 0.6", only: :dev}
     ]
   end
 
