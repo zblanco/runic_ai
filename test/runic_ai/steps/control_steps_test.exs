@@ -211,6 +211,67 @@ defmodule RunicAI.Steps.ControlStepsTest do
              )
   end
 
+  test "controlled generate annotates terminal fallback errors with their route" do
+    client = fn model, _prompt, _opts ->
+      {:error, Error.provider("#{model} failed", details: %{requested_model: model})}
+    end
+
+    state = State.new!(system: "You are helpful")
+
+    turn_request =
+      TurnRequest.new!(state,
+        input_message: "Hello",
+        model: "test:primary",
+        client: client
+      )
+
+    prompt = AssembleTurnPrompt.build_prompt(turn_request)
+
+    assert {:error, %Error{} = error} =
+             GenerateTurnControlled.generate(turn_request, prompt,
+               fallback_policy: [alternates: [%{model: "test:fallback"}]]
+             )
+
+    assert error.details.requested_model == "test:fallback"
+    assert error.details.fallback?
+    assert error.details.primary_model == "test:primary"
+    assert error.details.fallback_model == "test:fallback"
+  end
+
+  test "controlled generate does not change models for permanent account failures" do
+    {:ok, models} = Agent.start_link(fn -> [] end)
+
+    client = fn model, _prompt, _opts ->
+      Agent.update(models, &(&1 ++ [model]))
+
+      {:error,
+       Error.provider("generation failed",
+         details: %{
+           requested_model: model,
+           status: 429,
+           reason_message: "insufficient_quota: credit balance exhausted"
+         }
+       )}
+    end
+
+    turn_request =
+      State.new!(system: "You are helpful")
+      |> TurnRequest.new!(
+        input_message: "Hello",
+        model: "test:primary",
+        client: client
+      )
+
+    prompt = AssembleTurnPrompt.build_prompt(turn_request)
+
+    assert {:error, %Error{}} =
+             GenerateTurnControlled.generate(turn_request, prompt,
+               fallback_policy: [alternates: [%{model: "test:fallback"}]]
+             )
+
+    assert Agent.get(models, & &1) == ["test:primary"]
+  end
+
   test "controlled tool execution falls back when batch results contain errors" do
     failing_tool =
       Definition.new!(
@@ -275,5 +336,106 @@ defmodule RunicAI.Steps.ControlStepsTest do
              )
 
     assert result.message.content == "fallback success"
+  end
+
+  test "controlled generate retries tool-free required turns then falls back to another model" do
+    {:ok, calls} = Agent.start_link(fn -> %{} end)
+
+    fallback_response =
+      TestClient.tool_response([
+        TestClient.tool_call("apply_patch", %{
+          operations: [%{op: "create", path: "lib/demo.ex", content: "demo"}]
+        })
+      ])
+
+    client = fn model, _prompt, _opts ->
+      Agent.update(calls, fn state ->
+        Map.update(state, model, 1, fn count -> count + 1 end)
+      end)
+
+      case model do
+        "test:primary" -> {:ok, TestClient.result("I cannot make the requested change.")}
+        "test:fallback" -> {:ok, fallback_response}
+      end
+    end
+
+    turn_request =
+      State.new!(system: "You are a coding agent")
+      |> TurnRequest.new!(
+        input_message: "Create the module",
+        model: "test:primary",
+        client: client,
+        tool_choice: :required
+      )
+
+    prompt = AssembleTurnPrompt.build_prompt(turn_request)
+
+    assert {:ok, result} =
+             GenerateTurnControlled.generate(turn_request, prompt,
+               retry_policy: [max_attempts: 2, backoff: 0],
+               fallback_policy: [alternates: [%{model: "test:fallback"}]]
+             )
+
+    assert Agent.get(calls, & &1) == %{"test:fallback" => 1, "test:primary" => 2}
+    assert result.finish_reason == :tool_calls
+    assert result.metadata.generation_evidence.fallback?
+    assert result.metadata.generation_evidence.primary_model == "test:primary"
+    assert result.metadata.generation_evidence.fallback_model == "test:fallback"
+    assert result.metadata.generation_evidence.tool_call_count == 1
+  end
+
+  test "controlled generate accepts a normal tool-free answer when tools are optional" do
+    client = fn _model, _prompt, _opts -> {:ok, TestClient.result("Done")} end
+
+    turn_request =
+      State.new!(system: "You are helpful")
+      |> TurnRequest.new!(
+        input_message: "Answer normally",
+        model: "test:primary",
+        client: client
+      )
+
+    prompt = AssembleTurnPrompt.build_prompt(turn_request)
+
+    assert {:ok, result} =
+             GenerateTurnControlled.generate(turn_request, prompt,
+               fallback_policy: [alternates: ["test:fallback"]]
+             )
+
+    assert result.message.content == "Done"
+    refute Map.get(result.metadata, :generation_evidence, %{})[:fallback?]
+  end
+
+  test "controlled generate accepts a final answer after a required tool was already observed" do
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+    client = fn _model, _prompt, _opts ->
+      Agent.update(calls, &(&1 + 1))
+      {:ok, TestClient.result("Verification passed")}
+    end
+
+    state =
+      State.new!(
+        system: "You are a coding agent",
+        messages: [RunicAI.Message.new!(:tool, "command passed", name: "run_tests")]
+      )
+
+    turn_request =
+      TurnRequest.new!(state,
+        model: "test:primary",
+        client: client,
+        tool_choice: :required
+      )
+
+    prompt = AssembleTurnPrompt.build_prompt(turn_request)
+
+    assert {:ok, result} =
+             GenerateTurnControlled.generate(turn_request, prompt,
+               retry_policy: [max_attempts: 3, backoff: 0],
+               fallback_policy: [alternates: ["test:fallback"]]
+             )
+
+    assert result.message.content == "Verification passed"
+    assert Agent.get(calls, & &1) == 1
   end
 end

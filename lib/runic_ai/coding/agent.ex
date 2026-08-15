@@ -21,6 +21,7 @@ defmodule RunicAI.Coding.Agent do
   alias RunicAI.Coding.Tools
   alias RunicAI.Coding.Workspace
   alias RunicAI.Control.BudgetPolicy
+  alias RunicAI.LLM.Retry, as: LLMRetry
   alias RunicAI.Recipes.IntegratedToolAgent
   alias RunicAI.Tool.Registry
 
@@ -365,7 +366,8 @@ defmodule RunicAI.Coding.Agent do
       execution_policy: Keyword.get(opts, :execution_policy),
       tool_planner: Keyword.get(opts, :tool_planner),
       budget_policy: budget_policy_from_opts(recipe, opts),
-      generation_retry_policy: Keyword.get(opts, :generation_retry_policy),
+      generation_retry_policy:
+        Keyword.get(opts, :generation_retry_policy, LLMRetry.default_policy()),
       generation_fallback_policy: Keyword.get(opts, :generation_fallback_policy),
       tool_retry_policy: Keyword.get(opts, :tool_retry_policy),
       tool_fallback_policy: Keyword.get(opts, :tool_fallback_policy),

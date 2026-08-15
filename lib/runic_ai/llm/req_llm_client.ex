@@ -7,6 +7,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
 
   alias RunicAI.Error
   alias RunicAI.LLM.Result
+  alias RunicAI.LLM.Retry
   alias RunicAI.Prompt
 
   @impl true
@@ -15,13 +16,19 @@ defmodule RunicAI.LLM.ReqLLMClient do
     |> ReqLLM.generate_text(normalize_prompt(prompt), opts)
     |> case do
       {:ok, response} ->
-        Result.from_req_llm_response(response)
+        Result.from_req_llm_response(response,
+          requested_model: model,
+          tool_choice: Keyword.get(opts, :tool_choice)
+        )
 
       {:error, reason} ->
+        details = provider_error_details(reason) |> Map.put(:requested_model, model)
+
         {:error,
          Error.provider("ReqLLM generate_text failed",
            source: __MODULE__,
-           details: provider_error_details(reason)
+           details: details,
+           retryable?: Retry.retryable_provider_error?(reason)
          )}
     end
   rescue
@@ -38,10 +45,13 @@ defmodule RunicAI.LLM.ReqLLMClient do
         {:ok, stream_response}
 
       {:error, reason} ->
+        details = provider_error_details(reason)
+
         {:error,
          Error.provider("ReqLLM stream_text failed",
            source: __MODULE__,
-           details: provider_error_details(reason)
+           details: details,
+           retryable?: Retry.retryable_provider_error?(reason)
          )}
     end
   rescue
@@ -68,10 +78,13 @@ defmodule RunicAI.LLM.ReqLLMClient do
          )}
 
       {:error, reason} ->
+        details = provider_error_details(reason)
+
         {:error,
          Error.provider("ReqLLM generate_object failed",
            source: __MODULE__,
-           details: provider_error_details(reason)
+           details: details,
+           retryable?: Retry.retryable_provider_error?(reason)
          )}
     end
   rescue
@@ -88,6 +101,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
       reason_message: reason_message(reason)
     }
     |> maybe_put(:status, field(reason, :status))
+    |> maybe_put(:retry_after_ms, Retry.retry_after_ms(reason))
     |> maybe_put(:response_body_preview, response_body_preview(field(reason, :response_body)))
   end
 

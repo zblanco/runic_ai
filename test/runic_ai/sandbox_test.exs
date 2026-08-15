@@ -1,12 +1,12 @@
 defmodule RunicAI.SandboxTest do
   use ExUnit.Case, async: true
 
-  alias RunicSandbox, as: Sandbox
-  alias RunicSandbox.ExecutionRequest
-  alias RunicSandbox.ExecutionResult
-  alias RunicSandbox.Manager
-  alias RunicSandbox.Policy
-  alias RunicSandbox.Profile
+  alias LitterBox, as: Sandbox
+  alias LitterBox.ExecutionRequest
+  alias LitterBox.ExecutionResult
+  alias LitterBox.Manager
+  alias LitterBox.Policy
+  alias LitterBox.Profile
 
   test "validates sandbox request and result contracts" do
     assert {:ok, request} =
@@ -140,11 +140,11 @@ defmodule RunicAI.SandboxTest do
     assert result.stdout == "supervised-sandbox\n"
   end
 
-  test "RunicSandbox facade supports extraction-style supervision and execution" do
-    name = :"runic_sandbox_#{System.unique_integer([:positive])}"
+  test "LitterBox facade supports extraction-style supervision and execution" do
+    name = :"litter_box_#{System.unique_integer([:positive])}"
 
     start_supervised!(
-      {RunicSandbox,
+      {LitterBox,
        name: name,
        sandboxes: [
          local_code: [
@@ -156,11 +156,11 @@ defmodule RunicAI.SandboxTest do
        ]}
     )
 
-    assert {:ok, status} = RunicSandbox.status(server: name)
+    assert {:ok, status} = LitterBox.status(server: name)
     assert status.sandboxes.local_code.backend == :just_bash
 
     assert {:ok, result} =
-             RunicSandbox.exec(
+             LitterBox.exec(
                %{
                  sandbox: :local_code,
                  runtime: :bash,

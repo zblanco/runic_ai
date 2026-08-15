@@ -140,7 +140,7 @@ defmodule RunicAI.Control.ControlContractsTest do
     assert {:ok, %RetryPolicy{max_attempts: 3}} =
              RetryPolicy.new(
                max_attempts: 3,
-               backoff: fn attempt -> attempt end,
+               backoff: fn attempt, _outcome -> attempt end,
                retry_if: &match?({:error, _}, &1)
              )
 

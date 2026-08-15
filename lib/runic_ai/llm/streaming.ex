@@ -13,7 +13,6 @@ defmodule RunicAI.LLM.Streaming do
   alias RunicAI.LLM
   alias RunicAI.LLM.Request
   alias RunicAI.LLM.Result
-  alias RunicAI.Message
 
   @control_keys [
     :stream?,
@@ -24,6 +23,8 @@ defmodule RunicAI.LLM.Streaming do
     :session_id,
     :agent,
     :message_kind,
+    :component_id,
+    :component_type,
     :source_step,
     :workflow_node,
     :runnable_id,
@@ -104,43 +105,36 @@ defmodule RunicAI.LLM.Streaming do
     identity = stream_identity(control)
     chunk_size = chunk_size(control)
 
-    acc =
-      stream_response.stream
-      |> Stream.chunk_every(chunk_size)
-      |> Enum.reduce(%{sequence: 0, content: []}, fn chunks, acc ->
-        chunks
-        |> normalize_batch()
-        |> Enum.reduce(acc, fn {channel, text, payload}, acc ->
-          emit_stream_chunk(control, identity, acc.sequence + 1, channel, text, payload)
+    {chunks, sequence} = consume_stream(stream_response.stream, chunk_size, control, identity)
 
-          content =
-            if channel == "content" do
-              [text | acc.content]
-            else
-              acc.content
-            end
+    with {:ok, response} <- materialize_stream_response(stream_response, chunks),
+         {:ok, result} <-
+           Result.from_req_llm_response(response,
+             requested_model: request.model,
+             tool_choice: Keyword.get(request.opts, :tool_choice)
+           ) do
+      evidence = Result.evidence(result)
 
-          %{acc | sequence: acc.sequence + 1, content: content}
-        end)
-      end)
+      emit_stream_completed(
+        control,
+        identity,
+        sequence + 1,
+        Result.text(result),
+        result.finish_reason,
+        evidence
+      )
 
-    text =
-      acc.content
-      |> Enum.reverse()
-      |> Enum.join("")
-
-    finish_reason = finish_reason(stream_response)
-    emit_stream_completed(control, identity, acc.sequence + 1, text, finish_reason)
-
-    Result.new(Message.new!(:assistant, text),
-      finish_reason: finish_reason,
-      raw: stream_response,
-      metadata: %{
-        stream_id: identity.stream_id,
-        message_id: identity.message_id,
-        model: request.model
-      }
-    )
+      {:ok,
+       %{
+         result
+         | metadata:
+             Map.merge(result.metadata, %{
+               stream_id: identity.stream_id,
+               message_id: identity.message_id,
+               model: request.model
+             })
+       }}
+    end
   rescue
     exception ->
       error =
@@ -151,7 +145,51 @@ defmodule RunicAI.LLM.Streaming do
 
       emit_stream_failure(control, error)
       {:error, error}
+  after
+    stop_metadata_handle(stream_response.metadata_handle)
   end
+
+  defp consume_stream(stream, chunk_size, control, identity) do
+    stream
+    |> Stream.chunk_every(chunk_size)
+    |> Enum.reduce({[], 0}, fn chunks, {all_chunks, sequence} ->
+      sequence =
+        chunks
+        |> normalize_batch()
+        |> Enum.reduce(sequence, fn {channel, text, payload}, sequence ->
+          emit_stream_chunk(control, identity, sequence + 1, channel, text, payload)
+          sequence + 1
+        end)
+
+      {Enum.reverse(chunks, all_chunks), sequence}
+    end)
+    |> then(fn {chunks, sequence} -> {Enum.reverse(chunks), sequence} end)
+  end
+
+  defp materialize_stream_response(stream_response, chunks) do
+    metadata = ReqLLM.StreamResponse.MetadataHandle.await(stream_response.metadata_handle)
+    {output_config, metadata} = ReqLLM.Output.Validation.pop_stream_config(metadata)
+
+    case metadata do
+      %{error: reason} ->
+        {:error, reason}
+
+      _metadata ->
+        stream_response.model
+        |> ReqLLM.Provider.ResponseBuilder.for_model()
+        |> apply(:build_response, [
+          chunks,
+          metadata,
+          [context: stream_response.context, model: stream_response.model]
+        ])
+        |> ReqLLM.Output.Validation.finalize_stream_response(output_config)
+    end
+  end
+
+  defp stop_metadata_handle(handle) when is_pid(handle),
+    do: ReqLLM.StreamResponse.MetadataHandle.stop(handle)
+
+  defp stop_metadata_handle(_handle), do: :ok
 
   defp normalize_batch(chunks) do
     parts = Enum.map(chunks, &chunk_part/1)
@@ -219,7 +257,14 @@ defmodule RunicAI.LLM.Streaming do
     emit(control, stream_stage(:llm_stream_chunk, data, control))
   end
 
-  defp emit_stream_completed(control, identity, sequence, content, finish_reason) do
+  defp emit_stream_completed(
+         control,
+         identity,
+         sequence,
+         content,
+         finish_reason,
+         generation_evidence
+       ) do
     data =
       base_stream_data(control, identity)
       |> Map.merge(%{
@@ -228,6 +273,7 @@ defmodule RunicAI.LLM.Streaming do
         channel: "content",
         sequence: sequence,
         finish_reason: finish_reason,
+        generation_evidence: generation_evidence,
         stream_complete: true
       })
 
@@ -304,16 +350,6 @@ defmodule RunicAI.LLM.Streaming do
       value when is_integer(value) and value > 0 -> value
       _other -> @default_chunk_size
     end
-  end
-
-  defp finish_reason(stream_response) do
-    if function_exported?(ReqLLM.StreamResponse, :finish_reason, 1) do
-      ReqLLM.StreamResponse.finish_reason(stream_response) || :stop
-    else
-      :stop
-    end
-  rescue
-    _exception -> :stop
   end
 
   defp stream_status(:llm_stream_chunk), do: :running

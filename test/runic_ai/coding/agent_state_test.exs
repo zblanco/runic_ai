@@ -46,4 +46,18 @@ defmodule RunicAI.Coding.AgentStateTest do
              }
            ] = summary.rendered_diagrams
   end
+
+  test "projects bounded provider generation evidence from session control" do
+    evidence = %{
+      requested_model: "openai:gpt-5.6-terra",
+      finish_reason: :stop,
+      tool_choice: :required,
+      tool_call_count: 0,
+      usage: %{total_tokens: 42}
+    }
+
+    session = SessionState.new!("coding", control: %{generation_evidence: [evidence]})
+
+    assert AgentState.summary(session).generation_evidence == [evidence]
+  end
 end

@@ -27,6 +27,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   alias RunicAI.Coding.RLM.WorkflowValidator
   alias RunicAI.Coding.Tools
   alias RunicAI.Coding.Workspace
+  alias RunicAI.Control.FallbackPolicy
   alias RunicAI.Error
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
@@ -40,8 +41,9 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   @default_model "openai:gpt-5.4-mini"
   @default_child_runtime_ms 120_000
   @child_agent_cleanup_grace_ms 5_000
-  @default_child_noop_repair_attempts 1
+  @default_child_noop_repair_attempts 2
   @default_child_patch_repair_attempts 1
+  @default_child_auto_review_limit 20
   @min_default_child_runtime_ms 250
   @child_runtime_completion_reserve_ms 2_000
   @default_child_runtime_by_mode %{
@@ -49,7 +51,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     explain_repo: 20_000,
     review: 20_000,
     triage_bug: 20_000,
-    verify: 30_000,
+    verify: 120_000,
     write_tests: 45_000,
     fix_ci: 45_000,
     patch: 90_000
@@ -249,11 +251,16 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
         status: :started
       })
 
+    before_snapshot = maybe_snapshot_node_workspace(node, context.workspace, opts)
+
     with {:ok, output, episode} <- dispatch_node(node, context, opts) do
+      changed_paths = node_changed_paths(before_snapshot, context.workspace, opts)
+
       context =
         context
         |> put_in([:outputs, node.id], output)
         |> record_special_output(node, output)
+        |> record_node_changed_paths(changed_paths)
         |> update_in([:episodes], &append_episode(&1, episode))
         |> update_in(
           [:trace],
@@ -293,6 +300,28 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
 
         {:error, error}
     end
+  end
+
+  defp maybe_snapshot_node_workspace(%{kind: kind}, workspace, opts)
+       when kind in [:command, :script, :tool] do
+    WorkspaceDelta.snapshot(workspace, child_workspace_delta_opts(opts))
+  end
+
+  defp maybe_snapshot_node_workspace(_node, _workspace, _opts), do: nil
+
+  defp node_changed_paths(nil, _workspace, _opts), do: []
+
+  defp node_changed_paths(before_snapshot, workspace, opts) do
+    workspace
+    |> WorkspaceDelta.snapshot(child_workspace_delta_opts(opts))
+    |> then(&WorkspaceDelta.diff(before_snapshot, &1))
+    |> WorkspaceDelta.changed_paths()
+  end
+
+  defp record_node_changed_paths(context, []), do: context
+
+  defp record_node_changed_paths(context, changed_paths) do
+    update_in(context, [:changed_files], &Enum.uniq(List.wrap(&1) ++ changed_paths))
   end
 
   defp dispatch_node(%{kind: :deterministic_step} = node, context, _opts) do
@@ -427,8 +456,11 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
         }
 
     with {:ok, patch_set} <- maybe_review_rlm_node(:edit, node, patch_set, context, opts),
-         {:ok, output} <- EditPatchSet.apply(context.workspace, patch_set) do
-      status = if output.status == :ok, do: :satisfied, else: :failed
+         {:ok, output} <-
+           EditPatchSet.apply(context.workspace, patch_set,
+             replay_context: Keyword.get(opts, :edit_replay_context)
+           ) do
+      status = if output.status in [:ok, :reconciled], do: :satisfied, else: :failed
       episode(node, output, status)
     end
   end
@@ -1270,15 +1302,53 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
     |> Enum.take(20)
   end
 
-  defp agent_opts(_mode, opts) do
+  defp agent_opts(mode, opts) do
+    agent_llm_opts = Keyword.get(opts, :agent_llm_opts) || Keyword.get(opts, :llm_opts, [])
+    primary_model = Keyword.get(opts, :agent_model, Keyword.get(opts, :model, @default_model))
+
     opts
     |> Keyword.get(:agent_opts, [])
     |> Keyword.merge(
-      model: Keyword.get(opts, :model, @default_model),
+      model: primary_model,
       client: Keyword.get(opts, :client),
+      llm_opts: agent_llm_opts,
       review_gates?: Keyword.get(opts, :agent_review_gates?, true)
     )
+    |> maybe_put_generation_fallback(primary_model, opts)
+    |> Keyword.put_new(:tool_requirement, child_tool_requirement(mode))
+    |> Keyword.put_new(:objective_gate?, mode in [:verify, "verify"])
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp child_tool_requirement(mode) when mode in [:patch, "patch", :verify, "verify"],
+    do: :required
+
+  defp child_tool_requirement(_mode), do: :optional
+
+  defp maybe_put_generation_fallback(agent_opts, primary_model, opts) do
+    fallback_model = Keyword.get(opts, :agent_fallback_model)
+
+    if is_binary(fallback_model) and fallback_model != "" and fallback_model != primary_model do
+      policy =
+        FallbackPolicy.new!(
+          alternates: [
+            %{
+              model: fallback_model,
+              llm_opts: Keyword.get(opts, :agent_fallback_llm_opts, [])
+            }
+          ],
+          metadata: %{
+            source: __MODULE__,
+            strategy: :required_tool_model_fallback,
+            primary_model: primary_model,
+            fallback_model: fallback_model
+          }
+        )
+
+      Keyword.put_new(agent_opts, :generation_fallback_policy, policy)
+    else
+      agent_opts
+    end
   end
 
   defp maybe_put_child_runtime(agent_opts, nil), do: agent_opts
@@ -1432,6 +1502,7 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
             elapsed_ms: elapsed_ms,
             changed_files: Map.get(summary, :changed_files, []),
             tools_used: Map.get(summary, :tools_used, []),
+            generation_evidence: Map.get(summary, :generation_evidence, []),
             objective_status: Map.get(summary, :objective_status),
             child_noop_repair_attempts: noop_repair_attempts,
             child_patch_repair_attempts: patch_repair_attempts
@@ -1649,11 +1720,34 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
   end
 
   defp repair_noop_child?(workflow, delta, mode, opts) do
+    summary = StandardAgent.summary(workflow)
+
     child_noop_repair_enabled?(mode, opts) and
       WorkspaceDelta.changed_paths(delta) == [] and
       is_nil(StandardAgent.latest_review_request(workflow)) and
-      summary_no_changed_files?(StandardAgent.summary(workflow))
+      summary_no_changed_files?(summary) and
+      not unrecoverable_generation_error?(summary)
   end
+
+  defp unrecoverable_generation_error?(summary) when is_map(summary) do
+    summary
+    |> Map.get(:generation_evidence, [])
+    |> List.wrap()
+    |> List.last()
+    |> case do
+      evidence when is_map(evidence) ->
+        evidence_field(evidence, :error_kind) in [:provider, "provider"] and
+          evidence_field(evidence, :retryable?) not in [true, "true"]
+
+      _other ->
+        false
+    end
+  end
+
+  defp unrecoverable_generation_error?(_summary), do: false
+
+  defp evidence_field(evidence, key),
+    do: Map.get(evidence, key) || Map.get(evidence, Atom.to_string(key))
 
   defp child_noop_repair_enabled?(mode, opts) when mode in [:patch, "patch"] do
     child_noop_repair_attempts(opts) > 0
@@ -1848,7 +1942,8 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
           task,
           decider,
           opts,
-          Keyword.get(opts, :child_auto_review_limit, 3)
+          Keyword.get(opts, :child_auto_review_limit, @default_child_auto_review_limit),
+          MapSet.new()
         )
 
       _other ->
@@ -1864,39 +1959,64 @@ defmodule RunicAI.Coding.RLM.WorkflowCompiler do
          _task,
          _decider,
          _opts,
-         limit
+         limit,
+         _reviewed_keys
        )
        when limit <= 0,
        do: workflow
 
-  defp auto_review_child_workflow(workflow, node, mode, workspace, task, decider, opts, limit) do
+  defp auto_review_child_workflow(
+         workflow,
+         node,
+         mode,
+         workspace,
+         task,
+         decider,
+         opts,
+         limit,
+         reviewed_keys
+       ) do
     case StandardAgent.latest_review_request(workflow) do
       %ReviewRequest{} = request ->
-        context = %{
-          child_agent?: true,
-          node_id: node.id,
-          node_kind: node.kind,
-          mode: mode,
-          workspace_root: workspace.root,
-          task: task
-        }
+        if MapSet.member?(reviewed_keys, request.resume_key) do
+          workflow
+        else
+          context = %{
+            child_agent?: true,
+            node_id: node.id,
+            node_kind: node.kind,
+            mode: mode,
+            workspace_root: workspace.root,
+            task: task
+          }
 
-        case decider.(request, context) do
-          {:ok, %ReviewDecision{status: status} = decision} when status in [:approved, :edited] ->
-            emit_node_stage(opts, :child_agent_review_decided, :ok, %{
-              node_id: node.id,
-              kind: node.kind,
-              mode: mode,
-              resume_key: request.resume_key,
-              decision_status: decision.status
-            })
+          case decider.(request, context) do
+            {:ok, %ReviewDecision{status: status} = decision}
+            when status in [:approved, :edited] ->
+              emit_node_stage(opts, :child_agent_review_decided, :ok, %{
+                node_id: node.id,
+                kind: node.kind,
+                mode: mode,
+                resume_key: request.resume_key,
+                decision_status: decision.status
+              })
 
-            workflow
-            |> Workflow.react_until_satisfied(%{agent_id: "coding", review_decision: decision})
-            |> auto_review_child_workflow(node, mode, workspace, task, decider, opts, limit - 1)
+              workflow
+              |> Workflow.react_until_satisfied(%{agent_id: "coding", review_decision: decision})
+              |> auto_review_child_workflow(
+                node,
+                mode,
+                workspace,
+                task,
+                decider,
+                opts,
+                limit - 1,
+                MapSet.put(reviewed_keys, request.resume_key)
+              )
 
-          _other ->
-            workflow
+            _other ->
+              workflow
+          end
         end
 
       _other ->

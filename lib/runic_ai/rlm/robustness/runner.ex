@@ -13,6 +13,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
   alias RunicAI.RLM.Robustness.Catalog
   alias RunicAI.RLM.Robustness.DeterministicChecks
   alias RunicAI.RLM.Robustness.Judge
+  alias RunicAI.RLM.Robustness.OpsLogicFixture
   alias RunicAI.RLM.Robustness.ProjectScenario
   alias RunicAI.RLM.Robustness.WorkspaceFactory
   alias RunicAI.Coding.RLM.AcceptanceCheck
@@ -273,7 +274,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       previous = Application.get_env(:runic_ai, :workbench, [])
       session_id = Ids.unique("browser-rlm-robustness:#{scenario.id}")
 
-      run_fun = fn _cwd, objective, run_opts ->
+      default_run_fun = fn _cwd, objective, run_opts ->
         event_sink = Keyword.fetch!(run_opts, :event_sink)
 
         with {:ok, review_summary} <- maybe_browser_probe_review(scenario, objective, run_opts) do
@@ -326,6 +327,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
         end
       end
 
+      run_fun = Keyword.get(opts, :browser_probe_run_fun, default_run_fun)
+
       try do
         SQLite.migrate!(Workbench.store!())
         Application.put_env(:runic_ai, :workbench, Keyword.put(previous, :run_fun, run_fun))
@@ -342,6 +345,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
             "toolsets" => browser_toolsets(scenario),
             "tool_config" => browser_tool_config(scenario)
           }
+          |> put_browser_model(Keyword.get(opts, :model))
           |> maybe_put("max_objective_iterations", browser_max_objective_iterations(scenario))
 
         {session_id, start, launch_snapshot, snapshot, browser_ui_capture} =
@@ -370,6 +374,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
           launch_result: inspect_result(start),
           final_output: browser_probe_final_output(snapshot, browser_evidence),
           browser_snapshot: summarize_snapshot(snapshot),
+          failure_attribution: failure_attribution(snapshot),
+          repair_count: snapshot_repair_count(snapshot),
           browser_evidence_path: browser_evidence_path,
           browser_ui_checks: browser_evidence.ui_checks,
           ui_gaps: browser_ui_gaps(browser_evidence)
@@ -892,7 +898,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       _iteration ->
         workspace = Workspace.new!(root: cwd)
 
-        case EditPatchSet.apply(workspace, opslogic_fixture_patch_set(objective)) do
+        case EditPatchSet.apply(workspace, OpsLogicFixture.patch_set(objective)) do
           {:ok, %{status: :ok} = result} ->
             changed_files =
               Map.get(result, :changed_files) || Map.get(result, :changed_paths) || []
@@ -945,7 +951,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       _iteration ->
         workspace = Workspace.new!(root: cwd)
 
-        case EditPatchSet.apply(workspace, opslogic_fixture_patch_set(objective)) do
+        case EditPatchSet.apply(workspace, OpsLogicFixture.patch_set(objective)) do
           {:ok, %{status: :ok} = result} ->
             changed_files =
               Map.get(result, :changed_files) || Map.get(result, :changed_paths) || []
@@ -981,7 +987,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
             params: %{
               path: "tmp/ops_logic/PLAN.md",
               overwrite: true,
-              content: opslogic_plan_markdown()
+              content: OpsLogicFixture.plan_markdown()
             }
           )
         ],
@@ -998,74 +1004,6 @@ defmodule RunicAI.RLM.Robustness.Runner do
       {:error, %Error{} = error} ->
         {:error, error}
     end
-  end
-
-  defp opslogic_fixture_patch_set(objective) do
-    files = [
-      {"tmp/ops_logic/mix.exs", "phoenix_live_view ecto_sql postgrex bandit lazy_html"},
-      {"tmp/ops_logic/config/test.exs", "import Config\n"},
-      {"tmp/ops_logic/lib/ops_logic/repo.ex",
-       "defmodule OpsLogic.Repo do\n  use Ecto.Repo\nend\n"},
-      {"tmp/ops_logic/lib/ops_logic/work_orders/scheduled_work_order.ex",
-       "defmodule OpsLogic.WorkOrders.ScheduledWorkOrder do\n  use Ecto.Schema\nend\n"},
-      {"tmp/ops_logic/lib/ops_logic_web/endpoint.ex",
-       "defmodule OpsLogicWeb.Endpoint do\n  use Phoenix.Endpoint, otp_app: :ops_logic\nend\n"},
-      {"tmp/ops_logic/lib/ops_logic/application.ex",
-       "defmodule OpsLogic.Application do\n  def children, do: [OpsLogicWeb.Endpoint]\nend\n"},
-      {"tmp/ops_logic/lib/ops_logic/work_orders.ex",
-       "defmodule OpsLogic.WorkOrders do\n  def persisted_state, do: :ok\n  def apply_worker_action, do: Ecto.Multi.new()\n  def supervisor, do: DynamicSupervisor\nend\n"},
-      {"tmp/ops_logic/lib/mix/tasks/ops_logic.db_smoke.ex", "opslogic_db_smoke_pass"},
-      {"tmp/ops_logic/lib/mix/tasks/ops_logic.browser_smoke.ex", "opslogic_browser_smoke_pass"},
-      {"tmp/ops_logic/priv/browser_smoke_runner.js", "OpsLogic Worker"},
-      {"tmp/ops_logic/lib/ops_logic/work_order_server.ex",
-       "defmodule OpsLogic.WorkOrderServer do\n  use GenServer\nend\n"},
-      {"tmp/ops_logic/lib/ops_logic/webhooks.ex", "work_order.completed"},
-      {"tmp/ops_logic/lib/ops_logic/persistence.ex", "repo_boundary"},
-      {"tmp/ops_logic/lib/ops_logic_web.ex", "use Phoenix.Router"},
-      {"tmp/ops_logic/lib/ops_logic_web/router.ex",
-       "use OpsLogicWeb, :router\nlive \"/dispatch\""},
-      {"tmp/ops_logic/lib/ops_logic_web/dispatcher_live.ex",
-       "schedule_work_order dispatch_schedule"},
-      {"tmp/ops_logic/lib/ops_logic_web/worker_live.ex",
-       "initiate_travel apply_worker_event assigned_work_orders"},
-      {"tmp/ops_logic/test/ops_logic_web/live/ops_logic_live_test.exs", "live_isolated"},
-      {"tmp/ops_logic/priv/repo/migrations/20260617000000_create_scheduled_work_orders.sql",
-       "CREATE TABLE scheduled_work_orders"}
-    ]
-
-    EditPatchSet.new!(
-      "Write OpsLogic robustness fixture implementation",
-      Enum.map(files, fn {path, content} ->
-        EditOperation.new!(:create_file,
-          params: %{path: path, content: content, overwrite: true}
-        )
-      end),
-      expected_changed_files: Enum.map(files, &elem(&1, 0)),
-      metadata: %{source: :opslogic_robustness_fixture, objective: objective}
-    )
-  end
-
-  defp opslogic_plan_markdown do
-    """
-    # OpsLogic Implementation Plan
-
-    Build `ops_logic` in `./tmp/ops_logic` as a Phoenix LiveView field-service SaaS.
-
-    ## Domain Contexts
-
-    - Customers: store customer records and location data.
-    - Work Orders: persist work order requests, instructions, scheduling windows, and lifecycle state.
-    - Dispatch: match workers by availability, skills, and territory.
-    - Field Runtime: dynamically supervise a GenServer per scheduled work order while delegating transitions to a functional core.
-    - Integrations: expose webhook subscriptions and event delivery contracts.
-
-    ## Delivery Steps
-
-    1. Scaffold the Mix project under `tmp/ops_logic`.
-    2. Add domain interfaces for scheduling, work-order state transitions, persistence, and webhooks.
-    3. Add LiveView-facing dispatcher and worker modules for accept, travel, arrive, start, and complete actions.
-    4. Add Postgres migration SQL and tests covering lifecycle, scheduling, webhooks, compile, and smoke behavior.
-    """
   end
 
   defp live_repair_loop_opts(%ProjectScenario{} = scenario) do
@@ -1808,7 +1746,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
     session_status = get_in(snapshot, [:session, :status])
     completion_proof = Map.get(snapshot, :completion_proof, %{})
 
-    map_value(completion_proof, :terminal?) == true or
+    terminal_session? =
       session_status in [
         "completed",
         "objective_satisfied",
@@ -1817,11 +1755,15 @@ defmodule RunicAI.RLM.Robustness.Runner do
         "cancelled",
         "stopped",
         "review"
-      ] or
-      Enum.any?(
-        Map.get(snapshot, :events, []),
-        &(&1.phase in ["final", "browser_probe_completed"])
-      ) or
+      ]
+
+    terminal_session? or
+      (map_value(completion_proof, :terminal?) == true and session_status != "running") or
+      (is_nil(session_status) and
+         Enum.any?(
+           Map.get(snapshot, :events, []),
+           &(&1.phase in ["final", "browser_probe_completed"])
+         )) or
       Enum.any?(
         Map.get(snapshot, :review_requests, []),
         &(map_value(&1, :status) in ["pending", "waiting", "review"])
@@ -2548,7 +2490,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       scorecard_count: metric(metrics, :scorecards, snapshot.scorecards),
       event_phases: compact_values(snapshot.events, :phase),
       event_statuses: compact_values(snapshot.events, :status),
-      run_statuses: compact_values(snapshot.runs, :status),
+      run_statuses: ordered_values(snapshot.runs, :status),
       review_statuses: compact_values(snapshot.review_requests, :status),
       artifact_paths: compact_values(snapshot.artifacts, :path),
       tool_names: compact_values(snapshot.tool_calls, :tool_name),
@@ -2586,6 +2528,21 @@ defmodule RunicAI.RLM.Robustness.Runner do
       client: map_value(launch, :client),
       objective_preview: preview(map_value(launch, :objective), 500)
     }
+  end
+
+  defp put_browser_model(launch, nil), do: launch
+
+  defp put_browser_model(launch, model) when is_binary(model) do
+    case String.split(model, ":", parts: 2) do
+      [provider, model_id] when provider != "" and model_id != "" ->
+        launch
+        |> Map.put("model", model)
+        |> Map.put("model_provider", provider)
+        |> Map.put("model_id", model_id)
+
+      _other ->
+        Map.put(launch, "model", model)
+    end
   end
 
   defp maybe_capture_browser_ui(
@@ -2658,6 +2615,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
           Keyword.get(opts, :browser_terminal_wait_ms, 90_000),
       active_progress_pre_final_required?:
         map_value(scenario.metadata, :active_progress_pre_final_required?) == true,
+      final_inspector_tab: map_value(scenario.metadata, :final_inspector_tab),
+      inspector_text_needle: map_value(scenario.metadata, :inspector_text_needle),
       scenario_id: scenario.id,
       scenario_title: scenario.title,
       workspace_root: workspace.root,
@@ -3085,6 +3044,15 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
   defp compact_values(_items, _key), do: []
 
+  defp ordered_values(items, key) when is_list(items) do
+    items
+    |> Enum.map(&map_value(&1, key))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&to_string/1)
+  end
+
+  defp ordered_values(_items, _key), do: []
+
   defp preview(nil, _limit), do: nil
 
   defp preview(value, limit) do
@@ -3120,6 +3088,7 @@ defmodule RunicAI.RLM.Robustness.Runner do
       event_trail_path: Map.get(lane_result, :event_trail_path),
       event_trail_summary: Map.get(lane_result, :event_trail_summary),
       browser_snapshot: Map.get(lane_result, :browser_snapshot),
+      failure_attribution: Map.get(lane_result, :failure_attribution, no_failure_attribution()),
       browser_evidence_path: Map.get(lane_result, :browser_evidence_path),
       browser_ui_checks: Map.get(lane_result, :browser_ui_checks, []),
       repair_count: repair_count(lane_result),
@@ -3301,6 +3270,9 @@ defmodule RunicAI.RLM.Robustness.Runner do
           get_in(result, [:deterministic, :passed]),
           get_in(result, [:deterministic, :failed]),
           get_in(result, [:evidence, :repair_count]) || 0,
+          run_attempt_count(result),
+          run_status_history(result),
+          failure_layer(result),
           current_progress(result),
           evidence_path(result),
           main_gap(result)
@@ -3316,8 +3288,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
     Live agent lanes: #{live?}
 
-    | Scenario | Task shape | Lane | Status | Deterministic | Judge | Passed | Failed | Repairs | Current | Evidence | Main gap |
-    | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- | --- |
+    | Scenario | Task shape | Lane | Status | Deterministic | Judge | Passed | Failed | Repairs | Attempts | Run statuses | Failure layer | Current | Evidence | Main gap |
+    | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- |
     #{Enum.map_join(rows, "\n", &("| " <> &1 <> " |"))}
 
     ## Notes
@@ -3330,6 +3302,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
       a same-session follow-up, and records DOM, screenshot, console, network,
       Workbench projection, and final-output evidence. Without that flag, it
       records backend-visible Workbench state only.
+    - Attempt counts, run-status history, and failure-layer attribution remain
+      visible when a later same-session attempt recovers an earlier failure.
     """
   end
 
@@ -3407,6 +3381,32 @@ defmodule RunicAI.RLM.Robustness.Runner do
 
       true ->
         "none"
+    end
+  end
+
+  defp run_attempt_count(result) do
+    get_in(result, [:evidence, :browser_snapshot, :run_count]) || 0
+  end
+
+  defp run_status_history(result) do
+    result
+    |> get_in([:evidence, :browser_snapshot, :run_statuses])
+    |> List.wrap()
+    |> Enum.join(" -> ")
+    |> case do
+      "" -> "none"
+      history -> history
+    end
+  end
+
+  defp failure_layer(result) do
+    attribution = get_in(result, [:evidence, :failure_attribution]) || %{}
+    layer = map_value(attribution, :layer) || "none"
+
+    if map_value(attribution, :recovered?) == true do
+      "#{layer} (recovered)"
+    else
+      to_string(layer)
     end
   end
 
@@ -3666,6 +3666,8 @@ defmodule RunicAI.RLM.Robustness.Runner do
   defp summarize_snapshot(nil), do: %{}
 
   defp summarize_snapshot(snapshot) do
+    run_statuses = ordered_values(snapshot.runs, :status)
+
     %{
       session: snapshot.session,
       message_count: length(snapshot.messages),
@@ -3673,10 +3675,95 @@ defmodule RunicAI.RLM.Robustness.Runner do
       review_count: length(snapshot.review_requests),
       artifact_count: length(snapshot.artifacts),
       run_count: length(snapshot.runs),
+      run_statuses: run_statuses,
+      failed_run_count: Enum.count(run_statuses, &(&1 in ["failed", "error"])),
+      completed_run_count:
+        Enum.count(run_statuses, &(&1 in ["completed", "objective_satisfied"])),
       final_output: final_message_text(snapshot),
       objective_contract_present?: not is_nil(Map.get(snapshot, :objective_contract)),
       blocked_evidence_present?: not is_nil(Map.get(snapshot, :blocked_evidence))
     }
+  end
+
+  defp failure_attribution(nil), do: no_failure_attribution()
+
+  defp failure_attribution(snapshot) do
+    run_statuses = ordered_values(Map.get(snapshot, :runs, []), :status)
+    failed_run_count = Enum.count(run_statuses, &(&1 in ["failed", "error"]))
+
+    failure_events =
+      snapshot
+      |> Map.get(:events, [])
+      |> Enum.filter(fn event ->
+        map_value(event, :status) in ["failed", "error", :failed, :error] or
+          map_value(event, :phase) in ["failed", :failed]
+      end)
+
+    failure_text =
+      Enum.map_join(failure_events, " ", fn event ->
+        [
+          map_value(event, :title),
+          map_value(event, :detail),
+          map_value(event, :data_json)
+        ]
+        |> inspect(limit: 40, printable_limit: 2_000)
+      end)
+
+    session_status = get_in(snapshot, [:session, :status])
+
+    if failed_run_count == 0 and failure_events == [] do
+      no_failure_attribution()
+    else
+      %{
+        layer: classify_failure_layer(failure_text),
+        recovered?: session_status in ["completed", "objective_satisfied"],
+        failed_run_count: failed_run_count,
+        run_statuses: run_statuses,
+        summary: failure_text |> String.replace(~r/\s+/, " ") |> String.slice(0, 500)
+      }
+    end
+  end
+
+  defp no_failure_attribution do
+    %{layer: :none, recovered?: false, failed_run_count: 0, run_statuses: [], summary: nil}
+  end
+
+  defp classify_failure_layer(text) do
+    text = String.downcase(text)
+
+    cond do
+      String.contains?(text, ["workflowvalidator", "workflow validator", "validation_error"]) ->
+        :validator
+
+      String.contains?(text, ["rate limit", "ratelimit", "quota", "provider", "reqllm"]) ->
+        :provider
+
+      String.contains?(text, ["workflowcompiler", "workflow compiler", "compile proposal"]) ->
+        :compiler
+
+      String.contains?(text, ["scorecard", "acceptance", "verification", "proof"]) ->
+        :proof
+
+      String.contains?(text, ["proposal", "planning", "planner"]) ->
+        :planner
+
+      String.contains?(text, ["browser", "liveview", "javascript", "dom", "ui "]) ->
+        :ui
+
+      true ->
+        :runtime
+    end
+  end
+
+  defp snapshot_repair_count(nil), do: 0
+
+  defp snapshot_repair_count(snapshot) do
+    snapshot
+    |> Map.get(:events, [])
+    |> Enum.count(fn event ->
+      map_value(event, :kind) in ["repair", :repair] and
+        map_value(event, :phase) in ["repair_attempt_completed", :repair_attempt_completed]
+    end)
   end
 
   defp default_label do

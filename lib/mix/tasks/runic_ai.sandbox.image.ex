@@ -104,7 +104,7 @@ defmodule Mix.Tasks.RunicAi.Sandbox.Image do
         workspace: [mode: :copy_in, persist?: false]
       ]
 
-      case RunicSandbox.exec(
+      case LitterBox.exec(
              %{
                sandbox: :local_code,
                runtime: runtime,
@@ -141,7 +141,7 @@ defmodule Mix.Tasks.RunicAi.Sandbox.Image do
       workspace: [mode: :copy_in, persist?: false]
     ]
 
-    case RunicSandbox.exec(
+    case LitterBox.exec(
            %{
              sandbox: :local_code,
              runtime: :bash,

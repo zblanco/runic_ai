@@ -26,7 +26,7 @@ defmodule RunicAI.Persistence.SQLiteTest do
   end
 
   test "migrates all core durability tables", %{store: store} do
-    assert {:ok, 1} = SQLite.schema_version(store)
+    assert {:ok, 4} = SQLite.schema_version(store)
 
     tables =
       SQLite.with_repo(store, fn ->
@@ -49,6 +49,13 @@ defmodule RunicAI.Persistence.SQLiteTest do
     assert "workflow_facts" in tables
     assert "terminal_events" in tables
     assert "terminal_events_fts" in tables
+    assert "workflow_definition_revisions" in tables
+    assert "workflow_operation_batches" in tables
+    assert "workflow_revision_events" in tables
+    assert "workflow_compiled_artifacts" in tables
+    assert "workflow_revision_projections" in tables
+    assert "workflow_eval_records" in tables
+    assert "workflow_optimization_candidates" in tables
   end
 
   test "dynamic repo stores are isolated" do
@@ -86,6 +93,31 @@ defmodule RunicAI.Persistence.SQLiteTest do
     assert event.id == "event:1"
     assert [%TerminalEvent{id: "event:1"}] = Queries.run_timeline(store, "run:1")
     assert [%TerminalEvent{id: "event:1"}] = Queries.search_events(store, "salience")
+  end
+
+  test "error-status final summaries project failed session and run truth", %{store: store} do
+    at = DateTime.utc_now()
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "event:failed-final",
+               session_id: "session:failed-final",
+               run_id: "run:failed-final",
+               agent: :rlm,
+               kind: :summary,
+               phase: :final,
+               status: :error,
+               title: "Agent finished",
+               detail: "status: failed",
+               data_json: %{objective_status: :failed, result_status: :failed},
+               at: at
+             })
+
+    assert %AgentSession{status: "failed", completed_at: nil, failed_at: ^at} =
+             Queries.get_session(store, "session:failed-final")
+
+    assert [%WorkflowRun{status: "failed", completed_at: nil, failed_at: ^at}] =
+             Queries.workflow_runs_for_session(store, "session:failed-final")
   end
 
   test "concurrent terminal events retry sequence collisions", %{store: store} do
@@ -1073,6 +1105,84 @@ defmodule RunicAI.Persistence.SQLiteTest do
                  "Error: protocol Jason.Encoder not implemented for RunicAI.Error (a struct)"
              }
            ] = Queries.messages_for_run(store, "assistant:error")
+  end
+
+  test "internal error observations do not terminalize an active session or workflow run", %{
+    store: store
+  } do
+    at = ~U[2026-05-03 12:13:00Z]
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:child-observation-error",
+               session_id: "rlm:repairing",
+               run_id: "rlm:repairing:run",
+               sequence: 1,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :child_agent_event,
+               status: :error,
+               title: "RLM child agent event error",
+               detail: "one child tool observation failed; repair remains active",
+               data_json: %{node_id: "implement", child_status: :error},
+               at: at
+             })
+
+    assert {"running", "running"} =
+             SQLite.with_repo(store, fn ->
+               {
+                 store.repo.get!(AgentSession, "rlm:repairing").status,
+                 store.repo.get!(WorkflowRun, "rlm:repairing:run").status
+               }
+             end)
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:child-observation-review",
+               session_id: "rlm:repairing",
+               run_id: "rlm:repairing:run",
+               sequence: 2,
+               agent: :rlm,
+               kind: :rlm_node,
+               phase: :child_agent_event,
+               status: :review,
+               title: "RLM child agent event review",
+               detail: "the child review is auto-decided inside the active parent run",
+               data_json: %{node_id: "implement", child_status: :review},
+               at: DateTime.add(at, 1, :second)
+             })
+
+    assert {"running", "running"} =
+             SQLite.with_repo(store, fn ->
+               {
+                 store.repo.get!(AgentSession, "rlm:repairing").status,
+                 store.repo.get!(WorkflowRun, "rlm:repairing:run").status
+               }
+             end)
+
+    assert {:ok, %TerminalEvent{}} =
+             SQLite.record_terminal_event(store, %{
+               id: "terminal:run-error",
+               session_id: "rlm:repairing",
+               run_id: "rlm:repairing:run",
+               sequence: 3,
+               agent: :rlm,
+               kind: :error,
+               phase: :final,
+               status: :error,
+               title: "Agent failed",
+               detail: "repair budget exhausted",
+               data_json: %{error: %{kind: :timeout}},
+               at: DateTime.add(at, 2, :second)
+             })
+
+    assert {"failed", "failed"} =
+             SQLite.with_repo(store, fn ->
+               {
+                 store.repo.get!(AgentSession, "rlm:repairing").status,
+                 store.repo.get!(WorkflowRun, "rlm:repairing:run").status
+               }
+             end)
   end
 
   test "assistant workflow llm_leaf completions project first-class message rows", %{store: store} do

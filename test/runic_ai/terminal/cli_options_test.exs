@@ -351,7 +351,7 @@ defmodule RunicAI.Terminal.CliOptionsTest do
     assert opts.objective_loop? == false
   end
 
-  test "keeps deterministic project generation opt-in for RLM patch runs" do
+  test "uses the coordinator default for deterministic project generation unless overridden" do
     cwd = tmp_dir()
 
     assert {:ok, opts} =
@@ -365,7 +365,7 @@ defmodule RunicAI.Terminal.CliOptionsTest do
                cwd
              ])
 
-    assert opts.seed_project_generation? == false
+    assert opts.seed_project_generation? == nil
 
     assert {:ok, opts} =
              CliOptions.parse([
@@ -380,6 +380,20 @@ defmodule RunicAI.Terminal.CliOptionsTest do
              ])
 
     assert opts.seed_project_generation? == true
+
+    assert {:ok, opts} =
+             CliOptions.parse([
+               "build OpsLogic",
+               "--agent",
+               "rlm",
+               "--mode",
+               "patch",
+               "--cwd",
+               cwd,
+               "--no-seed-project-generation"
+             ])
+
+    assert opts.seed_project_generation? == false
   end
 
   test "does not add concurrency defaults to standard agent unless requested" do

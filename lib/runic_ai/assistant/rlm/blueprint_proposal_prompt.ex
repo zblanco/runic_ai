@@ -95,8 +95,10 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       Use `max_depth` and `max_files` on `source_discovery` for repository
       trees so README, mix.exs, package manifests, docs, and source files can
       be discovered.
-    - prefer `tabular_parser`, `record_map`, and `record_group` for CSV, JSONL,
-      support tickets, and cleanup tasks.
+    - prefer `tabular_parser` plus either `record_group` or a
+      `record_map -> lambda_reduce` branch for CSV, JSONL, support tickets, and
+      cleanup tasks. Use `record_group` directly after the parser when the
+      required grouping key already exists in each record.
     - prefer safe computing components before shell/code execution for bounded
       deterministic work. Use `json_compute` for JSON/JSONL and map queries,
       `collection_compute` for grouping/deduping/sorting/reducing,
@@ -104,15 +106,28 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
       date/time logic, `score_compute` for ranking/scoring, and
       `artifact_compute` for read-only file manifests/previews or durable
       artifact IO.
-    - use `record_map` to normalize per-record facts before `record_group`;
-      preserve original identifiers, names, addresses, timelines, policy terms,
-      and invalid values when the objective asks for cleanup or comparison.
+    - use `record_map` only when per-record derivation is needed, then connect
+      it directly to a typed `lambda_reduce` and proceed to final synthesis or
+      artifact production. The current `lambda_reduce` output is synthesis,
+      not records, so never place `record_group` after it. Preserve original
+      identifiers, names, addresses, timelines, policy terms, and invalid
+      values when the objective asks for cleanup or comparison.
     - prefer `document_compare` for old/new or multi-document comparison tasks.
-    - `llm_map` and `record_map` are native Runic map components. Fan them into
-      `blueprint_reduce` before connecting to synthesis, composition, artifact,
-      or scorecard nodes.
-    - prefer `report_composer` when deterministic section assembly is enough;
-      use `llm_leaf` when synthesis needs a model.
+    - `llm_map` and `record_map` are native Runic map components. If they have a
+      downstream node, that immediate child must be a typed `lambda_reduce`.
+      Put final synthesis, artifact, or scorecard nodes after that reduce. For
+      grouping, instead connect parsed records directly to `record_group` and
+      omit the map branch. Do not use the legacy untyped `blueprint_reduce` in
+      a newly generated graph.
+    - `lambda_review` outputs a scorecard, not report text. Never connect it
+      directly to `artifact_writer`; place `lambda_generate` after review, or
+      omit review and send synthesis/report output to the writer.
+    - `lambda_generate` and `report_composer` deterministically assemble their
+      input; their prompt params do not invoke a model. Use `llm_leaf` after a
+      typed `lambda_reduce` when the final artifact requires judgment,
+      cross-source reasoning, narrative synthesis, or distinct section bodies.
+      Use deterministic composition only when the upstream value already has
+      section-specific content ready to render.
     - do not connect raw `source_discovery`, `tabular_parser`, or
       `document_compare` output directly to `report_composer` unless the output
       is already human-readable prose. Use `llm_map`, `record_map` with a
@@ -207,7 +222,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
         },
         %{
           id: "join_notes",
-          type: "blueprint_reduce",
+          type: "lambda_reduce",
           params: %{strategy: "join"}
         },
         %{
@@ -215,7 +230,10 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
           type: "llm_leaf",
           params: %{
             strategy: "llm_reduce",
-            prompt: "Write the requested report from these notes: {{items}}"
+            group_prompt:
+              "Preserve the objective-relevant evidence and source provenance from these analyzed notes: {{items}}.",
+            prompt:
+              "Produce the final artifact for {{objective}} from the evidence below. Write complete, distinct content for these required sections: #{Enum.join(Keyword.get(opts, :required_sections, ["Summary"]), ", ")}. Preserve source citations and clearly distinguish facts from inferences. Evidence: {{items}}"
           }
         }
       ] ++
@@ -321,7 +339,7 @@ defmodule RunicAI.Assistant.RLM.BlueprintProposalPrompt do
             "For objective {{objective}}, turn this record into concise analysis: {{record}}."
         }
       },
-      %{id: "join_classifications", type: "blueprint_reduce", params: %{strategy: "join"}},
+      %{id: "join_classifications", type: "lambda_reduce", params: %{strategy: "join"}},
       %{
         id: "group",
         type: "record_group",

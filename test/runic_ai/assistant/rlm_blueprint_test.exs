@@ -462,7 +462,7 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
           ],
           stop_conditions: ["artifact written", "scorecard satisfied"],
           policies: %{generated_functions: %{max_tier: "tier1"}, budgets: %{max_nodes: 12}},
-          metadata: %{}
+          metadata: %{proposal_kind: "model_proposed"}
         }
 
       {:ok, TestClient.result(Jason.encode!(blueprint))}
@@ -485,6 +485,12 @@ defmodule RunicAI.Assistant.RLMBlueprintTest do
              :artifact_writer,
              :objective_scorecard
            ]
+
+    score = Enum.find(blueprint.components, &(&1.type == :objective_scorecard))
+    assert score.params["artifact_path"] == ".docs/tickets.md"
+    refute Map.has_key?(score.params, :artifact_path)
+    assert blueprint.metadata["proposal_kind"] == :generated
+    refute Map.has_key?(blueprint.metadata, :proposal_kind)
   end
 
   test "coordinator prefers curated ticket clustering recipe for common tabular tasks" do

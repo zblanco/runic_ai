@@ -22,9 +22,12 @@ defmodule RunicAI.RLM.ValueContract do
     :report,
     :artifact,
     :tool_result,
+    :coding_context,
     :computed,
     :scorecard,
     :budget_summary,
+    :workflow_input,
+    :workflow_output,
     :any
   ]
 

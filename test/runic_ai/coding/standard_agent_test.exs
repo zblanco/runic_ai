@@ -414,6 +414,8 @@ defmodule RunicAI.Coding.StandardAgentTest do
     registry = Agent.default_registry(workspace, mode: :patch)
     definition = Registry.fetch!(registry, "apply_patch")
 
+    assert definition.parameter_schema[:operations][:type] == {:list, :any}
+
     assert {:ok, result} =
              Definition.execute(definition, %{
                "operations" => [

@@ -138,6 +138,161 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert scorecard.objective_status == :objective_incomplete
   end
 
+  test "child results use the latest verification for each command after repair" do
+    contract = ChildContract.new!(:verifier, verification_commands: ["project-native checks"])
+
+    child =
+      ChildResult.from_agent_summary(
+        %{
+          status: :satisfied,
+          reply: "Repaired and verified.",
+          verifications: [
+            %{command: "mix test", status: :fail, exit_status: 2},
+            %{command: "mix test", status: :pass, exit_status: 0},
+            %{command: "mix format --check-formatted", status: :pass, exit_status: 0}
+          ]
+        },
+        contract
+      )
+
+    assert child.status == :completed
+  end
+
+  test "execution evidence requires current project-native checks rather than source inspection" do
+    child_without_checks =
+      ChildResult.new!(:completed,
+        id: "implement",
+        changed_files: ["lib/example.ex"],
+        command_statuses: []
+      )
+
+    missing =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{child_results: [child_without_checks]})
+
+    assert missing.status == :fail
+    assert missing.message =~ "without executable verification"
+
+    child_with_checks = %{
+      child_without_checks
+      | command_statuses: [
+          %{command: "compile_project", status: :pass},
+          %{command: "run_tests", status: :pass}
+        ]
+    }
+
+    passing =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{child_results: [child_with_checks]})
+
+    assert passing.status == :pass
+
+    child_with_failed_smoke = %{
+      child_with_checks
+      | command_statuses:
+          child_with_checks.command_statuses ++
+            [
+              %{
+                command: "runtime_smoke",
+                argv: ["mix", "run", "-e", "Demo.Smoke.run()"],
+                exit_status: 1,
+                status: :fail,
+                output_preview: "undefined function smoke/0"
+              }
+            ]
+    }
+
+    failing =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{
+        child_results: [child_with_failed_smoke]
+      })
+
+    assert failing.status == :fail
+    assert failing.metadata.observed.output_preview =~ "undefined function"
+
+    repaired =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{
+        child_results: [child_with_failed_smoke],
+        command_results: [
+          %{
+            argv: ["mix", "run", "-e", "Demo.Smoke.run()"],
+            command: "runtime_smoke",
+            exit_status: 0,
+            status: :pass,
+            output_preview: "ok"
+          }
+        ]
+      })
+
+    assert repaired.status == :pass
+
+    mutation_helper_failure =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{
+        child_results: [
+          %{
+            command_statuses: [
+              %{
+                tool: "run_command",
+                argv: ["printf", "%s\\n", "content", ">", ".formatter.exs"],
+                status: :fail
+              },
+              %{tool: "run_tests", argv: ["mix", "test"], status: :pass}
+            ]
+          }
+        ]
+      })
+
+    assert mutation_helper_failure.status == :pass
+
+    normalized_rerun =
+      RunicAI.Coding.RLM.ExecutionEvidence.result(%{
+        child_results: [
+          %{command_statuses: [%{command: "mix test", status: :fail, exit_status: 1}]}
+        ],
+        command_results: [%{argv: ["mix", "test"], status: :pass, exit_status: 0}]
+      })
+
+    assert normalized_rerun.status == :pass
+  end
+
+  test "seeded implementation progress cannot complete without executable verification" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    proposal =
+      RunicAI.Coding.RLM.RecipeLibrary.proposal(
+        :implementation,
+        "Build a small library in the selected workspace"
+      )
+
+    results =
+      ProgressGate.evaluate(
+        workspace,
+        proposal,
+        %{changed_files: ["lib/example.ex"], child_results: [], command_results: []},
+        []
+      )
+
+    execution = Enum.find(results, &(&1.id == "implementation-execution-verification"))
+    assert execution.status == :fail
+  end
+
+  test "verification gate enforces execution evidence for mutating objective contracts" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("Build the requested library",
+        metadata: %{mutation_required?: true}
+      )
+
+    assert {:ok, result} = VerificationGate.run(workspace, contract, %{})
+    assert result.status == :objective_incomplete
+
+    assert Enum.any?(
+             result.scorecard.acceptance_results,
+             &(&1.id == "implementation-execution-verification" and &1.status == :fail)
+           )
+  end
+
   test "edit patch sets apply typed operations and reject no-op outcomes" do
     root = sample_project()
     workspace = Workspace.new!(root: root)
@@ -165,6 +320,43 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert Enum.any?(result.diagnostics, &(&1.kind == :no_changed_paths))
   end
 
+  test "edit patch sets reconcile a durable unknown-after-dispatch replay" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    patch_set =
+      EditPatchSet.new!(
+        "create durable marker",
+        [
+          EditOperation.new!(:create_file,
+            params: %{path: "lib/durable_marker.ex", content: "defmodule DurableMarker do\nend\n"}
+          )
+        ],
+        id: "edit:durable-marker",
+        expected_changed_files: ["lib/durable_marker.ex"]
+      )
+
+    assert {:ok, first} = EditPatchSet.apply(workspace, patch_set)
+    assert first.status == :ok
+
+    path = Path.join(root, "lib/durable_marker.ex")
+    mtime = File.stat!(path).mtime
+
+    assert {:ok, replay} =
+             EditPatchSet.apply(workspace, patch_set,
+               replay_context: %{
+                 attempt: 2,
+                 prior_attempt_id: "workflow-node-attempt-1",
+                 prior_outcome: :unknown_after_dispatch
+               }
+             )
+
+    assert replay.status == :reconciled
+    assert [%{status: :reconciled} = operation_result] = replay.operation_results
+    assert operation_result.metadata.reconciliation.outcome == :matched_after_state
+    assert File.stat!(path).mtime == mtime
+  end
+
   test "verification gates emit scorecards and repair needs from failed checks" do
     root = sample_project()
     workspace = Workspace.new!(root: root)
@@ -180,6 +372,53 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert result.status == :objective_incomplete
     assert result.scorecard.objective_status == :objective_incomplete
     assert [%RunicAI.Coding.RLM.RepairNeed{}] = result.repair_needs
+  end
+
+  test "a positive verifier claim cannot override missing deterministic acceptance proof" do
+    root = sample_project()
+    File.write!(Path.join(root, "lib/plausible.ex"), "defmodule Plausible do\nend\n")
+    workspace = Workspace.new!(root: root)
+
+    contract =
+      AcceptanceContract.new!("implement and prove Plausible.run/1",
+        checks: [
+          AcceptanceCheck.new!(:file_exists,
+            id: "plausible-artifact",
+            params: %{path: "lib/plausible.ex"}
+          ),
+          AcceptanceCheck.new!(:function_exists,
+            id: "required-run-function",
+            params: %{path: "lib/plausible.ex", name: "run", arity: 1}
+          )
+        ]
+      )
+
+    asserted_complete = %{
+      status: :ok,
+      verifier: :agent_report,
+      summary: "The implementation is complete and the artifact looks valid."
+    }
+
+    assert {:ok, result} =
+             VerificationGate.run(workspace, contract, %{
+               changed_files: ["lib/plausible.ex"],
+               verification_observations: [asserted_complete]
+             })
+
+    assert result.status == :objective_incomplete
+    assert result.scorecard.objective_status == :objective_incomplete
+
+    assert Enum.any?(
+             result.evaluation.results,
+             &(&1.id == "plausible-artifact" and &1.status == :pass)
+           )
+
+    assert Enum.any?(
+             result.evaluation.results,
+             &(&1.id == "required-run-function" and &1.status == :fail)
+           )
+
+    assert Enum.any?(result.repair_needs, &(&1.target == "required-run-function"))
   end
 
   test "verification gates defer semantic requirement checks without crashing" do
@@ -694,7 +933,7 @@ defmodule RunicAI.Coding.RLMReliabilityTest do
     assert {:error, error} =
              RunicAI.Coding.RLM.RuntimeBudget.run(
                fn -> raise "boom" end,
-               timeout_ms: 100,
+               timeout_ms: 1_000,
                stage: :test_stage
              )
 

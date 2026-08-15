@@ -14,6 +14,9 @@ defmodule RunicAI.LLM.ModelCatalogTest do
 
     assert openai
     assert Enum.any?(openai.models, &(&1.id == "gpt-5.4-mini"))
+    assert Enum.any?(openai.models, &(&1.id == "gpt-5.6-luna"))
+    assert Enum.any?(openai.models, &(&1.id == "gpt-5.6-terra"))
+    assert Enum.any?(openai.models, &(&1.id == "gpt-5.6-sol"))
     refute Enum.any?(openai.models, &(&1.id == "text-embedding-3-large"))
   end
 end

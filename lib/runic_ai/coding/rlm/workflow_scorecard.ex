@@ -113,6 +113,12 @@ defmodule RunicAI.Coding.RLM.WorkflowScorecard do
     blocking_acceptance_results = blocking_acceptance_results(current_acceptance_results)
 
     cond do
+      verified_acceptance_supersedes_failed_child?(
+        current_acceptance_results,
+        blocking_acceptance_results
+      ) ->
+        :objective_satisfied
+
       any_child_status?(child_results, [:failed]) ->
         :failed
 
@@ -209,6 +215,29 @@ defmodule RunicAI.Coding.RLM.WorkflowScorecard do
     )
   end
 
+  defp verified_acceptance_supersedes_failed_child?(results, []) do
+    results != [] and required_results_passed?(results) and durable_results(results) != [] and
+      Enum.any?(results, &(result_type(&1) in delivery_result_types()))
+  end
+
+  defp verified_acceptance_supersedes_failed_child?(_results, _blocking), do: false
+
+  defp delivery_result_types do
+    [
+      :artifact_present,
+      :changed_file_count_between,
+      :file_exists,
+      :function_exists,
+      :module_exists,
+      :runtime_smoke,
+      :semantic_requirement,
+      :source_contains,
+      :source_not_contains,
+      :test_count_min,
+      :warning_count_zero
+    ]
+  end
+
   defp required_results_passed?(results) do
     Enum.all?(results, fn result ->
       not required?(result) or passed?(result)
@@ -250,6 +279,7 @@ defmodule RunicAI.Coding.RLM.WorkflowScorecard do
       "function_exists" -> :function_exists
       "test_count_min" -> :test_count_min
       "warning_count_zero" -> :warning_count_zero
+      "changed_file_count_between" -> :changed_file_count_between
       _other -> type
     end
   end

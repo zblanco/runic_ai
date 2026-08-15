@@ -155,7 +155,27 @@ defmodule RunicAI.Coding.RLM.RecipeLibrary do
         ProposalNode.new!("implement", :agent,
           params: %{
             mode: "patch",
-            task: implementation_task(objective, objective_contract)
+            task: implementation_task(objective, objective_contract),
+            contract: %{
+              id: "implementation-child",
+              role: "implementer",
+              stop_criteria: ["objective-specific implementation exists"]
+            }
+          }
+        ),
+        ProposalNode.new!("verify_implementation", :agent,
+          params: %{
+            mode: "verify",
+            task: verification_task(objective),
+            contract: %{
+              id: "verification-child",
+              role: "verifier",
+              verification_commands: ["project-native verification"],
+              stop_criteria: [
+                "the latest project-native formatter, compiler, test, linter, or runtime checks pass",
+                "any repair is followed by fresh verification"
+              ]
+            }
           }
         ),
         ProposalNode.new!("verify", :verification_gate,
@@ -167,7 +187,8 @@ defmodule RunicAI.Coding.RLM.RecipeLibrary do
       ],
       edges: [
         %{from: "acceptance_contract", to: "implement"},
-        %{from: "implement", to: "verify"},
+        %{from: "implement", to: "verify_implementation"},
+        %{from: "verify_implementation", to: "verify"},
         %{from: "verify", to: "summarize"}
       ],
       sources: Keyword.get(opts, :sources, []),
@@ -290,8 +311,31 @@ defmodule RunicAI.Coding.RLM.RecipeLibrary do
       noun phrase to a generic subset.
     - If the objective asks for a runtime smoke, expose a concrete
       non-interactive smoke entry point and verify it from the project root.
-    - Run relevant verification when possible and report exact blockers when not possible.
+    - Run relevant verification when available in this child, but leave a
+      complete source-and-test handoff for the independent verifier rather than
+      claiming completion from source inspection alone.
     - Do not replace the objective with a repository summary or file dump.
+    """
+    |> String.trim()
+  end
+
+  defp verification_task(objective) do
+    """
+    Independently verify and, when necessary, repair the implementation for this objective:
+
+    #{objective}
+
+    Requirements:
+    - Inspect the delivered project and detect its native build and test tooling.
+    - Run the relevant formatter, compiler or type checker, tests, linter, and
+      runtime smoke when one is present and meaningful.
+    - When the project tooling supports it, compile with warnings treated as
+      errors so warnings cannot be hidden by otherwise passing tests.
+    - Treat every non-zero command result as a failure that must be repaired or
+      reported as a concrete blocker.
+    - After the final edit, rerun every relevant project-native check so the
+      recorded passing evidence is fresh for the final workspace state.
+    - Do not declare success from source inspection or another agent's claims.
     """
     |> String.trim()
   end

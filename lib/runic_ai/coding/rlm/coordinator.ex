@@ -14,10 +14,17 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   alias RunicAI.Coding.RLM.WorkflowValidator
   alias RunicAI.Error
   alias RunicAI.LLM
+  alias RunicAI.LLM.Retry, as: LLMRetry
   alias RunicAI.LLM.Result
+  alias RunicAI.Workflows.Adapters.CodingProposal, as: CodingProposalAdapter
+  alias RunicAI.Workflows.Compiler, as: SharedWorkflowCompiler
+  alias RunicAI.Workflows.Editor
+  alias RunicAI.Workflows.IR
+  alias RunicAI.Workflows.OperationProtocol
 
   @default_model "openai:gpt-5.4-mini"
   @default_repair_attempts 2
+  @default_repair_mode :typed_operations
   @default_generation_mode :json_text
   @max_conversation_history_messages 12
   @max_conversation_history_chars 16_000
@@ -114,6 +121,11 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       selector. Prefer params.argv as an argv array; params.command as a string
       and params.args.argv are accepted for compatibility. Never emit command
       checks without argv or command.
+    - every command_passes, command_fails_with, or runtime_smoke check must have
+      an upstream command node with the exact same argv and cwd. Connect that
+      command node to the verification gate, directly or through other nodes.
+      Verification gates evaluate observed evidence; they do not secretly run
+      commands that are absent from the visible workflow graph.
     - source_contains/source_not_contains checks may use params.path for a file
       or directory, params.paths for multiple paths, or params.glob/globs for
       layout-tolerant source assertions.
@@ -127,7 +139,7 @@ defmodule RunicAI.Coding.RLM.Coordinator do
       the outer repair loop handle retries.
 
     Generic valid node shapes:
-    #{Jason.encode!(node_shape_examples())}
+    #{Jason.encode!(node_shape_examples(opts))}
 
     Do not select or assume language-, framework-, generator-, or domain-specific
     workflow templates. Use generic coordination patterns only as control-flow
@@ -174,11 +186,10 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   end
 
   defp generate_and_validate(objective, environment, opts, validation_opts) do
-    model = Keyword.get(opts, :model, @default_model)
+    model = Keyword.get(opts, :proposal_model, Keyword.get(opts, :model, @default_model))
 
     llm_opts =
-      opts
-      |> Keyword.get(:llm_opts, [])
+      (Keyword.get(opts, :proposal_llm_opts) || Keyword.get(opts, :llm_opts, []))
       |> maybe_put_client(Keyword.get(opts, :client))
       |> maybe_put_receive_timeout(Keyword.get(opts, :proposal_llm_timeout_ms))
 
@@ -222,16 +233,202 @@ defmodule RunicAI.Coding.RLM.Coordinator do
        ) do
     repair_attempts = Keyword.get(opts, :proposal_repair_attempts, @default_repair_attempts)
 
-    repair_generated(
-      objective,
-      environment,
-      opts,
-      validation_opts,
-      model,
-      llm_opts,
-      object,
-      [error],
-      repair_attempts
+    case operation_repair_seed(object, objective, opts) do
+      {:ok, ir} ->
+        repair_generated_with_operations(
+          objective,
+          environment,
+          opts,
+          validation_opts,
+          model,
+          llm_opts,
+          ir,
+          [error],
+          repair_attempts,
+          []
+        )
+
+      :whole_object ->
+        repair_generated(
+          objective,
+          environment,
+          opts,
+          validation_opts,
+          model,
+          llm_opts,
+          object,
+          [error],
+          repair_attempts
+        )
+    end
+  end
+
+  defp operation_repair_seed(object, objective, opts) do
+    if Keyword.get(opts, :proposal_repair_mode, @default_repair_mode) == :typed_operations do
+      with candidate <- normalize_generated_candidate(object, objective),
+           {:ok, proposal} <- WorkflowProposal.from_input(candidate),
+           proposal <- enrich_mutating_agent_tasks(proposal, opts),
+           {:ok, adapted} <- CodingProposalAdapter.adapt(proposal) do
+        {:ok, adapted.ir}
+      else
+        _error -> :whole_object
+      end
+    else
+      :whole_object
+    end
+  end
+
+  defp repair_generated_with_operations(
+         _objective,
+         _environment,
+         _opts,
+         _validation_opts,
+         _model,
+         _llm_opts,
+         _ir,
+         errors,
+         0,
+         _history
+       ) do
+    {:error, proposal_failure_error(:generated, errors)}
+  end
+
+  defp repair_generated_with_operations(
+         objective,
+         environment,
+         opts,
+         validation_opts,
+         model,
+         llm_opts,
+         ir,
+         errors,
+         attempts_left,
+         history
+       ) do
+    prompt = operation_repair_prompt(objective, environment, opts, ir, errors)
+
+    with {:ok, object} <- generate_operation_object(model, prompt, opts, llm_opts),
+         {:ok, operations} <- operation_list(object),
+         {:ok, edit} <- Editor.apply(ir, OperationProtocol.batch(ir, operations)),
+         {:ok, proposal} <- SharedWorkflowCompiler.to_coding_proposal(edit.ir) do
+      next_history = history ++ [operation_repair_record(edit)]
+
+      case validate_candidate(proposal, opts, validation_opts, :repaired) do
+        {:ok, proposal, report} ->
+          {:ok, proposal, attach_operation_repair(report, next_history)}
+
+        {:error, error} ->
+          repair_generated_with_operations(
+            objective,
+            environment,
+            opts,
+            validation_opts,
+            model,
+            llm_opts,
+            edit.ir,
+            [error | errors],
+            attempts_left - 1,
+            next_history
+          )
+      end
+    else
+      {:error, error} ->
+        repair_error = operation_repair_error(error)
+
+        repair_generated_with_operations(
+          objective,
+          environment,
+          opts,
+          validation_opts,
+          model,
+          llm_opts,
+          ir,
+          [repair_error | errors],
+          attempts_left - 1,
+          history ++ [operation_repair_failure_record(ir, repair_error)]
+        )
+    end
+  end
+
+  defp operation_repair_prompt(objective, environment, opts, %IR{} = ir, errors) do
+    """
+    You are repairing an invalid RunicAI workflow through a targeted semantic
+    operation transaction.
+
+    Objective:
+    #{objective}
+
+    Prior conversation context:
+    #{conversation_context(opts)}
+
+    Relevant sources:
+    #{Jason.encode!(CodebaseEnvironment.source_summaries(environment, Keyword.get(opts, :source_limit, 40)))}
+
+    Validation errors:
+    #{Jason.encode!(Enum.map(errors, &error_details/1))}
+
+    #{OperationProtocol.grammar()}
+
+    Base revision: #{ir.revision}
+    Base semantic hash: #{IR.semantic_hash(ir)}
+    Current editable manifest:
+    #{Jason.encode!(OperationProtocol.editable_manifest(ir))}
+    """
+  end
+
+  defp operation_list(object) when is_map(object) do
+    case field(object, :operations) do
+      operations when is_list(operations) ->
+        {:ok, operations}
+
+      value ->
+        {:error,
+         coordinator_error("workflow repair must return a typed operation list",
+           stage: :operation_repair,
+           operations: value
+         )}
+    end
+  end
+
+  defp operation_repair_record(edit) do
+    %{
+      status: :applied,
+      base_revision: edit.base_revision,
+      result_revision: edit.result_revision,
+      base_hash: edit.base_hash,
+      result_hash: edit.result_hash,
+      operations: edit.operations,
+      affected_nodes: edit.affected_nodes,
+      diff: edit.diff
+    }
+  end
+
+  defp operation_repair_failure_record(%IR{} = ir, error) do
+    %{
+      status: :rejected,
+      base_revision: ir.revision,
+      base_hash: IR.semantic_hash(ir),
+      error: error_details(error)
+    }
+  end
+
+  defp attach_operation_repair(report, history) do
+    metadata =
+      Map.put(report.metadata, :coordinator_repair, %{
+        strategy: :typed_operations,
+        attempts: length(history),
+        batches: history
+      })
+
+    %{report | metadata: metadata}
+  end
+
+  defp operation_repair_error(%Error{} = error), do: error
+
+  defp operation_repair_error(error) do
+    coordinator_error("workflow typed-operation repair failed",
+      stage: :operation_repair,
+      error: error_details(error)
     )
   end
 
@@ -343,11 +540,63 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   end
 
   defp generate_proposal_object(model, prompt, opts, llm_opts) do
+    RunicAI.Control.Recovery.run(
+      fn -> generate_proposal_object_once(model, prompt, opts, llm_opts) end,
+      retry_policy:
+        Keyword.get(opts, :proposal_generation_retry_policy, LLMRetry.default_policy())
+    )
+  end
+
+  defp generate_operation_object(model, prompt, opts, llm_opts) do
+    RunicAI.Control.Recovery.run(
+      fn -> generate_operation_object_once(model, prompt, opts, llm_opts) end,
+      retry_policy:
+        Keyword.get(opts, :proposal_generation_retry_policy, LLMRetry.default_policy())
+    )
+  end
+
+  defp generate_operation_object_once(model, prompt, opts, llm_opts) do
+    case Keyword.get(opts, :proposal_generation, @default_generation_mode) do
+      :object ->
+        case LLM.generate_object(model, prompt, operation_schema(), llm_opts) do
+          {:ok, object} ->
+            {:ok, object}
+
+          {:error, %Error{retryable?: true} = error} ->
+            {:error, error}
+
+          {:error, error} ->
+            if Keyword.get(opts, :object_generation_fallback?, true) do
+              generate_json_text_object(model, prompt, llm_opts)
+            else
+              {:error, error}
+            end
+        end
+
+      :json_text ->
+        generate_json_text_object(model, prompt, llm_opts)
+    end
+  end
+
+  defp operation_schema do
+    [
+      operations: [
+        type: {:list, :map},
+        required: true,
+        doc: "Smallest typed workflow IR operation transaction that fixes the diagnostics."
+      ]
+    ]
+  end
+
+  defp generate_proposal_object_once(model, prompt, opts, llm_opts) do
     case Keyword.get(opts, :proposal_generation, @default_generation_mode) do
       :object ->
         case LLM.generate_object(model, prompt, schema(), llm_opts) do
           {:ok, object} ->
             {:ok, object}
+
+          {:error, %Error{retryable?: true} = error} ->
+            {:error, error}
 
           {:error, error} ->
             if Keyword.get(opts, :object_generation_fallback?, true) do
@@ -372,6 +621,10 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     expected_artifacts, stop_conditions, metadata.
     """
 
+    generate_json_text_object(model, prompt, llm_opts)
+  end
+
+  defp generate_json_text_object(model, prompt, llm_opts) do
     case LLM.generate_text(model, prompt, llm_opts) do
       {:ok, %Result{} = result} ->
         result
@@ -809,7 +1062,16 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   end
 
   defp implementation_recipe_enabled?(opts) do
-    Keyword.get(opts, :seed_implementation?, Keyword.get(opts, :seed_project_generation?, false))
+    cond do
+      Keyword.has_key?(opts, :seed_implementation?) ->
+        Keyword.fetch!(opts, :seed_implementation?)
+
+      Keyword.has_key?(opts, :seed_project_generation?) ->
+        Keyword.fetch!(opts, :seed_project_generation?)
+
+      true ->
+        true
+    end
   end
 
   defp implementation_objective?(objective) when is_binary(objective) do
@@ -838,42 +1100,62 @@ defmodule RunicAI.Coding.RLM.Coordinator do
     }
   end
 
-  defp node_shape_examples do
-    [
-      %{
-        id: "scaffold",
-        kind: "command",
-        params: %{args: %{argv: ["allowed-command", "arg"], cwd: "."}}
-      },
-      %{
-        id: "implement",
-        kind: "agent",
-        params: %{
-          mode: "patch",
-          workspace_path: "relative/project",
-          task: "Implement a concrete slice and verify it."
+  defp node_shape_examples(opts) do
+    validation_opts = Keyword.get(opts, :validation_opts, [])
+
+    command_examples =
+      if Keyword.get(validation_opts, :allow_commands?, false) do
+        [
+          %{
+            id: "scaffold",
+            kind: "command",
+            params: %{args: %{argv: ["allowed-command", "arg"], cwd: "."}}
+          }
+        ]
+      else
+        []
+      end
+
+    verification_checks =
+      [
+        %{id: "required-file", type: "file_exists", params: %{path: "relative/path"}},
+        %{
+          id: "source-evidence",
+          type: "source_contains",
+          params: %{glob: "relative/**/*.ex", text: "ExpectedEvidence"}
         }
-      },
-      %{
-        id: "verify",
-        kind: "verification_gate",
-        params: %{
-          checks: [
-            %{id: "required-file", type: "file_exists", params: %{path: "relative/path"}},
-            %{
-              id: "source-evidence",
-              type: "source_contains",
-              params: %{glob: "relative/**/*.ex", text: "ExpectedEvidence"}
-            },
+      ] ++
+        if Keyword.get(validation_opts, :allow_commands?, false) do
+          [
             %{
               id: "tests-pass",
               type: "command_passes",
               params: %{argv: ["allowed-command", "test"]}
             }
           ]
+        else
+          []
+        end
+
+    command_examples ++
+      [
+        %{
+          id: "implement",
+          kind: "agent",
+          params: %{
+            mode: "patch",
+            workspace_path: "relative/project",
+            task: "Implement a concrete slice and verify it."
+          }
+        },
+        %{
+          id: "verify",
+          kind: "verification_gate",
+          params: %{
+            checks: verification_checks
+          }
         }
-      }
-    ]
+      ]
   end
 
   defp fallback_enabled?(opts) do
@@ -890,9 +1172,13 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   defp mutation_enabled?(opts) do
     validation_opts = Keyword.get(opts, :validation_opts, [])
 
-    Keyword.get(opts, :mutation?, false) or
-      Keyword.get(opts, :mode) == :patch or
+    if RunicAI.Agent.CapabilityResolver.requested?(validation_opts) do
       Keyword.get(validation_opts, :allow_mutation?, false)
+    else
+      Keyword.get(opts, :mutation?, false) or
+        Keyword.get(opts, :mode) == :patch or
+        Keyword.get(validation_opts, :allow_mutation?, false)
+    end
   end
 
   defp normalize_coordination_opts(opts) do
@@ -920,11 +1206,26 @@ defmodule RunicAI.Coding.RLM.Coordinator do
 
   defp maybe_enable_mutation(validation_opts, opts) do
     if Keyword.get(opts, :mode) == :patch or Keyword.get(opts, :mutation?, false) do
-      validation_opts
-      |> Keyword.put_new(:allow_mutation?, true)
-      |> Keyword.put_new(:allow_verification?, true)
-      |> Keyword.put_new(:allow_commands?, true)
-      |> Keyword.put_new(:allowed_commands, ["mix", "git"])
+      if RunicAI.Agent.CapabilityResolver.requested?(validation_opts) do
+        toolsets = RunicAI.Agent.CapabilityResolver.enabled_toolsets(validation_opts)
+        terminal? = :terminal in toolsets
+
+        validation_opts
+        |> Keyword.put_new(:allow_mutation?, :patch in toolsets)
+        |> Keyword.put_new(
+          :allow_verification?,
+          :verify in toolsets or :profile in toolsets
+        )
+        |> Keyword.put_new(:allow_commands?, terminal?)
+        |> Keyword.put_new(:allow_scripts?, :code_execution in toolsets)
+        |> Keyword.put_new(:allowed_commands, if(terminal?, do: ["mix", "git"], else: []))
+      else
+        validation_opts
+        |> Keyword.put_new(:allow_mutation?, true)
+        |> Keyword.put_new(:allow_verification?, true)
+        |> Keyword.put_new(:allow_commands?, true)
+        |> Keyword.put_new(:allowed_commands, ["mix", "git"])
+      end
     else
       validation_opts
     end
@@ -983,9 +1284,70 @@ defmodule RunicAI.Coding.RLM.Coordinator do
   defp proposal_failure_error(stage, errors) do
     coordinator_error("RLM coding coordinator could not produce an accepted workflow proposal",
       stage: stage,
-      errors: Enum.map(errors, &error_details/1)
+      errors: Enum.map(errors, &error_details/1),
+      diagnostics: Enum.flat_map(errors, &error_diagnostics/1)
     )
   end
+
+  defp error_diagnostics(%Error{} = error) do
+    details = error.details || %{}
+    nested = field(details, :validation_errors) || field(details, :errors)
+
+    diagnostic =
+      %{
+        kind: error.kind,
+        message: error.message,
+        source: inspect(error.source),
+        retryable?: error.retryable?,
+        stage: field(details, :stage),
+        reason: field(details, :reason),
+        node_id: field(details, :node_id),
+        node_ids: field(details, :node_ids),
+        kinds: field(details, :kinds),
+        allowed_kinds: field(details, :allowed_kinds),
+        missing_commands: field(details, :missing_commands)
+      }
+      |> compact_map()
+
+    nested_diagnostics =
+      nested
+      |> List.wrap()
+      |> Enum.flat_map(&error_diagnostics/1)
+
+    [diagnostic | nested_diagnostics]
+    |> Enum.reject(&(&1 == %{}))
+  end
+
+  defp error_diagnostics(error) when is_map(error) do
+    details = field(error, :details) || %{}
+    nested = field(details, :validation_errors) || field(details, :errors)
+
+    diagnostic =
+      %{
+        kind: field(error, :kind),
+        message: field(error, :message),
+        source: field(error, :source),
+        retryable?: field(error, :retryable?),
+        stage: field(details, :stage),
+        reason: field(details, :reason),
+        node_id: field(details, :node_id),
+        node_ids: field(details, :node_ids),
+        kinds: field(details, :kinds),
+        allowed_kinds: field(details, :allowed_kinds),
+        missing_commands: field(details, :missing_commands)
+      }
+      |> compact_map()
+
+    nested_diagnostics =
+      nested
+      |> List.wrap()
+      |> Enum.flat_map(&error_diagnostics/1)
+
+    [diagnostic | nested_diagnostics]
+    |> Enum.reject(&(&1 == %{}))
+  end
+
+  defp error_diagnostics(error), do: [%{kind: :unknown, message: inspect(error)}]
 
   defp coordinator_error(message, details) do
     Error.validation(message, source: __MODULE__, details: Map.new(details))

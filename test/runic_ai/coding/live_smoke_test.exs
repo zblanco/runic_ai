@@ -13,12 +13,12 @@ defmodule RunicAI.Coding.LiveSmokeTest do
   alias RunicAI.Coding.Workspace
   alias RunicAI.Recipes.IntegratedToolAgent
 
-  @model "openai:gpt-5.4-mini"
+  @model "openai:gpt-5.6-luna"
   @required_tools MapSet.new(["apply_patch", "run_tests"])
   @read_tools MapSet.new(["find_files", "list_dir", "read_file", "read_many", "search_text"])
 
   @tag timeout: 180_000
-  test "gpt-5.4-mini can inspect, patch, and verify a disposable Mix project" do
+  test "gpt-5.6-luna can inspect, patch, and verify a disposable Mix project" do
     root = mix_project_fixture()
     workspace = Workspace.new!(root: root)
 

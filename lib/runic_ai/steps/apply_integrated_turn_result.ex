@@ -13,6 +13,7 @@ defmodule RunicAI.Steps.ApplyIntegratedTurnResult do
   alias RunicAI.Error
   alias RunicAI.Integrated.Emission
   alias RunicAI.Integrated.SessionState
+  alias RunicAI.LLM.GenerationEvidence
   alias RunicAI.LLM.Result, as: LLMResult
   alias RunicAI.Rules.ContinueChat
 
@@ -118,6 +119,7 @@ defmodule RunicAI.Steps.ApplyIntegratedTurnResult do
           |> Map.put(:model_calls, Map.get(session.control, :model_calls, 0) + 1)
           |> Map.put(:token_usage, merge_usage(token_usage, usage))
           |> maybe_increment_retries(llm_result)
+          |> GenerationEvidence.append(llm_result)
     }
   end
 
@@ -129,14 +131,22 @@ defmodule RunicAI.Steps.ApplyIntegratedTurnResult do
         Map.get(session.control, :retries, 0)
       end
 
+    control =
+      session.control
+      |> Map.put(:attempts, Map.get(session.control, :attempts, 0) + 1)
+      |> Map.put(:retries, retries)
+      |> maybe_append_generation_error(turn_result)
+
     %SessionState{
       session
-      | control:
-          session.control
-          |> Map.put(:attempts, Map.get(session.control, :attempts, 0) + 1)
-          |> Map.put(:retries, retries)
+      | control: control
     }
   end
+
+  defp maybe_append_generation_error(control, %TurnResult{details: %{error: %Error{} = error}}),
+    do: GenerationEvidence.append_error(control, error)
+
+  defp maybe_append_generation_error(control, _turn_result), do: control
 
   defp maybe_increment_retries(control, %LLMResult{}),
     do: Map.put(control, :retries, Map.get(control, :retries, 0))

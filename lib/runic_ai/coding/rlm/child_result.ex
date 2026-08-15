@@ -140,6 +140,7 @@ defmodule RunicAI.Coding.RLM.ChildResult do
           source: :standard_coding_agent,
           raw_status: field(summary, :status),
           tools_used: List.wrap(field(summary, :tools_used)),
+          generation_evidence: List.wrap(field(summary, :generation_evidence)),
           child_noop_repair_attempts: field(summary, :child_noop_repair_attempts),
           child_patch_repair_attempts: field(summary, :child_patch_repair_attempts)
         }
@@ -330,9 +331,19 @@ defmodule RunicAI.Coding.RLM.ChildResult do
     summary
     |> field(:verifications)
     |> List.wrap()
-    |> Enum.any?(fn verification ->
-      field(verification, :status) not in [:pass, "pass"]
+    |> Enum.reduce(%{}, fn verification, current ->
+      Map.put(current, verification_key(verification), verification)
     end)
+    |> Map.values()
+    |> Enum.any?(fn verification ->
+      verification_status(verification) != :pass
+    end)
+  end
+
+  defp verification_key(verification) do
+    verification
+    |> then(&(field(&1, :command) || field(&1, :tool) || field(&1, :argv)))
+    |> inspect()
   end
 
   defp observed_commands(summary) do
@@ -350,9 +361,31 @@ defmodule RunicAI.Coding.RLM.ChildResult do
     |> Enum.map(fn verification ->
       %{
         command: field(verification, :command) || field(verification, :tool),
-        status: field(verification, :status)
+        tool: field(verification, :tool),
+        argv: field(verification, :argv),
+        cwd: field(verification, :cwd),
+        exit_status: field(verification, :exit_status),
+        status: verification_status(verification),
+        output_preview: field(verification, :output_preview)
       }
     end)
+  end
+
+  defp verification_status(verification) do
+    case field(verification, :status) do
+      status when status in [:pass, :ok, "pass", "ok"] ->
+        :pass
+
+      status when status in [:fail, :failed, :error, "fail", "failed", "error"] ->
+        :fail
+
+      _other ->
+        case field(verification, :exit_status) do
+          0 -> :pass
+          code when is_integer(code) -> :fail
+          _other -> :fail
+        end
+    end
   end
 
   defp contract_checks(nil), do: []

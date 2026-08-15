@@ -47,7 +47,7 @@ defmodule RunicAI.Coding.PersistenceTest do
       {:ok, conn} = SQLite.open(":memory:")
       on_exit(fn -> SQLite.close(conn) end)
 
-      assert {:ok, 1} = SQLite.schema_version(conn)
+      assert {:ok, 4} = SQLite.schema_version(conn)
 
       assert {:ok, ref} =
                SQLite.put_artifact(conn, %{

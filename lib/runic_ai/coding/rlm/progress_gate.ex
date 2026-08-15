@@ -10,6 +10,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   """
 
   alias RunicAI.Coding.RLM.AcceptanceCheck
+  alias RunicAI.Coding.RLM.ExecutionEvidence
   alias RunicAI.Coding.RLM.ObjectiveContract
   alias RunicAI.Coding.RLM.ObjectiveEvidence
   alias RunicAI.Coding.RLM.ObjectiveJudge
@@ -100,7 +101,8 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
         scaffold_marker_result(workspace_evidence),
         meaningful_tests_result(objective, terms, workspace_evidence, policy, semantic_enabled?),
         implementation_activity_result(context, workspace_evidence, policy),
-        delivery_root_result(proposal, objective, context, workspace_evidence, policy)
+        delivery_root_result(proposal, objective, context, workspace_evidence, policy),
+        execution_verification_result(proposal, context, policy)
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -114,6 +116,30 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
       objective_evidence_summary: semantic.objective_evidence_summary
     }
   end
+
+  defp execution_verification_result(proposal, context, policy) do
+    if execution_verification_required?(proposal, policy) do
+      ExecutionEvidence.result(context)
+    end
+  end
+
+  defp execution_verification_required?(proposal, policy) do
+    case policy_value(policy, :require_execution_verification?, :default) do
+      value when value in [true, "true"] -> true
+      value when value in [false, "false"] -> false
+      _default -> seeded_implementation?(proposal)
+    end
+  end
+
+  defp seeded_implementation?(%WorkflowProposal{metadata: metadata}) when is_map(metadata) do
+    (Map.get(metadata, :recipe) || Map.get(metadata, "recipe")) in [
+      :implementation,
+      "implementation"
+    ] and
+      (Map.get(metadata, :seeded?) || Map.get(metadata, "seeded?")) in [true, "true"]
+  end
+
+  defp seeded_implementation?(_proposal), do: false
 
   @spec objective_terms(String.t(), keyword() | map() | false | nil) :: [String.t()]
   def objective_terms(objective, policy \\ []) when is_binary(objective) do
@@ -143,7 +169,7 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
         command_statuses: List.wrap(Map.get(context, :command_results, [])),
         changed_files: changed_files(context),
         repair_count: repair_count(previous_scorecard),
-        residual_risks: residual_risks(context),
+        residual_risks: residual_risks(context, acceptance_results),
         metadata: %{
           gate: :generic_progress,
           objective: progress.objective,
@@ -790,14 +816,44 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
   defp error_details(error), do: %{message: inspect(error)}
 
   defp changed_files(context) do
-    context
-    |> Map.get(:changed_files, [])
-    |> List.wrap()
+    context_files = context |> Map.get(:changed_files, []) |> List.wrap()
+
+    child_files =
+      context
+      |> Map.get(:child_results, [])
+      |> List.wrap()
+      |> Enum.flat_map(fn child -> List.wrap(child_field(child, :changed_files)) end)
+
+    (context_files ++ child_files)
     |> Enum.filter(&is_binary/1)
     |> Enum.uniq()
   end
 
-  defp residual_risks(context), do: context |> Map.get(:risks, []) |> List.wrap()
+  defp residual_risks(context, acceptance_results) do
+    context_risks = context |> Map.get(:risks, []) |> List.wrap()
+
+    child_risks =
+      context
+      |> Map.get(:child_results, [])
+      |> List.wrap()
+      |> Enum.flat_map(fn child ->
+        List.wrap(child_field(child, :unresolved_risks) || child_field(child, :risks))
+      end)
+
+    risks = Enum.uniq(context_risks ++ child_risks)
+
+    if Enum.any?(acceptance_results, &AcceptanceCheck.blocking_failure?/1) do
+      risks
+    else
+      Enum.reject(risks, &superseded_execution_risk?/1)
+    end
+  end
+
+  defp superseded_execution_risk?(risk) when is_binary(risk) do
+    String.starts_with?(risk, ["verification was not run", "turn ended with error: provider:"])
+  end
+
+  defp superseded_execution_risk?(_risk), do: false
 
   defp previous_acceptance_results(%WorkflowScorecard{} = scorecard),
     do: scorecard.acceptance_results
@@ -847,4 +903,9 @@ defmodule RunicAI.Coding.RLM.ProgressGate do
     do: Map.get(policy, key, Map.get(policy, Atom.to_string(key), default))
 
   defp truthy_policy?(policy, key), do: policy_value(policy, key, false) in [true, true, "true"]
+
+  defp child_field(child, key) when is_map(child),
+    do: Map.get(child, key, Map.get(child, Atom.to_string(key)))
+
+  defp child_field(_child, _key), do: nil
 end

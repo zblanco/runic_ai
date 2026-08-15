@@ -2,7 +2,7 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
   @moduledoc """
   Process-owned registry for model-visible sandbox sessions.
 
-  RunicSandbox session handles are signed and manager-owned. This registry keeps
+  LitterBox session handles are signed and manager-owned. This registry keeps
   the actual handle inside a long-lived process and exposes only opaque ids to
   tools, so later model-visible calls can operate on the same sandbox session
   without serializing backend authority data.
@@ -11,15 +11,15 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
   use GenServer
 
   alias RunicAI.Error
-  alias RunicSandbox, as: Sandbox
-  alias RunicSandbox.Checkpoint
-  alias RunicSandbox.ExecutionResult
-  alias RunicSandbox.FileRef
-  alias RunicSandbox.ProcessHandle, as: SandboxProcessHandle
-  alias RunicSandbox.ProcessStatus
-  alias RunicSandbox.Proxy
-  alias RunicSandbox.Service
-  alias RunicSandbox.Session
+  alias LitterBox, as: Sandbox
+  alias LitterBox.Checkpoint
+  alias LitterBox.ExecutionResult
+  alias LitterBox.FileRef
+  alias LitterBox.ProcessHandle, as: SandboxProcessHandle
+  alias LitterBox.ProcessStatus
+  alias LitterBox.Proxy
+  alias LitterBox.Service
+  alias LitterBox.Session
 
   defstruct sessions: %{}, processes: %{}, proxies: %{}
 
@@ -714,7 +714,7 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
     end)
   end
 
-  defp session_event_snapshot(%RunicSandbox.SessionEvent{} = event, max_chunk_bytes) do
+  defp session_event_snapshot(%LitterBox.SessionEvent{} = event, max_chunk_bytes) do
     %{
       id: event.id,
       session_id: event.session_id,
@@ -754,7 +754,7 @@ defmodule RunicAI.Coding.SandboxSessionRegistry do
   defp normalize_sandbox_result({:ok, value}), do: {:ok, value}
   defp normalize_sandbox_result(:ok), do: :ok
 
-  defp normalize_sandbox_result({:error, %RunicSandbox.Error{} = error}) do
+  defp normalize_sandbox_result({:error, %LitterBox.Error{} = error}) do
     {:error,
      Error.new(error.kind, error.message,
        details: error.details,

@@ -111,18 +111,19 @@ defmodule RunicAI.Coding.RLM.EditPatchSet do
           {:ok, map()} | {:error, Error.t()}
   def apply(%Workspace{} = workspace, patch_set_input, opts \\ []) when is_list(opts) do
     with {:ok, patch_set} <- from_input(patch_set_input) do
+      replay_context = Keyword.get(opts, :replay_context)
+
       {patch_results, skipped} =
         patch_set.operations
         |> Enum.map(&EditOperation.to_patch_input/1)
         |> Enum.reduce({[], []}, fn
           {:ok, patch_input}, {results, skipped} ->
-            {:ok, result} =
-              Tools.apply_patch(
-                workspace,
-                patch_input
-                |> Map.update!(:metadata, &Map.merge(patch_set.metadata, &1))
-                |> Map.put(:dry_run, Keyword.get(opts, :dry_run?, false))
-              )
+            args =
+              patch_input
+              |> Map.update!(:metadata, &Map.merge(patch_set.metadata, &1))
+              |> Map.put(:dry_run, Keyword.get(opts, :dry_run?, false))
+
+            {:ok, result} = apply_patch(workspace, args, replay_context)
 
             {[result | results], skipped}
 
@@ -152,6 +153,7 @@ defmodule RunicAI.Coding.RLM.EditPatchSet do
           changed_paths == [] -> :error
           missing_expected != [] -> :error
           Keyword.get(opts, :dry_run?, false) -> :dry_run
+          Enum.all?(patch_results, &(&1.status == :reconciled)) -> :reconciled
           true -> :ok
         end
 
@@ -173,6 +175,11 @@ defmodule RunicAI.Coding.RLM.EditPatchSet do
        }}
     end
   end
+
+  defp apply_patch(workspace, args, replay_context) when is_map(replay_context),
+    do: Tools.reconcile_patch_after_unknown(workspace, args, replay_context)
+
+  defp apply_patch(workspace, args, _replay_context), do: Tools.apply_patch(workspace, args)
 
   defp normalize_operations(operations) when is_list(operations) do
     operations

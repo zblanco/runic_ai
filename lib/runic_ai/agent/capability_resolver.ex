@@ -14,7 +14,7 @@ defmodule RunicAI.Agent.CapabilityResolver do
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
   alias RunicAI.Tool.Registry
-  alias RunicSandbox.Error, as: SandboxError
+  alias LitterBox.Error, as: SandboxError
 
   @known_toolsets [
     :file,
@@ -519,7 +519,7 @@ defmodule RunicAI.Agent.CapabilityResolver do
   defp validate_sandbox_config(opts) do
     case sandbox_opts(opts) do
       [profile: profile] ->
-        case RunicSandbox.Profile.new(profile) do
+        case LitterBox.Profile.new(profile) do
           {:ok, _profile} -> :ok
           {:error, error} -> {:error, sandbox_error_to_runic_ai_error(error)}
         end

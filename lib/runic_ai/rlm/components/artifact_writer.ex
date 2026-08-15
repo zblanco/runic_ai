@@ -26,14 +26,21 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
     with :ok <- validate_target(path, write_policy),
          {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
          content <- content(input, params),
+         content_sha256 <- sha256(content),
          :ok <- File.mkdir_p(Path.dirname(resolved.path)),
-         :ok <- File.write(resolved.path, content) do
+         {:ok, reconciliation} <- reconcile_or_write(resolved.path, content, content_sha256) do
       {:ok,
        %{
-         status: :written,
+         status: reconciliation_status(reconciliation),
          path: resolved.relative,
          absolute_path: resolved.path,
          bytes: byte_size(content),
+         sha256: content_sha256,
+         idempotency_key: "artifact_writer:#{resolved.relative}:#{content_sha256}",
+         reconciliation: %{
+           strategy: :compare_existing_content,
+           outcome: reconciliation
+         },
          write_policy: write_policy,
          provenance: collect_provenance(input)
        }}
@@ -68,6 +75,54 @@ defmodule RunicAI.RLM.Components.ArtifactWriter do
   defp fallback_content(%{"content" => content}) when is_binary(content), do: content
   defp fallback_content(value) when is_binary(value), do: value
   defp fallback_content(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+
+  defp reconcile_or_write(path, content, content_sha256) do
+    case File.read(path) do
+      {:ok, existing} ->
+        if sha256(existing) == content_sha256 do
+          {:ok, :matched_existing}
+        else
+          atomic_write(path, content, :replaced_existing)
+        end
+
+      {:error, :enoent} ->
+        atomic_write(path, content, :created)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp atomic_write(path, content, outcome) do
+    temporary =
+      Path.join(
+        Path.dirname(path),
+        ".#{Path.basename(path)}.runic-ai-#{System.unique_integer([:positive])}.tmp"
+      )
+
+    case File.write(temporary, content, [:binary, :exclusive]) do
+      :ok ->
+        case File.rename(temporary, path) do
+          :ok ->
+            {:ok, outcome}
+
+          {:error, reason} ->
+            _ = File.rm(temporary)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp reconciliation_status(:matched_existing), do: :reconciled
+  defp reconciliation_status(_outcome), do: :written
+
+  defp sha256(content) do
+    :crypto.hash(:sha256, content)
+    |> Base.encode16(case: :lower)
+  end
 
   defp collect_provenance(value) when is_list(value) do
     value

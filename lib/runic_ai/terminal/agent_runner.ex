@@ -428,10 +428,18 @@ defmodule RunicAI.Terminal.AgentRunner do
       client: options.client,
       client_label: options.client_label,
       model_resolution: options.model_resolution,
+      proposal_model: rlm_role_model(options, "proposal_model"),
+      agent_model: rlm_role_model(options, "agent_model"),
+      agent_fallback_model: rlm_role_model(options, "agent_fallback_model"),
+      proposal_llm_opts: rlm_role_llm_opts(options, "proposal_reasoning_effort"),
+      agent_llm_opts: rlm_role_llm_opts(options, "agent_reasoning_effort"),
+      agent_fallback_llm_opts: rlm_role_llm_opts(options, "agent_fallback_reasoning_effort"),
       max_turns: options.max_turns,
       max_runtime_ms: options.max_runtime_ms,
       max_objective_iterations: options.max_objective_iterations,
       proposal_timeout_ms: options.proposal_timeout_ms,
+      max_child_runtime_ms: rlm_positive_integer(options, "max_child_runtime_ms"),
+      child_noop_repair_attempts: rlm_positive_integer(options, "child_noop_repair_attempts"),
       objective_loop?: options.objective_loop?,
       repair?: rlm_repair_enabled?(options),
       max_repair_iterations: rlm_max_repairs(options),
@@ -459,11 +467,15 @@ defmodule RunicAI.Terminal.AgentRunner do
       objective_contract: Keyword.get(opts, :objective_contract),
       semantic_judge: Keyword.get(opts, :semantic_judge),
       semantic_judge_generation: Keyword.get(opts, :semantic_judge_generation),
-      semantic_model: Keyword.get(opts, :semantic_model),
+      semantic_model:
+        Keyword.get(opts, :semantic_model) || rlm_role_model(options, "judge_model"),
       semantic_client: Keyword.get(opts, :semantic_client),
-      semantic_llm_opts: Keyword.get(opts, :semantic_llm_opts),
+      semantic_llm_opts:
+        Keyword.get(opts, :semantic_llm_opts) ||
+          rlm_role_llm_opts(options, "judge_reasoning_effort"),
       semantic_evidence_policy: Keyword.get(opts, :semantic_evidence_policy),
       progress_policy: Keyword.get(opts, :progress_policy),
+      agent_review_gates?: options.approve != :always,
       max_objective_auto_resumes: Keyword.get(opts, :max_objective_auto_resumes),
       repair_opts: rlm_repair_opts(options, opts),
       event_sink: event_sink,
@@ -498,6 +510,82 @@ defmodule RunicAI.Terminal.AgentRunner do
   end
 
   defp rlm_recipe(%CliOptions{}), do: nil
+
+  defp rlm_role_model(%CliOptions{agent: :rlm, tool_config: tool_config}, key) do
+    case nested_config(tool_config, ["rlm", key]) do
+      value when is_binary(value) and value != "" -> value
+      _other -> nil
+    end
+  end
+
+  defp rlm_role_model(%CliOptions{}, _key), do: nil
+
+  defp rlm_role_llm_opts(%CliOptions{agent: :rlm, tool_config: tool_config}, key) do
+    role = String.replace_suffix(key, "_reasoning_effort", "")
+    reasoning_effort = tool_config |> nested_config(["rlm", key]) |> normalize_reasoning_effort()
+
+    max_completion_tokens =
+      nested_positive_integer(tool_config, ["rlm", "#{role}_max_completion_tokens"])
+
+    []
+    |> maybe_put_keyword(:reasoning_effort, reasoning_effort)
+    |> maybe_put_keyword(:max_completion_tokens, max_completion_tokens)
+    |> case do
+      [] -> nil
+      opts -> opts
+    end
+  end
+
+  defp rlm_role_llm_opts(%CliOptions{}, _key), do: nil
+
+  defp rlm_positive_integer(%CliOptions{agent: :rlm, tool_config: tool_config}, key) do
+    case nested_config(tool_config, ["rlm", key]) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      value when is_binary(value) ->
+        case Integer.parse(value) do
+          {integer, ""} when integer > 0 -> integer
+          _other -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp rlm_positive_integer(%CliOptions{}, _key), do: nil
+
+  defp nested_positive_integer(config, path) do
+    case nested_config(config, path) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      value when is_binary(value) ->
+        case Integer.parse(value) do
+          {integer, ""} when integer > 0 -> integer
+          _other -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp maybe_put_keyword(opts, _key, nil), do: opts
+  defp maybe_put_keyword(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp normalize_reasoning_effort(value)
+       when value in [:none, :low, :medium, :high, :xhigh, :max],
+       do: value
+
+  defp normalize_reasoning_effort("none"), do: :none
+  defp normalize_reasoning_effort("low"), do: :low
+  defp normalize_reasoning_effort("medium"), do: :medium
+  defp normalize_reasoning_effort("high"), do: :high
+  defp normalize_reasoning_effort("xhigh"), do: :xhigh
+  defp normalize_reasoning_effort("max"), do: :max
+  defp normalize_reasoning_effort(_value), do: nil
 
   defp rlm_repair_enabled?(%CliOptions{agent: :rlm, repair?: repair?}) when is_boolean(repair?),
     do: repair?

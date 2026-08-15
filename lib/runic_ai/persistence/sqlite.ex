@@ -18,7 +18,7 @@ defmodule RunicAI.Persistence.SQLite do
   alias RunicAI.Persistence.Schemas.RunArtifact
   alias RunicAI.Persistence.Schemas.TerminalEvent
 
-  @schema_version 1
+  @schema_version 4
   @default_busy_attempts 5
   @default_busy_backoff_ms 25
 

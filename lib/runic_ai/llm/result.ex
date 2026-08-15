@@ -56,8 +56,9 @@ defmodule RunicAI.LLM.Result do
     end
   end
 
-  @spec from_req_llm_response(ReqLLM.Response.t()) :: {:ok, t()} | {:error, Error.t()}
-  def from_req_llm_response(%ReqLLM.Response{} = response) do
+  @spec from_req_llm_response(ReqLLM.Response.t(), keyword()) ::
+          {:ok, t()} | {:error, Error.t()}
+  def from_req_llm_response(%ReqLLM.Response{} = response, opts \\ []) do
     message =
       response.message ||
         response.context
@@ -72,7 +73,8 @@ defmodule RunicAI.LLM.Result do
       new(message,
         finish_reason: response.finish_reason,
         usage: response.usage || %{},
-        raw: response
+        raw: response,
+        metadata: %{generation_evidence: generation_evidence(response, opts)}
       )
     end
   end
@@ -87,6 +89,55 @@ defmodule RunicAI.LLM.Result do
 
   @spec text(t()) :: String.t()
   def text(%__MODULE__{message: message}), do: Message.text(message)
+
+  @spec evidence(t()) :: map()
+  def evidence(%__MODULE__{} = result) do
+    Map.get(result.metadata, :generation_evidence) ||
+      %{
+        finish_reason: result.finish_reason,
+        usage: result.usage,
+        tool_call_count: tool_call_count(result.raw),
+        text_bytes: byte_size(text(result))
+      }
+  end
+
+  defp generation_evidence(response, opts) do
+    %{
+      response_id: response.id,
+      response_model: response.model,
+      requested_model: Keyword.get(opts, :requested_model),
+      finish_reason: response.finish_reason,
+      usage: response.usage || %{},
+      tool_choice: Keyword.get(opts, :tool_choice),
+      tool_call_count: length(ReqLLM.Response.tool_calls(response)),
+      text_bytes: byte_size(ReqLLM.Response.text(response) || ""),
+      provider_meta: sanitize_provider_meta(response.provider_meta)
+    }
+    |> Enum.reject(fn {_key, value} -> value in [nil, %{}] end)
+    |> Map.new()
+  end
+
+  defp tool_call_count(%ReqLLM.Response{} = response),
+    do: length(ReqLLM.Response.tool_calls(response))
+
+  defp tool_call_count(_raw), do: 0
+
+  defp sanitize_provider_meta(metadata) when is_map(metadata) do
+    Map.take(metadata, [
+      :request_id,
+      :response_id,
+      :raw_finish_reason,
+      :status,
+      :warnings,
+      "request_id",
+      "response_id",
+      "raw_finish_reason",
+      "status",
+      "warnings"
+    ])
+  end
+
+  defp sanitize_provider_meta(_metadata), do: %{}
 
   defp validate_message_role(%Message{role: :assistant}), do: :ok
 

@@ -14,6 +14,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
+  alias RunicAI.JSONMap
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
   alias RunicAI.RLM.StrategyRouter
@@ -197,7 +198,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
       Enum.map(blueprint.components, fn
         %ComponentBlueprint{type: type, params: params} = component
         when type in [:objective_scorecard, :verification] ->
-          %{component | params: Map.merge(params || %{}, runtime_params)}
+          %{component | params: JSONMap.merge(params || %{}, runtime_params)}
 
         component ->
           component
@@ -261,7 +262,8 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
     with {:ok, blueprint} <- WorkflowBlueprint.from_input(object),
          blueprint <- enforce_runtime_scorecard_params(blueprint, opts),
          {:ok, _report} <- BlueprintValidator.validate(blueprint, validation_opts(opts)) do
-      {:ok, %{blueprint | metadata: Map.put(blueprint.metadata || %{}, :proposal_kind, stage)}}
+      {:ok,
+       %{blueprint | metadata: JSONMap.put(blueprint.metadata || %{}, :proposal_kind, stage)}}
     else
       {:error, %Error{} = error} ->
         {:error,
@@ -340,7 +342,7 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
          %{
            blueprint
            | metadata:
-               Map.put(blueprint.metadata || %{}, :proposal_failure, %{
+               JSONMap.put(blueprint.metadata || %{}, :proposal_failure, %{
                  message: error.message,
                  details: error.details
                })
@@ -402,8 +404,8 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
          blueprint
          | metadata:
              blueprint.metadata
-             |> Map.put(:proposal_kind, :routed_strategy)
-             |> Map.put(:strategy_route, StrategyRouter.metadata(decision))
+             |> JSONMap.put(:proposal_kind, :routed_strategy)
+             |> JSONMap.put(:strategy_route, StrategyRouter.metadata(decision))
        }}
     end
   end
@@ -447,10 +449,10 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
          blueprint
          | metadata:
              blueprint.metadata
-             |> Map.put(:proposal_kind, :strategy_change_repair)
-             |> Map.put(:strategy_route, StrategyRouter.metadata(decision))
-             |> Map.put(:rerouted_to, decision.fallback)
-             |> Map.put(:repair_failure, %{message: error.message, details: error.details})
+             |> JSONMap.put(:proposal_kind, :strategy_change_repair)
+             |> JSONMap.put(:strategy_route, StrategyRouter.metadata(decision))
+             |> JSONMap.put(:rerouted_to, decision.fallback)
+             |> JSONMap.put(:repair_failure, %{message: error.message, details: error.details})
        }}
     end
   end
@@ -586,8 +588,8 @@ defmodule RunicAI.Assistant.RLM.Coordinator do
        blueprint
        | metadata:
            (blueprint.metadata || %{})
-           |> Map.put(:proposal_kind, :curated_recipe)
-           |> Map.put(:recipe, shape)
+           |> JSONMap.put(:proposal_kind, :curated_recipe)
+           |> JSONMap.put(:recipe, shape)
      }}
   end
 

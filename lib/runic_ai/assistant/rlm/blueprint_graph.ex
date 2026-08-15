@@ -221,7 +221,8 @@ defmodule RunicAI.Assistant.RLM.BlueprintGraph do
         view = graph_view(blueprint, specs, graph)
 
         root_leaf_diagnostics(view, opts) ++
-          isolated_component_diagnostics(view) ++ source_materializer_parent_diagnostics(view)
+          isolated_component_diagnostics(view) ++
+          source_materializer_parent_diagnostics(view) ++ native_shape_diagnostics(view)
       else
         []
       end
@@ -287,6 +288,63 @@ defmodule RunicAI.Assistant.RLM.BlueprintGraph do
             "source_materializer requires source_splitter or lambda_split output, not raw discovery or arbitrary transformed values",
             %{
               component_id: spec.id,
+              parent_component_ids: Enum.map(parents, & &1.id),
+              parent_component_types: Enum.map(parents, & &1.type)
+            }
+          )
+        ]
+      end
+    end)
+  end
+
+  defp native_shape_diagnostics(%__MODULE__{} = graph) do
+    map_child_diagnostics(graph) ++ reduce_parent_diagnostics(graph)
+  end
+
+  defp map_child_diagnostics(%__MODULE__{} = graph) do
+    graph.specs
+    |> Enum.filter(&(&1.execution_shape == :map))
+    |> Enum.flat_map(fn spec ->
+      children = Enum.map(child_ids(graph, spec.id), &Map.fetch!(graph.by_id, &1))
+      invalid = Enum.reject(children, &(&1.execution_shape == :reduce))
+
+      if invalid == [] do
+        []
+      else
+        [
+          diagnostic(
+            :error,
+            :native_map_requires_reduce_child,
+            "native map output must flow directly into a reduce-shaped component before ordinary batch components",
+            %{
+              component_id: spec.id,
+              component_type: spec.type,
+              invalid_child_ids: Enum.map(invalid, & &1.id),
+              invalid_child_types: Enum.map(invalid, & &1.type)
+            }
+          )
+        ]
+      end
+    end)
+  end
+
+  defp reduce_parent_diagnostics(%__MODULE__{} = graph) do
+    graph.specs
+    |> Enum.filter(&(&1.execution_shape == :reduce))
+    |> Enum.flat_map(fn spec ->
+      parents = Enum.map(parent_ids(graph, spec.id), &Map.fetch!(graph.by_id, &1))
+
+      if Enum.any?(parents, &(&1.execution_shape == :map)) do
+        []
+      else
+        [
+          diagnostic(
+            :error,
+            :missing_native_map_parent,
+            "reduce-shaped component requires a direct native map parent",
+            %{
+              component_id: spec.id,
+              component_type: spec.type,
               parent_component_ids: Enum.map(parents, & &1.id),
               parent_component_types: Enum.map(parents, & &1.type)
             }

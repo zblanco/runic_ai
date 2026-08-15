@@ -98,6 +98,7 @@ defmodule RunicAI.Persistence.HarnessProjection do
           %{
             attrs
             | agent_kind: projected_session_agent_kind(session, attrs, event),
+              status: projected_session_status(session, attrs.status, event),
               workspace_root: attrs.workspace_root || session.workspace_root,
               objective: attrs.objective || session.objective,
               model: attrs.model || session.model,
@@ -116,6 +117,17 @@ defmodule RunicAI.Persistence.HarnessProjection do
       session.agent_kind || attrs.agent_kind
     end
   end
+
+  defp projected_session_status(
+         %AgentSession{status: status},
+         _projected_status,
+         %TerminalEvent{} = event
+       )
+       when status in ["completed", "failed", "blocked", "cancelled"] do
+    if data_field(event, :kind) == "workflow_edit", do: status, else: session_status(event)
+  end
+
+  defp projected_session_status(_session, projected_status, _event), do: projected_status
 
   defp agent_route_event?(%TerminalEvent{} = event) do
     not is_nil(data_field(event, :routed_agent)) or not is_nil(data_field(event, :route_reason))
@@ -396,7 +408,8 @@ defmodule RunicAI.Persistence.HarnessProjection do
     attrs = %{
       id: field(data, :id) || field(event.data_json, :id) || "review:#{event.id}",
       session_id: event.session_id,
-      workflow_run_id: event.run_id,
+      workflow_run_id:
+        field(data, :workflow_run_id) || field(event.data_json, :workflow_run_id) || event.run_id,
       tool_call_id: field(data, :tool_call_id) || field(event.data_json, :tool_call_id),
       kind: field(data, :kind) || field(event.data_json, :kind) || event.phase || "review",
       checkpoint: field(data, :checkpoint) || field(event.data_json, :checkpoint),
@@ -831,24 +844,39 @@ defmodule RunicAI.Persistence.HarnessProjection do
   defp conversation_id(%TerminalEvent{} = event),
     do: "conversation:#{event.session_id || event.run_id}"
 
-  defp session_status(%TerminalEvent{status: "error"}), do: "failed"
+  defp session_status(%TerminalEvent{kind: "error"}), do: "failed"
+
+  defp session_status(%TerminalEvent{status: "error"} = event) do
+    if final_summary?(event), do: "failed", else: "running"
+  end
+
   defp session_status(%TerminalEvent{status: "blocked"}), do: "blocked"
 
-  defp session_status(%TerminalEvent{status: status}) when status in ["review", "waiting"],
-    do: status
+  defp session_status(%TerminalEvent{kind: kind, status: status})
+       when kind in ["hitl", "summary", "status"] and status in ["review", "waiting"],
+       do: status
 
   defp session_status(%TerminalEvent{} = event) do
     if final_summary?(event), do: "completed", else: "running"
   end
 
-  defp run_status(%TerminalEvent{status: "error"}), do: "failed"
+  defp run_status(%TerminalEvent{kind: "error"}), do: "failed"
+
+  defp run_status(%TerminalEvent{status: "error"} = event) do
+    if final_summary?(event), do: "failed", else: "running"
+  end
+
   defp run_status(%TerminalEvent{status: "blocked"}), do: "blocked"
 
   defp run_status(%TerminalEvent{} = event) do
     if final_summary?(event), do: "completed", else: "running"
   end
 
-  defp conversation_status(%TerminalEvent{status: "error"}), do: "failed"
+  defp conversation_status(%TerminalEvent{kind: "error"}), do: "failed"
+
+  defp conversation_status(%TerminalEvent{status: "error"} = event) do
+    if final_summary?(event), do: "failed", else: "active"
+  end
 
   defp conversation_status(%TerminalEvent{} = event) do
     if final_summary?(event), do: "completed", else: "active"
@@ -901,7 +929,10 @@ defmodule RunicAI.Persistence.HarnessProjection do
     if event.status in ["ok"] and final_summary?(event), do: event.at
   end
 
-  defp failed_at(%TerminalEvent{status: "error"} = event), do: event.at
+  defp failed_at(%TerminalEvent{status: "error"} = event) do
+    if final_summary?(event), do: event.at
+  end
+
   defp failed_at(_event), do: nil
 
   defp final_summary?(%TerminalEvent{kind: "summary", phase: phase})

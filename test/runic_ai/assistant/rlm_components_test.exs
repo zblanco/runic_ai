@@ -12,9 +12,11 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
   alias RunicAI.RLM.Components.BlueprintTransform
   alias RunicAI.RLM.Components.BudgetLedger
   alias RunicAI.RLM.Components.DocumentCompare
+  alias RunicAI.RLM.Components.HierarchicalReduce
   alias RunicAI.RLM.Components.LLMMap
   alias RunicAI.RLM.Components.ObjectiveScorecard
   alias RunicAI.RLM.Components.RecordGroup
+  alias RunicAI.RLM.Components.RecordMap
   alias RunicAI.RLM.Components.ReportComposer
   alias RunicAI.RLM.Components.SafeCompute
   alias RunicAI.RLM.Components.SourceDiscovery
@@ -297,6 +299,108 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
     assert_receive {:mapped, prompt}
     assert prompt =~ "one business day"
     assert prompt =~ "two business days"
+  end
+
+  test "LLM map always supplies authoritative source metadata to drafted prompts" do
+    parent = self()
+
+    client = fn _model, prompt, _opts ->
+      send(parent, {:mapped_with_source, prompt})
+      {:ok, RunicAI.LLM.TestClient.result("mapped")}
+    end
+
+    input = %{
+      slices: [
+        %{
+          id: "incident:1",
+          path: "notes/incidents.md",
+          start_line: 4,
+          end_line: 8,
+          text: "Payment retries duplicated work."
+        }
+      ]
+    }
+
+    assert {:ok, %{count: 1}} =
+             LLMMap.run(input, %{prompt: "Extract evidence from {{text}}"},
+               client: client,
+               model: "test:model"
+             )
+
+    assert_receive {:mapped_with_source, prompt}
+    assert prompt =~ "Payment retries duplicated work."
+    assert prompt =~ "source_path: notes/incidents.md"
+    assert prompt =~ "start_line: 4"
+    assert prompt =~ "end_line: 8"
+  end
+
+  test "record map always supplies authoritative record data when drafted prompt omits it" do
+    parent = self()
+
+    client = fn _model, prompt, _opts ->
+      send(parent, {:record_prompt, prompt})
+      {:ok, RunicAI.LLM.TestClient.result("mapped")}
+    end
+
+    input = %{
+      records: [
+        %{
+          id: "row:2",
+          data: %{"id" => "1", "team" => "api", "status" => "ready"},
+          provenance: [%{path: "data/work-items.csv", row: 2}]
+        }
+      ]
+    }
+
+    assert {:ok, %{count: 1}} =
+             RecordMap.run(input, %{prompt: "Derive ownership without inventing fields."},
+               client: client,
+               model: "test:model"
+             )
+
+    assert_receive {:record_prompt, prompt}
+    assert prompt =~ "Authoritative input record (JSON)"
+    assert prompt =~ ~s("id":"1")
+    assert prompt =~ ~s("team":"api")
+    assert prompt =~ "data/work-items.csv"
+  end
+
+  test "LLM reduce supplies evidence when drafted group and final prompts omit items" do
+    parent = self()
+
+    client = fn _model, prompt, _opts ->
+      send(parent, {:reduced, prompt})
+      {:ok, RunicAI.LLM.TestClient.result("merged evidence")}
+    end
+
+    input = %{
+      text: "Payment retries duplicated work [notes/incidents.md].",
+      provenance: [%{path: "notes/incidents.md", line_span: [1, 6]}]
+    }
+
+    assert {:ok, result} =
+             HierarchicalReduce.run(
+               input,
+               %{
+                 strategy: :llm_reduce,
+                 group_prompt: "Combine evidence for {{objective}}.",
+                 prompt: "Write the final report."
+               },
+               client: client,
+               model: "test:model",
+               objective: "assess delivery risk"
+             )
+
+    assert result.text == "merged evidence"
+    assert_receive {:reduced, group_prompt}
+    assert group_prompt =~ "Combine evidence for assess delivery risk."
+    assert group_prompt =~ "Runtime evidence group (authoritative)"
+    assert group_prompt =~ "Payment retries duplicated work [notes/incidents.md]."
+
+    assert_receive {:reduced, final_prompt}
+    assert final_prompt =~ "Write the final report."
+    assert final_prompt =~ "Runtime merged evidence (authoritative)"
+    assert final_prompt =~ "merged evidence"
   end
 
   test "tabular parser and record group process JSONL records" do
@@ -594,7 +698,20 @@ defmodule RunicAI.Assistant.RLMComponentsTest do
              })
 
     assert artifact.path == ".docs/report.md"
+    assert artifact.status == :written
+    assert artifact.reconciliation.outcome == :created
+    assert artifact.idempotency_key =~ "artifact_writer:.docs/report.md:"
     assert File.read!(Path.join(root, ".docs/report.md")) == "# Report\n"
+
+    assert {:ok, reconciled} =
+             ArtifactWriter.run(workspace, %{text: "# Report\n"}, %{
+               path: ".docs/report.md",
+               write_policy: :docs_only
+             })
+
+    assert reconciled.status == :reconciled
+    assert reconciled.reconciliation.outcome == :matched_existing
+    assert reconciled.idempotency_key == artifact.idempotency_key
 
     assert {:error, error} =
              ArtifactWriter.run(workspace, "bad", %{

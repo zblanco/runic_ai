@@ -15,6 +15,7 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
   alias RunicAI.Coding.RLM.Checkpoint
   alias RunicAI.Coding.RLM.ChildResult
   alias RunicAI.Coding.RLM.CodebaseEnvironment
+  alias RunicAI.Coding.RLM.ExecutionEvidence
   alias RunicAI.Coding.RLM.ProposalNode
   alias RunicAI.Coding.RLM.ProgressGate
   alias RunicAI.Coding.RLM.RepairAttempt
@@ -38,20 +39,52 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
   def run(result, %CodebaseEnvironment{} = environment, opts \\ []) when is_map(result) do
     repair_opts = Keyword.get(opts, :repair_opts, [])
 
-    if satisfied?(result) do
-      {:ok, mark_repair_status(result, :not_needed, [])}
-    else
-      max_iterations =
-        Keyword.get(
-          repair_opts,
-          :max_iterations,
-          Keyword.get(opts, :max_repair_iterations, @default_max_iterations)
-        )
+    cond do
+      satisfied?(result) ->
+        {:ok, mark_repair_status(result, :not_needed, [])}
 
-      result
-      |> ensure_context()
-      |> iterate(environment, opts, repair_opts, max_iterations, [])
+      evidence = unrecoverable_generation_evidence(result) ->
+        {:error,
+         Error.provider("RLM repair cannot proceed after a non-retryable generation failure",
+           source: __MODULE__,
+           details: %{generation_evidence: evidence}
+         )}
+
+      true ->
+        max_iterations =
+          Keyword.get(
+            repair_opts,
+            :max_iterations,
+            Keyword.get(opts, :max_repair_iterations, @default_max_iterations)
+          )
+
+        result
+        |> ensure_context()
+        |> iterate(environment, opts, repair_opts, max_iterations, [])
     end
+  end
+
+  defp unrecoverable_generation_evidence(result) do
+    result
+    |> get_in([:context, :child_results])
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.find_value(fn child ->
+      child
+      |> field(:metadata)
+      |> field(:generation_evidence)
+      |> List.wrap()
+      |> List.last()
+      |> case do
+        evidence when is_map(evidence) ->
+          if field(evidence, :error_kind) in [:provider, "provider"] and
+               field(evidence, :retryable?) not in [true, "true"],
+             do: evidence
+
+        _other ->
+          nil
+      end
+    end)
   end
 
   @spec satisfied?(run_result()) :: boolean()
@@ -938,7 +971,11 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
          opts,
          iteration
        ) do
-    commands = verification_commands(proposal, opts)
+    commands =
+      proposal
+      |> verification_commands(opts)
+      |> Kernel.++(failed_child_verification_commands(context))
+      |> Enum.uniq_by(& &1.args)
 
     Enum.reduce(commands, context, fn %{args: command_args, check: check}, context ->
       policy =
@@ -971,6 +1008,47 @@ defmodule RunicAI.Coding.RLM.RepairLoop do
           context
       end
     end)
+  end
+
+  # A generic implementation recipe cannot know whether the selected project
+  # uses Mix, Cargo, npm, or another toolchain. The verifier child does know and
+  # records the concrete argv it ran. When a repair changes the workspace, rerun
+  # those failed commands deterministically so stale child evidence cannot keep
+  # a repaired project failed (or, conversely, let an unverified repair pass).
+  defp failed_child_verification_commands(context) do
+    context
+    |> Map.get(:child_results, [])
+    |> List.wrap()
+    |> Enum.flat_map(fn child ->
+      child
+      |> field(:command_statuses)
+      |> List.wrap()
+    end)
+    |> Enum.filter(
+      &(ExecutionEvidence.verification_observation?(&1) and command_status(&1) == :fail)
+    )
+    |> Enum.flat_map(fn observation ->
+      case verification_args_from_observation(observation) do
+        nil -> []
+        args -> [%{args: args, check: nil}]
+      end
+    end)
+  end
+
+  defp verification_args_from_observation(observation) do
+    case field(observation, :argv) do
+      argv when is_list(argv) and argv != [] ->
+        %{
+          argv: argv,
+          cwd: field(observation, :cwd) || ".",
+          timeout_ms: field(observation, :timeout_ms)
+        }
+        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.new()
+
+      _other ->
+        nil
+    end
   end
 
   defp verification_commands(%WorkflowProposal{} = proposal, opts) do

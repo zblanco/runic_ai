@@ -385,7 +385,7 @@ defmodule RunicAI.Terminal.EventTest do
     assert %Event{kind: :message, status: :blocked, data: data} =
              Enum.find(events, &(&1.kind == :message))
 
-    assert data["objective_contract"]["metadata"]["domain"] == "field_service"
+    assert data["objective_contract"]["metadata"]["domain"] == "generic"
 
     assert data["repair_needs"] == [
              %{"id" => "runtime-budget-exhausted", "target" => "implement_project"}

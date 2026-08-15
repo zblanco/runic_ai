@@ -34,9 +34,10 @@ defmodule RunicAI.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:runic_sandbox, path: "packages/runic_sandbox"},
+      {:litter_box, path: "../litter_box"},
       {:runic, "~> 0.1.0-alpha.8"},
-      {:req_llm, "~> 1.9"},
+      {:req_llm, "~> 1.20"},
+      {:llm_db, "~> 2026.8.2", override: true},
       {:ecto_sql, "~> 3.14"},
       {:ecto_sqlite3, "~> 0.24"},
       {:phoenix, "~> 1.8.6"},

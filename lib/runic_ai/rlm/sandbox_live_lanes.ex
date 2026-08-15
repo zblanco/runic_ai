@@ -200,7 +200,7 @@ defmodule RunicAI.RLM.SandboxLiveLanes do
       check(:vmsan_cli, executable != nil, "vmsan CLI is installed"),
       check(:vmsan_version, command_success?(version), "vmsan version command succeeds"),
       check(:kvm_device, kvm_exists?, "/dev/kvm exists"),
-      check(:runic_sandbox_health, health_ready?(health), "RunicSandbox vmsan health is ready")
+      check(:litter_box_health, health_ready?(health), "LitterBox vmsan health is ready")
     ]
 
     ready? = Enum.all?(checks, & &1.passed?)
@@ -239,7 +239,7 @@ defmodule RunicAI.RLM.SandboxLiveLanes do
 
     checks = [
       check(:sprites_token, token_present?, "#{token_env} is configured"),
-      check(:runic_sandbox_health, health_ready?(health), "RunicSandbox sprites health is ready")
+      check(:litter_box_health, health_ready?(health), "LitterBox sprites health is ready")
     ]
 
     ready? = Enum.all?(checks, & &1.passed?)
@@ -447,10 +447,10 @@ defmodule RunicAI.RLM.SandboxLiveLanes do
   defp env(opts, name), do: Keyword.get(opts, :env, &System.get_env/1).(name)
 
   defp sandbox_exec(opts, request, exec_opts),
-    do: Keyword.get(opts, :sandbox_exec, &RunicSandbox.exec/2).(request, exec_opts)
+    do: Keyword.get(opts, :sandbox_exec, &LitterBox.exec/2).(request, exec_opts)
 
   defp sandbox_status(opts, status_opts),
-    do: Keyword.get(opts, :sandbox_status, &RunicSandbox.status/1).(status_opts)
+    do: Keyword.get(opts, :sandbox_status, &LitterBox.status/1).(status_opts)
 
   defp error_message(%{message: message}), do: message
   defp error_message(error), do: inspect(error)

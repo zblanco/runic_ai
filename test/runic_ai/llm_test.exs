@@ -4,6 +4,7 @@ defmodule RunicAI.LLMTest do
   alias RunicAI.LLM
   alias RunicAI.LLM.Request
   alias RunicAI.LLM.Result
+  alias RunicAI.LLM.Retry
   alias RunicAI.LLM.TestClient
   alias RunicAI.Message
   alias RunicAI.Prompt
@@ -51,6 +52,49 @@ defmodule RunicAI.LLMTest do
 
       assert {:ok, result} = LLM.generate_text(request)
       assert Result.text(result) =~ "I received: Hello"
+    end
+  end
+
+  describe "provider retry classification" do
+    test "uses provider retry hints for temporary rate limits" do
+      error = %{
+        status: 429,
+        reason: "Google quota window exceeded. Please retry in 2.5s."
+      }
+
+      assert Retry.retryable_provider_error?(error)
+      assert Retry.retry_after_ms(error) == 2_500
+      assert Retry.backoff_ms(1, {:error, error}) == 2_500
+    end
+
+    test "does not retry permanent billing quota failures" do
+      error = %{
+        status: 429,
+        reason: "insufficient_quota: check your plan and billing details"
+      }
+
+      refute Retry.retryable_provider_error?(error)
+      assert Retry.permanent_provider_failure?(error)
+      assert Retry.retry_after_ms(error) == nil
+    end
+
+    test "does not retry a per-day quota even when the provider suggests a short delay" do
+      error = %{
+        status: 429,
+        message: "You exceeded your current quota. Please retry in 56.6s.",
+        response_body: %{
+          "error" => %{
+            "details" => [
+              %{
+                "quotaId" => "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+              }
+            ]
+          }
+        }
+      }
+
+      refute Retry.retryable_provider_error?(error)
+      assert Retry.retry_after_ms(error) == 56_600
     end
   end
 

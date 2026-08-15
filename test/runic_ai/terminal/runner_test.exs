@@ -332,7 +332,7 @@ defmodule RunicAI.Terminal.RunnerTest do
              )
 
     assert result.status == :ok
-    assert_receive {:rlm_agent_runner_opts, true, nil, false}
+    assert_receive {:rlm_agent_runner_opts, true, nil, nil}
 
     rendered =
       :rlm_report_output
@@ -342,6 +342,110 @@ defmodule RunicAI.Terminal.RunnerTest do
 
     assert rendered =~ "Final report"
     assert rendered =~ "objective_satisfied"
+  end
+
+  test "agent runner derives role-specific RLM models and reasoning from tool config" do
+    root = tmp_dir()
+    caller = self()
+
+    run_fun = fn _cwd, _objective, opts ->
+      send(
+        caller,
+        {:rlm_role_opts, opts[:proposal_model], opts[:agent_model], opts[:agent_fallback_model],
+         opts[:semantic_model], opts[:proposal_llm_opts], opts[:agent_llm_opts],
+         opts[:agent_fallback_llm_opts], opts[:semantic_llm_opts], opts[:max_child_runtime_ms],
+         opts[:child_noop_repair_attempts], opts[:agent_review_gates?]}
+      )
+
+      {:ok, rlm_result()}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build a general Elixir library",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--cwd",
+        root,
+        "--persistence",
+        "none",
+        "--tool-config",
+        "rlm.proposal_model=openai:gpt-5.6-sol",
+        "--tool-config",
+        "rlm.agent_model=openai:gpt-5.6-terra",
+        "--tool-config",
+        "rlm.agent_fallback_model=openai:gpt-5.6-sol",
+        "--tool-config",
+        "rlm.judge_model=openai:gpt-5.6-sol",
+        "--tool-config",
+        "rlm.proposal_reasoning_effort=high",
+        "--tool-config",
+        "rlm.proposal_max_completion_tokens=12000",
+        "--tool-config",
+        "rlm.agent_reasoning_effort=medium",
+        "--tool-config",
+        "rlm.agent_max_completion_tokens=16000",
+        "--tool-config",
+        "rlm.agent_fallback_reasoning_effort=high",
+        "--tool-config",
+        "rlm.agent_fallback_max_completion_tokens=16000",
+        "--tool-config",
+        "rlm.judge_reasoning_effort=high",
+        "--tool-config",
+        "rlm.judge_max_completion_tokens=8000",
+        "--tool-config",
+        "rlm.max_child_runtime_ms=240000",
+        "--tool-config",
+        "rlm.child_noop_repair_attempts=3"
+      ])
+
+    assert {:ok, _result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert_receive {:rlm_role_opts, "openai:gpt-5.6-sol", "openai:gpt-5.6-terra",
+                    "openai:gpt-5.6-sol", "openai:gpt-5.6-sol",
+                    [max_completion_tokens: 12_000, reasoning_effort: :high],
+                    [max_completion_tokens: 16_000, reasoning_effort: :medium],
+                    [max_completion_tokens: 16_000, reasoning_effort: :high],
+                    [max_completion_tokens: 8_000, reasoning_effort: :high], 240_000, 3, true}
+  end
+
+  test "agent runner avoids redundant child review gates after session-wide approval" do
+    root = tmp_dir()
+    caller = self()
+
+    run_fun = fn _cwd, _objective, opts ->
+      send(caller, {:child_review_gates, opts[:agent_review_gates?]})
+      {:ok, rlm_result()}
+    end
+
+    {:ok, options} =
+      CliOptions.parse([
+        "Build a general library",
+        "--agent",
+        "rlm",
+        "--mode",
+        "patch",
+        "--approve",
+        "always",
+        "--cwd",
+        root,
+        "--persistence",
+        "none"
+      ])
+
+    assert {:ok, _result} =
+             AgentRunner.run(options,
+               run_fun: run_fun,
+               output_fun: fn _line -> :ok end
+             )
+
+    assert_receive {:child_review_gates, false}
   end
 
   test "agent runner passes objective-loop controls into the RLM runner" do

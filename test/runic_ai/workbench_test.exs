@@ -610,6 +610,54 @@ defmodule RunicAI.WorkbenchTest do
     assert [%{"id" => "tests"}] = snapshot.objective_loop.open_tasks
   end
 
+  test "session terminal truth overrides stale running objective progress" do
+    session_id = unique_session_id("terminal-progress-summary")
+    run_id = session_id <> ":run"
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("terminal-progress-running"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :assistant,
+               kind: :summary,
+               phase: :objective_loop_progress,
+               status: :running,
+               title: "Objective running",
+               detail: "status: running",
+               data_json: %{
+                 objective: "Reuse a proven workflow",
+                 objective_session: %{
+                   id: run_id,
+                   objective: "Reuse a proven workflow",
+                   status: :running,
+                   decision: %{action: :continue}
+                 }
+               },
+               at: DateTime.utc_now()
+             })
+
+    assert {:ok, _event} =
+             Workbench.record_terminal_event(%{
+               id: unique_event_id("terminal-progress-completed"),
+               session_id: session_id,
+               run_id: run_id,
+               agent: :assistant,
+               kind: :summary,
+               phase: :final,
+               status: :ok,
+               title: "Workflow completed",
+               detail: "verified output persisted",
+               data_json: %{},
+               at: DateTime.add(DateTime.utc_now(), 1)
+             })
+
+    assert snapshot = Workbench.session_snapshot(session_id)
+    assert snapshot.session.status == "completed"
+    assert snapshot.progress_summary.objective_status == "completed"
+    refute Map.has_key?(snapshot.progress_summary, :objective_action)
+  end
+
   test "session snapshot exposes objective-loop latest error fields" do
     session_id = unique_session_id("objective-error-summary")
     run_id = session_id <> ":run"

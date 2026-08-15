@@ -239,7 +239,7 @@ defmodule RunicAI.Terminal.CliOptions do
          objective_loop?: Keyword.get(opts, :objective_loop, false),
          repair?: Keyword.get(opts, :repair),
          max_repairs: Keyword.get(opts, :max_repairs),
-         seed_project_generation?: Keyword.get(opts, :seed_project_generation, false),
+         seed_project_generation?: Keyword.get(opts, :seed_project_generation),
          max_concurrency: Keyword.get(opts, :max_concurrency),
          max_llm_map_concurrency: Keyword.get(opts, :max_llm_map_concurrency),
          max_llm_map_calls: Keyword.get(opts, :max_llm_map_calls),

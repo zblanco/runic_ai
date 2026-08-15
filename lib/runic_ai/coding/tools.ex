@@ -6,7 +6,7 @@ defmodule RunicAI.Coding.Tools do
   `RunicAI.Tool.Definition` values by `default_registry/2`.
 
   `execute_code/4` and `sandbox_status/2` are the RunicAI-facing sandbox tools.
-  They route arbitrary code execution through `RunicSandbox`, preserve sandbox
+  They route arbitrary code execution through `LitterBox`, preserve sandbox
   backend/isolation metadata on the result, and are meant to be exposed through
   explicit capability profiles or recipes rather than through every default
   coding mode.
@@ -40,8 +40,8 @@ defmodule RunicAI.Coding.Tools do
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.SQLite.Store, as: SQLiteStore
-  alias RunicSandbox, as: Sandbox
-  alias RunicSandbox.Error, as: SandboxError
+  alias LitterBox, as: Sandbox
+  alias LitterBox.Error, as: SandboxError
   alias RunicAI.Terminal.Event, as: TerminalEvent
   alias RunicAI.Tool.Definition
   alias RunicAI.Tool.Registry
@@ -367,6 +367,30 @@ defmodule RunicAI.Coding.Tools do
           metadata: normalize_map(arg(args, :metadata, %{}))
         },
         dry_run?: dry_run?
+      )
+
+    {:ok, result}
+  end
+
+  @doc """
+  Runtime-only patch replay after a durable prior attempt was dispatched but
+  its completion is unknown. This is intentionally not registered as an LLM
+  tool; the workflow runtime, not model-authored arguments, supplies the replay
+  context.
+  """
+  @spec reconcile_patch_after_unknown(Workspace.t(), map(), map()) ::
+          {:ok, RunicAI.Coding.PatchResult.t()} | {:error, Error.t()}
+  def reconcile_patch_after_unknown(%Workspace{} = workspace, args, replay_context)
+      when is_map(args) and is_map(replay_context) do
+    result =
+      Patch.reconcile_after_unknown(
+        workspace,
+        %{
+          operations: arg(args, :operations, []),
+          metadata: normalize_map(arg(args, :metadata, %{}))
+        },
+        replay_context,
+        dry_run?: arg(args, :dry_run, arg(args, :dry_run?, false))
       )
 
     {:ok, result}
@@ -1443,9 +1467,9 @@ defmodule RunicAI.Coding.Tools do
     [
       definition(
         "apply_patch",
-        "Apply structured create, update, delete, and move operations.",
+        "Apply structured create, update, delete, and move operations. Pass operations as a JSON array of operation objects, not an encoded JSON string or a prose diff.",
         [
-          operations: [type: :any, required: true],
+          operations: [type: {:list, :any}, required: true],
           dry_run: [type: :boolean, default: false],
           metadata: [type: :any]
         ],
@@ -2293,12 +2317,35 @@ defmodule RunicAI.Coding.Tools do
       |> CommandPolicy.from_input!()
       |> Map.put(:allowed_commands, ["git"])
 
-    run_command(
-      workspace,
-      %{argv: ["git" | git_args], cwd: cwd, timeout_ms: timeout_ms},
-      git_policy,
-      opts
-    )
+    with :ok <- ensure_workspace_git_root(workspace) do
+      run_command(
+        workspace,
+        %{argv: ["git" | git_args], cwd: cwd, timeout_ms: timeout_ms},
+        git_policy,
+        opts
+      )
+    end
+  end
+
+  # Git walks parent directories when invoked from an ordinary directory. A
+  # workflow workspace is an isolation boundary, so allowing that discovery
+  # can expose a parent checkout and make a child believe unrelated parent
+  # changes belong to its task. Require the selected workspace itself to own
+  # the repository marker. This supports normal repositories and worktrees,
+  # whose `.git` marker is respectively a directory or a file.
+  defp ensure_workspace_git_root(%Workspace{} = workspace) do
+    if File.exists?(Path.join(workspace.root, ".git")) do
+      :ok
+    else
+      {:error,
+       Error.validation("workspace root is not a git repository",
+         source: __MODULE__,
+         details: %{
+           code: :workspace_not_git_root,
+           workspace_root: workspace.root
+         }
+       )}
+    end
   end
 
   defp search(workspace, args, matcher) do

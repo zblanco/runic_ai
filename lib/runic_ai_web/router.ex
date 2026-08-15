@@ -24,6 +24,7 @@ defmodule RunicAIWeb.Router do
     live "/agents", AgentLive, :index
     live "/agents/:agent_id", AgentLive, :show
     live "/runs/:run_id/graph", GraphLive, :show
+    live "/workflow-review-study/:case_id", WorkflowReviewStudyLive, :show
     live "/debug", DebugLive, :logs
     live "/debug/logs", DebugLive, :logs
     live "/debug/traces", DebugLive, :traces

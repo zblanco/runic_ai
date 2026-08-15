@@ -10,6 +10,12 @@ defmodule RunicAI.Coding.Patch do
     * `:move` with `:from`, `:to`, and optional `:expected_hash`
 
   Hashes are lowercase SHA-256 hex strings of the whole file content.
+
+  Normal application is intentionally strict. `reconcile_after_unknown/4` is a
+  separate runtime-only boundary for retrying an attempt whose dispatch was
+  durably recorded but whose completion is unknown. It compares workspace
+  state with the requested post-state and never accepts a caller-supplied
+  idempotency label as proof.
   """
 
   alias RunicAI.Coding.PatchResult
@@ -85,11 +91,46 @@ defmodule RunicAI.Coding.Patch do
 
     case patch_input |> expand_text_patch(workspace) |> from_input() do
       {:ok, %__MODULE__{operations: operations, metadata: metadata}} ->
-        apply_operations(workspace, operations, dry_run?, metadata)
+        apply_operations(workspace, operations, dry_run?, metadata, nil)
 
       {:error, error} ->
         PatchResult.new!(:error,
           diagnostics: [diagnostic(:invalid_patch, error.message, error.details)]
+        )
+    end
+  end
+
+  @doc """
+  Reconciles a patch after an earlier runtime attempt was durably recorded as
+  dispatched but its completion could not be observed.
+
+  This function is deliberately not exposed in the model-facing tool schema.
+  The caller must supply the durable prior attempt identity and a monotonically
+  increasing attempt number. Update, delete, and move operations additionally
+  require `expected_hash`, otherwise their post-state is not strong enough to
+  permit automatic reconciliation.
+  """
+  @spec reconcile_after_unknown(Workspace.t(), t() | keyword() | map(), map(), keyword()) ::
+          PatchResult.t()
+  def reconcile_after_unknown(%Workspace{} = workspace, patch_input, replay_context, opts \\ [])
+      when is_map(replay_context) and is_list(opts) do
+    dry_run? = Keyword.get(opts, :dry_run?, false)
+
+    case validate_replay_context(replay_context) do
+      {:ok, replay_context} ->
+        case patch_input |> expand_text_patch(workspace) |> from_input() do
+          {:ok, %__MODULE__{operations: operations, metadata: metadata}} ->
+            apply_operations(workspace, operations, dry_run?, metadata, replay_context)
+
+          {:error, %Error{} = error} ->
+            PatchResult.new!(:error,
+              diagnostics: [diagnostic(:invalid_patch, error.message, error.details)]
+            )
+        end
+
+      {:error, %Error{} = error} ->
+        PatchResult.new!(:error,
+          diagnostics: [diagnostic(:invalid_replay_context, error.message, error.details)]
         )
     end
   end
@@ -113,18 +154,20 @@ defmodule RunicAI.Coding.Patch do
     end
   end
 
-  defp apply_operations(workspace, operations, dry_run?, patch_metadata) do
+  defp apply_operations(workspace, operations, dry_run?, patch_metadata, replay_context) do
     initial = %{
       changed_paths: [],
       operation_summaries: [],
       diagnostics: [],
       before_hashes: %{},
-      after_hashes: %{}
+      after_hashes: %{},
+      applied_operations: 0,
+      reconciled_operations: 0
     }
 
     operations
     |> Enum.reduce_while(initial, fn operation, acc ->
-      case apply_operation(workspace, operation, dry_run?) do
+      case apply_operation(workspace, operation, dry_run?, replay_context) do
         {:ok, operation_result} ->
           {:cont, merge_operation_result(acc, operation_result)}
 
@@ -132,16 +175,21 @@ defmodule RunicAI.Coding.Patch do
           {:halt, %{acc | diagnostics: acc.diagnostics ++ [diagnostic]}}
       end
     end)
-    |> build_result(dry_run?, patch_metadata)
+    |> build_result(dry_run?, patch_metadata, replay_context)
   end
 
-  defp build_result(state, dry_run?, patch_metadata) do
+  defp build_result(state, dry_run?, patch_metadata, replay_context) do
     status =
       cond do
         state.diagnostics != [] -> :error
         dry_run? -> :dry_run
+        state.applied_operations == 0 and state.reconciled_operations > 0 -> :reconciled
         true -> :ok
       end
+
+    metadata =
+      patch_metadata
+      |> Map.put(:reconciliation, reconciliation_metadata(state, replay_context))
 
     PatchResult.new!(status,
       changed_paths: Enum.uniq(state.changed_paths),
@@ -149,11 +197,22 @@ defmodule RunicAI.Coding.Patch do
       diagnostics: state.diagnostics,
       before_hashes: state.before_hashes,
       after_hashes: state.after_hashes,
-      metadata: patch_metadata
+      metadata: metadata
     )
   end
 
-  defp apply_operation(workspace, %{op: :create} = operation, dry_run?) do
+  defp apply_operation(workspace, operation, dry_run?, nil),
+    do: apply_operation_strict(workspace, operation, dry_run?)
+
+  defp apply_operation(workspace, operation, dry_run?, replay_context) do
+    case reconcile_operation(workspace, operation, dry_run?, replay_context) do
+      {:ok, result} -> {:ok, result}
+      :apply -> apply_operation_strict(workspace, operation, dry_run?)
+      {:error, diagnostic} -> {:error, diagnostic}
+    end
+  end
+
+  defp apply_operation_strict(workspace, %{op: :create} = operation, dry_run?) do
     with {:ok, path} <- require_path(operation),
          {:ok, content} <- require_content(operation),
          {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
@@ -167,16 +226,18 @@ defmodule RunicAI.Coding.Patch do
          changed_paths: [resolved.relative],
          operation_summaries: [
            %{op: :create, path: resolved.relative, dry_run?: dry_run?, bytes: byte_size(content)}
+           |> Map.put(:reconciliation_outcome, if(dry_run?, do: :would_apply, else: :applied))
          ],
          before_hashes: %{resolved.relative => nil},
-         after_hashes: %{resolved.relative => after_hash}
+         after_hashes: %{resolved.relative => after_hash},
+         applied_operations: 1
        }}
     else
       {:error, error} -> {:error, operation_diagnostic(:create, operation, error)}
     end
   end
 
-  defp apply_operation(workspace, %{op: :update} = operation, dry_run?) do
+  defp apply_operation_strict(workspace, %{op: :update} = operation, dry_run?) do
     with {:ok, path} <- require_path(operation),
          {:ok, content} <- require_content(operation),
          {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
@@ -192,16 +253,18 @@ defmodule RunicAI.Coding.Patch do
          changed_paths: [resolved.relative],
          operation_summaries: [
            %{op: :update, path: resolved.relative, dry_run?: dry_run?, bytes: byte_size(content)}
+           |> Map.put(:reconciliation_outcome, if(dry_run?, do: :would_apply, else: :applied))
          ],
          before_hashes: %{resolved.relative => before_hash},
-         after_hashes: %{resolved.relative => after_hash}
+         after_hashes: %{resolved.relative => after_hash},
+         applied_operations: 1
        }}
     else
       {:error, error} -> {:error, operation_diagnostic(:update, operation, error)}
     end
   end
 
-  defp apply_operation(workspace, %{op: :delete} = operation, dry_run?) do
+  defp apply_operation_strict(workspace, %{op: :delete} = operation, dry_run?) do
     with {:ok, path} <- require_path(operation),
          {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
          :ok <- require_file(resolved.path),
@@ -212,17 +275,23 @@ defmodule RunicAI.Coding.Patch do
        %{
          changed_paths: [resolved.relative],
          operation_summaries: [
-           %{op: :delete, path: resolved.relative, dry_run?: dry_run?}
+           %{
+             op: :delete,
+             path: resolved.relative,
+             dry_run?: dry_run?,
+             reconciliation_outcome: if(dry_run?, do: :would_apply, else: :applied)
+           }
          ],
          before_hashes: %{resolved.relative => before_hash},
-         after_hashes: %{resolved.relative => nil}
+         after_hashes: %{resolved.relative => nil},
+         applied_operations: 1
        }}
     else
       {:error, error} -> {:error, operation_diagnostic(:delete, operation, error)}
     end
   end
 
-  defp apply_operation(workspace, %{op: :move} = operation, dry_run?) do
+  defp apply_operation_strict(workspace, %{op: :move} = operation, dry_run?) do
     with {:ok, from} <- require_field(operation, :from),
          {:ok, to} <- require_field(operation, :to),
          {:ok, from_resolved} <- Workspace.resolve_path(workspace, from, :write),
@@ -240,20 +309,292 @@ defmodule RunicAI.Coding.Patch do
              op: :move,
              from: from_resolved.relative,
              to: to_resolved.relative,
-             dry_run?: dry_run?
+             dry_run?: dry_run?,
+             reconciliation_outcome: if(dry_run?, do: :would_apply, else: :applied)
            }
          ],
          before_hashes: %{from_resolved.relative => before_hash, to_resolved.relative => nil},
-         after_hashes: %{from_resolved.relative => nil, to_resolved.relative => before_hash}
+         after_hashes: %{from_resolved.relative => nil, to_resolved.relative => before_hash},
+         applied_operations: 1
        }}
     else
       {:error, error} -> {:error, operation_diagnostic(:move, operation, error)}
     end
   end
 
-  defp apply_operation(_workspace, operation, _dry_run?) do
+  defp apply_operation_strict(_workspace, operation, _dry_run?) do
     {:error,
      diagnostic(:invalid_operation, "unsupported patch operation", %{operation: operation})}
+  end
+
+  defp reconcile_operation(workspace, %{op: :create} = operation, dry_run?, replay_context) do
+    with {:ok, path} <- require_path(operation),
+         {:ok, content} <- require_content(operation),
+         {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
+         :ok <- validate_content(resolved.relative, content) do
+      desired_hash = sha256(content)
+
+      case existing_hash(resolved.path) do
+        {:ok, ^desired_hash} ->
+          {:ok,
+           reconciled_operation_result(
+             operation,
+             [resolved.relative],
+             %{resolved.relative => desired_hash},
+             %{resolved.relative => desired_hash},
+             dry_run?,
+             replay_context
+           )}
+
+        {:ok, _other_hash} ->
+          :apply
+
+        {:error, :enoent} ->
+          :apply
+
+        {:error, %Error{} = error} ->
+          {:error, operation_diagnostic(:create, operation, error)}
+      end
+    else
+      {:error, error} -> {:error, operation_diagnostic(:create, operation, error)}
+    end
+  end
+
+  defp reconcile_operation(workspace, %{op: :update} = operation, dry_run?, replay_context) do
+    reconcile_content_target(workspace, operation, :update, dry_run?, replay_context)
+  end
+
+  defp reconcile_operation(workspace, %{op: :delete} = operation, dry_run?, replay_context) do
+    with {:ok, expected_hash} <- require_reconciliation_hash(operation, :delete),
+         {:ok, path} <- require_path(operation),
+         {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write) do
+      case existing_hash(resolved.path) do
+        {:error, :enoent} ->
+          {:ok,
+           reconciled_operation_result(
+             operation,
+             [resolved.relative],
+             %{resolved.relative => nil},
+             %{resolved.relative => nil},
+             dry_run?,
+             replay_context,
+             %{expected_prior_hash: expected_hash}
+           )}
+
+        {:ok, _hash} ->
+          :apply
+
+        {:error, %Error{} = error} ->
+          {:error, operation_diagnostic(:delete, operation, error)}
+      end
+    else
+      {:error, error} -> {:error, operation_diagnostic(:delete, operation, error)}
+    end
+  end
+
+  defp reconcile_operation(workspace, %{op: :move} = operation, dry_run?, replay_context) do
+    with {:ok, expected_hash} <- require_reconciliation_hash(operation, :move),
+         {:ok, from} <- require_field(operation, :from),
+         {:ok, to} <- require_field(operation, :to),
+         {:ok, from_resolved} <- Workspace.resolve_path(workspace, from, :write),
+         {:ok, to_resolved} <- Workspace.resolve_path(workspace, to, :write) do
+      case {existing_hash(from_resolved.path), existing_hash(to_resolved.path)} do
+        {{:error, :enoent}, {:ok, ^expected_hash}} ->
+          {:ok,
+           reconciled_operation_result(
+             operation,
+             [from_resolved.relative, to_resolved.relative],
+             %{from_resolved.relative => nil, to_resolved.relative => expected_hash},
+             %{from_resolved.relative => nil, to_resolved.relative => expected_hash},
+             dry_run?,
+             replay_context,
+             %{expected_prior_hash: expected_hash}
+           )}
+
+        {{:ok, _hash}, _to_state} ->
+          :apply
+
+        {{:error, :enoent}, {:ok, actual_hash}} ->
+          {:error,
+           diagnostic(:move, "move destination does not match the expected source hash", %{
+             operation: operation,
+             expected_hash: expected_hash,
+             actual_hash: actual_hash
+           })}
+
+        {{:error, :enoent}, {:error, :enoent}} ->
+          {:error,
+           diagnostic(:move, "move reconciliation found neither source nor destination", %{
+             operation: operation,
+             expected_hash: expected_hash
+           })}
+
+        {{:error, %Error{} = error}, _to_state} ->
+          {:error, operation_diagnostic(:move, operation, error)}
+
+        {_from_state, {:error, %Error{} = error}} ->
+          {:error, operation_diagnostic(:move, operation, error)}
+      end
+    else
+      {:error, error} -> {:error, operation_diagnostic(:move, operation, error)}
+    end
+  end
+
+  defp reconcile_operation(_workspace, operation, _dry_run?, _replay_context) do
+    {:error,
+     diagnostic(:invalid_operation, "unsupported patch operation", %{operation: operation})}
+  end
+
+  defp reconcile_content_target(workspace, operation, op, dry_run?, replay_context) do
+    with {:ok, expected_hash} <- require_reconciliation_hash(operation, op),
+         {:ok, path} <- require_path(operation),
+         {:ok, content} <- require_content(operation),
+         {:ok, resolved} <- Workspace.resolve_path(workspace, path, :write),
+         :ok <- validate_content(resolved.relative, content) do
+      desired_hash = sha256(content)
+
+      case existing_hash(resolved.path) do
+        {:ok, ^desired_hash} ->
+          {:ok,
+           reconciled_operation_result(
+             operation,
+             [resolved.relative],
+             %{resolved.relative => desired_hash},
+             %{resolved.relative => desired_hash},
+             dry_run?,
+             replay_context,
+             %{expected_prior_hash: expected_hash}
+           )}
+
+        {:ok, _other_hash} ->
+          :apply
+
+        {:error, :enoent} ->
+          :apply
+
+        {:error, %Error{} = error} ->
+          {:error, operation_diagnostic(op, operation, error)}
+      end
+    else
+      {:error, error} -> {:error, operation_diagnostic(op, operation, error)}
+    end
+  end
+
+  defp reconciled_operation_result(
+         operation,
+         paths,
+         before_hashes,
+         after_hashes,
+         dry_run?,
+         replay_context,
+         extra_summary \\ %{}
+       ) do
+    summary =
+      operation
+      |> Map.take([:op, :path, :from, :to])
+      |> Map.merge(extra_summary)
+      |> Map.merge(%{
+        dry_run?: dry_run?,
+        reconciliation_outcome: :matched_after_state,
+        physically_changed?: false,
+        prior_attempt_id: replay_context.prior_attempt_id
+      })
+
+    %{
+      changed_paths: paths,
+      operation_summaries: [summary],
+      before_hashes: before_hashes,
+      after_hashes: after_hashes,
+      reconciled_operations: 1
+    }
+  end
+
+  defp require_reconciliation_hash(operation, op) do
+    case Map.get(operation, :expected_hash) do
+      hash when is_binary(hash) and byte_size(hash) == 64 ->
+        {:ok, hash}
+
+      value ->
+        {:error,
+         Error.validation("#{op} reconciliation requires a SHA-256 expected_hash",
+           source: __MODULE__,
+           details: %{op: op, expected_hash: value}
+         )}
+    end
+  end
+
+  defp existing_hash(path) do
+    cond do
+      not File.exists?(path) ->
+        {:error, :enoent}
+
+      not File.regular?(path) ->
+        {:error,
+         Error.validation("path must be a regular file",
+           source: __MODULE__,
+           details: %{path: path}
+         )}
+
+      true ->
+        file_sha256(path)
+    end
+  end
+
+  defp validate_replay_context(context) do
+    attempt = get(context, :attempt, nil)
+    prior_attempt_id = get(context, :prior_attempt_id, nil)
+    prior_outcome = normalize_prior_outcome(get(context, :prior_outcome, nil))
+
+    if is_integer(attempt) and attempt > 1 and is_binary(prior_attempt_id) and
+         prior_attempt_id != "" and prior_outcome == :unknown_after_dispatch do
+      {:ok,
+       %{
+         attempt: attempt,
+         prior_attempt_id: prior_attempt_id,
+         prior_outcome: prior_outcome
+       }}
+    else
+      {:error,
+       Error.validation(
+         "patch reconciliation requires a later attempt backed by an unknown-after-dispatch record",
+         source: __MODULE__,
+         details: %{
+           attempt: attempt,
+           prior_attempt_id: prior_attempt_id,
+           prior_outcome: prior_outcome
+         }
+       )}
+    end
+  end
+
+  defp normalize_prior_outcome(:unknown_after_dispatch), do: :unknown_after_dispatch
+  defp normalize_prior_outcome("unknown_after_dispatch"), do: :unknown_after_dispatch
+  defp normalize_prior_outcome(other), do: other
+
+  defp reconciliation_metadata(state, nil) do
+    %{
+      strategy: :strict_apply,
+      outcome: if(state.diagnostics == [], do: :applied, else: :failed),
+      applied_operations: state.applied_operations,
+      reconciled_operations: 0
+    }
+  end
+
+  defp reconciliation_metadata(state, replay_context) do
+    outcome =
+      cond do
+        state.diagnostics != [] -> :conflict
+        state.applied_operations == 0 -> :matched_after_state
+        state.reconciled_operations == 0 -> :completed_remaining_operations
+        true -> :partially_reconciled
+      end
+
+    Map.merge(replay_context, %{
+      strategy: :compare_operation_post_state,
+      outcome: outcome,
+      applied_operations: state.applied_operations,
+      reconciled_operations: state.reconciled_operations
+    })
   end
 
   defp maybe_write_file(path, content, true) when is_binary(path) and is_binary(content), do: :ok
@@ -482,7 +823,10 @@ defmodule RunicAI.Coding.Patch do
       operation_summaries: acc.operation_summaries ++ Map.get(result, :operation_summaries, []),
       diagnostics: acc.diagnostics,
       before_hashes: Map.merge(acc.before_hashes, Map.get(result, :before_hashes, %{})),
-      after_hashes: Map.merge(acc.after_hashes, Map.get(result, :after_hashes, %{}))
+      after_hashes: Map.merge(acc.after_hashes, Map.get(result, :after_hashes, %{})),
+      applied_operations: acc.applied_operations + Map.get(result, :applied_operations, 0),
+      reconciled_operations:
+        acc.reconciled_operations + Map.get(result, :reconciled_operations, 0)
     }
   end
 

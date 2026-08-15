@@ -15,6 +15,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
   alias RunicAI.Integrated.Emission
   alias RunicAI.Integrated.SessionState
   alias RunicAI.Integrated.Signal
+  alias RunicAI.LLM.GenerationEvidence
   alias RunicAI.LLM.Result, as: LLMResult
   alias RunicAI.Message
   alias RunicAI.Recipes.ChatAgentKernel
@@ -817,6 +818,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgent do
           |> Map.put(:attempts, Map.get(session.control, :attempts, 0) + 1)
           |> Map.put(:model_calls, Map.get(session.control, :model_calls, 0) + 1)
           |> Map.put(:token_usage, merge_usage(token_usage, usage))
+          |> GenerationEvidence.append(llm_result)
     }
   end
 

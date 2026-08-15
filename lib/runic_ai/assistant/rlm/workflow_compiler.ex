@@ -96,8 +96,48 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
          {:ok, workflow} <-
            WorkflowExecutor.run(compiled.workflow, input, executor_opts(opts, compiled)) do
       elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
-      {:ok, result(compiled, workflow, elapsed_ms: elapsed_ms)}
+      result = result(compiled, workflow, elapsed_ms: elapsed_ms)
+
+      with :ok <- ensure_terminal_completion(compiled, result) do
+        {:ok, result}
+      end
     end
+  end
+
+  @doc false
+  @spec ensure_terminal_completion(compiled(), map()) :: :ok | {:error, Error.t()}
+  def ensure_terminal_completion(_compiled, %{output: output}) when not is_nil(output), do: :ok
+
+  def ensure_terminal_completion(compiled, result) do
+    component_results = Map.get(result, :component_results, [])
+
+    completed =
+      component_results
+      |> Enum.filter(&(Map.get(&1, :production_count, 0) > 0))
+      |> Enum.map(& &1.id)
+
+    pending =
+      component_results
+      |> Enum.reject(&(Map.get(&1, :production_count, 0) > 0))
+      |> Enum.map(& &1.id)
+
+    {:error,
+     Error.validation("workflow execution stopped before producing its terminal output",
+       source: __MODULE__,
+       details: %{
+         code: :workflow_stalled_before_terminal,
+         output_component_id: output_component_id(compiled),
+         output_name: compiled.output_name,
+         completed_component_ids: completed,
+         pending_component_ids: pending
+       }
+     )}
+  end
+
+  defp output_component_id(compiled) do
+    Enum.find_value(compiled.node_names, fn {id, name} ->
+      if name == compiled.output_name, do: id
+    end)
   end
 
   @spec result(compiled(), Workflow.t(), keyword()) :: map()
@@ -370,7 +410,7 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
 
   defp scheduler_policy(%ComponentSpec{} = spec, opts \\ []) do
     spec.type
-    |> preset_policy()
+    |> preset_policy(opts)
     |> Map.merge(native_execution_policy(spec))
     |> Map.merge(policy_overrides(spec.policy))
     |> Map.merge(review_gate_policy(spec, opts))
@@ -379,13 +419,15 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
 
   defp name_matcher(name), do: {:name, Regex.compile!("^#{Regex.escape(to_string(name))}$")}
 
-  defp preset_policy(type) when type in [:llm_map, :record_map, :llm_leaf] do
-    SchedulerPolicy.llm_policy() |> policy_map()
+  defp preset_policy(type, opts) when type in [:llm_map, :record_map, :llm_leaf] do
+    timeout_ms = positive_integer(Keyword.get(opts, :llm_timeout_ms)) || 30_000
+    SchedulerPolicy.llm_policy(timeout_ms: timeout_ms) |> policy_map()
   end
 
-  defp preset_policy(:source_discovery), do: SchedulerPolicy.fast_fail() |> policy_map()
+  defp preset_policy(:source_discovery, _opts),
+    do: SchedulerPolicy.fast_fail() |> policy_map()
 
-  defp preset_policy(type)
+  defp preset_policy(type, _opts)
        when type in [
               :source_splitter,
               :source_materializer,
@@ -396,7 +438,7 @@ defmodule RunicAI.Assistant.RLM.WorkflowCompiler do
     SchedulerPolicy.io_policy() |> policy_map() |> Map.put(:on_failure, :halt)
   end
 
-  defp preset_policy(_type), do: %{}
+  defp preset_policy(_type, _opts), do: %{}
 
   defp policy_overrides(policy) when is_map(policy) do
     scheduler = get(policy, :scheduler, nil)

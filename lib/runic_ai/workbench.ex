@@ -14,8 +14,14 @@ defmodule RunicAI.Workbench do
   alias RunicAI.LLM.ModelCatalog
   alias RunicAI.Persistence.Queries
   alias RunicAI.Persistence.SQLite
+  alias RunicAI.Persistence.Term
+  alias RunicAI.Persistence.ManagedWorkflows
+  alias RunicAI.Persistence.WorkflowDefinitions
+  alias RunicAI.Persistence.WorkflowExecutor
+  alias RunicAI.Persistence.WorkflowTask
   alias RunicAI.Persistence.Schemas.AgentMessage
   alias RunicAI.Persistence.Schemas.AgentSession
+  alias RunicAI.Persistence.Schemas.ManagedWorkflow
   alias RunicAI.Persistence.Schemas.ReviewRequest
   alias RunicAI.Persistence.Schemas.RunArtifact
   alias RunicAI.Persistence.Schemas.Scorecard
@@ -33,6 +39,15 @@ defmodule RunicAI.Workbench do
   alias RunicAI.Terminal.GraphPresenter
   alias RunicAI.Terminal.RLMRunner
   alias RunicAI.Workbench.StoreServer
+  alias RunicAI.Workbench.WorkflowRunner
+  alias RunicAI.Coding.Workspace
+  alias RunicAI.Coding.PathPolicy
+  alias RunicAI.Workflows.Compiler, as: WorkflowCompiler
+  alias RunicAI.Workflows.Catalog, as: WorkflowCatalog
+  alias RunicAI.Workflows.Editor, as: WorkflowEditor
+  alias RunicAI.Workflows.IntentPlanner
+  alias RunicAI.Workflows.IR, as: WorkflowIR
+  alias RunicAI.Workflows.Validator, as: WorkflowValidator
 
   @topic "runic_ai:workbench"
   @task_supervisor RunicAI.Workbench.TaskSupervisor
@@ -104,6 +119,7 @@ defmodule RunicAI.Workbench do
     "workspace-review" => :workspace_review,
     "none" => :none
   }
+  @intent_strategy_choices %{"auto" => :auto, "direct" => :direct, "workflow" => :workflow}
   @review_wait_poll_interval_ms 250
   @rlm_workspace_cues ~w(
     api app branch bug code codebase command compile compiler component config
@@ -149,6 +165,480 @@ defmodule RunicAI.Workbench do
   @spec store!() :: Store.t()
   def store!, do: StoreServer.store!()
 
+  @spec resume_workflow_run(String.t()) :: {:ok, map()} | {:error, term()}
+  def resume_workflow_run(run_id) when is_binary(run_id) do
+    store = store!()
+
+    result =
+      case workflow_run(store, run_id) do
+        %WorkflowRun{} = run when run.trigger in ["workflow_task", "workflow_task_retry"] ->
+          WorkflowTask.resume(store, run_id, runner: WorkflowRunner.runner())
+
+        %WorkflowRun{} ->
+          WorkflowExecutor.resume(store, run_id, runner: WorkflowRunner.runner())
+
+        nil ->
+          {:error, :not_found}
+      end
+
+    case result do
+      {:ok, %{run: run}} = result ->
+        watch_workflow_run(run)
+        result
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec restart_workflow_child_run(String.t()) :: {:ok, map()} | {:error, term()}
+  def restart_workflow_child_run(run_id) when is_binary(run_id) do
+    case WorkflowTask.restart(store!(), run_id,
+           runner: WorkflowRunner.runner(),
+           reason: "human restarted failed child from Workbench"
+         ) do
+      {:ok, %{run: run}} = result ->
+        watch_workflow_run(run)
+        result
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec start_workflow_run(String.t()) :: {:ok, map()} | {:error, term()}
+  def start_workflow_run(run_id) when is_binary(run_id) do
+    case WorkflowExecutor.start_run(store!(), run_id, runner: WorkflowRunner.runner()) do
+      {:ok, %{run: run}} = result ->
+        watch_workflow_run(run)
+        result
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec request_workflow_run_review(String.t(), map() | keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def request_workflow_run_review(run_id, attrs \\ %{}) when is_binary(run_id) do
+    attrs =
+      attrs
+      |> Map.new()
+      |> Map.put_new(:checkpoint, "operator_review")
+      |> Map.put_new(:prompt, "Review the pinned workflow run before it continues")
+
+    WorkflowExecutor.pause_for_review(store!(), run_id, attrs, runner: WorkflowRunner.runner())
+  end
+
+  defp watch_workflow_run(%WorkflowRun{} = run) do
+    Task.Supervisor.start_child(@task_supervisor, fn ->
+      store = store!()
+      terminal = WorkflowExecutor.await_terminal(store, run.id, timeout: 300_000)
+
+      if run.trigger in ["workflow_task", "workflow_task_retry"] and
+           match?({:ok, %WorkflowRun{status: "completed"}}, terminal) do
+        _ =
+          WorkflowTask.await_result(store, run.id,
+            runner: WorkflowRunner.runner(),
+            timeout: 1_000
+          )
+      end
+
+      if root_workflow_run?(run) do
+        _ = record_root_workflow_terminal(store, run, terminal)
+      end
+
+      Phoenix.PubSub.broadcast(
+        RunicAI.PubSub,
+        session_topic(run.session_id),
+        {:workbench, :workflow_run, run.session_id}
+      )
+    end)
+
+    :ok
+  end
+
+  defp root_workflow_run?(%WorkflowRun{parent_run_id: nil, trigger: trigger}),
+    do: trigger in ["intent_reuse", "workbench", "manual", "fork"]
+
+  defp root_workflow_run?(%WorkflowRun{}), do: false
+
+  defp record_root_workflow_terminal(store, run, {:ok, %WorkflowRun{} = terminal}) do
+    {kind, phase, status, title} = workflow_terminal_event_identity(terminal.status)
+
+    output =
+      case WorkflowExecutor.output(store, terminal.id) do
+        {:ok, value} -> value
+        {:error, _reason} -> %{}
+      end
+
+    record_terminal_event(%{
+      id: Ids.unique("terminal_event"),
+      session_id: run.session_id,
+      run_id: terminal.id,
+      agent: :assistant,
+      kind: kind,
+      phase: phase,
+      status: status,
+      title: title,
+      detail: "Pinned workflow run #{terminal.status}",
+      data_json: %{
+        workflow_run_id: terminal.id,
+        definition_revision: terminal.definition_revision,
+        definition_hash: terminal.definition_hash,
+        compiled_hash: terminal.compiled_hash,
+        output: output,
+        trigger: terminal.trigger
+      },
+      at: DateTime.utc_now()
+    })
+  end
+
+  defp record_root_workflow_terminal(_store, _run, {:error, _reason}), do: :ok
+
+  defp workflow_terminal_event_identity("completed"),
+    do: {:summary, :completed, :ok, "Workflow completed"}
+
+  defp workflow_terminal_event_identity("blocked"),
+    do: {:status, :workflow_blocked, :blocked, "Workflow blocked"}
+
+  defp workflow_terminal_event_identity("cancelled"),
+    do: {:status, :workflow_cancelled, :blocked, "Workflow cancelled"}
+
+  defp workflow_terminal_event_identity(_status),
+    do: {:error, :workflow_failed, :error, "Workflow failed"}
+
+  @spec apply_workflow_operations(String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def apply_workflow_operations(run_id, source, opts \\ [])
+      when is_binary(run_id) and is_binary(source) and is_list(opts) do
+    store = store!()
+
+    with %WorkflowRun{} = run <- workflow_run(store, run_id),
+         workflow when not is_nil(workflow) <-
+           ManagedWorkflows.get(store, run.managed_workflow_id),
+         {:ok, workspace} <- workflow_workspace(store, run) do
+      apply_workflow_operations_to_definition(store, workflow, workspace, source, opts)
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec apply_workflow_definition_operations(String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def apply_workflow_definition_operations(definition_id, session_id, source, opts \\ [])
+      when is_binary(definition_id) and is_binary(session_id) and is_binary(source) and
+             is_list(opts) do
+    store = store!()
+
+    with %ManagedWorkflow{} = workflow <- ManagedWorkflows.get(store, definition_id),
+         :ok <- require_session_definition(workflow, session_id),
+         {:ok, workspace} <- workflow_workspace(store, session_id) do
+      apply_workflow_operations_to_definition(store, workflow, workspace, source, opts)
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp apply_workflow_operations_to_definition(store, workflow, workspace, source, opts) do
+    with revision when not is_nil(revision) <-
+           WorkflowDefinitions.get_revision(store, workflow.latest_revision_id),
+         :ok <- require_expected_revision(revision, opts),
+         {:ok, operations} <- decode_workflow_operations(source),
+         {:ok, base_ir} <- WorkflowIR.from_input(revision.ir_json),
+         {:ok, preview} <-
+           WorkflowEditor.apply(base_ir, %{
+             base_revision: revision.revision,
+             base_hash: revision.semantic_hash,
+             operations: operations
+           }),
+         {:ok, compiled} <- WorkflowCompiler.compile(preview.ir, workspace),
+         {:ok, revised} <-
+           WorkflowDefinitions.revise(store, workflow.id, %{
+             base_revision: revision.revision,
+             base_hash: revision.semantic_hash,
+             operations: operations,
+             actor: Keyword.get(opts, :actor, "workbench:human"),
+             operation_metadata: Keyword.get(opts, :operation_metadata, %{})
+           }),
+         true <-
+           compiled.semantic_hash == revised.revision.semantic_hash ||
+             {:error, :compiled_revision_hash_mismatch},
+         {:ok, artifact} <-
+           WorkflowDefinitions.record_compilation(store, revised.revision.id, %{
+             artifact: compiled,
+             compiled_hash: compiled.compiled_hash,
+             catalog_hash: revised.revision.catalog_hash,
+             source_map: compiled.source_map,
+             metadata: %{
+               compiled_by: Keyword.get(opts, :actor, "workbench:human"),
+               artifact_format: "recompile_from_ir_v1",
+               compiled_hash_format: "stable_lowering_v2"
+             }
+           }) do
+      {:ok, %{revision: revised.revision, edit: revised.edit, artifact: artifact}}
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec suggest_workflow_operations(String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def suggest_workflow_operations(run_id, source, opts \\ [])
+      when is_binary(run_id) and is_binary(source) and is_list(opts) do
+    store = store!()
+
+    with %WorkflowRun{} = run <- workflow_run(store, run_id),
+         workflow when not is_nil(workflow) <-
+           ManagedWorkflows.get(store, run.managed_workflow_id),
+         revision when not is_nil(revision) <-
+           WorkflowDefinitions.get_revision(store, workflow.latest_revision_id),
+         {:ok, operations} <- decode_workflow_operations(source),
+         {:ok, base_ir} <- WorkflowIR.from_input(revision.ir_json),
+         {:ok, preview} <-
+           WorkflowEditor.apply(base_ir, %{
+             base_revision: revision.revision,
+             base_hash: revision.semantic_hash,
+             operations: operations
+           }),
+         {:ok, workspace} <- workflow_workspace(store, run),
+         {:ok, compiled} <- WorkflowCompiler.compile(preview.ir, workspace) do
+      review_id = Ids.unique("workflow_edit_review")
+      suggested_by = Keyword.get(opts, :actor, "workbench:agent")
+
+      event = %{
+        id: Ids.unique("terminal_event"),
+        session_id: run.session_id,
+        run_id: run.session_id,
+        agent: :assistant,
+        kind: :hitl,
+        phase: :review_requested,
+        status: :review,
+        title: "Workflow edit suggestion",
+        detail:
+          "Review #{length(operations)} typed operation(s) affecting #{length(preview.affected_nodes)} node(s)",
+        data_json: %{
+          id: review_id,
+          workflow_run_id: run.id,
+          kind: :workflow_edit,
+          checkpoint: "workflow_edit",
+          resume_key: review_id,
+          details: %{
+            managed_workflow_id: workflow.id,
+            workflow_key: workflow.workflow_key,
+            base_revision_id: revision.id,
+            base_revision: revision.revision,
+            base_hash: revision.semantic_hash,
+            result_hash: preview.result_hash,
+            compiled_hash: compiled.compiled_hash,
+            operations: operations,
+            affected_nodes: preview.affected_nodes,
+            diff: preview.diff,
+            rationale: Keyword.get(opts, :rationale),
+            suggested_by: suggested_by
+          }
+        },
+        at: DateTime.utc_now()
+      }
+
+      with {:ok, _event} <- record_terminal_event(event),
+           {:ok, review} <- get_review_request(run.session_id, review_id) do
+        {:ok, %{review: review, edit: preview, compiled: compiled}}
+      end
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec undo_latest_workflow_operations(String.t()) :: {:ok, map()} | {:error, term()}
+  def undo_latest_workflow_operations(run_id) when is_binary(run_id) do
+    store = store!()
+
+    with %WorkflowRun{} = run <- workflow_run(store, run_id),
+         workflow when not is_nil(workflow) <-
+           ManagedWorkflows.get(store, run.managed_workflow_id),
+         batch when not is_nil(batch) <-
+           store
+           |> WorkflowDefinitions.operation_batches(workflow.id)
+           |> List.last(),
+         true <-
+           batch.result_revision_id == workflow.latest_revision_id ||
+             {:error, :latest_revision_has_no_undo_batch},
+         inverse when is_list(inverse) and inverse != [] <-
+           Map.get(batch.data_json || %{}, "inverse_operations") ||
+             Map.get(batch.data_json || %{}, :inverse_operations) do
+      apply_workflow_operations(run_id, Jason.encode!(inverse))
+    else
+      nil -> {:error, :not_found}
+      false -> {:error, :inverse_operations_unavailable}
+      [] -> {:error, :inverse_operations_unavailable}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec compare_workflow_revisions(String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def compare_workflow_revisions(run_id, from_revision_id, to_revision_id)
+      when is_binary(run_id) and is_binary(from_revision_id) and is_binary(to_revision_id) do
+    store = store!()
+
+    with true <- from_revision_id != to_revision_id || {:error, :same_revision},
+         %WorkflowRun{} = run <- workflow_run(store, run_id),
+         true <- is_binary(run.managed_workflow_id) || {:error, :not_revisioned},
+         workflow when not is_nil(workflow) <-
+           ManagedWorkflows.get(store, run.managed_workflow_id),
+         revisions = WorkflowDefinitions.revisions(store, workflow.id),
+         revisions_by_id = Map.new(revisions, &{&1.id, &1}),
+         from when not is_nil(from) <- Map.get(revisions_by_id, from_revision_id),
+         to when not is_nil(to) <- Map.get(revisions_by_id, to_revision_id),
+         {:ok, diff} <- WorkflowEditor.diff(from.ir_json, to.ir_json) do
+      {:ok,
+       %{
+         workflow_id: workflow.id,
+         from: workflow_revision_view(from),
+         to: workflow_revision_view(to),
+         diff: diff
+       }}
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec workflow_definition_action(String.t(), atom()) :: {:ok, map()} | {:error, term()}
+  def workflow_definition_action(run_id, action)
+      when is_binary(run_id) and
+             action in [
+               :request_review,
+               :approve,
+               :activate,
+               :revalidate,
+               :migrate_catalog,
+               :archive
+             ] do
+    store = store!()
+
+    with %WorkflowRun{} = run <- workflow_run(store, run_id) do
+      apply_workflow_definition_action(store, run.managed_workflow_id, action,
+        actor: "workbench:human",
+        session_id: run.session_id
+      )
+    else
+      nil -> {:error, :not_found}
+    end
+  end
+
+  @spec workflow_definition_action_by_id(String.t(), atom(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def workflow_definition_action_by_id(definition_id, action, opts \\ [])
+      when is_binary(definition_id) and
+             action in [
+               :request_review,
+               :approve,
+               :activate,
+               :revalidate,
+               :migrate_catalog,
+               :archive
+             ] and
+             is_list(opts) do
+    apply_workflow_definition_action(
+      store!(),
+      definition_id,
+      action,
+      Keyword.put_new(opts, :actor, "workbench:human")
+    )
+  end
+
+  @spec launch_workflow_definition(String.t(), String.t()) ::
+          {:ok, WorkflowRun.t()} | {:error, term()}
+  def launch_workflow_definition(definition_id, session_id)
+      when is_binary(definition_id) and is_binary(session_id) do
+    store = store!()
+
+    with %ManagedWorkflow{} = workflow <- ManagedWorkflows.get(store, definition_id),
+         :ok <- require_session_definition(workflow, session_id),
+         revision when not is_nil(revision) <-
+           WorkflowDefinitions.get_revision(store, workflow.active_revision_id) do
+      planning = field(revision.metadata_json || %{}, :planning) || %{}
+      input = field(planning, :request) || %{}
+
+      WorkflowDefinitions.launch(store, definition_id, %{
+        session_id: session_id,
+        status: :pending,
+        trigger: :workbench,
+        input: input,
+        metadata: %{launched_from: "workflow_definition_review"}
+      })
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp apply_workflow_definition_action(store, definition_id, action, opts) do
+    case action do
+      :request_review -> WorkflowDefinitions.request_review(store, definition_id, opts)
+      :approve -> WorkflowDefinitions.approve(store, definition_id, opts)
+      :activate -> WorkflowDefinitions.activate(store, definition_id, opts)
+      :revalidate -> WorkflowDefinitions.revalidate(store, definition_id, opts)
+      :migrate_catalog -> migrate_workflow_catalog(store, definition_id, opts)
+      :archive -> WorkflowDefinitions.archive(store, definition_id, opts)
+    end
+  end
+
+  defp migrate_workflow_catalog(store, definition_id, opts) do
+    session_id = Keyword.get(opts, :session_id)
+
+    with %ManagedWorkflow{} = workflow <- ManagedWorkflows.get(store, definition_id),
+         :ok <- require_session_definition(workflow, session_id),
+         {:ok, preview} <- WorkflowDefinitions.catalog_migration_preview(store, workflow.id),
+         {:ok, workspace} <- workflow_workspace(store, session_id),
+         {:ok, compiled} <- WorkflowCompiler.compile(preview.ir, workspace),
+         true <-
+           compiled.semantic_hash == preview.semantic_hash ||
+             {:error, :compiled_migration_hash_mismatch},
+         {:ok, migrated} <-
+           WorkflowDefinitions.migrate_catalog(store, workflow.id, %{
+             base_revision_id: preview.base_revision.id,
+             base_hash: preview.base_revision.semantic_hash,
+             expected_semantic_hash: preview.semantic_hash,
+             artifact: compiled,
+             compiled_hash: compiled.compiled_hash,
+             source_map: compiled.source_map,
+             actor: Keyword.get(opts, :actor, "workbench:human"),
+             artifact_metadata: %{compiled_by: Keyword.get(opts, :actor, "workbench:human")}
+           }) do
+      {:ok, migrated}
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec fork_workflow_run_to_latest(String.t()) :: {:ok, WorkflowRun.t()} | {:error, term()}
+  def fork_workflow_run_to_latest(run_id) when is_binary(run_id) do
+    store = store!()
+
+    with %WorkflowRun{} = run <- workflow_run(store, run_id),
+         workflow when not is_nil(workflow) <-
+           ManagedWorkflows.get(store, run.managed_workflow_id),
+         true <-
+           workflow.latest_revision_id != run.definition_revision_id ||
+             {:error, :already_on_latest_revision} do
+      WorkflowDefinitions.fork_run(store, run.id, workflow.latest_revision_id, %{
+        session_id: run.session_id,
+        reason: "human selected latest revision in Workbench"
+      })
+    else
+      nil -> {:error, :not_found}
+      {:error, _reason} = error -> error
+    end
+  end
+
   @spec health() :: map()
   def health do
     StoreServer.health()
@@ -190,7 +680,7 @@ defmodule RunicAI.Workbench do
           acc
 
         name ->
-          case RunicSandbox.Profile.from_named_config(name, profile_config) do
+          case LitterBox.Profile.from_named_config(name, profile_config) do
             {:ok, profile} -> Map.put(acc, profile.name, profile)
             {:error, _error} -> acc
           end
@@ -229,7 +719,7 @@ defmodule RunicAI.Workbench do
         %{status: :not_started, reason: :not_started, sandboxes: %{}}
 
       _pid ->
-        case RunicSandbox.status(server: RunicAI.Sandbox) do
+        case LitterBox.status(server: RunicAI.Sandbox) do
           {:ok, status} ->
             status
             |> sandbox_health_output()
@@ -244,7 +734,7 @@ defmodule RunicAI.Workbench do
   end
 
   defp direct_sandbox_status(profile) do
-    case RunicSandbox.status(profile: profile) do
+    case LitterBox.status(profile: profile) do
       {:ok, status} -> sandbox_health_output(status)
       {:error, error} -> %{status: :unavailable, reason: sandbox_error_reason(error)}
     end
@@ -285,7 +775,7 @@ defmodule RunicAI.Workbench do
     })
   end
 
-  defp sandbox_profile_snapshot(%RunicSandbox.Profile{} = profile) do
+  defp sandbox_profile_snapshot(%LitterBox.Profile{} = profile) do
     %{
       name: profile.name,
       backend: profile.backend,
@@ -300,7 +790,7 @@ defmodule RunicAI.Workbench do
     |> sandbox_health_output()
   end
 
-  defp empty_pool_status(%RunicSandbox.Profile{} = profile) do
+  defp empty_pool_status(%LitterBox.Profile{} = profile) do
     %{
       warm: profile.pool.warm,
       max: profile.pool.max,
@@ -441,6 +931,7 @@ defmodule RunicAI.Workbench do
       reviews = Queries.review_requests(store, session_id)
       artifacts = Queries.artifacts_for_run(store, session_id)
       scorecards = Queries.scorecards_for_run(store, session_id)
+      workflow_definitions = workflow_definitions_for_session(store, session_id)
       objective_loop = Queries.latest_objective_loop_state(store, session_id)
       event_views = Enum.map(events, &event_view/1)
       sandbox_execution_views = sandbox_execution_views(event_views)
@@ -473,7 +964,9 @@ defmodule RunicAI.Workbench do
         sandbox_executions: sandbox_execution_views,
         child_repairs: child_repair_views,
         tool_calls: Enum.map(tools, &tool_call_view/1),
-        runs: Enum.map(runs, &run_view/1),
+        runs: Enum.map(runs, &run_view(store, &1)),
+        workflow_definitions:
+          Enum.map(workflow_definitions, &workflow_definition_view(store, &1)),
         review_requests: review_views,
         artifacts: artifact_views,
         scorecards: scorecard_views,
@@ -482,7 +975,7 @@ defmodule RunicAI.Workbench do
         blocked_evidence: blocked_evidence,
         completion_proof: completion_proof,
         plan_workflow_graph: plan_workflow_graph_view(event_views),
-        progress_summary: progress_summary_view(event_views, blocked_evidence),
+        progress_summary: progress_summary_view(session, event_views, blocked_evidence),
         metrics: %{
           messages: length(messages),
           events: length(events),
@@ -490,6 +983,7 @@ defmodule RunicAI.Workbench do
           child_repairs: length(child_repair_views),
           tool_calls: length(tools),
           runs: length(runs),
+          workflow_definitions: length(workflow_definitions),
           review_requests: length(reviews),
           artifacts: length(artifacts),
           scorecards: length(scorecards)
@@ -534,22 +1028,143 @@ defmodule RunicAI.Workbench do
     end
   end
 
+  @spec start_workflow_intent(map()) :: {:ok, map()} | {:error, term()}
+  def start_workflow_intent(params) when is_map(params) do
+    with {:ok, launch} <- normalize_launch(params),
+         {:ok, intent} <- normalize_workflow_intent(params, launch) do
+      launch = Map.put(launch, :conversation_history, conversation_history(launch))
+
+      with {:ok, %TerminalEvent{}} <- record_terminal_event(user_message_event(launch)),
+           {:ok, %TerminalEvent{}} <- record_terminal_event(launch_event(launch)),
+           {:ok, %TerminalEvent{}} <- record_terminal_event(capability_profile_event(launch)),
+           {:ok, pid} <- start_workflow_intent_task(launch, intent) do
+        {:ok, %{session_id: launch.session_id, run_id: launch.run_id, pid: pid}}
+      end
+    end
+  end
+
   @spec record_review_decision(String.t(), String.t(), map()) ::
           {:ok, TerminalEvent.t()} | {:error, term()}
   def record_review_decision(session_id, review_id, params)
       when is_binary(session_id) and is_binary(review_id) and is_map(params) do
     with {:ok, %ReviewRequest{} = review} <- get_review_request(session_id, review_id),
          :ok <- require_pending_review_decision(review),
-         {:ok, decision} <- normalize_review_decision(params) do
+         {:ok, decision} <- normalize_review_decision(params),
+         {:ok, decision} <- maybe_apply_suggested_workflow_edit(review, decision),
+         {:ok, definition_decision} <- maybe_decide_definition_review(review, decision),
+         {:ok, runtime_decision} <- maybe_decide_runtime_workflow_review(review, decision) do
       agent = review_decision_agent(session_id)
 
       with {:ok, %TerminalEvent{} = event} <-
              record_terminal_event(review_decision_event(session_id, review, decision, agent)) do
         maybe_start_objective_operator_resume(session_id, review, decision)
+        maybe_resume_definition_workflow(review, definition_decision)
+        maybe_resume_runtime_workflow(review, runtime_decision)
         {:ok, event}
       end
     end
   end
+
+  defp maybe_apply_suggested_workflow_edit(
+         %ReviewRequest{kind: "workflow_edit", workflow_run_id: run_id} = review,
+         %{action: action} = decision
+       )
+       when is_binary(run_id) and action in ["approve", "rewrite"] do
+    details = review.details_json || %{}
+
+    source =
+      case action do
+        "rewrite" -> Map.get(decision, :edited_value)
+        "approve" -> Jason.encode!(field(details, :operations) || [])
+      end
+
+    with {:ok, result} <-
+           apply_workflow_operations(run_id, source,
+             actor: "workbench:human:accepted_suggestion",
+             expected_revision_id: field(details, :base_revision_id),
+             expected_hash: field(details, :base_hash),
+             operation_metadata: %{
+               suggestion_review_id: review.id,
+               suggested_by: field(details, :suggested_by),
+               rationale: field(details, :rationale)
+             }
+           ) do
+      {:ok,
+       Map.merge(decision, %{
+         applied_revision_id: result.revision.id,
+         applied_revision: result.revision.revision,
+         applied_semantic_hash: result.revision.semantic_hash
+       })}
+    end
+  end
+
+  defp maybe_apply_suggested_workflow_edit(
+         %ReviewRequest{kind: "workflow_edit"},
+         %{action: action} = decision
+       )
+       when action in ["deny", "stop"],
+       do: {:ok, Map.put(decision, :suggestion_disposition, "rejected")}
+
+  defp maybe_apply_suggested_workflow_edit(%ReviewRequest{}, decision), do: {:ok, decision}
+
+  defp maybe_decide_definition_review(
+         %ReviewRequest{kind: "workflow_revision", details_json: details},
+         %{action: action} = decision
+       )
+       when action in ["approve", "rewrite", "deny", "stop"] do
+    workflow_id = field(details || %{}, :managed_workflow_id)
+
+    result =
+      if action in ["approve", "rewrite"] do
+        WorkflowDefinitions.approve(store!(), workflow_id,
+          actor: "workbench:human",
+          reason: Map.get(decision, :edited_value)
+        )
+      else
+        WorkflowDefinitions.reject(store!(), workflow_id,
+          actor: "workbench:human",
+          reason: Map.get(decision, :edited_value)
+        )
+      end
+
+    case result do
+      {:ok, lifecycle} -> {:ok, lifecycle}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_decide_definition_review(%ReviewRequest{}, _decision),
+    do: {:ok, :not_definition}
+
+  defp maybe_decide_runtime_workflow_review(
+         %ReviewRequest{kind: "workflow_run", workflow_run_id: run_id},
+         %{action: action} = decision
+       )
+       when is_binary(run_id) and action in ["approve", "deny", "stop"] do
+    status = if action == "approve", do: :approved, else: :denied
+
+    case WorkflowExecutor.decide_review(store!(), run_id, status,
+           actor: "workbench:human",
+           reason: Map.get(decision, :edited_value)
+         ) do
+      {:ok, _result} -> {:ok, status}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_decide_runtime_workflow_review(_review, _decision), do: {:ok, :not_runtime}
+
+  defp maybe_resume_runtime_workflow(
+         %ReviewRequest{workflow_run_id: run_id},
+         :approved
+       )
+       when is_binary(run_id) do
+    resume_workflow_run(run_id)
+  end
+
+  defp maybe_resume_runtime_workflow(_review, _decision), do: :ok
+
+  defp maybe_resume_definition_workflow(_review, _decision), do: :ok
 
   @spec record_approval_policy(String.t(), map()) ::
           {:ok, %{policy: atom(), approved_count: non_neg_integer()}} | {:error, term()}
@@ -757,6 +1372,31 @@ defmodule RunicAI.Workbench do
     end
   end
 
+  defp normalize_workflow_intent(params, launch) do
+    with {:ok, strategy} <-
+           choice(value(params, "orchestration"), @intent_strategy_choices, :auto),
+         {:ok, input_paths} <- normalize_list(value(params, "input_paths")),
+         {:ok, required_sections} <- normalize_list(value(params, "required_sections")) do
+      output_path = params |> value("output_path") |> blank_to_nil()
+
+      {:ok,
+       %{
+         strategy: strategy,
+         request: %{
+           objective: launch.objective,
+           input_paths: input_paths,
+           output_path: output_path,
+           required_sections: required_sections,
+           metadata: %{
+             source: "phoenix_workbench",
+             session_id: launch.session_id,
+             run_id: launch.run_id
+           }
+         }
+       }}
+    end
+  end
+
   defp route_agent(:rlm, _objective, :patch), do: {:rlm, nil}
 
   defp route_agent(:rlm, objective, _mode) do
@@ -812,6 +1452,263 @@ defmodule RunicAI.Workbench do
       nil -> Task.start(fun)
       _pid -> Task.Supervisor.start_child(@task_supervisor, fun)
     end
+  end
+
+  defp start_workflow_intent_task(launch, intent) do
+    fun = fn -> run_workflow_intent_with_deadline(launch, intent) end
+
+    case Process.whereis(@task_supervisor) do
+      nil -> Task.start(fun)
+      _pid -> Task.Supervisor.start_child(@task_supervisor, fun)
+    end
+  end
+
+  defp run_workflow_intent_with_deadline(launch, intent) do
+    caller = self()
+    tag = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        send(caller, {tag, run_workflow_intent(launch, intent)})
+      end)
+
+    receive do
+      {^tag, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        record_workflow_intent_failure(launch, reason)
+    after
+      launch.max_runtime_ms ->
+        failure =
+          record_workflow_intent_failure(
+            launch,
+            Error.timeout("Workflow planning exceeded its configured runtime budget",
+              source: __MODULE__,
+              details: %{
+                code: :workflow_intent_timeout,
+                max_runtime_ms: launch.max_runtime_ms
+              }
+            )
+          )
+
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> failure
+        after
+          100 ->
+            Process.demonitor(monitor, [:flush])
+            failure
+        end
+    end
+  end
+
+  defp run_workflow_intent(launch, intent) do
+    store = store!()
+
+    with {:ok, workspace} <- intent_workspace(launch),
+         planning <- plan_workflow_intent(store, workspace, launch, intent) do
+      handle_workflow_intent_result(planning, store, launch, intent)
+    else
+      {:error, reason} -> record_workflow_intent_failure(launch, reason)
+    end
+  rescue
+    exception ->
+      record_workflow_intent_failure(
+        launch,
+        Error.from_exception(exception,
+          source: __MODULE__,
+          message: "Workbench workflow planning failed"
+        )
+      )
+  end
+
+  defp plan_workflow_intent(store, workspace, launch, intent) do
+    opts =
+      [
+        strategy: intent.strategy,
+        model: launch.model,
+        scope_type: :session,
+        scope_id: launch.session_id,
+        workflow_key: intent_workflow_key(launch),
+        actor: "workbench:planner",
+        write_policy: launch.write_policy,
+        capability_profile: launch.capability_profile,
+        conversation_history: launch.conversation_history,
+        receive_timeout: min(launch.max_runtime_ms, 120_000),
+        llm_opts: [receive_timeout: min(launch.max_runtime_ms, 120_000)]
+      ]
+      |> maybe_put(:client, intent_planner_client())
+
+    case Keyword.get(config(), :intent_planner_fun) do
+      fun when is_function(fun, 4) -> fun.(store, workspace, intent.request, opts)
+      _other -> IntentPlanner.plan(store, workspace, intent.request, opts)
+    end
+  end
+
+  defp intent_planner_client do
+    case Keyword.get(config(), :intent_planner_client) do
+      fun when is_function(fun, 3) -> fun
+      module when is_atom(module) -> module
+      _other -> nil
+    end
+  end
+
+  defp intent_workspace(launch) do
+    path_policy =
+      case launch.write_policy do
+        :docs_only -> PathPolicy.new!(hidden_policy: :allow, allowed_write_roots: [".docs"])
+        :workspace_review -> PathPolicy.new!(hidden_policy: :allow, allowed_write_roots: ["."])
+        :none -> PathPolicy.new!(hidden_policy: :deny, allowed_write_roots: ["."])
+      end
+
+    Workspace.new(root: launch.cwd, path_policy: path_policy, persistence: store!())
+  end
+
+  defp handle_workflow_intent_result(
+         {:ok, %{strategy: :direct, status: :ready} = result},
+         _store,
+         launch,
+         _intent
+       ) do
+    with {:ok, _event} <- record_workflow_intent_event(launch, result, :ok) do
+      run_agent(launch)
+    end
+  end
+
+  defp handle_workflow_intent_result(
+         {:ok, %{strategy: :reuse_exact, status: :ready} = result},
+         store,
+         launch,
+         intent
+       ) do
+    workflow_key = result.route.selected.workflow.workflow_key
+
+    with {:ok, _event} <- record_workflow_intent_event(launch, result, :ok),
+         {:ok, execution} <-
+           WorkflowExecutor.launch_and_run(store, workflow_key, intent.request,
+             runner: WorkflowRunner.runner(),
+             run: %{
+               session_id: launch.session_id,
+               trigger: :intent_reuse,
+               metadata: %{planning_strategy: :reuse_exact, route: result.route.rationale}
+             }
+           ) do
+      watch_workflow_run(execution.run)
+      {:ok, execution}
+    else
+      {:error, reason} -> record_workflow_intent_failure(launch, reason)
+    end
+  end
+
+  defp handle_workflow_intent_result(
+         {:ok, %{strategy: strategy, status: :drafted} = result},
+         store,
+         launch,
+         _intent
+       )
+       when strategy in [:draft, :adapt] do
+    with {:ok, review} <-
+           WorkflowDefinitions.request_review(store, result.definition.workflow.id,
+             actor: "workbench:planner",
+             session_id: launch.session_id
+           ),
+         {:ok, _event} <-
+           record_workflow_intent_event(
+             launch,
+             Map.put(result, :definition_review, review),
+             :review
+           ) do
+      {:ok, result}
+    else
+      {:error, reason} -> record_workflow_intent_failure(launch, reason)
+    end
+  end
+
+  defp handle_workflow_intent_result(
+         {:ok, %{strategy: :adapt, status: :adaptation_required} = result},
+         _store,
+         launch,
+         _intent
+       ) do
+    record_workflow_intent_event(launch, result, :blocked)
+  end
+
+  defp handle_workflow_intent_result({:error, reason}, _store, launch, _intent),
+    do: record_workflow_intent_failure(launch, reason)
+
+  defp record_workflow_intent_event(launch, result, status) do
+    route = result.route
+    definition = Map.get(result, :definition)
+    workflow = definition && definition.workflow
+    revision = definition && definition.revision
+
+    record_terminal_event(%{
+      id: Ids.unique("terminal_event"),
+      session_id: launch.session_id,
+      run_id: launch.run_id,
+      agent: :assistant,
+      kind: :status,
+      phase: :workflow_intent_routed,
+      status: status,
+      title: workflow_intent_title(result.strategy, status),
+      detail: route.rationale,
+      data_json: %{
+        planning_strategy: result.strategy,
+        rationale: route.rationale,
+        reasons: route.reasons,
+        considered_candidate_count: length(route.candidates),
+        managed_workflow_id: workflow && workflow.id,
+        workflow_key: workflow && workflow.workflow_key,
+        definition_revision_id: revision && revision.id,
+        definition_revision: revision && revision.revision,
+        semantic_hash: revision && revision.semantic_hash,
+        catalog_hash: revision && revision.catalog_hash
+      },
+      at: DateTime.utc_now()
+    })
+  end
+
+  defp record_workflow_intent_failure(launch, reason) do
+    error =
+      case reason do
+        %Error{} = error ->
+          error
+
+        _other ->
+          Error.from_reason(reason,
+            source: __MODULE__,
+            message: "Workbench workflow planning failed"
+          )
+      end
+
+    record_terminal_event(%{
+      id: Ids.unique("terminal_event"),
+      session_id: launch.session_id,
+      run_id: launch.run_id,
+      agent: :assistant,
+      kind: :error,
+      phase: :workflow_intent_failed,
+      status: :error,
+      title: "Workflow planning failed",
+      detail: error.message,
+      data_json: %{error: launch_error_payload(error)},
+      at: DateTime.utc_now()
+    })
+  end
+
+  defp workflow_intent_title(:direct, _status), do: "Direct agent selected"
+  defp workflow_intent_title(:reuse_exact, _status), do: "Proven workflow selected"
+  defp workflow_intent_title(:adapt, :review), do: "Adapted workflow ready for review"
+  defp workflow_intent_title(:adapt, :blocked), do: "Workflow adaptation required"
+  defp workflow_intent_title(:draft, :review), do: "Drafted workflow ready for review"
+  defp workflow_intent_title(strategy, _status), do: "Workflow route: #{strategy}"
+
+  defp intent_workflow_key(launch) do
+    suffix = launch.run_id |> to_string() |> String.replace(~r/[^a-zA-Z0-9_-]+/u, "-")
+    "intent-#{String.trim(suffix, "-")}"
   end
 
   defp run_agent(launch) do
@@ -1487,10 +2384,15 @@ defmodule RunicAI.Workbench do
   defp review_decision_event(session_id, %ReviewRequest{} = review, decision, agent) do
     decided_at = DateTime.utc_now()
 
+    event_run_id =
+      if review.kind in ["workflow_run", "workflow_edit"],
+        do: session_id,
+        else: review.workflow_run_id || session_id
+
     %{
       id: Ids.unique("terminal_event"),
       session_id: session_id,
-      run_id: review.workflow_run_id || session_id,
+      run_id: event_run_id,
       agent: agent,
       kind: :hitl,
       phase: :review_decision,
@@ -1500,6 +2402,7 @@ defmodule RunicAI.Workbench do
       data_json: %{
         id: review.id,
         run_id: review.workflow_run_id || session_id,
+        workflow_run_id: review.workflow_run_id,
         kind: review.kind,
         checkpoint: review.checkpoint,
         resume_key: review.resume_key,
@@ -1513,6 +2416,10 @@ defmodule RunicAI.Workbench do
             approved_runtime_ms: Map.get(decision, :approved_runtime_ms),
             max_runtime_ms: Map.get(decision, :max_runtime_ms),
             source: Map.get(decision, :source),
+            applied_revision_id: Map.get(decision, :applied_revision_id),
+            applied_revision: Map.get(decision, :applied_revision),
+            applied_semantic_hash: Map.get(decision, :applied_semantic_hash),
+            suggestion_disposition: Map.get(decision, :suggestion_disposition),
             decided_at: decided_at
           }
           |> compact_map()
@@ -2173,6 +3080,7 @@ defmodule RunicAI.Workbench do
       },
       nodes: graph_nodes(graph),
       edges: graph_edges(graph),
+      acceptance: List.wrap(field(graph, :stop_conditions)),
       source_hash: hash_source(mermaid || inspect(graph))
     }
   end
@@ -2206,13 +3114,39 @@ defmodule RunicAI.Workbench do
       id: to_string(id),
       label: to_string(field(node, :label) || field(node, :title) || field(node, :name) || id),
       kind: stringify(field(node, :kind) || field(node, :type)),
-      status: stringify(field(node, :status))
+      status: stringify(field(node, :status)),
+      execution_shape: stringify(field(node, :execution_shape)),
+      inputs: field(node, :inputs) || %{},
+      outputs: field(node, :outputs) || %{},
+      policy: field(node, :policy) || %{},
+      replay:
+        node
+        |> field(:metadata)
+        |> field(:workflow_ir_replay),
+      effects:
+        node
+        |> field(:metadata)
+        |> field(:workflow_ir_effects)
+        |> List.wrap()
+        |> Enum.map(&to_string/1)
     }
   end
 
   defp graph_node(node, index) do
     id = stringify(node) || "node_#{index}"
-    %{id: id, label: id, kind: nil, status: nil}
+
+    %{
+      id: id,
+      label: id,
+      kind: nil,
+      status: nil,
+      execution_shape: nil,
+      inputs: %{},
+      outputs: %{},
+      policy: %{},
+      replay: nil,
+      effects: []
+    }
   end
 
   defp graph_edges(graph) do
@@ -2237,7 +3171,7 @@ defmodule RunicAI.Workbench do
 
   defp graph_edge(_edge), do: nil
 
-  defp progress_summary_view(events, blocked_evidence) do
+  defp progress_summary_view(session, events, blocked_evidence) do
     events = Enum.reject(events, &is_nil/1)
     latest = latest_progress_event(events)
     latest_node = latest_progress_field_event(events, [:node_id, :node, :current_node])
@@ -2315,6 +3249,37 @@ defmodule RunicAI.Workbench do
       event_trail: "#{length(events)} persisted events"
     }
     |> compact_map()
+    |> align_progress_with_session(session)
+  end
+
+  defp align_progress_with_session(summary, session) do
+    session_status = session |> field(:status) |> stringify()
+    objective_status = summary |> field(:objective_status) |> stringify()
+
+    if session_status in [
+         "waiting",
+         "review",
+         "blocked",
+         "failed",
+         "cancelled",
+         "stopped",
+         "completed"
+       ] and
+         objective_status in [nil, "pending", "running"] do
+      summary
+      |> Map.put(:objective_status, session_status)
+      |> drop_stale_continue_action()
+    else
+      summary
+    end
+  end
+
+  defp drop_stale_continue_action(summary) do
+    if summary |> field(:objective_action) |> stringify() == "continue" do
+      Map.delete(summary, :objective_action)
+    else
+      summary
+    end
   end
 
   defp latest_progress_event(events) do
@@ -2425,18 +3390,297 @@ defmodule RunicAI.Workbench do
     }
   end
 
-  defp run_view(%WorkflowRun{} = run) do
+  defp run_view(store, %WorkflowRun{} = run) do
+    definition = workflow_definition_view(store, run)
+
     %{
       id: run.id,
       workflow_key: run.workflow_key,
       workflow_name: run.workflow_name,
+      managed_workflow_id: run.managed_workflow_id,
+      definition_revision_id: run.definition_revision_id,
+      definition_revision: run.definition_revision,
+      definition_hash: run.definition_hash,
+      compiled_artifact_id: run.compiled_artifact_id,
+      compiled_hash: run.compiled_hash,
+      catalog_hash: run.catalog_hash,
       status: run.status,
       trigger: run.trigger,
+      parent_run_id: run.parent_run_id,
+      parent_node_id: run.parent_node_id,
+      invocation_key: run.invocation_key,
+      attempt: run.attempt,
+      supersedes_run_id: run.supersedes_run_id,
       metadata: run.metadata_json || %{},
       started_at: run.started_at || run.inserted_at,
       completed_at: run.completed_at,
-      failed_at: run.failed_at
+      failed_at: run.failed_at,
+      output_summary: workflow_run_output_summary(run.output_blob),
+      definition: definition
     }
+  end
+
+  defp workflow_run_output_summary(blob) when is_binary(blob) do
+    output = Term.from_blob(blob)
+    scorecard = field(output, :scorecard) || %{}
+    artifacts = output |> field(:artifacts) |> List.wrap()
+    metrics = field(output, :execution_metrics) || %{}
+
+    %{
+      objective_status: scorecard |> field(:objective_status) |> stringify(),
+      artifact_count: length(artifacts),
+      artifact_paths:
+        artifacts
+        |> Enum.map(&field(&1, :path))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.take(3),
+      nodes_executed: field(metrics, :nodes_executed),
+      record_map_calls: field(metrics, :record_map_calls),
+      dialect: output |> field(:dialect) |> stringify()
+    }
+    |> compact_map()
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp workflow_run_output_summary(_blob), do: nil
+
+  defp workflow_definition_view(_store, %WorkflowRun{managed_workflow_id: nil}), do: nil
+
+  defp workflow_definition_view(store, %WorkflowRun{} = run) do
+    case ManagedWorkflows.get(store, run.managed_workflow_id) do
+      nil ->
+        nil
+
+      workflow ->
+        store
+        |> workflow_definition_view(workflow)
+        |> Map.merge(%{
+          pinned_is_latest?: run.definition_revision_id == workflow.latest_revision_id,
+          pinned_is_active?: run.definition_revision_id == workflow.active_revision_id
+        })
+    end
+  end
+
+  defp workflow_definition_view(store, %ManagedWorkflow{} = workflow) do
+    latest = WorkflowDefinitions.get_revision(store, workflow.latest_revision_id)
+    revisions = WorkflowDefinitions.revisions(store, workflow.id)
+    latest_event = workflow |> then(&WorkflowDefinitions.events(store, &1.id)) |> List.last()
+
+    latest_batch =
+      workflow
+      |> then(&WorkflowDefinitions.operation_batches(store, &1.id))
+      |> List.last()
+
+    ir = workflow_ir(latest)
+    validation = if ir, do: WorkflowValidator.report(ir, mode: :runnable), else: nil
+
+    %{
+      id: workflow.id,
+      workflow_key: workflow.workflow_key,
+      workflow_name: workflow.workflow_name,
+      scope_type: workflow.scope_type,
+      scope_id: workflow.scope_id,
+      status: workflow.status,
+      latest_revision_id: workflow.latest_revision_id,
+      latest_revision: latest && latest.revision,
+      latest_hash: latest && latest.semantic_hash,
+      catalog_hash: latest && latest.catalog_hash,
+      current_catalog_hash: WorkflowCatalog.snapshot_hash(),
+      catalog_current?: latest && latest.catalog_hash == WorkflowCatalog.snapshot_hash(),
+      review_revision_id: workflow.review_revision_id,
+      active_revision_id: workflow.active_revision_id,
+      latest_action: latest_event && latest_event.action,
+      latest_batch: workflow_operation_batch_view(latest_batch, workflow.latest_revision_id),
+      revisions: Enum.map(revisions, &workflow_revision_view/1),
+      planning: workflow_planning(ir, latest),
+      objective: ir && ir.objective,
+      policies: (ir && ir.policies) || %{},
+      holes: (ir && ir.holes) || [],
+      acceptance: (ir && ir.acceptance) || [],
+      validation: validation,
+      graph: workflow_ir_graph(ir),
+      pinned_is_latest?: nil,
+      pinned_is_active?: nil
+    }
+  end
+
+  defp workflow_definitions_for_session(store, session_id) do
+    SQLite.with_repo(store, fn ->
+      store.repo.all(
+        from(workflow in ManagedWorkflow,
+          where: workflow.scope_type == "session" and workflow.scope_id == ^session_id,
+          order_by: [desc: workflow.updated_at]
+        )
+      )
+    end)
+  end
+
+  defp workflow_ir(nil), do: nil
+
+  defp workflow_ir(revision) do
+    case WorkflowIR.from_input(revision.ir_json) do
+      {:ok, ir} -> ir
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp workflow_planning(nil, _revision), do: %{}
+
+  defp workflow_planning(ir, revision) do
+    field(ir.metadata, :planning) || field(revision.metadata_json || %{}, :planning) || %{}
+  end
+
+  defp workflow_ir_graph(nil), do: nil
+
+  defp workflow_ir_graph(ir) do
+    nodes =
+      ir.nodes
+      |> Map.values()
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn node ->
+        %{
+          id: node.id,
+          label: node.id,
+          kind: node.component,
+          status: nil,
+          execution_shape: field(node.contract, :execution_shape),
+          inputs: field(node.contract, :inputs) || %{},
+          outputs: field(node.contract, :outputs) || %{},
+          effects: Enum.map(node.effects, &to_string/1),
+          replay: field(node.contract, :replay) || %{},
+          policy: node.policy,
+          arguments: node.arguments
+        }
+      end)
+
+    edges =
+      ir.edges
+      |> Map.values()
+      |> Enum.sort_by(& &1.id)
+      |> Enum.map(fn edge ->
+        %{
+          from: edge.from.node,
+          to: edge.to.node,
+          label: "#{edge.from.port} -> #{edge.to.port}"
+        }
+      end)
+
+    graph = %{nodes: nodes, edges: edges, direction: "LR"}
+    mermaid = GraphPresenter.to_mermaid(graph, direction: "LR")
+
+    %{
+      title: ir.objective,
+      nodes: nodes,
+      edges: edges,
+      mermaid: mermaid,
+      fallback: GraphPresenter.adjacency_text(graph),
+      acceptance: ir.acceptance,
+      source_hash: hash_source(mermaid)
+    }
+  end
+
+  defp workflow_operation_batch_view(nil, _latest_revision_id), do: nil
+
+  defp workflow_operation_batch_view(batch, latest_revision_id) do
+    data = batch.data_json || %{}
+
+    %{
+      id: batch.id,
+      base_revision_id: batch.base_revision_id,
+      result_revision_id: batch.result_revision_id,
+      base_hash: batch.base_hash,
+      result_hash: batch.result_hash,
+      operations: field(data, :operations) || [],
+      inverse_operations: field(data, :inverse_operations) || [],
+      affected_nodes: field(data, :affected_nodes) || [],
+      diff: field(data, :diff) || %{},
+      latest?: batch.result_revision_id == latest_revision_id
+    }
+  end
+
+  defp workflow_revision_view(revision) do
+    %{
+      id: revision.id,
+      revision: revision.revision,
+      semantic_hash: revision.semantic_hash,
+      parent_revision_id: revision.parent_revision_id,
+      created_by: revision.created_by,
+      inserted_at: revision.inserted_at
+    }
+  end
+
+  defp workflow_run(store, run_id) do
+    SQLite.with_repo(store, fn -> store.repo.get(WorkflowRun, run_id) end)
+  end
+
+  defp workflow_workspace(store, %WorkflowRun{} = run) do
+    workflow_workspace(store, run.session_id)
+  end
+
+  defp workflow_workspace(store, session_id) when is_binary(session_id) do
+    root =
+      SQLite.with_repo(store, fn ->
+        case store.repo.get(AgentSession, session_id) do
+          %AgentSession{workspace_root: root} when is_binary(root) -> root
+          _session -> File.cwd!()
+        end
+      end)
+
+    Workspace.new(root: root)
+  end
+
+  defp require_session_definition(
+         %ManagedWorkflow{scope_type: "session", scope_id: session_id},
+         session_id
+       ),
+       do: :ok
+
+  defp require_session_definition(%ManagedWorkflow{}, _session_id),
+    do: {:error, :workflow_definition_session_mismatch}
+
+  defp decode_workflow_operations(source) do
+    with {:ok, decoded} <- Jason.decode(source),
+         operations <-
+           if(is_map(decoded), do: Map.get(decoded, "operations", decoded), else: decoded),
+         true <- is_list(operations) || {:error, :operations_must_be_a_list} do
+      {:ok, operations}
+    else
+      {:error, %Jason.DecodeError{} = error} -> {:error, {:invalid_operations_json, error}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp require_expected_revision(revision, opts) do
+    expected_id = Keyword.get(opts, :expected_revision_id)
+    expected_hash = Keyword.get(opts, :expected_hash)
+
+    cond do
+      is_binary(expected_id) and expected_id != revision.id ->
+        {:error,
+         Error.validation("workflow edit suggestion has a stale base revision",
+           source: __MODULE__,
+           details: %{
+             code: :stale_suggested_revision,
+             expected: expected_id,
+             actual: revision.id
+           }
+         )}
+
+      is_binary(expected_hash) and expected_hash != revision.semantic_hash ->
+        {:error,
+         Error.validation("workflow edit suggestion has a stale base hash",
+           source: __MODULE__,
+           details: %{
+             code: :stale_suggested_hash,
+             expected: expected_hash,
+             actual: revision.semantic_hash
+           }
+         )}
+
+      true ->
+        :ok
+    end
   end
 
   defp review_request_view(%ReviewRequest{} = request) do

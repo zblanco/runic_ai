@@ -148,6 +148,15 @@ defmodule RunicAI.Coding.ReviewGate do
   defp review_operations(operations) when is_list(operations), do: operations
 
   defp review_operations(operations) when is_binary(operations) do
+    case Jason.decode(operations) do
+      {:ok, decoded} when is_list(decoded) -> decoded
+      _other -> review_text_patch_operations(operations)
+    end
+  end
+
+  defp review_operations(_operations), do: :unknown
+
+  defp review_text_patch_operations(operations) do
     if String.contains?(operations, "*** Begin Patch") do
       operations
       |> String.split("\n", trim: true)
@@ -173,8 +182,6 @@ defmodule RunicAI.Coding.ReviewGate do
       :unknown
     end
   end
-
-  defp review_operations(_operations), do: :unknown
 
   defp most_restrictive(classifications, base_details) do
     review =

@@ -35,6 +35,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
   alias RunicAI.RLM.TaskKind
   alias RunicAI.ReviewDecision
   alias RunicAI.ReviewRequest
+  alias RunicAI.Persistence.WorkflowTask
 
   @default_model "openai:gpt-5.4-mini"
   @sandbox_execute_argument_keys [
@@ -598,6 +599,44 @@ defmodule RunicAI.RLM.ComponentRuntime do
     BudgetLedger.run(input, Map.merge(base.budgets || %{}, params || %{}))
   end
 
+  defp dispatch(
+         %ComponentBlueprint{type: :workflow_task, params: params} = component,
+         input,
+         runtime
+       ) do
+    opts = runtime_opts(runtime)
+    workflow_key = get(params, :workflow_key, nil)
+
+    reference =
+      %{
+        workflow_key: workflow_key,
+        revision: get(params, :revision, nil),
+        revision_id: get(params, :revision_id, nil),
+        definition_hash: get(params, :definition_hash, nil),
+        contract_hash: get(params, :contract_hash, nil)
+      }
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+
+    with store when not is_nil(store) <- Keyword.get(opts, :workflow_store),
+         runner when not is_nil(runner) <- Keyword.get(opts, :workflow_runner),
+         parent_run_id when is_binary(parent_run_id) <-
+           Keyword.get(opts, :workflow_parent_run_id) || Keyword.get(opts, :run_id),
+         {:ok, result} <-
+           WorkflowTask.invoke(store, parent_run_id, reference, workflow_task_input(input),
+             runner: runner,
+             parent_node_id: get(params, :parent_node_id, component.id),
+             retry_failed?: get(params, :retry_failed?, false),
+             timeout: get(params, :timeout_ms, 30_000)
+           ) do
+      {:ok, result.output}
+    else
+      nil -> workflow_task_runtime_error(workflow_key)
+      false -> workflow_task_runtime_error(workflow_key)
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp dispatch(%ComponentBlueprint{type: type}, _input, _runtime) do
     {:error,
      Error.validation("unsupported assistant component type",
@@ -619,6 +658,18 @@ defmodule RunicAI.RLM.ComponentRuntime do
        details: %{params: params}
      )}
   end
+
+  defp workflow_task_runtime_error(workflow_key) do
+    {:error,
+     Error.validation("workflow_task requires durable store, runner, and parent run context",
+       source: __MODULE__,
+       details: %{code: :missing_workflow_task_runtime, workflow_key: workflow_key}
+     )}
+  end
+
+  defp workflow_task_input(%{input: input}) when is_map(input), do: input
+  defp workflow_task_input(%{"input" => input}) when is_map(input), do: input
+  defp workflow_task_input(input), do: input
 
   defp execute_capability_tool(tool_name, arguments, params, input, runtime) do
     base = runtime_context(runtime)
@@ -948,6 +999,7 @@ defmodule RunicAI.RLM.ComponentRuntime do
 
   defp component_llm_opts(opts, %ComponentBlueprint{} = component) do
     opts
+    |> maybe_put(:model, get(component.params, :model, nil))
     |> Keyword.put(:component_id, component.id)
     |> Keyword.put(:component_type, component.type)
     |> Keyword.put_new(:workflow_node, component.id)

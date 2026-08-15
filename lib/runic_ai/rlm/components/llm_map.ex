@@ -137,7 +137,32 @@ defmodule RunicAI.RLM.Components.LLMMap do
       input: input
     }
 
-    render_template(template, data)
+    template
+    |> render_template(data)
+    |> append_source_context(record)
+  end
+
+  # Source identity is part of the llm_map runtime contract, not optional prompt
+  # decoration. Generated templates can forget to mention it even while asking
+  # the model to preserve citations, so provide the authoritative metadata at
+  # the boundary where one source record becomes one model call.
+  defp append_source_context(prompt, record) do
+    case get(record, :path, get(record, :source_path, nil)) do
+      path when is_binary(path) and path != "" ->
+        """
+        #{prompt}
+
+        Runtime source metadata (authoritative):
+        - source_path: #{path}
+        - start_line: #{get(record, :start_line, "unknown")}
+        - end_line: #{get(record, :end_line, "unknown")}
+        Preserve this source_path in claims and citations derived from this record.
+        """
+        |> String.trim()
+
+      _other ->
+        prompt
+    end
   end
 
   defp render_template(template, data) do

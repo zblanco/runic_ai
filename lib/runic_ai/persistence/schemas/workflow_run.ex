@@ -18,9 +18,21 @@ defmodule RunicAI.Persistence.Schemas.WorkflowRun do
     field(:workflow_id_blob, :binary)
     field(:session_id, :string)
     field(:managed_workflow_id, :string)
+    field(:definition_revision_id, :string)
+    field(:definition_revision, :integer)
+    field(:definition_hash, :string)
+    field(:compiled_artifact_id, :string)
+    field(:compiled_hash, :string)
+    field(:catalog_hash, :string)
     field(:status, :string)
     field(:trigger, :string)
+    field(:parent_run_id, :string)
+    field(:parent_node_id, :string)
+    field(:invocation_key, :string)
+    field(:attempt, :integer, default: 1)
+    field(:supersedes_run_id, :string)
     field(:input_blob, :binary)
+    field(:output_blob, :binary)
     field(:metadata_json, :map)
     field(:last_event_sequence, :integer)
     field(:started_at, :utc_datetime_usec)
@@ -44,9 +56,21 @@ defmodule RunicAI.Persistence.Schemas.WorkflowRun do
       :workflow_id_blob,
       :session_id,
       :managed_workflow_id,
+      :definition_revision_id,
+      :definition_revision,
+      :definition_hash,
+      :compiled_artifact_id,
+      :compiled_hash,
+      :catalog_hash,
       :status,
       :trigger,
+      :parent_run_id,
+      :parent_node_id,
+      :invocation_key,
+      :attempt,
+      :supersedes_run_id,
       :input_blob,
+      :output_blob,
       :metadata_json,
       :last_event_sequence,
       :started_at,
@@ -57,6 +81,8 @@ defmodule RunicAI.Persistence.Schemas.WorkflowRun do
     ])
     |> Schema.normalize_strings([:status, :trigger])
     |> Schema.put_json_defaults([:metadata_json, :error_json])
+    |> validate_number(:attempt, greater_than: 0)
+    |> unique_constraint(:invocation_key, name: :workflow_runs_invocation_attempt_index)
     |> Schema.validate_status([
       :pending,
       :running,

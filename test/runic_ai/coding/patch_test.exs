@@ -87,6 +87,145 @@ defmodule RunicAI.Coding.PatchTest do
     assert File.read!(Path.join(root, "demo.txt")) == "new\n"
   end
 
+  test "reconciles a create after an unknown completion without touching the file" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+    patch = %{operations: [%{op: :create, path: "result.txt", content: "done\n"}]}
+
+    first = Patch.apply_patch(workspace, patch)
+    assert first.status == :ok
+
+    path = Path.join(root, "result.txt")
+    mtime = File.stat!(path).mtime
+
+    replay =
+      Patch.reconcile_after_unknown(workspace, patch, %{
+        attempt: 2,
+        prior_attempt_id: "patch-attempt-1",
+        prior_outcome: :unknown_after_dispatch
+      })
+
+    assert replay.status == :reconciled
+    assert replay.metadata.reconciliation.outcome == :matched_after_state
+    assert replay.metadata.reconciliation.prior_attempt_id == "patch-attempt-1"
+
+    assert [%{reconciliation_outcome: :matched_after_state, physically_changed?: false}] =
+             replay.operation_summaries
+
+    assert File.read!(path) == "done\n"
+    assert File.stat!(path).mtime == mtime
+  end
+
+  test "replay applies only operations missing after a partial unknown attempt" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    first_content = "first\n"
+    second_before = "before\n"
+    File.write!(Path.join(root, "first.txt"), first_content)
+    File.write!(Path.join(root, "second.txt"), second_before)
+
+    patch = %{
+      operations: [
+        %{
+          op: :update,
+          path: "first.txt",
+          content: "after-first\n",
+          expected_hash: Patch.sha256(first_content)
+        },
+        %{
+          op: :update,
+          path: "second.txt",
+          content: "after-second\n",
+          expected_hash: Patch.sha256(second_before)
+        }
+      ]
+    }
+
+    first_only = %{patch | operations: [hd(patch.operations)]}
+    assert Patch.apply_patch(workspace, first_only).status == :ok
+    first_mtime = File.stat!(Path.join(root, "first.txt")).mtime
+
+    replay =
+      Patch.reconcile_after_unknown(workspace, patch, %{
+        attempt: 2,
+        prior_attempt_id: "partial-attempt-1",
+        prior_outcome: "unknown_after_dispatch"
+      })
+
+    assert replay.status == :ok
+    assert replay.metadata.reconciliation.outcome == :partially_reconciled
+    assert replay.metadata.reconciliation.reconciled_operations == 1
+    assert replay.metadata.reconciliation.applied_operations == 1
+    assert File.stat!(Path.join(root, "first.txt")).mtime == first_mtime
+    assert File.read!(Path.join(root, "second.txt")) == "after-second\n"
+  end
+
+  test "reconciliation refuses missing mutation proof and conflicting post-state" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+    File.write!(Path.join(root, "demo.txt"), "desired\n")
+
+    no_hash =
+      Patch.reconcile_after_unknown(
+        workspace,
+        %{operations: [%{op: :update, path: "demo.txt", content: "desired\n"}]},
+        %{
+          attempt: 2,
+          prior_attempt_id: "attempt-1",
+          prior_outcome: :unknown_after_dispatch
+        }
+      )
+
+    assert no_hash.status == :error
+    assert [%{message: message}] = no_hash.diagnostics
+    assert message =~ "requires a SHA-256 expected_hash"
+
+    invalid_context =
+      Patch.reconcile_after_unknown(
+        workspace,
+        %{
+          operations: [
+            %{
+              op: :update,
+              path: "demo.txt",
+              content: "desired\n",
+              expected_hash: Patch.sha256("before\n")
+            }
+          ]
+        },
+        %{attempt: 1, prior_attempt_id: "attempt-1", prior_outcome: :unknown_after_dispatch}
+      )
+
+    assert invalid_context.status == :error
+    assert [%{code: :invalid_replay_context}] = invalid_context.diagnostics
+
+    conflict =
+      Patch.reconcile_after_unknown(
+        workspace,
+        %{
+          operations: [
+            %{
+              op: :update,
+              path: "demo.txt",
+              content: "different\n",
+              expected_hash: Patch.sha256("before\n")
+            }
+          ]
+        },
+        %{
+          attempt: 2,
+          prior_attempt_id: "attempt-1",
+          prior_outcome: :unknown_after_dispatch
+        }
+      )
+
+    assert conflict.status == :error
+    assert [%{message: conflict_message}] = conflict.diagnostics
+    assert conflict_message =~ "expected hash does not match"
+    assert File.read!(Path.join(root, "demo.txt")) == "desired\n"
+  end
+
   test "accepts standard text patch strings for model-friendly updates" do
     root = tmp_dir()
     File.write!(Path.join(root, "demo.txt"), "one\ntwo\nthree\n")

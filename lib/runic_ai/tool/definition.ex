@@ -274,6 +274,14 @@ defmodule RunicAI.Tool.Definition do
 
   defp coerce_value(:boolean, value), do: coerce_boolean(value)
   defp coerce_value({:list, :string}, value) when is_binary(value), do: [value]
+
+  defp coerce_value({:list, :any}, value) when is_binary(value) do
+    case Jason.decode(value) do
+      {:ok, decoded} when is_list(decoded) -> decoded
+      _other -> value
+    end
+  end
+
   defp coerce_value(_type, value), do: value
 
   defp coerce_integer(value) when is_binary(value) do

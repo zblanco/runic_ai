@@ -5,7 +5,7 @@ defmodule RunicAI.Coding.PatchResult do
 
   alias RunicAI.Error
 
-  @valid_statuses [:ok, :error, :dry_run]
+  @valid_statuses [:ok, :error, :dry_run, :reconciled]
 
   @enforce_keys [
     :status,
@@ -26,7 +26,7 @@ defmodule RunicAI.Coding.PatchResult do
     metadata: %{}
   ]
 
-  @type status :: :ok | :error | :dry_run
+  @type status :: :ok | :error | :dry_run | :reconciled
 
   @type t :: %__MODULE__{
           status: status(),

@@ -1,6 +1,6 @@
 defmodule RunicAI.Sandbox.GeneratedComponentProof do
   @moduledoc """
-  Proves proposed generated-component files inside a `RunicSandbox` session.
+  Proves proposed generated-component files inside a `LitterBox` session.
 
   This runner is intentionally generation-agnostic. Callers provide the
   generated source and tests as data; the runner materializes them only through
@@ -10,9 +10,9 @@ defmodule RunicAI.Sandbox.GeneratedComponentProof do
 
   alias RunicAI.Error
   alias RunicAI.Sandbox.GeneratedComponent
-  alias RunicSandbox.AttachBridge
-  alias RunicSandbox.Capabilities
-  alias RunicSandbox.Session
+  alias LitterBox.AttachBridge
+  alias LitterBox.Capabilities
+  alias LitterBox.Session
 
   @default_timeout_ms 30_000
   @default_max_output_bytes 16_384
@@ -362,7 +362,7 @@ defmodule RunicAI.Sandbox.GeneratedComponentProof do
   defp normalize_sandbox_result(:ok), do: :ok
   defp normalize_sandbox_result({:error, error}), do: {:error, normalize_error(error)}
 
-  defp normalize_error(%RunicSandbox.Error{} = error) do
+  defp normalize_error(%LitterBox.Error{} = error) do
     Error.new(error.kind, error.message,
       details: error.details,
       source: error.source,
@@ -374,12 +374,12 @@ defmodule RunicAI.Sandbox.GeneratedComponentProof do
   defp normalize_error(%Error{} = error), do: error
   defp normalize_error(reason), do: Error.from_reason(reason, source: __MODULE__)
 
-  defp open_session_fun(opts), do: Keyword.get(opts, :open_session, &RunicSandbox.open_session/3)
-  defp attach_fun(opts), do: Keyword.get(opts, :attach, &RunicSandbox.attach/3)
-  defp close_attach_fun(opts), do: Keyword.get(opts, :close_attach, &RunicSandbox.close_attach/2)
+  defp open_session_fun(opts), do: Keyword.get(opts, :open_session, &LitterBox.open_session/3)
+  defp attach_fun(opts), do: Keyword.get(opts, :attach, &LitterBox.attach/3)
+  defp close_attach_fun(opts), do: Keyword.get(opts, :close_attach, &LitterBox.close_attach/2)
 
   defp close_session_fun(opts),
-    do: Keyword.get(opts, :close_session, &RunicSandbox.close_session/2)
+    do: Keyword.get(opts, :close_session, &LitterBox.close_session/2)
 
   defp attach_opts(opts), do: Keyword.get(opts, :attach_opts, [])
   defp close_opts(opts), do: Keyword.get(opts, :close_opts, [])

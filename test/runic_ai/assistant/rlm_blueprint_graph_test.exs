@@ -260,6 +260,31 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
     assert write_policy.backoff == :none
   end
 
+  test "caller can raise the scheduler timeout for model-backed nodes" do
+    root = tmp_dir()
+    workspace = Workspace.new!(root: root)
+
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Long model synthesis",
+        [ComponentBlueprint.new!("synthesize", :llm_leaf)],
+        stop_conditions: ["done"]
+      )
+
+    assert {:ok, compiled} =
+             WorkflowCompiler.compile(blueprint, workspace, llm_timeout_ms: 180_000)
+
+    synthesize_name = compiled.node_names["synthesize"]
+
+    assert Enum.any?(compiled.scheduler_policies, fn
+             {{:name, matcher}, %{timeout_ms: 180_000}} ->
+               Regex.match?(matcher, to_string(synthesize_name))
+
+             _other ->
+               false
+           end)
+  end
+
   test "workflow compiler rejects incompatible Runic port contracts" do
     root = tmp_dir()
     workspace = Workspace.new!(root: root)
@@ -379,6 +404,54 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
 
     assert result.compiled.graph_summary.runic.serializers.mermaid =~ "flowchart"
     assert is_list(result.compiled.graph_summary.runic.serializers.cytoscape)
+  end
+
+  test "graph rejects ordinary batch components directly after a native map" do
+    blueprint =
+      WorkflowBlueprint.new!(
+        "Group mapped records",
+        [
+          ComponentBlueprint.new!("parse", :tabular_parser, params: %{format: :csv}),
+          ComponentBlueprint.new!("map", :record_map),
+          ComponentBlueprint.new!("group", :record_group, params: %{group_by: "team"}),
+          ComponentBlueprint.new!("reduce", :lambda_reduce)
+        ],
+        edges: [
+          %{from: "parse", to: "map"},
+          %{from: "map", to: "group"},
+          %{from: "group", to: "reduce"}
+        ],
+        stop_conditions: ["records grouped"]
+      )
+
+    assert {:error, %Error{} = error} = BlueprintGraph.build(blueprint)
+    diagnostics = error.details.diagnostics
+
+    assert Enum.any?(diagnostics, &(&1.code == :native_map_requires_reduce_child))
+    assert Enum.any?(diagnostics, &(&1.code == :missing_native_map_parent))
+  end
+
+  test "compiler result guard rejects a stalled workflow without terminal production" do
+    compiled = %{
+      output_name: "assistant_node_2_score",
+      node_names: %{"source" => "assistant_node_1_source", "score" => "assistant_node_2_score"}
+    }
+
+    result = %{
+      output: nil,
+      component_results: [
+        %{id: "source", production_count: 1},
+        %{id: "score", production_count: 0}
+      ]
+    }
+
+    assert {:error, %Error{} = error} =
+             WorkflowCompiler.ensure_terminal_completion(compiled, result)
+
+    assert error.details.code == :workflow_stalled_before_terminal
+    assert error.details.output_component_id == "score"
+    assert error.details.completed_component_ids == ["source"]
+    assert error.details.pending_component_ids == ["score"]
   end
 
   test "workflow compiler executes Lambda-style map reduce generate smoke" do
@@ -668,6 +741,7 @@ defmodule RunicAI.Assistant.RLMBlueprintGraphTest do
   end
 
   defp params_for(:artifact_writer), do: %{path: ".docs/out.md"}
+  defp params_for(:workflow_task), do: %{workflow_key: "fixture-workflow@1"}
   defp params_for(_type), do: %{}
 
   defp tmp_dir do

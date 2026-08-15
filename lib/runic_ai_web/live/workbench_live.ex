@@ -8,6 +8,7 @@ defmodule RunicAIWeb.WorkbenchLive do
   alias RunicAI.Event
   alias RunicAI.LLM.ModelCatalog
   alias RunicAI.Workbench
+  alias RunicAI.Workflows.SemanticDiffPresenter
   alias RunicAIWeb.Markdown
 
   @debug_kinds ["events", "tool_calls", "messages", "runs"]
@@ -76,6 +77,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       |> assign(:bookmarked_artifact_ids, MapSet.new())
       |> assign(:selected_artifact_id, nil)
       |> assign(:comparison_session_ids, [])
+      |> assign(:workflow_revision_comparisons, %{})
       |> assign(:contrast_mode, "normal")
       |> assign(:motion_mode, "full")
       |> assign(:workbench_refresh_timer, nil)
@@ -123,7 +125,14 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   @impl true
   def handle_event("submit_objective", %{"run" => params}, socket) do
-    case Workbench.start_agent_run(params) do
+    starter =
+      if Map.get(params, "orchestration", "agent") in ["auto", "direct", "workflow"] do
+        &Workbench.start_workflow_intent/1
+      else
+        &Workbench.start_agent_run/1
+      end
+
+    case starter.(params) do
       {:ok, %{session_id: session_id}} ->
         {:noreply,
          socket
@@ -262,6 +271,222 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   def handle_event("set_inspector_tab", _params, socket), do: {:noreply, socket}
 
+  def handle_event("resume_workflow_run", %{"run-id" => run_id}, socket) do
+    case Workbench.resume_workflow_run(run_id) do
+      {:ok, _result} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Workflow run resumed from its pinned revision")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not resume workflow run: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("start_workflow_run", %{"run-id" => run_id}, socket) do
+    case Workbench.start_workflow_run(run_id) do
+      {:ok, _started} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Workflow run started from its pinned revision")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not start workflow run: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("restart_workflow_child_run", %{"run-id" => run_id}, socket) do
+    case Workbench.restart_workflow_child_run(run_id) do
+      {:ok, %{run: retry}} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Restarted only failed child as attempt #{retry.attempt}")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(socket, :error, "Could not restart workflow child: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("request_workflow_run_review", %{"run-id" => run_id}, socket) do
+    case Workbench.request_workflow_run_review(run_id) do
+      {:ok, _result} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Workflow run paused for durable review")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(socket, :error, "Could not pause workflow run for review: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("apply_workflow_operations", %{"workflow_edit" => params}, socket) do
+    run_id = Map.get(params, "run_id")
+    operations = Map.get(params, "operations", "")
+    action = Map.get(params, "action", "apply")
+
+    result =
+      case action do
+        "suggest" -> Workbench.suggest_workflow_operations(run_id, operations)
+        _apply -> Workbench.apply_workflow_operations(run_id, operations)
+      end
+
+    case result do
+      {:ok, %{review: review}} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Staged workflow edit suggestion #{short(review.id)} for review")
+         |> assign(:workspace_tab, "reviews")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:ok, result} ->
+        {:noreply,
+         socket
+         |> put_flash(
+           :info,
+           "Created workflow revision #{result.revision.revision}; #{length(result.edit.affected_nodes)} node(s) affected"
+         )
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not apply workflow edit: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event(
+        "apply_workflow_definition_operations",
+        %{"workflow_definition_edit" => params},
+        socket
+      ) do
+    definition_id = Map.get(params, "definition_id")
+    operations = Map.get(params, "operations", "")
+    session_id = socket.assigns.selected_session_id
+
+    case Workbench.apply_workflow_definition_operations(
+           definition_id,
+           session_id,
+           operations
+         ) do
+      {:ok, result} ->
+        {:noreply,
+         socket
+         |> put_flash(
+           :info,
+           "Created workflow revision #{result.revision.revision}; #{length(result.edit.affected_nodes)} node(s) affected"
+         )
+         |> load_workbench(session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not apply workflow edit: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("workflow_definition_action", params, socket) do
+    run_id = Map.get(params, "run-id")
+    definition_id = Map.get(params, "definition-id")
+
+    result =
+      with {:ok, action} <- workflow_definition_action(Map.get(params, "action")) do
+        outcome =
+          if is_binary(definition_id) do
+            Workbench.workflow_definition_action_by_id(definition_id, action,
+              session_id: socket.assigns.selected_session_id
+            )
+          else
+            Workbench.workflow_definition_action(run_id, action)
+          end
+
+        case outcome do
+          {:ok, value} -> {:ok, action, value}
+          {:error, _reason} = error -> error
+        end
+      end
+
+    case result do
+      {:ok, action, _result} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Workflow definition #{action_label(action)}")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(socket, :error, "Could not update workflow definition: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("launch_workflow_definition", %{"definition-id" => definition_id}, socket) do
+    case Workbench.launch_workflow_definition(definition_id, socket.assigns.selected_session_id) do
+      {:ok, run} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Created pinned workflow run #{short(run.id)}")
+         |> assign(:inspector_tab, "artifacts")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not launch workflow: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("fork_workflow_run", %{"run-id" => run_id}, socket) do
+    case Workbench.fork_workflow_run_to_latest(run_id) do
+      {:ok, fork} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Forked run #{short(fork.id)} on the latest revision")
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not fork workflow run: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("undo_workflow_operations", %{"run-id" => run_id}, socket) do
+    case Workbench.undo_latest_workflow_operations(run_id) do
+      {:ok, result} ->
+        {:noreply,
+         socket
+         |> put_flash(
+           :info,
+           "Reverted the latest operation batch as revision #{result.revision.revision}"
+         )
+         |> load_workbench(socket.assigns.selected_session_id)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not undo workflow edit: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("compare_workflow_revisions", %{"workflow_compare" => params}, socket) do
+    run_id = Map.get(params, "run_id")
+    from_revision_id = Map.get(params, "from_revision_id")
+    to_revision_id = Map.get(params, "to_revision_id")
+
+    case Workbench.compare_workflow_revisions(run_id, from_revision_id, to_revision_id) do
+      {:ok, comparison} ->
+        comparisons =
+          Map.put(socket.assigns.workflow_revision_comparisons, run_id, comparison)
+
+        {:noreply,
+         socket
+         |> assign(:workflow_revision_comparisons, comparisons)
+         |> put_flash(
+           :info,
+           "Compared workflow revisions #{comparison.from.revision} and #{comparison.to.revision}"
+         )}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(socket, :error, "Could not compare workflow revisions: #{inspect(reason)}")}
+    end
+  end
+
   def handle_event("set_session_filter", %{"filter" => filter}, socket) do
     filter = normalize_session_filter(filter)
     {:noreply, push_patch(socket, to: filter_path(socket, filter))}
@@ -354,6 +579,10 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   def handle_info({:workbench, :terminal_event, _event}, socket) do
     {:noreply, socket}
+  end
+
+  def handle_info({:workbench, :workflow_run, session_id}, socket) do
+    handle_workbench_event(socket, session_id)
   end
 
   def handle_info(:refresh_workbench, socket) do
@@ -550,6 +779,7 @@ defmodule RunicAIWeb.WorkbenchLive do
       child_repairs: [],
       tool_calls: [],
       runs: [],
+      workflow_definitions: [],
       review_requests: [],
       artifacts: [],
       scorecards: [],
@@ -566,6 +796,7 @@ defmodule RunicAIWeb.WorkbenchLive do
         child_repairs: 0,
         tool_calls: 0,
         runs: 0,
+        workflow_definitions: 0,
         review_requests: 0,
         artifacts: 0,
         scorecards: 0
@@ -580,6 +811,10 @@ defmodule RunicAIWeb.WorkbenchLive do
 
     %{
       "objective" => "",
+      "orchestration" => "agent",
+      "input_paths" => "",
+      "output_path" => "",
+      "required_sections" => "",
       "agent" => cfg |> Keyword.get(:default_agent, :assistant) |> Atom.to_string(),
       "cwd" => File.cwd!(),
       "model_provider" => provider,
@@ -1180,6 +1415,95 @@ defmodule RunicAIWeb.WorkbenchLive do
             </div>
           </details>
 
+          <details class="col-span-2 overflow-hidden rounded-[22px] border border-rune-text/10 bg-black/15 max-[700px]:col-span-1">
+            <summary class="grid cursor-pointer grid-cols-[1fr_auto] items-center gap-3 px-4 py-3 marker:text-rune-gold hover:bg-rune-text/[0.035]">
+              <span class="min-w-0">
+                <span class="block font-mono text-[10px] uppercase text-rune-muted">
+                  Orchestration
+                </span>
+                <span class="mt-1 block truncate text-sm font-semibold text-rune-text">
+                  {orchestration_label(Phoenix.HTML.Form.input_value(@new_run_form, :orchestration))}
+                </span>
+              </span>
+              <span class="inline-flex items-center gap-2 rounded-full border border-rune-cyan/20 bg-rune-cyan/10 px-2.5 py-1.5 font-mono text-[10px] uppercase text-rune-cyan">
+                <.icon name="hero-share" class="size-3.5" /> intent route
+              </span>
+            </summary>
+            <div class="grid gap-3 border-t border-rune-text/10 p-4">
+              <label class="grid gap-1">
+                <span class="font-mono text-[10px] uppercase text-rune-muted">Planning path</span>
+                <select
+                  name={@new_run_form[:orchestration].name}
+                  class="min-h-[36px] rounded-[11px] border border-rune-text/10 bg-rune-ink px-3 py-2 text-sm text-rune-text-soft"
+                >
+                  <option
+                    value="agent"
+                    selected={Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "agent"}
+                  >
+                    Agent only
+                  </option>
+                  <option
+                    value="auto"
+                    selected={Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "auto"}
+                  >
+                    Auto: direct, reuse, adapt, or draft
+                  </option>
+                  <option
+                    value="direct"
+                    selected={
+                      Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "direct"
+                    }
+                  >
+                    Force direct agent
+                  </option>
+                  <option
+                    value="workflow"
+                    selected={
+                      Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "workflow"
+                    }
+                  >
+                    Force workflow planning
+                  </option>
+                </select>
+              </label>
+              <div class="grid grid-cols-2 gap-3 max-[700px]:grid-cols-1">
+                <label class="grid gap-1">
+                  <span class="font-mono text-[10px] uppercase text-rune-muted">Input paths</span>
+                  <input
+                    type="text"
+                    name={@new_run_form[:input_paths].name}
+                    value={Phoenix.HTML.Form.input_value(@new_run_form, :input_paths)}
+                    placeholder="notes/incidents.md, notes/roadmap.md"
+                    class="min-h-[36px] rounded-[11px] border border-rune-text/10 bg-rune-ink px-3 py-2 font-mono text-[11px] text-rune-text-soft outline-none"
+                  />
+                </label>
+                <label class="grid gap-1">
+                  <span class="font-mono text-[10px] uppercase text-rune-muted">Output artifact</span>
+                  <input
+                    type="text"
+                    name={@new_run_form[:output_path].name}
+                    value={Phoenix.HTML.Form.input_value(@new_run_form, :output_path)}
+                    placeholder=".docs/report.md"
+                    class="min-h-[36px] rounded-[11px] border border-rune-text/10 bg-rune-ink px-3 py-2 font-mono text-[11px] text-rune-text-soft outline-none"
+                  />
+                </label>
+              </div>
+              <label class="grid gap-1">
+                <span class="font-mono text-[10px] uppercase text-rune-muted">Required sections</span>
+                <input
+                  type="text"
+                  name={@new_run_form[:required_sections].name}
+                  value={Phoenix.HTML.Form.input_value(@new_run_form, :required_sections)}
+                  placeholder="Summary, Risks, Actions"
+                  class="min-h-[36px] rounded-[11px] border border-rune-text/10 bg-rune-ink px-3 py-2 font-mono text-[11px] text-rune-text-soft outline-none"
+                />
+              </label>
+              <p class="text-xs leading-5 text-rune-muted">
+                Workflow planning persists a typed revision for review before execution. Auto may choose the direct agent when orchestration would add no value.
+              </p>
+            </div>
+          </details>
+
           <textarea
             id="run-objective"
             name={@new_run_form[:objective].name}
@@ -1494,10 +1818,14 @@ defmodule RunicAIWeb.WorkbenchLive do
               >
                 <.icon name="hero-forward" class="size-3.5" />
               </button>
-              <span class={[
-                "inline-flex min-h-[30px] items-center gap-2 rounded-full border border-rune-text/5 px-2.5 py-1.5 font-mono text-[11px]",
-                status_badge_class(selected_status(@snapshot))
-              ]}>
+              <span
+                class={[
+                  "inline-flex min-h-[30px] items-center gap-2 rounded-full border border-rune-text/5 px-2.5 py-1.5 font-mono text-[11px]",
+                  status_badge_class(selected_status(@snapshot))
+                ]}
+                id="selected-session-status"
+                data-session-status={selected_status(@snapshot)}
+              >
                 {selected_agent(@snapshot)} - {selected_status(@snapshot)}
               </span>
               <span
@@ -1662,6 +1990,189 @@ defmodule RunicAIWeb.WorkbenchLive do
                   <div class="grid grid-cols-4 gap-3.5 max-[1240px]:grid-cols-2 max-[880px]:grid-cols-1">
                     <.plan_step :for={step <- plan_steps(@snapshot)} step={step} />
                   </div>
+                  <article
+                    :for={definition <- @snapshot.workflow_definitions}
+                    id={"intent-workflow-definition-#{dom_id(definition.id)}"}
+                    class="runic-frost overflow-hidden rounded-[18px] border border-rune-cyan/20 bg-black/20"
+                  >
+                    <header class="flex flex-wrap items-start justify-between gap-3 border-b border-rune-text/10 px-4 py-3">
+                      <div class="min-w-0">
+                        <p class="font-mono text-[10px] uppercase tracking-wide text-rune-cyan">
+                          {field(definition.planning, :strategy) || "workflow"} route · revision {definition.latest_revision}
+                        </p>
+                        <h3 class="mt-1 text-sm font-semibold text-rune-text">
+                          {definition.workflow_name || definition.workflow_key}
+                        </h3>
+                        <p class="mt-1 text-xs leading-5 text-rune-muted">
+                          {field(definition.planning, :rationale) ||
+                            "Persisted typed workflow revision"}
+                        </p>
+                      </div>
+                      <div class="grid justify-items-end gap-1 font-mono text-[10px] text-rune-muted">
+                        <span class="rounded-full border border-rune-text/10 bg-black/25 px-2 py-1 text-rune-text-soft">
+                          {definition.latest_action || definition.status}
+                        </span>
+                        <span>{definition.validation && definition.validation.status} validation</span>
+                        <span>{short(definition.latest_hash)} definition</span>
+                        <span>{short(definition.catalog_hash)} catalog</span>
+                      </div>
+                    </header>
+                    <div class="grid gap-3 p-4">
+                      <dl class="grid grid-cols-[110px_1fr] gap-x-3 gap-y-2 font-mono text-[10.5px] text-rune-text-soft">
+                        <dt class="text-rune-muted">objective</dt>
+                        <dd>{definition.objective}</dd>
+                        <dt class="text-rune-muted">route reasons</dt>
+                        <dd>{list_text(field(definition.planning, :reasons), "none")}</dd>
+                        <dt class="text-rune-muted">candidates</dt>
+                        <dd>
+                          {length(List.wrap(field(definition.planning, :considered_candidates)))} considered
+                        </dd>
+                        <dt class="text-rune-muted">effects / policy</dt>
+                        <dd>{map_keys_text(definition.policies, "catalog defaults")}</dd>
+                        <dt class="text-rune-muted">holes</dt>
+                        <dd>{length(definition.holes)}</dd>
+                        <dt class="text-rune-muted">acceptance</dt>
+                        <dd>{length(definition.acceptance)} required check(s)</dd>
+                      </dl>
+                      <div :if={definition.status != "archived"} class="flex flex-wrap gap-2">
+                        <button
+                          :if={
+                            definition.latest_action in [
+                              "drafted",
+                              "revised",
+                              "revalidated",
+                              "catalog_migrated"
+                            ]
+                          }
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="request_review"
+                          class="rounded-full border border-rune-magenta/30 px-3 py-1 font-mono text-[10px] text-rune-magenta"
+                        >
+                          Request review
+                        </button>
+                        <button
+                          :if={!definition.catalog_current?}
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="migrate_catalog"
+                          class="rounded-full border border-rune-amber/30 bg-rune-amber/10 px-3 py-1 font-mono text-[10px] text-rune-amber"
+                        >
+                          Migrate contracts & compile
+                        </button>
+                        <button
+                          :if={definition.latest_action == "review_requested"}
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="approve"
+                          class="rounded-full border border-rune-success/30 px-3 py-1 font-mono text-[10px] text-rune-success"
+                        >
+                          Approve revision
+                        </button>
+                        <button
+                          :if={definition.latest_action == "approved"}
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="activate"
+                          class="rounded-full border border-rune-success/30 bg-rune-success/10 px-3 py-1 font-mono text-[10px] text-rune-success"
+                        >
+                          Activate revision
+                        </button>
+                        <button
+                          :if={definition.status == "active" && definition.active_revision_id}
+                          type="button"
+                          phx-click="launch_workflow_definition"
+                          phx-value-definition-id={definition.id}
+                          class="rounded-full border border-rune-cyan/30 bg-rune-cyan/10 px-3 py-1 font-mono text-[10px] text-rune-cyan"
+                        >
+                          Create pinned run
+                        </button>
+                        <button
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="revalidate"
+                          class="rounded-full border border-rune-text/15 px-3 py-1 font-mono text-[10px] text-rune-text-soft"
+                        >
+                          Revalidate
+                        </button>
+                        <button
+                          type="button"
+                          phx-click="workflow_definition_action"
+                          phx-value-definition-id={definition.id}
+                          phx-value-action="archive"
+                          class="rounded-full border border-rune-error/25 bg-rune-error/[0.06] px-3 py-1 font-mono text-[10px] text-rune-error"
+                        >
+                          Archive workflow
+                        </button>
+                      </div>
+                      <p
+                        :if={definition.status == "archived"}
+                        class="rounded-xl border border-rune-text/10 bg-black/20 px-3 py-2 font-mono text-[10px] text-rune-muted"
+                      >
+                        Archived · retained for audit, unavailable to routing and new launches
+                      </p>
+                      <.form
+                        :if={definition.status != "archived"}
+                        for={
+                          to_form(
+                            %{"definition_id" => definition.id, "operations" => ""},
+                            as: :workflow_definition_edit
+                          )
+                        }
+                        id={"intent-workflow-edit-form-#{dom_id(definition.id)}"}
+                        phx-submit="apply_workflow_definition_operations"
+                        class="grid gap-2 rounded-xl border border-rune-text/10 bg-rune-ink/40 p-3"
+                      >
+                        <input
+                          type="hidden"
+                          name="workflow_definition_edit[definition_id]"
+                          value={definition.id}
+                        />
+                        <label class="font-mono text-[10px] uppercase tracking-wide text-rune-muted">
+                          Typed operations before activation or launch
+                        </label>
+                        <textarea
+                          name="workflow_definition_edit[operations]"
+                          rows="3"
+                          placeholder={
+                            ~s|[{"op":"set_argument","node_id":"synthesize","key":"prompt","value":"Write an evidence-grounded report"}]|
+                          }
+                          class="w-full rounded-lg border border-rune-text/10 bg-rune-ink/60 px-3 py-2 font-mono text-[10px] text-rune-text outline-none focus:border-rune-cyan/50"
+                        ></textarea>
+                        <button
+                          type="submit"
+                          class="w-fit rounded-full border border-rune-cyan/30 bg-rune-cyan/10 px-3 py-1 font-mono text-[10px] text-rune-cyan"
+                        >
+                          Apply typed edit and compile revision
+                        </button>
+                      </.form>
+                      <div
+                        :if={definition.latest_batch}
+                        class="rounded-xl border border-rune-text/10 bg-rune-ink/40 p-3"
+                      >
+                        <p class="font-mono text-[10px] uppercase tracking-wide text-rune-muted">
+                          Latest semantic change · {length(definition.latest_batch.operations)} operation(s) · affected {list_text(
+                            definition.latest_batch.affected_nodes,
+                            "workflow"
+                          )}
+                        </p>
+                        <.semantic_change_list
+                          operations={definition.latest_batch.operations}
+                          diff={definition.latest_batch.diff}
+                        />
+                      </div>
+                      <.graph_canvas
+                        :if={definition.graph}
+                        graph={definition.graph}
+                        id={"intent-workflow-graph-#{dom_id(definition.id)}"}
+                      />
+                    </div>
+                  </article>
                   <div :if={@snapshot.plan_workflow_graph}>
                     <.graph_canvas
                       graph={@snapshot.plan_workflow_graph}
@@ -1787,11 +2298,76 @@ defmodule RunicAIWeb.WorkbenchLive do
                     never approve
                   </option>
                 </select>
+                <select
+                  name={@new_run_form[:orchestration].name}
+                  class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 text-center font-mono text-[11px] text-rune-text-soft"
+                >
+                  <option
+                    value="agent"
+                    selected={Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "agent"}
+                  >
+                    agent only
+                  </option>
+                  <option
+                    value="auto"
+                    selected={Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "auto"}
+                  >
+                    auto route
+                  </option>
+                  <option
+                    value="direct"
+                    selected={
+                      Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "direct"
+                    }
+                  >
+                    force direct
+                  </option>
+                  <option
+                    value="workflow"
+                    selected={
+                      Phoenix.HTML.Form.input_value(@new_run_form, :orchestration) == "workflow"
+                    }
+                  >
+                    design workflow
+                  </option>
+                </select>
                 <details class="rounded-[11px] border border-rune-text/5 bg-black/20 px-3 py-2 text-[11px] leading-5 text-rune-text-soft">
                   <summary class="cursor-pointer font-mono text-[10px] uppercase tracking-[0.08em] text-rune-muted">
                     Run setup
                   </summary>
                   <div class="mt-2 grid gap-2">
+                    <label class="grid gap-1">
+                      <span class="font-mono text-[10px] uppercase text-rune-muted">Workflow input paths</span>
+                      <input
+                        type="text"
+                        name={@new_run_form[:input_paths].name}
+                        value={Phoenix.HTML.Form.input_value(@new_run_form, :input_paths)}
+                        placeholder="notes/a.md, notes/b.md"
+                        class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none"
+                      />
+                    </label>
+                    <div class="grid grid-cols-2 gap-2 max-[700px]:grid-cols-1">
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">Output artifact</span>
+                        <input
+                          type="text"
+                          name={@new_run_form[:output_path].name}
+                          value={Phoenix.HTML.Form.input_value(@new_run_form, :output_path)}
+                          placeholder=".docs/report.md"
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none"
+                        />
+                      </label>
+                      <label class="grid gap-1">
+                        <span class="font-mono text-[10px] uppercase text-rune-muted">Required sections</span>
+                        <input
+                          type="text"
+                          name={@new_run_form[:required_sections].name}
+                          value={Phoenix.HTML.Form.input_value(@new_run_form, :required_sections)}
+                          placeholder="Summary, Risks, Actions"
+                          class="min-h-[31px] rounded-[11px] border border-rune-text/5 bg-black/25 px-2 py-1.5 font-mono text-[11px] text-rune-text-soft outline-none"
+                        />
+                      </label>
+                    </div>
                     <label class="grid gap-1">
                       <span class="font-mono text-[10px] uppercase text-rune-muted">Profile</span>
                       <select
@@ -2320,14 +2896,295 @@ defmodule RunicAIWeb.WorkbenchLive do
                 tone={scorecard.objective_status}
                 detail={scorecard_summary(scorecard)}
               />
-              <.artifact_record
+              <div
                 :for={run <- Enum.take(@snapshot.runs, 6)}
-                title={run.workflow_name || run.workflow_key || run.id}
-                meta={run.status}
-                tone={run.status}
-                detail={run.trigger || "workflow run"}
-                href={~p"/runs/#{run.id}/graph"}
-              />
+                id={"workflow-run-#{dom_id(run.id)}"}
+                data-run-status={run.status}
+              >
+                <.artifact_record
+                  title={run.workflow_name || run.workflow_key || run.id}
+                  meta={run.status}
+                  tone={run.status}
+                  detail={workflow_run_lineage(run)}
+                  href={~p"/runs/#{run.id}/graph"}
+                />
+                <div
+                  :if={run.output_summary}
+                  id={"workflow-run-proof-#{dom_id(run.id)}"}
+                  data-objective-status={Map.get(run.output_summary, :objective_status)}
+                  class="mb-3 ml-2 rounded-xl border border-rune-success/20 bg-rune-success/[0.055] px-3 py-2.5"
+                >
+                  <p class="font-mono text-[10px] font-semibold uppercase tracking-wide text-rune-success">
+                    Outcome {Map.get(run.output_summary, :objective_status) || "persisted"}
+                  </p>
+                  <p class="mt-1 text-[11px] leading-5 text-rune-text-soft">
+                    {workflow_run_proof_summary(run.output_summary)}
+                  </p>
+                  <p
+                    :if={Map.get(run.output_summary, :artifact_paths, []) != []}
+                    class="mt-1 truncate font-mono text-[10px] text-rune-muted"
+                  >
+                    {Enum.join(Map.get(run.output_summary, :artifact_paths, []), ", ")}
+                  </p>
+                </div>
+                <button
+                  :if={run.definition_revision_id && run.status in ["paused", "waiting"]}
+                  type="button"
+                  phx-click="resume_workflow_run"
+                  phx-value-run-id={run.id}
+                  class="mb-2 ml-2 rounded-full border border-rune-success/30 bg-rune-success/10 px-3 py-1 font-mono text-[10px] text-rune-success transition hover:bg-rune-success/20"
+                >
+                  Resume pinned revision
+                </button>
+                <button
+                  :if={run.definition_revision_id && run.status == "pending"}
+                  type="button"
+                  phx-click="start_workflow_run"
+                  phx-value-run-id={run.id}
+                  class="mb-2 ml-2 rounded-full border border-rune-success/30 bg-rune-success/10 px-3 py-1 font-mono text-[10px] text-rune-success transition hover:bg-rune-success/20"
+                >
+                  Start pinned revision
+                </button>
+                <button
+                  :if={run.definition_revision_id && run.status == "running"}
+                  type="button"
+                  phx-click="request_workflow_run_review"
+                  phx-value-run-id={run.id}
+                  class="mb-2 ml-2 rounded-full border border-rune-magenta/30 bg-rune-magenta/10 px-3 py-1 font-mono text-[10px] text-rune-magenta transition hover:bg-rune-magenta/20"
+                >
+                  Pause for runtime review
+                </button>
+                <button
+                  :if={
+                    run.trigger in ["workflow_task", "workflow_task_retry"] &&
+                      run.status in ["failed", "blocked", "cancelled"]
+                  }
+                  type="button"
+                  phx-click="restart_workflow_child_run"
+                  phx-value-run-id={run.id}
+                  class="mb-2 ml-2 rounded-full border border-rune-warning/30 bg-rune-warning/10 px-3 py-1 font-mono text-[10px] text-rune-warning transition hover:bg-rune-warning/20"
+                >
+                  Restart only this child
+                </button>
+                <div
+                  :if={run.definition}
+                  id={"workflow-definition-controls-#{dom_id(run.id)}"}
+                  class="mb-3 ml-2 rounded-xl border border-rune-text/10 bg-rune-text/[0.025] p-3"
+                >
+                  <p class="mb-2 font-mono text-[10px] text-rune-muted">
+                    pinned revision {run.definition_revision}; latest revision {run.definition.latest_revision};
+                    lifecycle {run.definition.latest_action || run.definition.status}
+                  </p>
+                  <.form
+                    :if={run.definition.status != "archived"}
+                    for={to_form(%{"run_id" => run.id, "operations" => ""}, as: :workflow_edit)}
+                    id={"workflow-edit-form-#{dom_id(run.id)}"}
+                    phx-submit="apply_workflow_operations"
+                    class="space-y-2"
+                  >
+                    <input type="hidden" name="workflow_edit[run_id]" value={run.id} />
+                    <textarea
+                      name="workflow_edit[operations]"
+                      rows="3"
+                      placeholder={~s|[{"op":"set_policy","key":"max_runtime_ms","value":5000}]|}
+                      class="w-full rounded-lg border border-rune-text/10 bg-rune-ink/60 px-3 py-2 font-mono text-[10px] text-rune-text outline-none focus:border-rune-cyan/50"
+                    ></textarea>
+                    <button
+                      type="submit"
+                      name="workflow_edit[action]"
+                      value="apply"
+                      class="rounded-full border border-rune-cyan/30 bg-rune-cyan/10 px-3 py-1 font-mono text-[10px] text-rune-cyan"
+                    >
+                      Apply typed edit and compile
+                    </button>
+                    <button
+                      type="submit"
+                      name="workflow_edit[action]"
+                      value="suggest"
+                      class="ml-2 rounded-full border border-rune-magenta/30 bg-rune-magenta/10 px-3 py-1 font-mono text-[10px] text-rune-magenta"
+                    >
+                      Stage as suggested edit
+                    </button>
+                  </.form>
+                  <div
+                    :if={run.definition.latest_batch}
+                    class="mt-3 rounded-lg border border-rune-text/10 bg-rune-ink/40 p-3"
+                  >
+                    <p class="font-mono text-[10px] font-semibold uppercase tracking-wide text-rune-text-soft">
+                      Latest semantic change
+                    </p>
+                    <p class="mt-1 font-mono text-[10px] text-rune-muted">
+                      affected {Enum.join(run.definition.latest_batch.affected_nodes, ", ")
+                      |> blank_fallback("workflow")} · {length(run.definition.latest_batch.operations)} operation(s) · {length(
+                        run.definition.latest_batch.inverse_operations
+                      )} inverse(s)
+                    </p>
+                    <.semantic_change_list
+                      operations={run.definition.latest_batch.operations}
+                      diff={run.definition.latest_batch.diff}
+                    />
+                    <button
+                      :if={
+                        run.definition.latest_batch.latest? and
+                          run.definition.latest_batch.inverse_operations != []
+                      }
+                      type="button"
+                      phx-click="undo_workflow_operations"
+                      phx-value-run-id={run.id}
+                      class="mt-2 rounded-full border border-rune-amber/30 px-3 py-1 font-mono text-[10px] text-rune-amber"
+                    >
+                      Undo latest operation batch
+                    </button>
+                  </div>
+                  <div
+                    :if={length(run.definition.revisions) > 1}
+                    class="mt-3 rounded-lg border border-rune-text/10 bg-rune-ink/40 p-3"
+                  >
+                    <p class="font-mono text-[10px] font-semibold uppercase tracking-wide text-rune-text-soft">
+                      Compare immutable revisions
+                    </p>
+                    <form
+                      id={"workflow-compare-form-#{dom_id(run.id)}"}
+                      phx-submit="compare_workflow_revisions"
+                      class="mt-2 flex flex-wrap items-end gap-2"
+                    >
+                      <input type="hidden" name="workflow_compare[run_id]" value={run.id} />
+                      <label class="grid gap-1 font-mono text-[9px] text-rune-muted">
+                        From
+                        <select
+                          name="workflow_compare[from_revision_id]"
+                          class="rounded-md border border-rune-text/10 bg-rune-ink px-2 py-1 text-[10px] text-rune-text-soft"
+                        >
+                          <option
+                            :for={revision <- run.definition.revisions}
+                            value={revision.id}
+                            selected={revision.id == List.first(run.definition.revisions).id}
+                          >
+                            revision {revision.revision} · {short(revision.semantic_hash)}
+                          </option>
+                        </select>
+                      </label>
+                      <label class="grid gap-1 font-mono text-[9px] text-rune-muted">
+                        To
+                        <select
+                          name="workflow_compare[to_revision_id]"
+                          class="rounded-md border border-rune-text/10 bg-rune-ink px-2 py-1 text-[10px] text-rune-text-soft"
+                        >
+                          <option
+                            :for={revision <- run.definition.revisions}
+                            value={revision.id}
+                            selected={revision.id == run.definition.latest_revision_id}
+                          >
+                            revision {revision.revision} · {short(revision.semantic_hash)}
+                          </option>
+                        </select>
+                      </label>
+                      <button
+                        type="submit"
+                        class="rounded-full border border-rune-cyan/30 px-3 py-1 font-mono text-[10px] text-rune-cyan"
+                      >
+                        Compare revisions
+                      </button>
+                    </form>
+                    <% comparison = Map.get(@workflow_revision_comparisons, run.id) %>
+                    <div
+                      :if={comparison}
+                      id={"workflow-revision-comparison-#{dom_id(run.id)}"}
+                      class="mt-3 rounded-md border border-rune-cyan/20 bg-rune-cyan/[0.04] p-2"
+                    >
+                      <p class="font-mono text-[10px] text-rune-cyan">
+                        Revision {comparison.from.revision} → {comparison.to.revision}
+                      </p>
+                      <p class="mt-1 font-mono text-[9px] text-rune-muted">
+                        {short(comparison.from.semantic_hash)} → {short(comparison.to.semantic_hash)}
+                      </p>
+                      <.semantic_change_list diff={comparison.diff} />
+                    </div>
+                  </div>
+                  <div :if={run.definition.status != "archived"} class="mt-2 flex flex-wrap gap-2">
+                    <button
+                      :if={
+                        run.definition.latest_action in [
+                          "drafted",
+                          "revised",
+                          "revalidated",
+                          "catalog_migrated"
+                        ]
+                      }
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="request_review"
+                      class="rounded-full border border-rune-magenta/30 px-3 py-1 font-mono text-[10px] text-rune-magenta"
+                    >
+                      Request revision review
+                    </button>
+                    <button
+                      :if={!run.definition.catalog_current?}
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="migrate_catalog"
+                      class="rounded-full border border-rune-amber/30 bg-rune-amber/10 px-3 py-1 font-mono text-[10px] text-rune-amber"
+                    >
+                      Migrate contracts & compile
+                    </button>
+                    <button
+                      :if={run.definition.latest_action == "review_requested"}
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="approve"
+                      class="rounded-full border border-rune-success/30 px-3 py-1 font-mono text-[10px] text-rune-success"
+                    >
+                      Approve revision
+                    </button>
+                    <button
+                      :if={run.definition.latest_action == "approved"}
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="activate"
+                      class="rounded-full border border-rune-success/30 bg-rune-success/10 px-3 py-1 font-mono text-[10px] text-rune-success"
+                    >
+                      Activate revision
+                    </button>
+                    <button
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="revalidate"
+                      class="rounded-full border border-rune-text/15 px-3 py-1 font-mono text-[10px] text-rune-text-soft"
+                    >
+                      Revalidate
+                    </button>
+                    <button
+                      :if={!run.definition.pinned_is_latest?}
+                      type="button"
+                      phx-click="fork_workflow_run"
+                      phx-value-run-id={run.id}
+                      class="rounded-full border border-rune-amber/30 bg-rune-amber/10 px-3 py-1 font-mono text-[10px] text-rune-amber"
+                    >
+                      Fork onto latest revision
+                    </button>
+                    <button
+                      type="button"
+                      phx-click="workflow_definition_action"
+                      phx-value-run-id={run.id}
+                      phx-value-action="archive"
+                      class="rounded-full border border-rune-error/25 bg-rune-error/[0.06] px-3 py-1 font-mono text-[10px] text-rune-error"
+                    >
+                      Archive workflow
+                    </button>
+                  </div>
+                  <p
+                    :if={run.definition.status == "archived"}
+                    class="mt-2 rounded-lg border border-rune-text/10 bg-black/20 px-3 py-2 font-mono text-[10px] text-rune-muted"
+                  >
+                    Archived · existing pinned history retained; new launches disabled
+                  </p>
+                </div>
+              </div>
               <div
                 :if={
                   @snapshot.artifacts == [] and @snapshot.tool_calls == [] and @snapshot.runs == [] and
@@ -2552,6 +3409,23 @@ defmodule RunicAIWeb.WorkbenchLive do
       <p class="mx-[18px] mt-2 text-[13px] leading-6 text-rune-text-soft">
         <strong>Context:</strong> {first_present(@event.detail, event_summary(@event))}
       </p>
+      <div
+        :if={workflow_edit_review?(@review)}
+        class="mx-[18px] mt-3 rounded-[12px] border border-rune-magenta/20 bg-black/20 p-3"
+      >
+        <p class="font-mono text-[10px] uppercase tracking-wide text-rune-magenta">
+          Suggested semantic edit · base revision {field(@review.details, :base_revision)}
+        </p>
+        <p class="mt-1 font-mono text-[10px] text-rune-muted">
+          affected {Enum.join(List.wrap(field(@review.details, :affected_nodes)), ", ")
+          |> blank_fallback("workflow")} · suggested by {field(@review.details, :suggested_by) ||
+            "agent"}
+        </p>
+        <.semantic_change_list
+          operations={field(@review.details, :operations)}
+          diff={field(@review.details, :diff)}
+        />
+      </div>
       <.form
         :if={review_open?(@review)}
         id={"review-form-#{dom_id(@review.id)}"}
@@ -2564,9 +3438,9 @@ defmodule RunicAIWeb.WorkbenchLive do
         <textarea
           name="review[rewrite]"
           class="min-h-[58px] w-full resize-y rounded-[12px] border border-rune-text/5 bg-black/20 px-3 py-2 text-xs leading-5 text-rune-text outline-none placeholder:text-rune-muted"
-          placeholder="Rewrite instruction..."
+          placeholder={review_rewrite_placeholder(@review)}
         ></textarea>
-        <div class="grid grid-cols-2 gap-2">
+        <div :if={!workflow_edit_review?(@review)} class="grid grid-cols-2 gap-2">
           <label class="grid gap-1 font-mono text-[10px] uppercase text-rune-muted">
             Extra loops
             <input
@@ -2596,7 +3470,7 @@ defmodule RunicAIWeb.WorkbenchLive do
             value="approve"
             class="min-h-[34px] rounded-[11px] border border-rune-primary/25 bg-rune-primary/20 px-3 py-2 text-xs font-semibold text-rune-primary-soft hover:border-rune-primary/45"
           >
-            Approve once
+            {if(workflow_edit_review?(@review), do: "Apply suggested edit", else: "Approve once")}
           </button>
           <button
             type="submit"
@@ -2604,7 +3478,10 @@ defmodule RunicAIWeb.WorkbenchLive do
             value="rewrite"
             class="min-h-[34px] rounded-[11px] border border-rune-text/5 bg-black/25 px-3 py-2 text-xs font-semibold text-rune-text hover:border-rune-gold/35"
           >
-            Rewrite instruction
+            {if(workflow_edit_review?(@review),
+              do: "Apply rewritten operations",
+              else: "Rewrite instruction"
+            )}
           </button>
           <button
             type="submit"
@@ -2612,9 +3489,10 @@ defmodule RunicAIWeb.WorkbenchLive do
             value="deny"
             class="min-h-[34px] rounded-[11px] border border-rune-text/5 bg-black/25 px-3 py-2 text-xs font-semibold text-rune-warning hover:border-rune-warning/35"
           >
-            Deny
+            {if(workflow_edit_review?(@review), do: "Reject suggestion", else: "Deny")}
           </button>
           <button
+            :if={!workflow_edit_review?(@review)}
             type="submit"
             name="review[action]"
             value="stop"
@@ -2625,7 +3503,7 @@ defmodule RunicAIWeb.WorkbenchLive do
         </div>
       </.form>
       <.form
-        :if={review_open?(@review)}
+        :if={review_open?(@review) && !workflow_edit_review?(@review)}
         id={"approval-policy-form-#{dom_id(@review.id)}"}
         for={%{}}
         as={:approval}
@@ -2676,6 +3554,45 @@ defmodule RunicAIWeb.WorkbenchLive do
           Stop session
         </button>
       </div>
+    </div>
+    """
+  end
+
+  attr :operations, :any, default: []
+  attr :diff, :any, default: %{}
+
+  defp semantic_change_list(assigns) do
+    projection =
+      SemanticDiffPresenter.present(%{operations: assigns.operations, diff: assigns.diff})
+
+    assigns = assign(assigns, :projection, projection)
+
+    ~H"""
+    <div class="mt-2 space-y-2" data-review-view="semantic">
+      <p class="font-mono text-[10px] text-rune-text-soft">{@projection.summary}</p>
+      <ol class="space-y-1.5">
+        <li
+          :for={change <- @projection.changes}
+          class="grid grid-cols-[auto_1fr] gap-2 rounded-lg border border-rune-text/10 bg-rune-ink/55 px-2.5 py-2"
+        >
+          <span class="h-fit rounded-full border border-rune-cyan/20 bg-rune-cyan/10 px-2 py-0.5 font-mono text-[8px] uppercase tracking-wide text-rune-cyan">
+            {change.kind}
+          </span>
+          <span>
+            <strong class="block text-[11px] font-medium text-rune-text">{change.title}</strong>
+            <span class="mt-0.5 block text-[10px] leading-4 text-rune-muted">{change.detail}</span>
+          </span>
+        </li>
+      </ol>
+      <details class="rounded-lg border border-rune-text/10 bg-black/20 px-2.5 py-2">
+        <summary class="cursor-pointer font-mono text-[9px] text-rune-muted">
+          Raw operation and diff data
+        </summary>
+        <pre class="mt-2 max-h-44 overflow-auto whitespace-pre-wrap rounded-md bg-rune-ink/70 p-2 font-mono text-[9px] text-rune-text-soft">{json_detail(%{
+            operations: @operations,
+            diff: @diff
+          })}</pre>
+      </details>
     </div>
     """
   end
@@ -4143,6 +5060,9 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp present_string(value) when is_map(value) or is_list(value), do: json_preview(value)
   defp present_string(value), do: to_string(value)
 
+  defp blank_fallback("", fallback), do: fallback
+  defp blank_fallback(value, _fallback), do: value
+
   defp json_field(map, key, default) when is_map(map) do
     Map.get(map, key, Map.get(map, String.to_existing_atom(key), default))
   rescue
@@ -4215,10 +5135,9 @@ defmodule RunicAIWeb.WorkbenchLive do
 
   defp review_event(_snapshot), do: nil
 
-  defp pending_review(%{session: %{status: status}, review_requests: reviews})
-       when status in ["running", "waiting", "review", "blocked"] do
-    reviews
-    |> Enum.filter(&(&1.status in ["pending", "waiting"]))
+  defp pending_review(%{session: %{status: status}, review_requests: reviews}) do
+    status
+    |> actionable_pending_reviews(reviews)
     |> Enum.sort_by(&pending_review_rank/1)
     |> List.first()
   end
@@ -4236,12 +5155,22 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp pending_review_rank(%{checkpoint: checkpoint}) when is_binary(checkpoint), do: 2
   defp pending_review_rank(_review), do: 3
 
-  defp pending_review_count(%{session: %{status: status}, review_requests: reviews})
-       when status in ["running", "waiting", "review", "blocked"] do
-    Enum.count(reviews, &(&1.status in ["pending", "waiting"]))
+  defp pending_review_count(%{session: %{status: status}, review_requests: reviews}) do
+    status
+    |> actionable_pending_reviews(reviews)
+    |> length()
   end
 
   defp pending_review_count(_snapshot), do: 0
+
+  defp actionable_pending_reviews(session_status, reviews) do
+    reviews
+    |> Enum.filter(&(&1.status in ["pending", "waiting"]))
+    |> Enum.filter(fn review ->
+      session_status in ["running", "waiting", "review", "blocked"] or
+        review.kind in ["workflow_run", "workflow_edit"]
+    end)
+  end
 
   defp review_event_from_request(review) do
     %{
@@ -4278,7 +5207,7 @@ defmodule RunicAIWeb.WorkbenchLive do
   end
 
   defp workflow_stage_step(snapshot, label, stage, events) do
-    event = first_workflow_stage_event(events, stage)
+    event = first_workflow_stage_event(events, stage) || workflow_run_stage_event(snapshot, stage)
 
     %{
       state: workflow_stage_state(snapshot, stage, event),
@@ -4302,6 +5231,7 @@ defmodule RunicAIWeb.WorkbenchLive do
           "proposed",
           "validated",
           "workflow_compiled",
+          "workflow_intent_routed",
           "rlm_plan",
           "blueprint"
         ])
@@ -4376,8 +5306,86 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp workflow_stage_detail(_snapshot, _stage, nil), do: "waiting for persisted event"
 
   defp workflow_stage_detail(_snapshot, _stage, event) do
-    event_phase(event) || event_kind(event) || event_status(event) || "persisted event"
+    Map.get(event, :detail) || event_phase(event) || event_kind(event) || event_status(event) ||
+      "persisted event"
   end
+
+  defp workflow_run_stage_event(%{runs: runs}, stage)
+       when stage in [:implementation, :verification] do
+    runs
+    |> Enum.find(& &1.definition_revision_id)
+    |> workflow_run_stage_event(stage)
+  end
+
+  defp workflow_run_stage_event(nil, _stage), do: nil
+
+  defp workflow_run_stage_event(run, :implementation) do
+    case run.status do
+      "completed" ->
+        %{
+          title: "Pinned workflow execution completed",
+          detail: "revision #{run.definition_revision} · #{run.trigger || "workflow run"}",
+          phase: "workflow_completed",
+          status: "ok"
+        }
+
+      status when status in ["failed", "blocked", "cancelled"] ->
+        %{
+          title: "Pinned workflow execution #{status}",
+          detail: "revision #{run.definition_revision}",
+          phase: "workflow_#{status}",
+          status: "error"
+        }
+
+      status when status in ["running", "waiting", "review", "paused"] ->
+        %{
+          title: "Pinned workflow #{status}",
+          detail: "revision #{run.definition_revision}",
+          phase: "workflow_#{status}",
+          status: status
+        }
+
+      _status ->
+        nil
+    end
+  end
+
+  defp workflow_run_stage_event(%{output_summary: summary} = run, :verification)
+       when is_map(summary) do
+    objective_status = Map.get(summary, :objective_status)
+
+    cond do
+      objective_status in ["objective_satisfied", "satisfied", "completed"] ->
+        %{
+          title: "Acceptance proof satisfied",
+          detail: workflow_run_proof_summary(summary),
+          phase: "scorecard",
+          status: "ok"
+        }
+
+      run.status in ["failed", "blocked", "cancelled"] ->
+        %{
+          title: "Workflow verification #{run.status}",
+          detail: objective_status || "no satisfied acceptance proof",
+          phase: "scorecard",
+          status: "error"
+        }
+
+      run.status == "completed" ->
+        %{
+          title: "Workflow output persisted",
+          detail: workflow_run_proof_summary(summary),
+          phase: "workflow_output",
+          status: "ok"
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp workflow_run_stage_event(_run, :verification), do: nil
+  defp workflow_run_stage_event(_snapshot, _stage), do: nil
 
   defp event_search_text(event) do
     [
@@ -4461,6 +5469,15 @@ defmodule RunicAIWeb.WorkbenchLive do
   end
 
   defp review_detail(review), do: review.resume_key || review.id
+
+  defp workflow_edit_review?(%{kind: "workflow_edit"}), do: true
+  defp workflow_edit_review?(_review), do: false
+
+  defp review_rewrite_placeholder(review) do
+    if workflow_edit_review?(review),
+      do: ~s|[{"op":"set_policy","key":"max_runtime_ms","value":5000}]|,
+      else: "Rewrite instruction..."
+  end
 
   defp review_open?(%{status: status}), do: status in ["pending", "waiting"]
   defp review_open?(_review), do: false
@@ -4560,13 +5577,13 @@ defmodule RunicAIWeb.WorkbenchLive do
   defp debug_table(snapshot, "runs", mode) do
     headers =
       if mode == "expanded",
-        do: ["id", "workflow", "status", "trigger"],
+        do: ["id", "workflow", "status", "revision / compiled"],
         else: ["id", "workflow", "status"]
 
     rows =
       Enum.map(snapshot.runs, fn run ->
         cells = [short(run.id), run.workflow_name || run.workflow_key, run.status]
-        %{cells: maybe_debug_detail(cells, run.trigger, mode)}
+        %{cells: maybe_debug_detail(cells, workflow_run_lineage(run), mode)}
       end)
 
     %{headers: headers, rows: rows}
@@ -4586,6 +5603,76 @@ defmodule RunicAIWeb.WorkbenchLive do
 
     %{headers: headers, rows: rows}
   end
+
+  defp workflow_run_lineage(run) do
+    parent_run_id = run.parent_run_id || json_field(run.metadata || %{}, "parent_run_id", nil)
+
+    [
+      run.trigger || "workflow run",
+      run.definition_revision && "revision #{run.definition_revision}",
+      run.definition_hash && "definition #{String.slice(run.definition_hash, 0, 12)}",
+      run.compiled_hash && "compiled #{String.slice(run.compiled_hash, 0, 12)}",
+      run.catalog_hash && "catalog #{String.slice(run.catalog_hash, 0, 12)}",
+      parent_run_id && "child of #{short(parent_run_id)}",
+      run.attempt && run.trigger in ["workflow_task", "workflow_task_retry"] &&
+        "attempt #{run.attempt}",
+      run.supersedes_run_id && "retries #{short(run.supersedes_run_id)}"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" - ")
+  end
+
+  defp workflow_run_proof_summary(summary) do
+    [
+      artifact_count_label(Map.get(summary, :artifact_count)),
+      count_label(Map.get(summary, :nodes_executed), "node"),
+      count_label(Map.get(summary, :record_map_calls), "mapped record"),
+      Map.get(summary, :dialect) && "#{Map.get(summary, :dialect)} dialect"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" · ")
+    |> blank_fallback("portable output persisted")
+  end
+
+  defp artifact_count_label(count), do: count_label(count, "artifact")
+
+  defp count_label(count, noun) when is_integer(count),
+    do: "#{count} #{noun}#{if count == 1, do: "", else: "s"}"
+
+  defp count_label(_count, _noun), do: nil
+
+  defp workflow_definition_action("request_review"), do: {:ok, :request_review}
+  defp workflow_definition_action("approve"), do: {:ok, :approve}
+  defp workflow_definition_action("activate"), do: {:ok, :activate}
+  defp workflow_definition_action("revalidate"), do: {:ok, :revalidate}
+  defp workflow_definition_action("migrate_catalog"), do: {:ok, :migrate_catalog}
+  defp workflow_definition_action("archive"), do: {:ok, :archive}
+  defp workflow_definition_action(action), do: {:error, {:unknown_definition_action, action}}
+
+  defp action_label(:request_review), do: "submitted for review"
+  defp action_label(:approve), do: "approved"
+  defp action_label(:activate), do: "activated"
+  defp action_label(:revalidate), do: "revalidated"
+  defp action_label(:migrate_catalog), do: "migrated to the current catalog as a new revision"
+  defp action_label(:archive), do: "archived"
+
+  defp orchestration_label("auto"), do: "Auto route: direct, reuse, adapt, or draft"
+  defp orchestration_label("direct"), do: "Force the direct agent path"
+  defp orchestration_label("workflow"), do: "Design a typed workflow"
+  defp orchestration_label(_value), do: "Agent only"
+
+  defp list_text(values, fallback) do
+    case List.wrap(values) do
+      [] -> fallback
+      values -> Enum.map_join(values, ", ", &to_string/1)
+    end
+  end
+
+  defp map_keys_text(map, _fallback) when is_map(map) and map_size(map) > 0 do
+    map |> Map.keys() |> Enum.map_join(", ", &to_string/1)
+  end
+
+  defp map_keys_text(_map, fallback), do: fallback
 
   defp maybe_debug_detail(cells, _detail, "compact"), do: cells
   defp maybe_debug_detail(cells, detail, _mode), do: cells ++ [detail || "-"]
@@ -4638,5 +5725,13 @@ defmodule RunicAIWeb.WorkbenchLive do
     |> String.slice(0, 80)
   rescue
     _exception -> inspect(value, limit: 10)
+  end
+
+  defp json_detail(value) do
+    value
+    |> Jason.encode!(pretty: true)
+    |> String.slice(0, 4_000)
+  rescue
+    _exception -> inspect(value, limit: 50, pretty: true)
   end
 end

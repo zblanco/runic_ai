@@ -31,6 +31,24 @@ defmodule RunicAI.Coding.GitAndCodexTest do
     end
   end
 
+  test "git read tools do not escape a nested workspace into its parent repository" do
+    if System.find_executable("git") do
+      parent_root = tmp_dir()
+      nested_root = Path.join(parent_root, "isolated-workspace")
+      File.mkdir_p!(nested_root)
+      System.cmd("git", ["init"], cd: parent_root, stderr_to_stdout: true)
+
+      workspace = Workspace.new!(root: nested_root)
+      policy = CommandPolicy.new!(allowed_commands: ["git"])
+
+      assert {:error, error} = Tools.git_status(workspace, %{}, policy)
+      assert error.details.code == :workspace_not_git_root
+      assert error.details.workspace_root == nested_root
+    else
+      assert true
+    end
+  end
+
   test "redacts secret-looking trace payloads" do
     value = %{
       api_key: "sk-thisshouldberedacted",

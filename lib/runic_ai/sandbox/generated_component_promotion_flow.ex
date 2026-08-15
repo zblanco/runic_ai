@@ -2,7 +2,7 @@ defmodule RunicAI.Sandbox.GeneratedComponentPromotionFlow do
   @moduledoc """
   Proof-first orchestration for sandbox-generated components.
 
-  This module sits above `RunicSandbox`. It does not execute provider-specific
+  This module sits above `LitterBox`. It does not execute provider-specific
   logic itself; it coordinates RunicAI's generated-component contract, sandbox
   proof runner, promotion policy, and workflow composition.
   """

@@ -4,7 +4,7 @@ defmodule RunicAI.RLM.REPL.State do
 
   The state stores handles, variables, bounded observations, checkpoints,
   budgets, and the structured final result. It deliberately stores only the
-  model-visible sandbox session id, not the signed RunicSandbox session handle.
+  model-visible sandbox session id, not the signed LitterBox session handle.
   """
 
   alias RunicAI.Error

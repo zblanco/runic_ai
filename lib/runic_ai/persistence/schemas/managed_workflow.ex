@@ -23,6 +23,9 @@ defmodule RunicAI.Persistence.Schemas.ManagedWorkflow do
     field(:checkpoint_strategy, :string)
     field(:restart_policy, :string)
     field(:last_run_id, :string)
+    field(:latest_revision_id, :string)
+    field(:review_revision_id, :string)
+    field(:active_revision_id, :string)
     field(:metadata_json, :map)
 
     timestamps()
@@ -52,6 +55,9 @@ defmodule RunicAI.Persistence.Schemas.ManagedWorkflow do
       :checkpoint_strategy,
       :restart_policy,
       :last_run_id,
+      :latest_revision_id,
+      :review_revision_id,
+      :active_revision_id,
       :metadata_json
     ])
     |> Schema.put_new_id("managed_workflow")

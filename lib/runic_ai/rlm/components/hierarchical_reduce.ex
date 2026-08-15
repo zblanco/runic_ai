@@ -75,17 +75,19 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
     chunks
     |> Enum.with_index(1)
     |> Enum.reduce_while({:ok, []}, fn {chunk, index}, {:ok, acc} ->
+      template = get(params, :group_prompt, nil) || default_group_prompt()
+      rendered_items = render_items(chunk)
+
       prompt =
-        render_template(
-          get(params, :group_prompt, nil) || default_group_prompt(),
-          %{
-            objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
-            input: input,
-            group_index: index,
-            group_count: length(chunks),
-            items: render_items(chunk)
-          }
-        )
+        template
+        |> render_template(%{
+          objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
+          input: input,
+          group_index: index,
+          group_count: length(chunks),
+          items: rendered_items
+        })
+        |> ensure_evidence_context(template, rendered_items, "Runtime evidence group")
 
       case Streaming.generate_text(model, prompt, stream_opts(llm_opts, "group", index)) do
         {:ok, %Result{} = result} -> {:cont, {:ok, [Result.text(result) | acc]}}
@@ -100,15 +102,19 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
   end
 
   defp final_reduce(intermediate, input, params, model, llm_opts, opts) do
+    template =
+      get(params, :prompt, nil) || get(params, :final_prompt, nil) || default_final_prompt()
+
+    rendered_items = Enum.join(intermediate, "\n\n---\n\n")
+
     prompt =
-      render_template(
-        get(params, :prompt, nil) || get(params, :final_prompt, nil) || default_final_prompt(),
-        %{
-          objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
-          input: input,
-          items: Enum.join(intermediate, "\n\n---\n\n")
-        }
-      )
+      template
+      |> render_template(%{
+        objective: Keyword.get(opts, :objective) || get(params, :objective, ""),
+        input: input,
+        items: rendered_items
+      })
+      |> ensure_evidence_context(template, rendered_items, "Runtime merged evidence")
 
     case Streaming.generate_text(model, prompt, stream_opts(llm_opts, "final", 1)) do
       {:ok, %Result{} = result} -> {:ok, Result.text(result)}
@@ -147,6 +153,17 @@ defmodule RunicAI.RLM.Components.HierarchicalReduce do
     case BlueprintTransform.eval(expr, data) do
       {:ok, rendered} -> rendered
       {:error, _error} -> template
+    end
+  end
+
+  # A generated instruction is allowed to change how evidence is summarized,
+  # but it cannot accidentally omit the evidence payload itself. Avoid
+  # duplication when the template already references {{items}}.
+  defp ensure_evidence_context(prompt, template, items, label) do
+    if Regex.match?(~r/\{\{\s*items\s*\}\}/i, template) do
+      prompt
+    else
+      "#{prompt}\n\n#{label} (authoritative):\n#{items}"
     end
   end
 

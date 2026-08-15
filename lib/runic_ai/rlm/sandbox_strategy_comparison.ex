@@ -288,7 +288,7 @@ defmodule RunicAI.RLM.SandboxStrategyComparison do
   end
 
   defp sandbox_exec(opts, request, exec_opts) do
-    Keyword.get(opts, :sandbox_exec, &RunicSandbox.exec/2).(request, exec_opts)
+    Keyword.get(opts, :sandbox_exec, &LitterBox.exec/2).(request, exec_opts)
   end
 
   defp local_actual(actual, execution) do

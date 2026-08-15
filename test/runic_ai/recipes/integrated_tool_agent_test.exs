@@ -3,6 +3,7 @@ defmodule RunicAI.Recipes.IntegratedToolAgentTest do
 
   alias Runic.Workflow
   alias RunicAI.Control.GuardDecision
+  alias RunicAI.Error
   alias RunicAI.Prompt
   alias RunicAI.Recipes.IntegratedToolAgent
   alias RunicAI.Tool.Definition
@@ -29,6 +30,40 @@ defmodule RunicAI.Recipes.IntegratedToolAgentTest do
              :tool,
              :assistant
            ]
+  end
+
+  test "retains provider error evidence when generation halts before a response" do
+    client = fn _model, _prompt, _opts ->
+      {:error,
+       Error.provider("generation failed",
+         source: RunicAI.LLM.ReqLLMClient,
+         details: %{
+           requested_model: "openai:gpt-5.6-sol",
+           status: 400,
+           reason_type: "ReqLLM.Error.API.Request",
+           reason_message: "unsupported option"
+         }
+       )}
+    end
+
+    workflow =
+      IntegratedToolAgent.new(
+        default_agent_id: "agent",
+        model: "openai:gpt-5.6-sol",
+        registry: [weather_tool()],
+        client: client,
+        generation_retry_policy: [max_attempts: 1]
+      )
+      |> Workflow.react_until_satisfied(%{user: "Make a change"})
+
+    session = IntegratedToolAgent.session(workflow, "agent")
+
+    assert session.status == :halted
+
+    assert [evidence] = session.control.generation_evidence
+    assert evidence.requested_model == "openai:gpt-5.6-sol"
+    assert evidence.status == 400
+    assert evidence.reason_message == "unsupported option"
   end
 
   test "pauses for review and resumes through the same workflow runtime" do
@@ -102,7 +137,11 @@ defmodule RunicAI.Recipes.IntegratedToolAgentTest do
       )
 
     assert IntegratedToolAgent.latest_reply_text(workflow, "agent") == "Paris is sunny."
-    assert IntegratedToolAgent.session(workflow, "agent").status == :idle
+    session = IntegratedToolAgent.session(workflow, "agent")
+
+    assert session.status == :idle
+
+    assert Enum.map(session.control.generation_evidence, & &1.tool_call_count) == [1, 0]
   end
 
   test "keeps one agent waiting while another agent completes independently" do

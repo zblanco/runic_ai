@@ -12,7 +12,11 @@ defmodule RunicAI.Control.RetryPolicy do
 
   @type t :: %__MODULE__{
           max_attempts: pos_integer(),
-          backoff: non_neg_integer() | (non_neg_integer() -> non_neg_integer()) | nil,
+          backoff:
+            non_neg_integer()
+            | (non_neg_integer() -> non_neg_integer())
+            | (non_neg_integer(), term() -> non_neg_integer())
+            | nil,
           retry_if: (term() -> boolean()) | nil,
           on_exhausted: :error | :halt,
           metadata: map()
@@ -105,10 +109,12 @@ defmodule RunicAI.Control.RetryPolicy do
   defp validate_backoff(nil), do: :ok
   defp validate_backoff(backoff) when is_integer(backoff) and backoff >= 0, do: :ok
   defp validate_backoff(backoff) when is_function(backoff, 1), do: :ok
+  defp validate_backoff(backoff) when is_function(backoff, 2), do: :ok
 
   defp validate_backoff(backoff) do
     {:error,
-     Error.validation("retry backoff must be nil, a non-negative integer, or a unary function",
+     Error.validation(
+       "retry backoff must be nil, a non-negative integer, or a unary/binary function",
        source: __MODULE__,
        details: %{backoff: backoff}
      )}

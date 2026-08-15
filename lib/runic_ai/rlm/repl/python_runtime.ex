@@ -3,7 +3,7 @@ defmodule RunicAI.RLM.REPL.PythonRuntime do
   Executes one Python turn for the sandbox-backed RLM REPL.
 
   This module deliberately talks to `RunicAI.Coding.SandboxSessionRegistry`
-  instead of raw `RunicSandbox.Session` handles. The REPL state carries only the
+  instead of raw `LitterBox.Session` handles. The REPL state carries only the
   model-visible session id; the registry owns the signed sandbox authority.
   """
 

@@ -14,6 +14,8 @@ defmodule RunicAI.Persistence.ManagedWorkflows do
   alias RunicAI.Persistence.SQLite
   alias RunicAI.Persistence.SQLite.Store
   alias RunicAI.Persistence.Term
+  alias RunicAI.Persistence.WorkflowDefinitions
+  alias RunicAI.Persistence.WorkflowExecutor
   alias RunicAI.Persistence.Schemas.ManagedWorkflow
   alias RunicAI.Persistence.Schemas.WorkflowRun
 
@@ -75,6 +77,16 @@ defmodule RunicAI.Persistence.ManagedWorkflows do
     do: create_run(store, workflow_key, Map.new(attrs))
 
   def create_run(%Store{} = store, workflow_key, attrs) when is_binary(workflow_key) do
+    case get(store, workflow_key) do
+      %ManagedWorkflow{active_revision_id: revision_id} when is_binary(revision_id) ->
+        WorkflowDefinitions.launch(store, workflow_key, attrs)
+
+      _workflow ->
+        create_legacy_run(store, workflow_key, attrs)
+    end
+  end
+
+  defp create_legacy_run(%Store{} = store, workflow_key, attrs) do
     SQLite.with_repo(store, fn ->
       SQLite.retry_busy_write(fn ->
         store.repo.transaction(fn ->
@@ -147,13 +159,28 @@ defmodule RunicAI.Persistence.ManagedWorkflows do
     runner = Keyword.fetch!(opts, :runner)
     runner_opts = Keyword.get(opts, :runner_opts, [])
 
-    with %ManagedWorkflow{last_run_id: run_id} when is_binary(run_id) <- get(store, workflow_key),
-         {:ok, pid} <- Runic.Runner.resume(runner, run_id, runner_opts) do
-      {:ok, pid}
-    else
-      %ManagedWorkflow{} -> {:error, :no_runs}
-      nil -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
+    case get(store, workflow_key) do
+      %ManagedWorkflow{last_run_id: run_id, active_revision_id: revision_id}
+      when is_binary(run_id) and is_binary(revision_id) ->
+        case WorkflowExecutor.resume(
+               store,
+               run_id,
+               opts
+               |> Keyword.put(:runner, runner)
+               |> Keyword.put(:worker_opts, runner_opts)
+             ) do
+          {:ok, %{pid: pid}} -> {:ok, pid}
+          {:error, reason} -> {:error, reason}
+        end
+
+      %ManagedWorkflow{last_run_id: run_id} when is_binary(run_id) ->
+        Runic.Runner.resume(runner, run_id, runner_opts)
+
+      %ManagedWorkflow{} ->
+        {:error, :no_runs}
+
+      nil ->
+        {:error, :not_found}
     end
   end
 

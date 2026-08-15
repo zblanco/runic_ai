@@ -97,6 +97,14 @@ defmodule RunicAI.LLM.TestClient do
   def stream_response(text) when is_binary(text) do
     tokens = String.graphemes(text)
 
+    {:ok, metadata_handle} =
+      ReqLLM.StreamResponse.MetadataHandle.start_link(fn ->
+        %{
+          usage: %{input_tokens: 10, output_tokens: 5, total_tokens: 15},
+          finish_reason: :stop
+        }
+      end)
+
     stream =
       Stream.map(tokens, fn token ->
         ReqLLM.StreamChunk.text(token)
@@ -104,9 +112,9 @@ defmodule RunicAI.LLM.TestClient do
 
     %ReqLLM.StreamResponse{
       stream: stream,
-      metadata_handle: nil,
+      metadata_handle: metadata_handle,
       cancel: fn -> :ok end,
-      model: "test:fake-model",
+      model: ReqLLM.model!("openai:gpt-4o-mini"),
       context: ReqLLM.Context.new()
     }
   end

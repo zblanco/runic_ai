@@ -11,8 +11,15 @@ defmodule RunicAI.Control.Recovery do
   def run(primary_fun, opts \\ []) when is_function(primary_fun, 0) and is_list(opts) do
     retry_policy = RetryPolicy.from_input!(Keyword.get(opts, :retry_policy))
     fallback_policy = FallbackPolicy.from_input!(Keyword.get(opts, :fallback_policy))
-    retryable? = Keyword.get(opts, :retryable?, &default_retryable?/1)
-    fallback? = Keyword.get(opts, :fallback?, &default_fallback?/1)
+
+    retryable? =
+      policy_predicate(retry_policy, :retry_if) ||
+        Keyword.get(opts, :retryable?, &default_retryable?/1)
+
+    fallback? =
+      policy_predicate(fallback_policy, :fallback_if) ||
+        Keyword.get(opts, :fallback?, &default_fallback?/1)
+
     run_fallback = Keyword.get(opts, :run_fallback, &default_run_fallback/2)
 
     primary_fun
@@ -34,7 +41,7 @@ defmodule RunicAI.Control.Recovery do
         outcome
 
       retryable?.(outcome) ->
-        maybe_sleep(retry_policy.backoff, attempt)
+        maybe_sleep(retry_policy.backoff, attempt, outcome)
         do_retry(primary_fun, retry_policy, retryable?, attempt + 1)
 
       true ->
@@ -81,12 +88,21 @@ defmodule RunicAI.Control.Recovery do
 
   defp apply_degrade(degrade_to, _outcome), do: degrade_to
 
-  defp maybe_sleep(nil, _attempt), do: :ok
-  defp maybe_sleep(backoff, _attempt) when is_integer(backoff), do: Process.sleep(backoff)
+  defp maybe_sleep(nil, _attempt, _outcome), do: :ok
 
-  defp maybe_sleep(backoff, attempt) when is_function(backoff, 1) do
+  defp maybe_sleep(backoff, _attempt, _outcome) when is_integer(backoff),
+    do: Process.sleep(backoff)
+
+  defp maybe_sleep(backoff, attempt, _outcome) when is_function(backoff, 1) do
     backoff
     |> apply([attempt])
+    |> max(0)
+    |> Process.sleep()
+  end
+
+  defp maybe_sleep(backoff, attempt, outcome) when is_function(backoff, 2) do
+    backoff
+    |> apply([attempt, outcome])
     |> max(0)
     |> Process.sleep()
   end
@@ -105,4 +121,7 @@ defmodule RunicAI.Control.Recovery do
   end
 
   defp default_run_fallback(alternate, _current_outcome), do: alternate
+
+  defp policy_predicate(nil, _field), do: nil
+  defp policy_predicate(policy, field), do: Map.get(policy, field)
 end

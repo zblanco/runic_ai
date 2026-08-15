@@ -54,6 +54,7 @@ defmodule RunicAI.RLM.ComponentCatalog do
     :artifact_writer,
     :objective_scorecard,
     :budget_ledger,
+    :workflow_task,
     :verification
   ]
 
@@ -375,7 +376,14 @@ defmodule RunicAI.RLM.ComponentCatalog do
       execution_shape: :step,
       inputs:
         ValueContract.input(
-          [:llm_items, :record_groups, :comparisons, :report, :materialized_slices],
+          [
+            :llm_items,
+            :record_groups,
+            :comparisons,
+            :report,
+            :materialized_slices,
+            :synthesis
+          ],
           "Inputs for terminal LLM synthesis"
         ),
       outputs: ValueContract.output(:synthesis, "Synthesized model output")
@@ -461,6 +469,15 @@ defmodule RunicAI.RLM.ComponentCatalog do
 
   defp entry!(:verification), do: %{entry!(:objective_scorecard) | type: :verification}
 
+  defp entry!(:workflow_task) do
+    %{
+      type: :workflow_task,
+      execution_shape: :side_effect_step,
+      inputs: ValueContract.input(:workflow_input, "Saved workflow public input"),
+      outputs: ValueContract.output(:workflow_output, "Saved workflow public output")
+    }
+  end
+
   defp computing_entry(type, doc) do
     %{
       type: type,
@@ -474,6 +491,14 @@ defmodule RunicAI.RLM.ComponentCatalog do
     with {:ok, params} <- ensure_map(params),
          :ok <- validate_optional_non_empty_string(params, :path),
          :ok <- validate_optional_positive_integer(params, :max_bytes) do
+      {:ok, params}
+    end
+  end
+
+  defp normalize_params(:workflow_task, params) do
+    with {:ok, params} <- ensure_map(params),
+         :ok <- validate_required_non_empty_string(params, :workflow_key),
+         :ok <- validate_optional_positive_integer(params, :revision) do
       {:ok, params}
     end
   end
@@ -587,6 +612,16 @@ defmodule RunicAI.RLM.ComponentCatalog do
       :missing ->
         :ok
 
+      value when is_binary(value) ->
+        if String.trim(value) == "", do: invalid_string(key, value), else: :ok
+
+      value ->
+        invalid_string(key, value)
+    end
+  end
+
+  defp validate_required_non_empty_string(params, key) do
+    case get(params, key, :missing) do
       value when is_binary(value) ->
         if String.trim(value) == "", do: invalid_string(key, value), else: :ok
 

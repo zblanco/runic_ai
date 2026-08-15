@@ -6,6 +6,8 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
   alias RunicAI.Error
   alias RunicAI.Agent.CapabilityResolver
   alias RunicAI.RLM.CostEstimate
+  alias RunicAI.Coding.RLM.AcceptanceCheck
+  alias RunicAI.Coding.RLM.AcceptanceContract
   alias RunicAI.Coding.RLM.EditPatchSet
   alias RunicAI.Coding.RLM.ProposalNode
   alias RunicAI.Coding.RLM.WorkflowProposal
@@ -72,6 +74,7 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
       |> reject_unknown_edges(proposal.edges, node_ids)
       |> reject_cycles(proposal, opts)
       |> reject_unsafe_nodes(proposal.nodes, opts)
+      |> reject_unbound_verification_commands(proposal)
       |> reject_missing_objective_workflow_coverage(proposal, opts)
       |> reject_budget_overflow(proposal, opts)
 
@@ -202,6 +205,108 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
         error -> [error | errors]
       end
     end)
+  end
+
+  defp reject_unbound_verification_commands(errors, %WorkflowProposal{} = proposal) do
+    parents = Enum.group_by(proposal.edges, & &1.to, & &1.from)
+    nodes_by_id = Map.new(proposal.nodes, &{&1.id, &1})
+
+    proposal.nodes
+    |> Enum.filter(&(&1.kind == :verification_gate))
+    |> Enum.reduce(errors, fn gate, errors ->
+      ancestor_commands =
+        gate.id
+        |> ancestor_ids(parents, MapSet.new())
+        |> Enum.flat_map(fn node_id ->
+          case Map.get(nodes_by_id, node_id) do
+            %ProposalNode{kind: :command} = node -> List.wrap(command_spec(node))
+            _other -> []
+          end
+        end)
+
+      missing =
+        gate
+        |> verification_checks(proposal.objective)
+        |> Enum.filter(&(&1.type in [:command_passes, :command_fails_with, :runtime_smoke]))
+        |> Enum.map(&verification_command_spec/1)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.reject(&(&1 in ancestor_commands))
+
+      if missing == [] do
+        errors
+      else
+        [
+          node_error(
+            gate,
+            "verification command checks require matching upstream command nodes",
+            :unbound_verification_command,
+            %{missing_commands: missing, ancestor_commands: ancestor_commands}
+          )
+          | errors
+        ]
+      end
+    end)
+  end
+
+  defp verification_checks(%ProposalNode{} = node, objective) do
+    contract =
+      case param(node, :contract) do
+        nil ->
+          %{objective: objective, checks: List.wrap(param(node, :checks))}
+
+        value when is_map(value) ->
+          value
+          |> Map.put_new(:objective, objective)
+          |> Map.put_new(:checks, List.wrap(param(node, :checks)))
+
+        value ->
+          value
+      end
+
+    case AcceptanceContract.from_input(contract) do
+      {:ok, contract} -> contract.checks
+      {:error, _error} -> []
+    end
+  end
+
+  defp verification_command_spec(%AcceptanceCheck{} = check) do
+    args = normalize_map(get(check.params, :args, %{}))
+    argv = get(check.params, :argv) || get(check.params, :command) || get(args, :argv)
+    cwd = get(check.params, :cwd) || get(args, :cwd) || "."
+    normalize_command_spec(argv, cwd)
+  end
+
+  defp command_spec(%ProposalNode{} = node) do
+    args = normalize_map(param(node, :args) || %{})
+    argv = param(node, :argv) || param(node, :command) || get(args, :argv)
+    cwd = param(node, :cwd) || get(args, :cwd) || "."
+    normalize_command_spec(argv, cwd)
+  end
+
+  defp normalize_command_spec(argv, cwd) when is_list(argv), do: %{argv: argv, cwd: cwd}
+
+  defp normalize_command_spec(command, cwd) when is_binary(command) do
+    %{argv: String.split(command, ~r/\s+/, trim: true), cwd: cwd}
+  end
+
+  defp normalize_command_spec(_argv, _cwd), do: nil
+
+  defp ancestor_ids(node_id, parents, visited) do
+    node_id
+    |> collect_ancestors(parents, visited)
+    |> MapSet.delete(node_id)
+  end
+
+  defp collect_ancestors(node_id, parents, visited) do
+    if MapSet.member?(visited, node_id) do
+      visited
+    else
+      visited = MapSet.put(visited, node_id)
+
+      parents
+      |> Map.get(node_id, [])
+      |> Enum.reduce(visited, &collect_ancestors(&1, parents, &2))
+    end
   end
 
   defp unsafe_node_error(%ProposalNode{kind: :tool} = node, opts) do
@@ -477,15 +582,23 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
   end
 
   defp allowed_tools(opts) do
-    cond do
-      Keyword.get(opts, :allow_mutation?, false) ->
-        @read_tools ++ @verify_tools ++ @patch_tools
+    permitted =
+      cond do
+        Keyword.get(opts, :allow_mutation?, false) ->
+          @read_tools ++ @verify_tools ++ @patch_tools
 
-      Keyword.get(opts, :allow_verification?, false) ->
-        @read_tools ++ @verify_tools
+        Keyword.get(opts, :allow_verification?, false) ->
+          @read_tools ++ @verify_tools
 
-      true ->
-        Keyword.get(opts, :allowed_tools, @read_tools)
+        true ->
+          @read_tools
+      end
+
+    if CapabilityResolver.requested?(opts) do
+      visible = Keyword.get(opts, :allowed_tools, [])
+      Enum.filter(permitted, &(&1 in visible))
+    else
+      Keyword.get(opts, :allowed_tools, permitted)
     end
   end
 
@@ -625,7 +738,15 @@ defmodule RunicAI.Coding.RLM.WorkflowValidator do
   end
 
   defp normalize_map(value) when is_map(value), do: value
-  defp normalize_map(value) when is_list(value), do: Map.new(value)
+
+  defp normalize_map(value) when is_list(value) do
+    if Enum.all?(value, &(is_tuple(&1) and tuple_size(&1) == 2)) do
+      Map.new(value)
+    else
+      %{argv: value}
+    end
+  end
+
   defp normalize_map(_value), do: %{}
 
   defp get(map, key, default \\ nil),

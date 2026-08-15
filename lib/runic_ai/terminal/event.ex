@@ -902,6 +902,7 @@ defmodule RunicAI.Terminal.Event do
         allow_command_output?: is_nil(scorecard_text),
         allow_non_answer_output?: is_nil(scorecard_text)
       ),
+      explicit_output_text(result),
       scorecard_text,
       text_candidate(field(result, :output)),
       text_candidate(field(result, :repair_history)),
@@ -1041,6 +1042,16 @@ defmodule RunicAI.Terminal.Event do
   end
 
   defp text_candidate(_value), do: nil
+
+  defp explicit_output_text(result) do
+    output = field(result, :output)
+
+    if command_output?(output) do
+      nil
+    else
+      text_candidate(output)
+    end
+  end
 
   defp structured_report_candidate(%{} = value) do
     if structured_report_map?(value) do

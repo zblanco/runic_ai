@@ -14,6 +14,7 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
   alias RunicAI.Assistant.RLM.WorkflowBlueprint
   alias RunicAI.Coding.Workspace
   alias RunicAI.Error
+  alias RunicAI.JSONMap
   alias RunicAI.LLM
   alias RunicAI.LLM.Result
 
@@ -65,9 +66,9 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
        %{
          blueprint
          | metadata:
-             blueprint.metadata
-             |> Map.put(:proposal_kind, :validation_repair)
-             |> Map.put(:repair_diagnostics, diagnostics)
+             (blueprint.metadata || %{})
+             |> JSONMap.put(:proposal_kind, :validation_repair)
+             |> JSONMap.put(:repair_diagnostics, diagnostics)
        }}
     else
       {:error, %Error{} = repair_error} ->
@@ -345,7 +346,7 @@ defmodule RunicAI.Assistant.RLM.RepairLoop do
            edges: reconnect_edges(blueprint.edges, missing_path_ids),
            stop_conditions: non_artifact_stop_conditions(blueprint.stop_conditions),
            metadata:
-             Map.put(blueprint.metadata || %{}, :runtime_repair, %{
+             JSONMap.put(blueprint.metadata || %{}, :runtime_repair, %{
                removed_components: missing_path_ids,
                reason: :artifact_writer_missing_path
              })

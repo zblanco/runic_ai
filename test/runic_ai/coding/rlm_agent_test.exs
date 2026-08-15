@@ -22,6 +22,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
   alias RunicAI.Coding.Review
   alias RunicAI.Coding.Workspace
   alias RunicAI.Coding.Persistence.InMemory
+  alias RunicAI.Error
   alias RunicAI.LLM.TestClient
   alias RunicAI.RLM.PlanNode
   alias RunicAI.RLM.PlanPatch
@@ -125,6 +126,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert Enum.map(proposal.nodes, & &1.kind) == [
              :deterministic_step,
              :agent,
+             :agent,
              :verification_gate,
              :reducer
            ]
@@ -132,6 +134,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert Enum.map(proposal.nodes, & &1.id) == [
              "acceptance_contract",
              "implement",
+             "verify_implementation",
              "verify",
              "summarize"
            ]
@@ -142,9 +145,17 @@ defmodule RunicAI.Coding.RLMAgentTest do
 
     implement_node = Enum.find(proposal.nodes, &(&1.id == "implement"))
     assert implement_node.params.mode == "patch"
+    assert implement_node.params.contract.role == "implementer"
     assert implement_node.params.task =~ "Do not replace the objective with a repository summary"
     assert implement_node.params.task =~ "workspace is empty"
     assert implement_node.params.task =~ "Do not stop solely because there is no existing"
+    assert implement_node.params.task =~ "source inspection alone"
+
+    verifier_node = Enum.find(proposal.nodes, &(&1.id == "verify_implementation"))
+    assert verifier_node.params.mode == "verify"
+    assert verifier_node.params.contract.role == "verifier"
+    assert verifier_node.params.contract.verification_commands != []
+    assert verifier_node.params.task =~ "passing evidence is fresh"
 
     verify_node = Enum.find(proposal.nodes, &(&1.id == "verify"))
     assert verify_node.params.contract.objective =~ "Build an Elixir proof of concept"
@@ -196,7 +207,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     refute "append_only_events" in requirement_ids
   end
 
-  test "coordinator uses the generic implementation seed for mutating build objectives" do
+  test "coordinator uses the generic implementation seed by default for mutating build objectives" do
     root = sample_project()
     environment = Agent.prepare!(root)
 
@@ -204,8 +215,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
              Coordinator.propose(
                "Build an Elixir field service dispatch proof of concept with tests and a runtime smoke",
                environment,
-               mode: :patch,
-               seed_implementation?: true
+               mode: :patch
              )
 
     assert proposal.metadata.recipe == :implementation
@@ -216,6 +226,72 @@ defmodule RunicAI.Coding.RLMAgentTest do
              proposal.nodes,
              &(&1.id == "verify" and &1.kind == :verification_gate)
            )
+  end
+
+  test "coordinator allows explicit dynamic planning instead of the generic implementation seed" do
+    root = sample_project()
+    environment = Agent.prepare!(root)
+
+    proposal_json =
+      Jason.encode!(%{
+        "objective" => "Build a novel library",
+        "nodes" => [
+          %{
+            "id" => "implement",
+            "kind" => "agent",
+            "params" => %{"mode" => "patch", "task" => "Implement the requested library."}
+          }
+        ],
+        "stop_conditions" => ["implementation child completes"]
+      })
+
+    client = fn _model, _prompt, _opts -> {:ok, TestClient.result(proposal_json)} end
+
+    assert {:ok, proposal, report} =
+             Coordinator.propose("Build a novel library", environment,
+               mode: :patch,
+               seed_implementation?: false,
+               client: client
+             )
+
+    refute proposal.metadata[:seeded?]
+    assert WorkflowValidationReport.accepted?(report)
+  end
+
+  test "coding patch capability prompt does not advertise unavailable command nodes" do
+    root = sample_project()
+    environment = Agent.prepare!(root)
+    caller = self()
+
+    proposal_json =
+      Jason.encode!(%{
+        "objective" => "Change the library behavior",
+        "nodes" => [
+          %{
+            "id" => "implement",
+            "kind" => "agent",
+            "params" => %{"mode" => "patch", "task" => "Apply the behavior change."}
+          }
+        ],
+        "stop_conditions" => ["implementation child completes"]
+      })
+
+    client = fn _model, prompt, _opts ->
+      send(caller, {:coordinator_prompt, prompt})
+      {:ok, TestClient.result(proposal_json)}
+    end
+
+    assert {:ok, _proposal, _report} =
+             Coordinator.propose("Change the library behavior", environment,
+               mode: :patch,
+               profile: :coding_patch,
+               seed_implementation?: false,
+               client: client
+             )
+
+    assert_receive {:coordinator_prompt, prompt}
+    assert prompt =~ ~s("allow_commands?":false)
+    refute prompt =~ ~s("kind":"command")
   end
 
   test "coordinator enriches mutating child agent tasks for empty workspace creation" do
@@ -627,6 +703,40 @@ defmodule RunicAI.Coding.RLMAgentTest do
     refute inspect(error.details) =~ "fallback"
   end
 
+  test "coordinator exposes shallow actionable diagnostics after proposal rejection" do
+    root = sample_project()
+    env = CodebaseEnvironment.new!(root, index?: true)
+
+    client = fn _model, _prompt, _schema, _opts ->
+      {:ok,
+       %{
+         "objective" => "Change Demo",
+         "nodes" => [
+           %{
+             "id" => "shell",
+             "kind" => "command",
+             "params" => %{"args" => %{"argv" => ["mix", "test"]}}
+           }
+         ],
+         "stop_conditions" => ["done"]
+       }}
+    end
+
+    assert {:error, error} =
+             Coordinator.propose("Change Demo", env,
+               client: client,
+               mode: :patch,
+               profile: :coding_patch,
+               seed_implementation?: false,
+               proposal_generation: :object,
+               proposal_repair_attempts: 0
+             )
+
+    assert Enum.any?(error.details.diagnostics, fn diagnostic ->
+             diagnostic[:reason] == :disallowed_node_kind and diagnostic[:node_ids] == ["shell"]
+           end)
+  end
+
   test "coordinator rejects malformed structured proposal output without implicit fallback" do
     root = sample_project()
     env = CodebaseEnvironment.new!(root, index?: true)
@@ -790,7 +900,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     env = CodebaseEnvironment.new!(root, index?: true)
     {:ok, calls} = Elixir.Agent.start_link(fn -> 0 end)
 
-    client = fn _model, _prompt, _opts ->
+    client = fn _model, prompt, _opts ->
       call = Elixir.Agent.get_and_update(calls, &{&1, &1 + 1})
 
       response =
@@ -803,6 +913,9 @@ defmodule RunicAI.Coding.RLMAgentTest do
             }
 
           _other ->
+            assert prompt =~ "Return a complete corrected workflow proposal object"
+            refute prompt =~ "targeted semantic"
+
             %{
               "nodes" => [
                 %{"id" => "discover", "kind" => "tool", "params" => %{"tool" => "find_files"}},
@@ -827,6 +940,163 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert proposal.objective == "Explain Demo"
     assert proposal.stop_conditions == ["answer returned"]
     assert Enum.map(proposal.nodes, & &1.id) == ["discover", "answer"]
+  end
+
+  test "coordinator repairs a normalized proposal with server-pinned typed operations" do
+    root = sample_project()
+    env = CodebaseEnvironment.new!(root, index?: true)
+    {:ok, calls} = Elixir.Agent.start_link(fn -> 0 end)
+
+    client = fn _model, prompt, _opts ->
+      call = Elixir.Agent.get_and_update(calls, &{&1, &1 + 1})
+
+      response =
+        case call do
+          0 ->
+            %{
+              "id" => "cyclic-repair",
+              "objective" => "Explain Demo",
+              "nodes" => [
+                %{
+                  "id" => "discover",
+                  "kind" => "tool",
+                  "params" => %{"tool" => "find_files"}
+                },
+                %{
+                  "id" => "answer",
+                  "kind" => "reducer",
+                  "params" => %{"reducer" => "report"}
+                }
+              ],
+              "edges" => [
+                %{"from" => "discover", "to" => "answer"},
+                %{"from" => "answer", "to" => "discover"}
+              ],
+              "stop_conditions" => ["answer returned"]
+            }
+
+          _other ->
+            assert prompt =~ "targeted semantic"
+            assert prompt =~ "Current editable manifest"
+            assert prompt =~ "disconnect: op,edge_id"
+            refute prompt =~ "Return a complete corrected workflow proposal object"
+
+            %{
+              "base_revision" => 999,
+              "base_hash" => "agent-cannot-override-server-pin",
+              "operations" => [
+                %{
+                  "op" => "disconnect",
+                  "edge_id" => "answer.context->discover.context"
+                }
+              ]
+            }
+        end
+
+      {:ok, TestClient.result(Jason.encode!(response))}
+    end
+
+    assert {:ok, proposal, report} =
+             Coordinator.propose("Explain Demo", env,
+               client: client,
+               fallback?: false,
+               proposal_repair_attempts: 1,
+               validation_opts: [allowed_tools: ["find_files", "read_many"]]
+             )
+
+    assert report.status == :accepted
+    assert proposal.id == "cyclic-repair"
+    assert Enum.map(proposal.edges, &{&1.from, &1.to}) == [{"discover", "answer"}]
+
+    assert %{
+             strategy: :typed_operations,
+             attempts: 1,
+             batches: [
+               %{
+                 status: :applied,
+                 base_revision: 1,
+                 result_revision: 2,
+                 affected_nodes: ["answer", "discover"]
+               }
+             ]
+           } = report.metadata.coordinator_repair
+
+    assert Elixir.Agent.get(calls, & &1) == 2
+  end
+
+  test "coordinator retries a rejected typed operation without mutating its semantic base" do
+    root = sample_project()
+    env = CodebaseEnvironment.new!(root, index?: true)
+    {:ok, calls} = Elixir.Agent.start_link(fn -> 0 end)
+
+    client = fn _model, prompt, _opts ->
+      call = Elixir.Agent.get_and_update(calls, &{&1, &1 + 1})
+
+      response =
+        case call do
+          0 ->
+            %{
+              "id" => "retry-typed-repair",
+              "objective" => "Explain Demo",
+              "nodes" => [
+                %{
+                  "id" => "discover",
+                  "kind" => "tool",
+                  "params" => %{"tool" => "find_files"}
+                },
+                %{
+                  "id" => "answer",
+                  "kind" => "reducer",
+                  "params" => %{"reducer" => "report"}
+                }
+              ],
+              "edges" => [
+                %{"from" => "discover", "to" => "answer"},
+                %{"from" => "answer", "to" => "discover"}
+              ],
+              "stop_conditions" => ["answer returned"]
+            }
+
+          1 ->
+            assert prompt =~ "Base revision: 1"
+
+            %{
+              "operations" => [
+                %{"op" => "disconnect", "edge_id" => "missing.context->edge.context"}
+              ]
+            }
+
+          _other ->
+            assert prompt =~ "Base revision: 1"
+            assert prompt =~ "workflow edge does not exist"
+
+            %{
+              "operations" => [
+                %{
+                  "op" => "disconnect",
+                  "edge_id" => "answer.context->discover.context"
+                }
+              ]
+            }
+        end
+
+      {:ok, TestClient.result(Jason.encode!(response))}
+    end
+
+    assert {:ok, _proposal, report} =
+             Coordinator.propose("Explain Demo", env,
+               client: client,
+               fallback?: false,
+               proposal_repair_attempts: 2,
+               validation_opts: [allowed_tools: ["find_files", "read_many"]]
+             )
+
+    assert report.metadata.coordinator_repair.attempts == 2
+
+    assert [%{status: :rejected, base_revision: 1}, %{status: :applied, base_revision: 1}] =
+             report.metadata.coordinator_repair.batches
+
+    assert Elixir.Agent.get(calls, & &1) == 3
   end
 
   test "coordinator preserves invalid JSON proposal text previews near the error" do
@@ -988,6 +1258,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert {:ok, proposal, report} =
              Coordinator.propose("Create a tiny Mix project", env,
                client: client,
+               seed_implementation?: false,
                proposal_generation: :object,
                fallback?: false,
                proposal_repair_attempts: 1,
@@ -1003,6 +1274,24 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert Enum.map(proposal.nodes, & &1.kind) == [:command, :verification_gate]
     assert proposal.metadata == %{"source" => "repair"}
     assert Elixir.Agent.get(calls, & &1) == 2
+  end
+
+  test "validator normalizes direct argv lists under command args without crashing" do
+    command =
+      ProposalNode.new!("test", :command, params: %{args: ["mix", "test"]})
+
+    proposal =
+      WorkflowProposal.new!("Run the tests", [command], stop_conditions: ["tests pass"])
+
+    report =
+      WorkflowValidator.validate(proposal,
+        allowed_kinds: ProposalNode.allowed_kinds(),
+        allow_commands?: true,
+        allowed_commands: ["mix"]
+      )
+
+    assert report.status == :accepted
+    assert report.errors == []
   end
 
   test "coordinator does not silently fall back for mutating objectives when fallback is disabled" do
@@ -1021,6 +1310,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert {:error, error} =
              Coordinator.propose("Create a tiny Mix project", env,
                client: client,
+               seed_implementation?: false,
                proposal_generation: :object,
                fallback?: false,
                proposal_repair_attempts: 1,
@@ -1063,6 +1353,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
              Coordinator.propose("Build an Elixir dispatch proof of concept", env,
                client: client,
                mode: :patch,
+               seed_implementation?: false,
                proposal_repair_attempts: 0,
                validation_opts: [allowed_tools: ["find_files", "read_many"]]
              )
@@ -1098,6 +1389,7 @@ defmodule RunicAI.Coding.RLMAgentTest do
              Coordinator.propose("Build an Elixir dispatch proof of concept", env,
                client: client,
                mode: :patch,
+               seed_implementation?: false,
                fallback?: false,
                proposal_repair_attempts: 0
              )
@@ -1109,6 +1401,56 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert provider_details.reason_message =~ "model rejected prompt"
     assert provider_details.status == 400
     assert provider_details.response_body_preview =~ "prompt too large"
+  end
+
+  test "coordinator retries a transient provider failure before proposal validation" do
+    root = sample_project()
+    env = CodebaseEnvironment.new!(root, index?: true)
+    {:ok, calls} = Elixir.Agent.start_link(fn -> 0 end)
+
+    proposal =
+      Jason.encode!(%{
+        id: "retry-repo-qa",
+        objective: "Locate Demo.answer/0",
+        assumptions: [],
+        sources: ["repo:manifest"],
+        nodes: [
+          %{id: "discover", kind: "tool", params: %{tool: "find_files"}},
+          %{id: "answer", kind: "reducer", params: %{reducer: "report"}}
+        ],
+        edges: [%{from: "discover", to: "answer"}],
+        policies: %{},
+        expected_artifacts: [],
+        stop_conditions: ["answer returned"],
+        metadata: %{}
+      })
+
+    client = fn _model, _prompt, _opts ->
+      case Elixir.Agent.get_and_update(calls, &{&1, &1 + 1}) do
+        0 ->
+          {:error,
+           RunicAI.Error.provider("temporarily rate limited",
+             retryable?: true,
+             details: %{status: 429, retry_after_ms: 0}
+           )}
+
+        _other ->
+          {:ok, TestClient.result(proposal)}
+      end
+    end
+
+    assert {:ok, generated, report} =
+             Coordinator.propose("Where is Demo.answer/0?", env,
+               client: client,
+               proposal_generation: :json_text,
+               proposal_generation_retry_policy: [max_attempts: 2, backoff: 0],
+               fallback?: false,
+               validation_opts: [allowed_tools: ["find_files"]]
+             )
+
+    assert report.status == :accepted
+    assert generated.id == "retry-repo-qa"
+    assert Elixir.Agent.get(calls, & &1) == 2
   end
 
   test "agent compiles and executes a decomposed repo QA workflow" do
@@ -1181,6 +1523,39 @@ defmodule RunicAI.Coding.RLMAgentTest do
 
     assert result.output.status == :pass
     assert result.output.argv == ["mix", "--version"]
+  end
+
+  test "command nodes record workspace files they create" do
+    root = sample_mix_project()
+    environment = CodebaseEnvironment.new!(root, index?: true)
+
+    proposal =
+      WorkflowProposal.new!(
+        "Create a marker through an explicit command node",
+        [
+          ProposalNode.new!("create-marker", :command,
+            params: %{
+              args: %{
+                argv: ["mix", "run", "-e", "File.write!(\"command-marker.txt\", \"ok\")"],
+                metadata: %{safe?: true, requires_review?: false}
+              }
+            }
+          )
+        ],
+        stop_conditions: ["marker created"]
+      )
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(proposal, environment, %{},
+               validation_opts: [
+                 allowed_kinds: ProposalNode.allowed_kinds(),
+                 allow_commands?: true,
+                 allowed_commands: ["mix"]
+               ]
+             )
+
+    assert result.output.status == :pass
+    assert "command-marker.txt" in result.context.changed_files
   end
 
   test "computing nodes execute safe component families inside coding RLM workflows" do
@@ -1771,6 +2146,65 @@ defmodule RunicAI.Coding.RLMAgentTest do
            )
   end
 
+  test "child agent can resume more than three approved patch gates" do
+    root = sample_project()
+    environment = CodebaseEnvironment.new!(root, index?: true)
+
+    client = fn _model, %RunicAI.Prompt{messages: messages}, _opts ->
+      completed_calls = Enum.count(messages, &(&1.role == :tool))
+
+      if completed_calls < 4 do
+        number = completed_calls + 1
+
+        {:ok,
+         TestClient.tool_response([
+           TestClient.tool_call(
+             "apply_patch",
+             %{
+               operations: [
+                 %{
+                   op: "create",
+                   path: "lib/review_#{number}.ex",
+                   content: "defmodule Review#{number}, do: :ok\n"
+                 }
+               ]
+             },
+             id: "call_#{number}"
+           )
+         ])}
+      else
+        {:ok, TestClient.result("Created four reviewed files. Verification: not run.")}
+      end
+    end
+
+    proposal =
+      WorkflowProposal.new!(
+        "Create four files through a review-gated child patch agent",
+        [
+          ProposalNode.new!("child", :agent, params: %{mode: "patch", task: "Create four files."})
+        ],
+        stop_conditions: ["four files created"]
+      )
+
+    review_decider = fn request, _context ->
+      {:ok, Review.allow(request, reason: "approved by parent policy")}
+    end
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(proposal, environment, %{},
+               client: client,
+               review_decider: review_decider,
+               validation_opts: [allow_mutation?: true]
+             )
+
+    assert Enum.all?(1..4, &File.exists?(Path.join(root, "lib/review_#{&1}.ex")))
+
+    assert [%ChildResult{status: :completed, changed_files: changed_files}] =
+             result.context.child_results
+
+    assert Enum.sort(changed_files) == Enum.map(1..4, &"lib/review_#{&1}.ex")
+  end
+
   test "patch child retries locally after a no-op attempt before outer repair" do
     root = sample_project()
     environment = CodebaseEnvironment.new!(root, index?: true)
@@ -1862,6 +2296,63 @@ defmodule RunicAI.Coding.RLMAgentTest do
                &1
              )
            )
+  end
+
+  test "patch child does not spend no-op repair attempts on non-retryable provider failures" do
+    root = sample_project()
+    environment = CodebaseEnvironment.new!(root, index?: true)
+    {:ok, calls} = Elixir.Agent.start_link(fn -> 0 end)
+
+    client = fn _model, _prompt, _opts ->
+      Elixir.Agent.update(calls, &(&1 + 1))
+
+      {:error,
+       Error.provider("generation failed",
+         details: %{
+           requested_model: "openai:gpt-5.6-terra",
+           status: 429,
+           reason_message: "insufficient_quota: credit balance exhausted"
+         }
+       )}
+    end
+
+    proposal =
+      WorkflowProposal.new!(
+        "Create a file",
+        [
+          ProposalNode.new!("child", :agent,
+            params: %{mode: "patch", task: "Create lib/provider_blocked.ex."}
+          )
+        ],
+        stop_conditions: ["file created"]
+      )
+
+    assert {:ok, result} =
+             WorkflowCompiler.run(proposal, environment, %{},
+               client: client,
+               agent_review_gates?: false,
+               child_noop_repair_attempts: 3,
+               validation_opts: [allow_mutation?: true]
+             )
+
+    assert Elixir.Agent.get(calls, & &1) == 1
+
+    assert [%ChildResult{metadata: metadata}] = result.context.child_results
+    assert metadata.child_noop_repair_attempts == nil
+
+    assert [evidence] = metadata.generation_evidence
+    assert evidence.status == 429
+    assert evidence.retryable? == false
+
+    assert {:error, %Error{} = repair_error} =
+             RepairLoop.run(result, environment,
+               client: client,
+               max_repair_iterations: 3
+             )
+
+    assert repair_error.message =~ "non-retryable generation failure"
+    assert repair_error.details.generation_evidence.status == 429
+    assert Elixir.Agent.get(calls, & &1) == 1
   end
 
   test "patch child retries locally after malformed apply_patch input" do
@@ -2370,6 +2861,39 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert scorecard.objective_status == :failed
   end
 
+  test "independent durable acceptance can supersede a failed child after repair" do
+    source_pass = %{
+      id: "implementation-present",
+      type: :source_contains,
+      status: :pass,
+      required?: true,
+      message: "source contains repaired implementation",
+      metadata: %{}
+    }
+
+    test_pass = %{
+      id: "tests-pass",
+      type: :command_passes,
+      status: :pass,
+      required?: true,
+      message: "command passed",
+      metadata: %{command: ["mix", "test"]}
+    }
+
+    scorecard =
+      WorkflowScorecard.new!(
+        acceptance_results: [source_pass, test_pass],
+        child_results: [%{id: "implement", status: :failed}]
+      )
+
+    assert scorecard.objective_status == :objective_satisfied
+
+    assert RunicAI.Coding.RLM.RepairController.from_scorecard(
+             scorecard,
+             scorecard.acceptance_results
+           ) == []
+  end
+
   test "scorecards let semantic acceptance supersede naming-variant heuristic failures" do
     source_name_mismatch = %{
       id: "public-facade-present",
@@ -2439,6 +2963,25 @@ defmodule RunicAI.Coding.RLMAgentTest do
     assert ChildResult.episode_status(child) == :blocked
     assert child.metadata.review_request.resume_key == "review:child:apply_patch"
     assert child.metadata.review_request.kind == :tool_execution
+  end
+
+  test "child result preserves raw generation evidence for operator diagnosis" do
+    evidence = %{
+      requested_model: "openai:gpt-5.6-terra",
+      finish_reason: :stop,
+      tool_choice: :required,
+      tool_call_count: 0,
+      usage: %{total_tokens: 120}
+    }
+
+    child =
+      ChildResult.from_agent_summary(%{
+        status: :idle,
+        reply: "Unable to continue",
+        generation_evidence: [evidence]
+      })
+
+    assert child.metadata.generation_evidence == [evidence]
   end
 
   test "plan patch validation enforces recursive expansion budgets" do
@@ -2556,6 +3099,87 @@ defmodule RunicAI.Coding.RLMAgentTest do
 
     assert report.status == :rejected
     assert Enum.any?(report.errors, &(&1.details.reason == :missing_verification_contract))
+  end
+
+  test "verification command checks require exact upstream command nodes" do
+    gate =
+      ProposalNode.new!("gate", :verification_gate,
+        params: %{
+          checks: [
+            %{id: "tests", type: "command_passes", params: %{argv: ["mix", "test"]}}
+          ]
+        }
+      )
+
+    unbound =
+      WorkflowProposal.new!(
+        "Run tests",
+        [gate],
+        stop_conditions: ["tests pass"]
+      )
+
+    report = WorkflowValidator.validate(unbound)
+
+    assert report.status == :rejected
+    assert Enum.any?(report.errors, &(&1.details.reason == :unbound_verification_command))
+
+    bound =
+      WorkflowProposal.new!(
+        "Run tests",
+        [
+          ProposalNode.new!("test", :command, params: %{args: %{argv: ["mix", "test"]}}),
+          gate
+        ],
+        edges: [%{from: "test", to: "gate"}],
+        stop_conditions: ["tests pass"]
+      )
+
+    assert WorkflowValidator.validate(bound,
+             allow_commands?: true,
+             allowed_commands: ["mix"]
+           ).status == :accepted
+  end
+
+  test "progress gate includes changed files produced by child workflows" do
+    root = sample_project()
+    workspace = Workspace.new!(root: root)
+
+    proposal =
+      WorkflowProposal.new!(
+        "Implement child-owned source changes",
+        [ProposalNode.new!("child", :agent, params: %{mode: "patch", task: "implement"})],
+        stop_conditions: ["implementation exists"]
+      )
+
+    child =
+      ChildResult.new!(:partial,
+        id: "child",
+        changed_files: ["lib/demo.ex"],
+        unresolved_risks: [
+          "verification was not run",
+          "turn ended with error: provider: transient"
+        ]
+      )
+
+    result =
+      ProgressGate.apply(
+        %{
+          proposal: proposal,
+          context: %{workspace: workspace, changed_files: [], child_results: [child]},
+          episodes: [],
+          trace: []
+        },
+        mode: :patch,
+        progress_policy: [lexical_coverage?: false]
+      )
+
+    assert result.objective_scorecard.changed_files == ["lib/demo.ex"]
+    assert result.objective_scorecard.residual_risks == []
+
+    assert Enum.any?(
+             result.objective_scorecard.acceptance_results,
+             &(&1.id == "progress-implementation-activity" and &1.status == :pass)
+           )
   end
 
   test "reducers dedupe findings and derive repair needs from failed verification" do

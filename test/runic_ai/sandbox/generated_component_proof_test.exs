@@ -3,9 +3,9 @@ defmodule RunicAI.Sandbox.GeneratedComponentProofTest do
 
   alias RunicAI.Sandbox.GeneratedComponent
   alias RunicAI.Sandbox.GeneratedComponentProof
-  alias RunicSandbox.AttachEvents
-  alias RunicSandbox.Capabilities
-  alias RunicSandbox.Session
+  alias LitterBox.AttachEvents
+  alias LitterBox.Capabilities
+  alias LitterBox.Session
 
   test "proves a generated component through attach summary evidence" do
     parent = self()
@@ -231,7 +231,7 @@ defmodule RunicAI.Sandbox.GeneratedComponentProofTest do
 
   defp attach_handle(%Session{} = session, opts) do
     result =
-      RunicSandbox.ExecutionResult.new!(
+      LitterBox.ExecutionResult.new!(
         status: Keyword.fetch!(opts, :status),
         stdout: Keyword.get(opts, :stdout, ""),
         stderr: Keyword.get(opts, :stderr, ""),
@@ -241,7 +241,7 @@ defmodule RunicAI.Sandbox.GeneratedComponentProofTest do
       )
 
     {:ok, request} =
-      RunicSandbox.ExecutionRequest.new(
+      LitterBox.ExecutionRequest.new(
         sandbox: :local_code,
         runtime: :bash,
         source: "sh component_test.sh"

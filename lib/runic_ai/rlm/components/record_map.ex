@@ -91,6 +91,7 @@ defmodule RunicAI.RLM.Components.RecordMap do
         input: input,
         index: index
       })
+      |> append_record_context(record, index)
 
     case LLM.generate_text(model, prompt, llm_opts) do
       {:ok, %Result{} = result} ->
@@ -123,6 +124,26 @@ defmodule RunicAI.RLM.Components.RecordMap do
       {:ok, rendered} -> rendered
       {:error, _error} -> template
     end
+  end
+
+  # Model-authored prompts sometimes describe the transformation but omit the
+  # `{{record}}` placeholder. The component boundary owns data delivery, so the
+  # authoritative record is always appended rather than trusting prompt prose.
+  defp append_record_context(prompt, record, index) do
+    context = %{
+      index: index,
+      id: get(record, :id, "record_#{index}"),
+      record: record_data(record),
+      provenance: get(record, :provenance, [])
+    }
+
+    encoded =
+      case Jason.encode(context) do
+        {:ok, json} -> json
+        {:error, _reason} -> inspect(context, limit: :infinity, printable_limit: :infinity)
+      end
+
+    "#{prompt}\n\nAuthoritative input record (JSON):\n#{encoded}"
   end
 
   defp records(%{records: records}) when is_list(records), do: records
