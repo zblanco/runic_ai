@@ -1,7 +1,7 @@
 defmodule RunicAI.MixProject do
   use Mix.Project
 
-  @version "0.2.0-dev"
+  @version "0.2.0-alpha.1"
   @source_url "https://github.com/zblanco/runic_ai"
 
   def project do
@@ -32,7 +32,7 @@ defmodule RunicAI.MixProject do
 
   defp package do
     [
-      files: ~w(lib mix.exs README.md CHANGELOG.md .formatter.exs),
+      files: ~w(lib guides mix.exs README.md CHANGELOG.md .formatter.exs),
       licenses: ["MIT"],
       links: %{"Source" => @source_url}
     ]

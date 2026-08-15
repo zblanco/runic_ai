@@ -2,26 +2,11 @@ defmodule RunicAI.Control.Trace do
   @moduledoc "Ordered, portable execution trace with explicitly supplied timestamps."
 
   alias RunicAI.JSONValue
+  alias RunicAI.Control.Trace.Event
 
   @wire_id "runic.ai/trace/v1"
   @event_wire "runic.ai/trace-event/v1"
   @statuses [:started, :succeeded, :failed, :suspended, :resumed, :skipped]
-
-  defmodule Event do
-    @moduledoc false
-    @enforce_keys [:id, :sequence, :component, :status, :occurred_at]
-    defstruct id: nil,
-              sequence: nil,
-              component: nil,
-              status: nil,
-              occurred_at: nil,
-              input_ref: nil,
-              output_ref: nil,
-              error: nil,
-              metadata: %{}
-
-    @type t :: %__MODULE__{}
-  end
 
   @enforce_keys [:run_id, :events]
   defstruct run_id: nil, events: []
