@@ -7,7 +7,8 @@ defmodule RunicAI.Tool.Observation do
 
   def message(%Result{status: :ok} = result) do
     Message.new!(:tool, [MessageContent.tool_result(result.call_id, result.tool, result.output)],
-      name: result.tool
+      name: result.tool,
+      metadata: %{"tool_call_id" => result.call_id}
     )
   end
 
@@ -18,6 +19,9 @@ defmodule RunicAI.Tool.Observation do
         MessageContent.tool_result(result.call_id, result.tool, %{
           "error" => RunicAI.Error.encode(result.error)
         })
-      ], name: result.tool)
+      ],
+      name: result.tool,
+      metadata: %{"tool_call_id" => result.call_id}
+    )
   end
 end

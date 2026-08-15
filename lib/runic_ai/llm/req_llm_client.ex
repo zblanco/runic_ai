@@ -83,10 +83,16 @@ defmodule RunicAI.LLM.ReqLLMClient do
   end
 
   defp to_req_message(%Message{role: :tool} = message) do
-    tool_call_id = Map.get(message.metadata, "tool_call_id")
+    tool_result = Enum.find(message.content, &(&1.type == :tool_result))
+
+    tool_call_id =
+      Map.get(message.metadata, "tool_call_id") || (tool_result && tool_result.call_id)
+
+    name = message.name || (tool_result && tool_result.name)
+    content = if(tool_result, do: Jason.encode!(tool_result.value), else: Message.text(message))
 
     if is_binary(tool_call_id) and tool_call_id != "" do
-      {:ok, ReqLLM.Context.tool_result(tool_call_id, message.name, Message.text(message))}
+      {:ok, ReqLLM.Context.tool_result(tool_call_id, name, content)}
     else
       {:error,
        Error.validation("tool messages require a tool_call_id",
