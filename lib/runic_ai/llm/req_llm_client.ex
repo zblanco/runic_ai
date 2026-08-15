@@ -53,15 +53,19 @@ defmodule RunicAI.LLM.ReqLLMClient do
       )
 
   defp req_opts(request) do
-    request.parameters
-    |> Enum.map(fn
-      {"temperature", value} -> {:temperature, value}
-      {"top_p", value} -> {:top_p, value}
-      {"max_tokens", value} -> {:max_tokens, value}
-      {"stop", value} -> {:stop, value}
-      {"seed", value} -> {:seed, value}
-      {"reasoning_effort", value} -> {:reasoning_effort, value}
-    end)
+    parameter_opts =
+      Enum.map(request.parameters, fn
+        {"temperature", value} -> {:temperature, value}
+        {"top_p", value} -> {:top_p, value}
+        {"max_tokens", value} -> {:max_tokens, value}
+        {"stop", value} -> {:stop, value}
+        {"seed", value} -> {:seed, value}
+        {"reasoning_effort", value} -> {:reasoning_effort, value}
+      end)
+
+    parameter_opts
+    |> put_tools(request.tools)
+    |> put_extension(request.extensions, "tool_choice", :tool_choice)
   end
 
   defp to_req_context(%Prompt{messages: messages}) do
@@ -78,6 +82,20 @@ defmodule RunicAI.LLM.ReqLLMClient do
     end
   end
 
+  defp to_req_message(%Message{role: :tool} = message) do
+    tool_call_id = Map.get(message.metadata, "tool_call_id")
+
+    if is_binary(tool_call_id) and tool_call_id != "" do
+      {:ok, ReqLLM.Context.tool_result(tool_call_id, message.name, Message.text(message))}
+    else
+      {:error,
+       Error.validation("tool messages require a tool_call_id",
+         code: "invalid_tool_message",
+         source: inspect(__MODULE__)
+       )}
+    end
+  end
+
   defp to_req_message(%Message{} = message) do
     if Enum.all?(message.content, &(&1.type == :text)) do
       text = Message.text(message)
@@ -87,17 +105,9 @@ defmodule RunicAI.LLM.ReqLLMClient do
           :system -> ReqLLM.Context.system(text, metadata: message.metadata)
           :user -> ReqLLM.Context.user(text, metadata: message.metadata)
           :assistant -> ReqLLM.Context.assistant(text, metadata: message.metadata)
-          :tool -> nil
         end
 
-      if req_message,
-        do: {:ok, req_message},
-        else:
-          {:error,
-           Error.validation("tool messages require the tool adapter",
-             code: "unsupported_message_part",
-             source: inspect(__MODULE__)
-           )}
+      {:ok, req_message}
     else
       {:error,
        Error.validation("ReqLLM adapter does not support this owned content part yet",
@@ -191,6 +201,56 @@ defmodule RunicAI.LLM.ReqLLMClient do
   end
 
   defp safe_arguments(_value), do: %{}
+
+  defp put_tools(opts, []), do: opts
+
+  defp put_tools(opts, tools) do
+    case Enum.reduce_while(tools, {:ok, []}, fn tool, {:ok, acc} ->
+           case to_req_tool(tool) do
+             {:ok, req_tool} -> {:cont, {:ok, [req_tool | acc]}}
+             {:error, error} -> {:halt, {:error, error}}
+           end
+         end) do
+      {:ok, req_tools} -> Keyword.put(opts, :tools, Enum.reverse(req_tools))
+      {:error, error} -> raise ArgumentError, error.message
+    end
+  end
+
+  defp to_req_tool(%{"name" => name, "description" => description, "parameters" => schema}) do
+    ReqLLM.Tool.new(
+      name: name,
+      description: description,
+      parameter_schema: schema,
+      callback: fn _arguments -> {:error, :host_executes_tools} end
+    )
+    |> case do
+      {:ok, tool} ->
+        {:ok, tool}
+
+      {:error, _reason} ->
+        {:error,
+         Error.validation("LLM tool specification is invalid",
+           code: "invalid_llm_tool",
+           source: inspect(__MODULE__),
+           details: %{"name" => name}
+         )}
+    end
+  end
+
+  defp to_req_tool(_tool),
+    do:
+      {:error,
+       Error.validation("LLM tool specification is invalid",
+         code: "invalid_llm_tool",
+         source: inspect(__MODULE__)
+       )}
+
+  defp put_extension(opts, extensions, key, option) do
+    case Map.get(extensions, key) do
+      nil -> opts
+      value -> Keyword.put(opts, option, value)
+    end
+  end
 
   defp provider_warnings(meta) when is_map(meta),
     do: Map.get(meta, :warnings) || Map.get(meta, "warnings") || []

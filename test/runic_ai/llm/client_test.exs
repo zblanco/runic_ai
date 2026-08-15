@@ -63,6 +63,40 @@ defmodule RunicAI.LLM.ClientTest do
              ReqLLMClient.generate(request, dispatch: invalid)
   end
 
+  test "portable tools and tool-result messages reach ReqLLM without executable bindings" do
+    tool = %{
+      "name" => "workspace_describe",
+      "description" => "Describe the workspace",
+      "parameters" => %{"type" => "object", "properties" => %{}}
+    }
+
+    prompt =
+      RunicAI.Prompt.new!([
+        Message.user("inspect"),
+        Message.new!(:tool, "done",
+          name: "workspace_describe",
+          metadata: %{"tool_call_id" => "call-1"}
+        )
+      ])
+
+    request =
+      Request.new!("openai:gpt-test", prompt,
+        tools: [tool],
+        extensions: %{"tool_choice" => "auto"}
+      )
+
+    dispatch = fn _request, %ReqLLM.Context{} = context, opts ->
+      assert [%ReqLLM.Message{role: :user}, %ReqLLM.Message{role: :tool, tool_call_id: "call-1"}] =
+               ReqLLM.Context.to_list(context)
+
+      assert [%ReqLLM.Tool{name: "workspace_describe"}] = Keyword.fetch!(opts, :tools)
+      assert Keyword.fetch!(opts, :tool_choice) == "auto"
+      {:ok, response("complete")}
+    end
+
+    assert {:ok, %Result{}} = ReqLLMClient.generate(request, dispatch: dispatch)
+  end
+
   defp response(text, opts \\ []) do
     message = ReqLLM.Context.assistant(text)
 
