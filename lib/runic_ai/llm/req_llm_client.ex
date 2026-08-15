@@ -126,6 +126,7 @@ defmodule RunicAI.LLM.ReqLLMClient do
          {:ok, usage} <- Usage.new(response.usage || %{}),
          {:ok, evidence} <- Evidence.new(evidence_map(response, request)) do
       Result.new(Message.assistant(text),
+        reasoning: ReqLLM.Response.thinking(response),
         object: object,
         tool_requests: tool_requests,
         usage: Usage.encode(usage),
@@ -172,10 +173,16 @@ defmodule RunicAI.LLM.ReqLLMClient do
     %{
       "provider" => provider_from_model(request.model),
       "model" => response.model || request.model,
-      "request_id" => response.id,
+      "request_id" => response_request_id(response),
       "finish_reason" => if(response.finish_reason, do: Atom.to_string(response.finish_reason))
     }
   end
+
+  defp response_request_id(%ReqLLM.Response{message: %{metadata: metadata}, id: id})
+       when is_map(metadata),
+       do: Map.get(metadata, :response_id) || Map.get(metadata, "response_id") || id
+
+  defp response_request_id(%ReqLLM.Response{id: id}), do: id
 
   defp safe_tool_call(call) do
     map = ReqLLM.ToolCall.to_map(call)

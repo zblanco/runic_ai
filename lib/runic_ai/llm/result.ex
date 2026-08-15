@@ -8,7 +8,13 @@ defmodule RunicAI.LLM.Result do
 
   @wire_id "runic.ai/llm-result/v1"
   @enforce_keys [:message, :usage, :evidence]
-  defstruct message: nil, object: nil, tool_requests: [], usage: nil, evidence: nil, warnings: []
+  defstruct message: nil,
+            reasoning: nil,
+            object: nil,
+            tool_requests: [],
+            usage: nil,
+            evidence: nil,
+            warnings: []
 
   @type t :: %__MODULE__{}
 
@@ -16,6 +22,7 @@ defmodule RunicAI.LLM.Result do
     with {:ok, message} <- Message.normalize(message),
          true <- message.role == :assistant,
          {:ok, object} <- normalize_optional_json(Keyword.get(opts, :object)),
+         true <- valid_reasoning?(Keyword.get(opts, :reasoning)),
          {:ok, tool_requests} when is_list(tool_requests) <-
            JSONValue.normalize(Keyword.get(opts, :tool_requests, [])),
          {:ok, usage} <- Usage.new(Keyword.get(opts, :usage, %{})),
@@ -25,6 +32,7 @@ defmodule RunicAI.LLM.Result do
       {:ok,
        %__MODULE__{
          message: message,
+         reasoning: Keyword.get(opts, :reasoning),
          object: object,
          tool_requests: tool_requests,
          usage: usage,
@@ -54,6 +62,7 @@ defmodule RunicAI.LLM.Result do
       "evidence" => Evidence.encode(result.evidence),
       "warnings" => result.warnings
     }
+    |> put_if("reasoning", result.reasoning, not is_nil(result.reasoning))
     |> put_if("object", result.object, not is_nil(result.object))
   end
 
@@ -62,6 +71,7 @@ defmodule RunicAI.LLM.Result do
          true <- Map.get(map, "$contract", @wire_id) == @wire_id,
          {:ok, message} <- Message.decode(Map.get(map, "message")) do
       new(message,
+        reasoning: Map.get(map, "reasoning"),
         object: Map.get(map, "object"),
         tool_requests: Map.get(map, "tool_requests", []),
         usage: Map.get(map, "usage", %{}),
@@ -76,6 +86,7 @@ defmodule RunicAI.LLM.Result do
   end
 
   def text(%__MODULE__{message: message}), do: Message.text(message)
+  defp valid_reasoning?(value), do: is_nil(value) or is_binary(value)
   defp normalize_optional_json(nil), do: {:ok, nil}
   defp normalize_optional_json(value), do: JSONValue.normalize(value)
   defp put_if(map, _key, _value, false), do: map

@@ -45,6 +45,20 @@ defmodule RunicAI.LLM.ClientTest do
     refute Error.encode(error) |> Jason.encode!() =~ "secret"
   end
 
+  test "reasoning stays separate from final answer text" do
+    request = Request.new!("openai:gpt-test", "think")
+
+    dispatch = fn _request, _context, _opts ->
+      {:ok, response("", thinking: "private channel")}
+    end
+
+    assert {:ok, %Result{reasoning: "private channel"} = result} =
+             ReqLLMClient.generate(request, dispatch: dispatch)
+
+    assert Result.text(result) == ""
+    assert Result.encode(result)["reasoning"] == "private channel"
+  end
+
   test "structured provider output is validated against the owned contract" do
     request =
       Request.new!("openai:gpt-test", "score",
@@ -98,7 +112,20 @@ defmodule RunicAI.LLM.ClientTest do
   end
 
   defp response(text, opts \\ []) do
-    message = ReqLLM.Context.assistant(text)
+    message =
+      ReqLLM.Context.assistant(text)
+      |> then(fn message ->
+        case Keyword.get(opts, :thinking) do
+          nil ->
+            message
+
+          thinking ->
+            %{
+              message
+              | content: message.content ++ [ReqLLM.Message.ContentPart.thinking(thinking)]
+            }
+        end
+      end)
 
     %ReqLLM.Response{
       id: "response-1",
