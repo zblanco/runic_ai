@@ -1,4 +1,8 @@
 defmodule RunicAI do
-  @external_resource Path.expand("../README.md", __DIR__)
-  @moduledoc File.read!(Path.expand("../README.md", __DIR__))
+  @moduledoc """
+  Portable AI-domain contracts, effect adapters, and Runic components.
+
+  RunicAI is process-agnostic. Host applications own runners, persistence,
+  supervision, authorization, and user interfaces.
+  """
 end
