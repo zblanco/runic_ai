@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0-alpha.2 - 2026-08-16
+
+- Add `RunicAI.Component.ContextAssemble`, a pure Runic component exposing the
+  existing provenance-, sensitivity-, and size-aware context assembly boundary.
+- Verify direct execution and native Runic composition produce the same owned
+  prompt and selected context window.
+
 ## 0.2.0-alpha.1 - 2026-08-15
 
 - Reset the package boundary around portable contracts and Runic components.

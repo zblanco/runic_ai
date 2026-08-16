@@ -22,6 +22,10 @@ Public durable values use explicit JSON-safe `encode/1` and `decode/1` forms.
 Executable clients, tool functions, and trace sinks are supplied separately by
 the host and are never embedded in persisted specifications.
 
+The small public component set includes LLM generation, tool execution, and
+deterministic retrieved-context assembly. Hosts compose these with ordinary
+`Runic.Workflow` APIs; RunicAI does not model a workflow builder inside a step.
+
 ## Guides
 
 - [Contracts and mental model](guides/contracts.md)

@@ -1,7 +1,7 @@
 defmodule RunicAI.MixProject do
   use Mix.Project
 
-  @version "0.2.0-alpha.1"
+  @version "0.2.0-alpha.2"
   @source_url "https://github.com/zblanco/runic_ai"
 
   def project do
